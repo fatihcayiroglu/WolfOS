@@ -67,6 +67,19 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("run.returncode != 33", exception)
         self.assertIn("exception-smoke:", (ROOT / "Makefile").read_text())
 
+    def test_pci_discovery_is_read_only(self):
+        pci = (ROOT / "kernel/src/pci.rs").read_text()
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        self.assertIn("pci::discover()", main)
+        for marker in ("WOLFOS_GPU_DETECTED", "WOLFOS_PCI_OK", "WOLFOS_PCI_TEST_OK"):
+            self.assertIn(marker, smoke)
+        for symbol in ("CONFIG_ADDRESS", "CONFIG_DATA", "0x8000_0000u32",
+                       "vendor == 0xffff", "0x03 =>"):
+            self.assertIn(symbol, pci)
+        self.assertNotIn("CONFIG_DATA, in(", pci)
+        self.assertIn('"-vga", "std"', smoke)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

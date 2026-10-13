@@ -18,6 +18,9 @@ MARKERS = (
     "WOLFOS_PMM_OK",
     "WOLFOS_PMM_TEST_OK iterations=10000 unique=128",
     "WOLFOS_PMM_DYNAMIC_OK",
+    "WOLFOS_GPU_DETECTED",
+    "WOLFOS_PCI_OK",
+    "WOLFOS_PCI_TEST_OK",
     "WOLFOS_FRAMEBUFFER_OK",
     "WOLFOS_BOOT_OK",
 )
@@ -33,7 +36,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="wolfos-smoke-") as tmp:
         log = pathlib.Path(tmp) / "serial.log"
         cmd = [
-            "qemu-system-x86_64", "-M", "q35", "-m", "512M",
+            "qemu-system-x86_64", "-M", "q35", "-m", "512M", "-vga", "std",
             "-cdrom", str(iso), "-boot", "d",
             "-serial", f"file:{log}", "-display", "none", "-no-reboot",
             "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
