@@ -1,6 +1,6 @@
 //! First real x86-64 cooperative kernel execution-context switch.
 //!
-//! This deliberately isolated acceptance exercise runs ONLY on the BSP after
+//! The initial roundtrip acceptance exercise runs ONLY on the BSP after
 //! the SMP boot tests finish. Two independently stacked Rust functions yield
 //! to one another and resume their original call frames. Six System V ABI
 //! nonvolatile GPRs and RSP are preserved by an audited assembly routine.
@@ -78,9 +78,12 @@ unsafe extern "C" {
 }
 
 /// # Safety
-/// BSP-only, maskable interrupts disabled. Both raw slots must be distinct,
-/// live and exclusively owned. The destination contains a valid suspended or
-/// ABI-aligned initial switch frame. No mutable Rust borrow may span this call.
+/// Runs on the calling CPU (BSP or AP), with maskable interrupts disabled.
+/// Both raw slots must be distinct, live and exclusively owned by that CPU.
+/// The destination holds a valid suspended/ABI-aligned initial switch frame.
+/// No mutable Rust borrow may span this call. Calls on distinct CPUs may
+/// execute concurrently ONLY if their stack/RSP storage is disjoint.
+
 pub(crate) unsafe fn switch_raw(previous: *mut usize, next: *const usize) {
     // SAFETY: caller maintains the exclusive stack/context ownership contract.
     unsafe { wolfos_switch_context(previous, next); }

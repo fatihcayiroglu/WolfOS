@@ -5,14 +5,14 @@
 //! their private GDT/TSS/IDT. All APs meet an Acquire/Release start barrier,
 //! perform independent deterministic CPU work, and park. BSP checks results.
 //!
-//! Includes a cooperative fixed-batch dispatcher but NOT a real preemptive
-//! scheduler: no context switching, user mode, IPIs or timers.
+//! Includes a fixed-batch dispatcher and two actual saved-context kernel
+//! threads per CPU; NOT a preemptive scheduler. No IPIs, user mode or timers.
 //! APs do not use serial, PMM, PCI, global page-table updates or disk access.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::mp::{MpInfo, MpRespData};
 
-use crate::{ap_stack, scheduler, serial, thread_scheduler};
+use crate::{ap_stack, scheduler, serial, thread_scheduler, percpu_context};
 
 pub const MAX_BOOT_CPUS: usize = 256;
 const ACK_MAGIC: u64 = 0x574F_4C46_4150_0000;
@@ -103,6 +103,11 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
         crate::halt_forever();
     }
     if !thread_scheduler::BOOT_TASKS.run_cpu(index) {
+        crate::halt_forever();
+    }
+    // Run two real saved-RSP thread contexts on THIS AP only. Other CPU
+    // context slots and per-CPU queues are never accessed by the AP.
+    if !percpu_context::run(index) {
         crate::halt_forever();
     }
     if !ap_stack::verify_active(index) {
@@ -203,6 +208,10 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
         serial::write_line("WOLFOS_THREADS_ERROR bsp_worker_failed");
         return false;
     }
+    if !percpu_context::run(bsp_index) {
+        serial::write_line("WOLFOS_SMP_CTX_ERROR bsp_context_failure");
+        return false;
+    }
     if !wait_for(cpus, mp.bsp_lapic_id, &AP_DONE) {
         serial::write_fmt(format_args!(
             "WOLFOS_SMP_ERROR ap_work_timeout expected={}\n", ap_count
@@ -219,6 +228,23 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
             return false;
         }
     }
+    // AP_DONE is published with Release only AFTER AP context work.
+    // wait_for() read every AP_DONE with Acquire, so BSP may safely read
+    // AP-specific non-atomic TCB records after all APs have parked.
+    if !percpu_context::verify_all(cpus.len()) {
+        serial::write_line("WOLFOS_SMP_CTX_ERROR per_cpu_context_verification");
+        return false;
+    }
+    serial::write_fmt(format_args!(
+        "WOLFOS_SMP_CTX_OK cpus={} active={} threads={} switches={} yields={} blocked={} woken={} finished={} stack_kib={} bank_kib={}\n",
+        cpus.len(), cpus.len(),
+        cpus.len() * percpu_context::THREADS_PER_PROCESSOR,
+        cpus.len() * percpu_context::SWITCHES_PER_PROCESSOR,
+        cpus.len() * percpu_context::YIELDS_PER_PROCESSOR,
+        cpus.len(), cpus.len(),
+        cpus.len() * percpu_context::THREADS_PER_PROCESSOR,
+        percpu_context::STACK_KIB, percpu_context::MAX_BANK_KIB
+    ));
     let Some(report) = scheduler::BOOT_QUEUE.verify(bsp_index) else {
         serial::write_line("WOLFOS_SCHED_ERROR job_verification_failed");
         return false;
