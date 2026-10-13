@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::InterruptStackFrame;
 use crate::serial;
 
-pub const TIMER_VECTOR: usize = 32;
+pub const TIMER_VECTOR: u8 = 32;
 const MASTER_COMMAND: u16 = 0x20;
 const MASTER_DATA: u16 = 0x21;
 const SLAVE_COMMAND: u16 = 0xA0;
