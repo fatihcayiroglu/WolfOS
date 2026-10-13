@@ -5,13 +5,14 @@
 //! their private GDT/TSS/IDT. All APs meet an Acquire/Release start barrier,
 //! perform independent deterministic CPU work, and park. BSP checks results.
 //!
-//! NOT a real scheduler: no context switching, user mode, IPIs or timers.
+//! Includes a cooperative fixed-batch dispatcher but NOT a real preemptive
+//! scheduler: no context switching, user mode, IPIs or timers.
 //! APs do not use serial, PMM, PCI, global page-table updates or disk access.
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::mp::{MpInfo, MpRespData};
 
-use crate::{ap_stack, serial};
+use crate::{ap_stack, scheduler, serial};
 
 pub const MAX_BOOT_CPUS: usize = 256;
 const ACK_MAGIC: u64 = 0x574F_4C46_4150_0000;
@@ -98,6 +99,9 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
     }
 
     let result = compute(index, info.lapic_id);
+    if !scheduler::BOOT_QUEUE.run_worker(index) {
+        crate::halt_forever();
+    }
     if !ap_stack::verify_active(index) {
         crate::halt_forever();
     }
@@ -131,6 +135,15 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
     }
     if bsp_count != 1 {
         serial::write_line("WOLFOS_SMP_ERROR bsp_not_unique");
+        return false;
+    }
+    let Some(bsp_index) = cpus.iter().position(|cpu| cpu.lapic_id == mp.bsp_lapic_id)
+    else {
+        return false;
+    };
+    // Configure before any AP can claim a queue item.
+    if !scheduler::BOOT_QUEUE.configure(cpus.len()) {
+        serial::write_line("WOLFOS_SCHED_ERROR invalid_initialization");
         return false;
     }
 
@@ -174,6 +187,11 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
     // All APs have reached the barrier. Send one release event to begin
     // independent CPU work on each permanent stack.
     START_WORK.store(true, Ordering::Release);
+    // BSP participates as a worker while APs run on private kernel stacks.
+    if !scheduler::BOOT_QUEUE.run_worker(bsp_index) {
+        serial::write_line("WOLFOS_SCHED_ERROR bsp_worker_failed");
+        return false;
+    }
     if !wait_for(cpus, mp.bsp_lapic_id, &AP_DONE) {
         serial::write_fmt(format_args!(
             "WOLFOS_SMP_ERROR ap_work_timeout expected={}\n", ap_count
@@ -190,6 +208,15 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
             return false;
         }
     }
+    let Some(report) = scheduler::BOOT_QUEUE.verify(bsp_index) else {
+        serial::write_line("WOLFOS_SCHED_ERROR job_verification_failed");
+        return false;
+    };
+    serial::write_fmt(format_args!(
+        "WOLFOS_SCHED_OK tasks={} cpus={} active={} bsp_jobs={} ap_jobs={}\n",
+        report.jobs, report.workers, report.active_cpus,
+        report.bsp_jobs, report.ap_jobs
+    ));
     serial::write_fmt(format_args!(
         "WOLFOS_SMP_WORK_OK total={} workers={} rounds={}\n",
         cpus.len(), ap_count, WORK_ROUNDS

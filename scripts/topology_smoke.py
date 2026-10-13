@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot four QEMU vCPUs and verify ACPI MADT topology, not CPU scheduling."""
+"""Boot four QEMU vCPUs and verify ACPI/MADT plus cooperative job dispatch."""
 from pathlib import Path
 import re
 import subprocess
@@ -67,10 +67,24 @@ def main() -> int:
         if work is None or tuple(map(int, work.groups())) != (EXPECTED_CPUS, 3, 32768):
             print("FAIL: independent AP work did not finish with verified results")
             return 1
+        dispatch = re.search(
+            r"WOLFOS_SCHED_OK tasks=(\d+) cpus=(\d+) active=(\d+) bsp_jobs=(\d+) ap_jobs=(\d+)",
+            output,
+        )
+        if dispatch is None:
+            print("FAIL: cooperative job queue did not report verified work")
+            return 1
+        tasks, cpus, active, bsp_jobs, ap_jobs = map(int, dispatch.groups())
+        if (tasks, cpus, active) != (512, EXPECTED_CPUS, EXPECTED_CPUS):
+            print(f"FAIL: incorrect scheduler job/CPU count {(tasks,cpus,active)}")
+            return 1
+        if bsp_jobs < 1 or ap_jobs < EXPECTED_CPUS - 1 or bsp_jobs + ap_jobs != tasks:
+            print(f"FAIL: verified work must include BSP and 3 APs: {(bsp_jobs,ap_jobs)}")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: 3 APs ran verified CPU work on WolfOS stacks after barrier; no SMP scheduler")
+        print("PASS: 4 CPUs executed an exactly-once 512-job cooperative queue; no preemption")
         return 0
 
 if __name__ == "__main__":
