@@ -49,6 +49,24 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_PMM_DYNAMIC_OK", smoke)
         self.assertIn("unsafe impl Sync", pmm)
 
+    def test_gdt_idt_and_exception_contract(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        intr = (ROOT / "kernel/src/interrupts.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        exception = (ROOT / "scripts/exception_smoke.py").read_text()
+        self.assertIn("#![feature(abi_x86_interrupt)]", main)
+        self.assertIn("interrupts::initialize()", main)
+        for code in ("Descriptor::tss_segment", "load_tss(tss_sel)", "idt_ref.load()",
+                     "set_stack_index(DOUBLE_FAULT_IST_INDEX)", "fn double_fault",
+                     "fn page_fault", "fn general_protection_fault", "fn invalid_opcode"):
+            self.assertIn(code, intr)
+        for marker in ("WOLFOS_GDT_OK", "WOLFOS_IDT_OK",
+                       "WOLFOS_EXCEPTION_BP vector=3", "WOLFOS_BREAKPOINT_RETURN_OK"):
+            self.assertIn(marker, smoke)
+        self.assertIn("WOLFOS_EXCEPTION_UD vector=6", exception)
+        self.assertIn("run.returncode != 33", exception)
+        self.assertIn("exception-smoke:", (ROOT / "Makefile").read_text())
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

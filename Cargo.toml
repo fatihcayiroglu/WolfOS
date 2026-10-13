@@ -11,10 +11,12 @@ path = "kernel/src/main.rs"
 
 [dependencies]
 limine = "=0.6.5"
+x86_64 = { version = "=0.15.5", features = ["abi_x86_interrupt"] }
 
 [features]
 default = []
 smoke-exit = []
+exception-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
