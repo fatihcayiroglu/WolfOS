@@ -34,6 +34,7 @@ MARKERS = (
     "WOLFOS_THREADS_OK threads=256 cpus=1 active=1 yielded=512 blocked=256 woken=256 finished=256",
     "WOLFOS_CONTEXT_OK tasks=2 switches=7 events=6 stacks_kib=16",
     "WOLFOS_KTHREAD_OK threads=3 dispatches=9 switches=18 yields=5 blocked=1 woken=1 finished=3 stack_kib=16",
+    "WOLFOS_CTX_BATCH_OK threads=16 dispatches=64 switches=128 yields=47 blocked=1 woken=1 finished=16 stack_kib=16",
     "WOLFOS_SMP_AP_IDT_OK total=1 ap_idts=0 ap_bp_returns=0",
     "WOLFOS_SMP_PERCPU_OK total=1 ap_tables=0",
     "WOLFOS_BOOT_OK",

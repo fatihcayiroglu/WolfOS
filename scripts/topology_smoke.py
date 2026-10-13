@@ -94,10 +94,13 @@ def main() -> int:
         if "WOLFOS_KTHREAD_OK threads=3 dispatches=9 switches=18 yields=5 blocked=1 woken=1 finished=3 stack_kib=16" not in output:
             print("FAIL: three context-backed kernel threads did not yield/block/wake and resume")
             return 1
+        if "WOLFOS_CTX_BATCH_OK threads=16 dispatches=64 switches=128 yields=47 blocked=1 woken=1 finished=16 stack_kib=16" not in output:
+            print("FAIL: 16 independent context-backed kernel TCBs did not all resume")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: 4-vCPU SMP queue, real 2-stack switch and 3 context-backed TCBs verified")
+        print("PASS: four-vCPU SMP queues and 16 real context-backed kernel TCBs verified")
         return 0
 
 if __name__ == "__main__":
