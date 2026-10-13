@@ -71,6 +71,8 @@ test:
 	rustc --edition=2024 --test kernel/src/pmm_layout.rs -o $(OUT)/pmm_layout_tests
 	rustc --edition=2024 --test kernel/src/acpi_layout.rs -o $(OUT)/acpi_layout_tests
 	$(OUT)/acpi_layout_tests
+	rustc --edition=2024 --test kernel/src/acpi_tables.rs -o $(OUT)/acpi_tables_tests
+	$(OUT)/acpi_tables_tests
 	$(OUT)/pmm_layout_tests
 
 check: test

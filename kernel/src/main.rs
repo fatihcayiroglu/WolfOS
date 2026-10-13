@@ -19,6 +19,8 @@ mod pci;
 mod paging;
 mod acpi;
 mod acpi_layout;
+mod acpi_tables;
+mod acpi_walk;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -26,7 +28,8 @@ static START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
-static BASE_REVISION: BaseRevision = BaseRevision::with_revision(0);
+// Base revision 4 guarantees ACPI firmware tables are mapped in typed HHDM regions.
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(4);
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -111,8 +114,12 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_ACPI_ERROR no Limine RSDP response");
         halt_forever();
     };
-    if !acpi::report_rsdp(rsdp_response.address) {
+    let Some(acpi_info) = acpi::report_rsdp(rsdp_response.address) else {
         serial::write_line("WOLFOS_ACPI_TEST_FAILED");
+        halt_forever();
+    };
+    if !acpi_walk::discover(acpi_info, hhdm.offset, entries) {
+        serial::write_line("WOLFOS_ACPI_TOPOLOGY_TEST_FAILED");
         halt_forever();
     }
 

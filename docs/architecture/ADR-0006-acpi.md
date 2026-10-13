@@ -1,8 +1,9 @@
 # ADR-0006: Read-only RSDP discovery as the entry point to ACPI
 
-Status: Proposed pending QEMU boot tests.
+Status: Accepted for RSDP read-only discovery (GitHub Actions P1 CI).
 
-- Request RSDP from Limine. Base revision 0 returns a kernel virtual pointer.
+- Request RSDP with Limine base revision 4. This guarantees virtual
+  RSDP addresses and ACPI tables mapped in typed HHDM regions.
 - Validate the ACPI signature, 20-byte checksum and, if revision >=2,
   bounded extended length and extended checksum.
 - Report revision, OEM ID and RSDT/XSDT physical addresses.

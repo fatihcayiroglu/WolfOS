@@ -1,14 +1,14 @@
 //! Read-only ACPI firmware discovery using Limine's RSDP virtual pointer.
-//! Limine base revision 0 guarantees this is a virtual address on x86-64.
+//! Limine base revision 4 guarantees a virtual RSDP pointer and mapped ACPI regions.
 //! Firmware memory is read but never modified. Tables not yet enumerated.
 
-use crate::acpi_layout::{parse_rsdp, MAX_RSDP_SIZE, MIN_RSDP_SIZE, ACPI_V2_RSDP_SIZE};
+use crate::acpi_layout::{parse_rsdp, RsdpInfo, MAX_RSDP_SIZE, MIN_RSDP_SIZE, ACPI_V2_RSDP_SIZE};
 use crate::serial;
 
-pub fn report_rsdp(rsdp_address: *mut ()) -> bool {
+pub fn report_rsdp(rsdp_address: *mut ()) -> Option<RsdpInfo> {
     if rsdp_address.is_null() {
         serial::write_line("WOLFOS_ACPI_ERROR null RSDP");
-        return false;
+        return None;
     }
     let ptr = rsdp_address.cast::<u8>();
     let mut bytes = [0_u8; MAX_RSDP_SIZE];
@@ -29,7 +29,7 @@ pub fn report_rsdp(rsdp_address: *mut ()) -> bool {
         length = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
         if !(ACPI_V2_RSDP_SIZE..=MAX_RSDP_SIZE).contains(&length) {
             serial::write_line("WOLFOS_ACPI_ERROR invalid extended length");
-            return false;
+            return None;
         }
         // SAFETY: Firmware provides the indicated contiguous RSDP length.
         for (i, dst) in bytes[ACPI_V2_RSDP_SIZE..length].iter_mut().enumerate() {
@@ -44,11 +44,11 @@ pub fn report_rsdp(rsdp_address: *mut ()) -> bool {
                 info.revision, oem, info.rsdt_physical,
                 info.xsdt_physical.unwrap_or(0), info.length
             ));
-            true
+            Some(info)
         }
         Err(err) => {
             serial::write_fmt(format_args!("WOLFOS_ACPI_ERROR {err:?}\n"));
-            false
+            None
         }
     }
 }
