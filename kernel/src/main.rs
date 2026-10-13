@@ -17,7 +17,7 @@ static START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
-static BASE_REVISION: BaseRevision = BaseRevision::new();
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(0);
 
 #[used]
 #[unsafe(link_section = ".requests")]
