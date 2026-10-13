@@ -23,6 +23,7 @@ mod acpi_tables;
 mod acpi_walk;
 mod smp;
 mod ap_stack;
+mod scheduler;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]

@@ -210,6 +210,28 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn(r"stack_kib=(\d+)", topo)
         self.assertIn(r"rounds=(\d+)", topo)
 
+    def test_cooperative_job_dispatcher_contract(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        queue = (ROOT / "kernel/src/scheduler.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        topo = (ROOT / "scripts/topology_smoke.py").read_text()
+        make = (ROOT / "Makefile").read_text()
+        self.assertIn("mod scheduler;", main)
+        self.assertIn("pub const JOB_COUNT: usize = 512", queue)
+        self.assertIn("compare_exchange(", queue)
+        self.assertIn("self.next.fetch_add(1", queue)
+        self.assertIn("self.states[id].load(Ordering::Acquire)", queue)
+        self.assertIn("self.completed.load(Ordering::Acquire) != JOB_COUNT", queue)
+        self.assertIn("scheduler::BOOT_QUEUE.configure(cpus.len())", smp)
+        self.assertIn("scheduler::BOOT_QUEUE.run_worker(index)", smp)
+        self.assertIn("scheduler::BOOT_QUEUE.run_worker(bsp_index)", smp)
+        self.assertIn("scheduler::BOOT_QUEUE.verify(bsp_index)", smp)
+        self.assertIn("WOLFOS_SCHED_OK tasks=", smp)
+        self.assertIn("WOLFOS_SCHED_OK tasks=512 cpus=1", smoke)
+        self.assertIn("WOLFOS_SCHED_OK tasks=", topo)
+        self.assertIn("scheduler_tests", make)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
