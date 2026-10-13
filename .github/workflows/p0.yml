@@ -1,0 +1,30 @@
+name: WolfOS P0
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install VM build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xorriso qemu-system-x86 make git
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-none
+      - name: Offline source contract checks
+        run: make test
+      - name: Build and smoke test in QEMU
+        run: make smoke
+      - name: Preserve ISO on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wolfos-p0-iso
+          path: out/*.iso
+          if-no-files-found: ignore

@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Boot a VM ISO and assert observable early kernel milestones."""
+from __future__ import annotations
+import pathlib
+import subprocess
+import sys
+import tempfile
+
+MARKERS = (
+    "WOLFOS: Rust kernel entered",
+    "WOLFOS_LIMINE_OK",
+    "WOLFOS_MEMMAP_OK",
+    "WOLFOS_FRAMEBUFFER_OK",
+    "WOLFOS_BOOT_OK",
+)
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: smoke.py path/to/wolfos-smoke.iso")
+        return 2
+    iso = pathlib.Path(sys.argv[1]).resolve()
+    if not iso.is_file():
+        print(f"ERROR: ISO not found: {iso}")
+        return 2
+    with tempfile.TemporaryDirectory(prefix="wolfos-smoke-") as tmp:
+        log = pathlib.Path(tmp) / "serial.log"
+        cmd = [
+            "qemu-system-x86_64", "-M", "q35", "-m", "512M",
+            "-cdrom", str(iso), "-boot", "d",
+            "-serial", f"file:{log}", "-display", "none", "-no-reboot",
+            "-device", "isa-debug-exit,iobase=0xf4,iosize=0x04",
+        ]
+        try:
+            run = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=45, check=False)
+        except subprocess.TimeoutExpired:
+            print("FAIL: QEMU did not reach smoke-exit in 45 seconds")
+            if log.exists():
+                print(log.read_text(errors="replace"))
+            return 1
+        except FileNotFoundError:
+            print("FAIL: qemu-system-x86_64 missing")
+            return 2
+        output = log.read_text(errors="replace") if log.exists() else ""
+        print(output)
+        missing = [marker for marker in MARKERS if marker not in output]
+        if missing:
+            print(f"FAIL: missing boot markers: {missing}")
+            print(run.stderr.decode(errors="replace"))
+            return 1
+        if run.returncode != 33:
+            print(f"FAIL: expected QEMU debug-exit 33, got {run.returncode}")
+            print(run.stderr.decode(errors="replace"))
+            return 1
+        print("PASS: WolfOS kernel booted, read memory map, and accessed framebuffer")
+        return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

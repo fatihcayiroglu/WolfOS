@@ -1,0 +1,26 @@
+[package]
+name = "wolfos-kernel"
+version = "0.1.0"
+edition = "2024"
+authors = ["WolfOS Contributors"]
+publish = false
+
+[[bin]]
+name = "wolfos-kernel"
+path = "kernel/src/main.rs"
+
+[dependencies]
+limine = "=0.6.5"
+
+[features]
+default = []
+smoke-exit = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+opt-level = "s"
