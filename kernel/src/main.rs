@@ -8,7 +8,7 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
 
 mod serial;
 mod cpu;
@@ -17,6 +17,8 @@ mod pmm_layout;
 mod interrupts;
 mod pci;
 mod paging;
+mod acpi;
+mod acpi_layout;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -37,6 +39,10 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
@@ -101,6 +107,15 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_line("WOLFOS_PCI_TEST_OK");
+    let Some(rsdp_response) = RSDP_REQUEST.response() else {
+        serial::write_line("WOLFOS_ACPI_ERROR no Limine RSDP response");
+        halt_forever();
+    };
+    if !acpi::report_rsdp(rsdp_response.address) {
+        serial::write_line("WOLFOS_ACPI_TEST_FAILED");
+        halt_forever();
+    }
+
     if !paging::mapping_roundtrip(hhdm.offset) {
         serial::write_line("WOLFOS_PAGING_TEST_FAILED");
         halt_forever();

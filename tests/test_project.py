@@ -99,6 +99,20 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("run.returncode != 33", fault)
         self.assertIn("paging-fault-smoke:", (ROOT / "Makefile").read_text())
 
+    def test_acpi_rsdp_contract(self):
+        kernel = (ROOT / "kernel/src/main.rs").read_text()
+        acpi = (ROOT / "kernel/src/acpi.rs").read_text()
+        parser = (ROOT / "kernel/src/acpi_layout.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        self.assertIn("RsdpRequest", kernel)
+        self.assertIn("acpi::report_rsdp(rsdp_response.address)", kernel)
+        self.assertIn("WOLFOS_ACPI_RSDP_OK", acpi)
+        self.assertIn("WOLFOS_ACPI_RSDP_OK", smoke)
+        self.assertIn('b"RSD PTR "', parser)
+        self.assertIn("BadChecksum", parser)
+        self.assertIn("BadExtendedChecksum", parser)
+        self.assertIn("acpi_layout_tests", (ROOT / "Makefile").read_text())
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
