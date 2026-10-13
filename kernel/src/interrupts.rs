@@ -140,6 +140,13 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         "WOLFOS_EXCEPTION_PF vector=14 address={:?} flags={:?} rip={:?}\n",
         address, code, frame.instruction_pointer
     ));
+    #[cfg(feature = "paging-fault-smoke")]
+    if address.as_u64() == crate::paging::TEST_VIRTUAL_ADDRESS
+        && !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+    {
+        serial::write_line("WOLFOS_PAGING_FAULT_OK");
+        serial::qemu_exit_success();
+    }
     crate::halt_forever();
 }
 

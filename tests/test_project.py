@@ -80,6 +80,25 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertNotIn("CONFIG_DATA, in(", pci)
         self.assertIn('"-vga", "std"', smoke)
 
+    def test_paging_acceptance_contract(self):
+        kernel = (ROOT / "kernel/src/main.rs").read_text()
+        paging = (ROOT / "kernel/src/paging.rs").read_text()
+        interrupt = (ROOT / "kernel/src/interrupts.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        fault = (ROOT / "scripts/paging_fault_smoke.py").read_text()
+        self.assertIn("paging::mapping_roundtrip(hhdm.offset)", kernel)
+        self.assertIn("paging::trigger_unmapped_read()", kernel)
+        for symbol in ("Cr3::read()", "OffsetPageTable::new", "mapper.map_to",
+                       "mapper.unmap", "flush.flush()", "pmm::free_frame"):
+            self.assertIn(symbol, paging)
+        self.assertIn("0x0000_4000_0000_0000", paging)
+        self.assertIn("WOLFOS_PAGING_MAP_OK", smoke)
+        self.assertIn("WOLFOS_PAGING_UNMAP_OK", smoke)
+        self.assertIn("WOLFOS_PAGING_FAULT_OK", interrupt)
+        self.assertIn("WOLFOS_EXCEPTION_PF vector=14", fault)
+        self.assertIn("run.returncode != 33", fault)
+        self.assertIn("paging-fault-smoke:", (ROOT / "Makefile").read_text())
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

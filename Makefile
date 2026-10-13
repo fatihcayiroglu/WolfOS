@@ -11,13 +11,15 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),exception)
 FEATURES := --features exception-smoke
+else ifeq ($(FLAVOR),paging-fault)
+FEATURES := --features paging-fault-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -58,6 +60,10 @@ smoke:
 exception-smoke:
 	$(MAKE) iso FLAVOR=exception
 	python3 scripts/exception_smoke.py $(OUT)/wolfos-exception.iso
+
+paging-fault-smoke:
+	$(MAKE) iso FLAVOR=paging-fault
+	python3 scripts/paging_fault_smoke.py $(OUT)/wolfos-paging-fault.iso
 
 test:
 	python3 -m unittest discover -s tests -v
