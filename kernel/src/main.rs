@@ -29,6 +29,8 @@ mod context_switch;
 mod kernel_threads;
 mod context_batch;
 mod percpu_context;
+#[cfg(feature = "timer-smoke")]
+mod timer;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -198,6 +200,11 @@ pub extern "C" fn kmain() -> ! {
     }
     if !context_batch::verify() {
         serial::write_line("WOLFOS_CTX_BATCH_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "timer-smoke")]
+    if !timer::verify() {
+        serial::write_line("WOLFOS_TIMER_TEST_FAILED");
         halt_forever();
     }
     serial::write_line("WOLFOS_BOOT_OK");

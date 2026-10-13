@@ -13,3 +13,5 @@ Windows and Steam applications are aspirational milestones: Linux ABI / POSIX, W
 No milestone can be marked complete without reproducible build and run evidence.
 
 P1 topology validation: isolated QEMU MADT tests with 1 and 4 virtual CPUs; APs now execute verified Rust work on dedicated stacks; task preemption, timers, IPIs and full SMP scheduling still pending.
+
+P1 timer milestone: isolated single-BSP PIT/8259 IRQ0 delivery and EOI acceptance in QEMU (under review); APIC timer, clocksource calibration, tick-driven preemption and IRQ-safe scheduler remain planned.

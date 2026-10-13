@@ -18,6 +18,7 @@ default = []
 smoke-exit = []
 exception-smoke = ["smoke-exit"]
 paging-fault-smoke = ["smoke-exit"]
+timer-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"

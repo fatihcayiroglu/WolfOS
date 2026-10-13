@@ -27,6 +27,8 @@ jobs:
         run: make paging-fault-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
+      - name: PIT IRQ0 hardware timer smoke (single BSP only)
+        run: make timer-smoke
       - name: Preserve ISO on failure
         if: failure()
         uses: actions/upload-artifact@v4
