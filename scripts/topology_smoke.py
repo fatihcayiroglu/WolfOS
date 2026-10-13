@@ -41,10 +41,18 @@ def main() -> int:
         if (total, lapic+x2apic) != (EXPECTED_CPUS, EXPECTED_CPUS):
             print(f"FAIL: expected four enabled CPUs, MADT reported {total}")
             return 1
+        ack = re.search(r"WOLFOS_SMP_APS_OK total=(\d+) bsp_lapic=(\d+) ap_acks=(\d+)", output)
+        if ack is None:
+            print("FAIL: four secondary CPUs were enumerated but Rust AP handoff did not complete")
+            return 1
+        total_online, _, aps = map(int, ack.groups())
+        if total_online != EXPECTED_CPUS or aps != EXPECTED_CPUS - 1:
+            print(f"FAIL: expected 3 Rust AP acknowledgements; got total={total_online}, aps={aps}")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: ACPI MADT discovered 4 enabled logical CPUs; SMP startup NOT tested")
+        print("PASS: MADT detected 4 CPUs and 3 APs executed Rust handshake; no SMP scheduler")
         return 0
 
 if __name__ == "__main__":

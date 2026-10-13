@@ -140,6 +140,21 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("topology-smoke:", make)
         self.assertIn("make topology-smoke", workflow)
 
+    def test_secondary_cpu_rust_handoff_contract(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        topo = (ROOT / "scripts/topology_smoke.py").read_text()
+        self.assertIn("MpRequest::new(0)", main)
+        self.assertIn("smp::boot_aps(mp)", main)
+        self.assertIn("WOLFOS_SMP_APS_OK", smp)
+        self.assertIn("cpu.bootstrap(secondary_entry", smp)
+        self.assertIn("Ordering::Release", smp)
+        self.assertIn("Ordering::Acquire", smp)
+        self.assertIn("interrupts::disable()", smp)
+        self.assertIn("WOLFOS_SMP_APS_OK total=1", smoke)
+        self.assertIn("aps != EXPECTED_CPUS - 1", topo)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
