@@ -10,6 +10,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 use limine::request::{FramebufferRequest, MemmapRequest};
 
 mod serial;
+mod cpu;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -41,6 +42,7 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_line("WOLFOS_LIMINE_OK");
+    cpu::log_identity();
 
     let Some(memmap) = MEMMAP_REQUEST.response() else {
         serial::write_line("WOLFOS_ERROR: memory map unavailable");
