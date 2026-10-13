@@ -62,7 +62,7 @@ def main() -> int:
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: 3 APs loaded private GDT/TSS/IST and shared IDT; no SMP scheduler")
+        print("PASS: 3 APs loaded independent IDTs and returned from INT3; no SMP scheduler")
         return 0
 
 if __name__ == "__main__":
