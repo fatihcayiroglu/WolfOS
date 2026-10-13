@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 //! WolfOS P0: original Rust kernel. Limine is a bootloader, not the OS kernel.
 //! No heap, userspace, real-disk operations or device driver manager yet.
@@ -13,6 +14,7 @@ mod serial;
 mod cpu;
 mod pmm;
 mod pmm_layout;
+mod interrupts;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -49,6 +51,9 @@ pub extern "C" fn kmain() -> ! {
     }
     serial::write_line("WOLFOS_LIMINE_OK");
     cpu::log_identity();
+    interrupts::initialize();
+    #[cfg(feature = "exception-smoke")]
+    interrupts::trigger_invalid_opcode();
 
     let Some(memmap) = MEMMAP_REQUEST.response() else {
         serial::write_line("WOLFOS_ERROR: memory map unavailable");

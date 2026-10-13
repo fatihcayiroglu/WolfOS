@@ -9,13 +9,15 @@ LIMINE_BRANCH := v10.x-binary
 
 ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
+else ifeq ($(FLAVOR),exception)
+FEATURES := --features exception-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -52,6 +54,10 @@ run-uefi: iso
 smoke:
 	$(MAKE) iso FLAVOR=smoke
 	python3 scripts/smoke.py $(OUT)/wolfos-smoke.iso
+
+exception-smoke:
+	$(MAKE) iso FLAVOR=exception
+	python3 scripts/exception_smoke.py $(OUT)/wolfos-exception.iso
 
 test:
 	python3 -m unittest discover -s tests -v
