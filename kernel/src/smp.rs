@@ -1,55 +1,113 @@
-//! First real multi-processor Rust execution test.
+//! Early secondary-CPU Rust execution on WolfOS-owned kernel stacks.
 //!
-//! Limine parks secondary processors until the BSP atomically provides an
-//! entrypoint. Each AP executes Rust on a bootloader-provided stack, publishes
-//! its unique handshake, then parks forever with external IRQs disabled.
+//! BSP prepares independent 32 KiB stacks, Limine wakes APs, and the APs
+//! switch stacks via a nonreturning x86-64 trampoline BEFORE setting up
+//! their private GDT/TSS/IDT. All APs meet an Acquire/Release start barrier,
+//! perform independent deterministic CPU work, and park. BSP checks results.
 //!
-//! This is NOT a working SMP scheduler. APs have private GDT/TSS/IST/IDT,
-//! but still do not use serial output or the dynamic allocator; no shared page-table
-//! modification occurs after releasing APs. Per-CPU working kernel stacks,
-//! IPI delivery and scheduler are required before running general tasks.
+//! NOT a real scheduler: no context switching, user mode, IPIs or timers.
+//! APs do not use serial, PMM, PCI, global page-table updates or disk access.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::mp::{MpInfo, MpRespData};
 
-use crate::serial;
+use crate::{ap_stack, serial};
 
 pub const MAX_BOOT_CPUS: usize = 256;
 const ACK_MAGIC: u64 = 0x574F_4C46_4150_0000;
+const WORK_ROUNDS: usize = 32_768;
 const WAIT_ROUNDS: usize = 100_000_000;
 
-// The BSP is the sole writer of the boot sequence. Each AP only writes the
-// slot assigned to it via Limine extra_argument, then never writes again.
-static AP_ACK: [AtomicU64; MAX_BOOT_CPUS] =
+static AP_READY: [AtomicU64; MAX_BOOT_CPUS] =
     [const { AtomicU64::new(0) }; MAX_BOOT_CPUS];
+static AP_DONE: [AtomicU64; MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_BOOT_CPUS];
+static AP_RESULT: [AtomicU64; MAX_BOOT_CPUS] =
+    [const { AtomicU64::new(0) }; MAX_BOOT_CPUS];
+static START_WORK: AtomicBool = AtomicBool::new(false);
 
 fn expected_ack(info: &MpInfo) -> u64 {
     ACK_MAGIC ^ ((info.processor_id as u64) << 32) ^ info.lapic_id as u64
 }
 
+fn compute(index: usize, lapic_id: u32) -> u64 {
+    let mut state = ACK_MAGIC ^ ((index as u64) << 32) ^ lapic_id as u64;
+    for step in 0..WORK_ROUNDS {
+        state ^= (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        state = state.rotate_left(7).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    }
+    state
+}
+
+fn wait_for(cpus: &[&MpInfo], bsp_id: u32, values: &[AtomicU64; MAX_BOOT_CPUS]) -> bool {
+    for _ in 0..WAIT_ROUNDS {
+        if cpus.iter().enumerate().all(|(index, cpu)| {
+            cpu.lapic_id == bsp_id ||
+                values[index].load(Ordering::Acquire) == expected_ack(cpu)
+        }) {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Bootloader's first AP entry: still uses the Limine-provided stack.
+/// We switch to the CPU's reserved WolfOS stack before using general Rust
+/// kernel services on that processor.
+///
 /// # Safety
-/// The bootloader must supply an independent valid stack and correct
-/// long-mode execution context as described in the Limine MP protocol.
-/// The AP remains isolated: no allocator, serial port, mutable kernel
-/// globals, or interrupt handling is used.
+/// MpInfo and its per-AP boot stack remain valid under Limine MP contract.
 unsafe extern "C" fn secondary_entry(info: &MpInfo) -> ! {
     x86_64::instructions::interrupts::disable();
-
     let index = info.extra_argument() as usize;
-    if index >= MAX_BOOT_CPUS {
+    // Slot zero is not inherently reserved: BSP position is arbitrary.
+    // BSP has already validated unique CPU IDs and assigned this index.
+    let Some(top) = ap_stack::prepareless_top(index) else {
+        crate::halt_forever();
+    };
+    // SAFETY: BSP prepared this exact stack before releasing the AP, and
+    // never mutates that stack after publishing the Limine entrypoint.
+    unsafe { ap_stack::enter(info, index, top) }
+}
+
+/// Symbol called by the x86-64 trampoline after replacing RSP. Always !.
+/// Both MpInfo pointer and index originate from the trusted Limine handoff.
+#[unsafe(no_mangle)]
+extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
+    x86_64::instructions::interrupts::disable();
+    if info_ptr.is_null() || index >= MAX_BOOT_CPUS ||
+        !ap_stack::verify_active(index)
+    {
         crate::halt_forever();
     }
-
+    // SAFETY: Limine MpInfo remains allocated throughout early boot;
+    // immutable CPU directory was validated by BSP before AP release.
+    let info = unsafe { &*info_ptr };
+    if info.extra_argument() as usize != index {
+        crate::halt_forever();
+    }
     if !crate::interrupts::initialize_secondary(index) {
         crate::halt_forever();
     }
-    AP_ACK[index].store(expected_ack(info), Ordering::Release);
+
+    AP_READY[index].store(expected_ack(info), Ordering::Release);
+    // Every secondary waits until ALL workers reached this barrier.
+    while !START_WORK.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+
+    let result = compute(index, info.lapic_id);
+    if !ap_stack::verify_active(index) {
+        crate::halt_forever();
+    }
+    AP_RESULT[index].store(result, Ordering::Release);
+    AP_DONE[index].store(expected_ack(info), Ordering::Release);
     crate::halt_forever();
 }
 
-/// Starts every non-BSP processor with Limine and verifies that real Rust
-/// code executes on all of them. The BSP remains the only active worker.
+/// BSP starts APs and validates stack-switch, exception and work completion.
+/// APs remain parked; BSP remains sole serial-logger and hardware manager.
 pub fn boot_aps(mp: &MpRespData) -> bool {
     let cpus = mp.cpus();
     if cpus.is_empty() || cpus.len() > MAX_BOOT_CPUS {
@@ -62,11 +120,8 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
     let mut bsp_count = 0usize;
     let mut ap_count = 0usize;
 
-    // Validate identity and exact BSP membership before releasing APs.
     for (i, cpu) in cpus.iter().enumerate() {
-        if cpu.lapic_id == mp.bsp_lapic_id {
-            bsp_count += 1;
-        }
+        if cpu.lapic_id == mp.bsp_lapic_id { bsp_count += 1; }
         for other in cpus[..i].iter() {
             if other.lapic_id == cpu.lapic_id {
                 serial::write_line("WOLFOS_SMP_ERROR duplicate_lapic_id");
@@ -79,53 +134,73 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
         return false;
     }
 
+    // Prepare ALL stacks before releasing ANY secondary processor.
     for (index, cpu) in cpus.iter().enumerate() {
-        if cpu.lapic_id == mp.bsp_lapic_id {
-            continue;
+        if cpu.lapic_id == mp.bsp_lapic_id { continue; }
+        if ap_stack::prepare(index).is_none() {
+            serial::write_line("WOLFOS_SMP_ERROR cannot_prepare_stack");
+            return false;
         }
-        // The AP's slot is its index in the immutable MP CPU directory.
-        let slot = index;
-        // Limine's bootstrap publishes the AP entrypoint with a Release
-        // atomic store. The secondary CPU then executes secondary_entry.
-        cpu.bootstrap(secondary_entry, slot as u64);
+    }
+    for (index, cpu) in cpus.iter().enumerate() {
+        if cpu.lapic_id == mp.bsp_lapic_id { continue; }
+        cpu.bootstrap(secondary_entry, index as u64);
         ap_count += 1;
     }
 
-    // QEMU acceptance requires that APs run Rust, not just show up in MADT.
-    for _ in 0..WAIT_ROUNDS {
-        let all_acked = cpus.iter().enumerate().all(|(index, cpu)| {
-            cpu.lapic_id == mp.bsp_lapic_id
-                || AP_ACK[index].load(Ordering::Acquire) == expected_ack(cpu)
-        });
-        if all_acked {
-            // Acquire of each AP_ACK observes its preceding breakpoint handler.
-            // Exactly one #BP must have returned through each AP's own IDT.
-            let ap_bp = crate::interrupts::ap_breakpoint_count();
-            if ap_bp != ap_count {
-                serial::write_fmt(format_args!(
-                    "WOLFOS_SMP_ERROR ap_breakpoints={} expected={}\n",
-                    ap_bp, ap_count
-                ));
-                return false;
-            }
-            serial::write_fmt(format_args!(
-                "WOLFOS_SMP_AP_IDT_OK total={} ap_idts={} ap_bp_returns={}\n",
-                cpus.len(), ap_count, ap_bp
-            ));
-            serial::write_fmt(format_args!(
-                "WOLFOS_SMP_APS_OK total={} bsp_lapic={} ap_acks={}\n",
-                cpus.len(), mp.bsp_lapic_id, ap_count
-            ));
-            serial::write_fmt(format_args!(
-                "WOLFOS_SMP_PERCPU_OK total={} ap_tables={}\n",
-                cpus.len(), ap_count
-            ));
-            return true;
-        }
-        core::hint::spin_loop();
+    if !wait_for(cpus, mp.bsp_lapic_id, &AP_READY) {
+        serial::write_fmt(format_args!(
+            "WOLFOS_SMP_ERROR ap_ready_timeout expected={}\n", ap_count
+        ));
+        return false;
+    }
+    // Acquire of AP_READY makes all per-AP GDT/TSS/IDT and #BP work visible.
+    let bp = crate::interrupts::ap_breakpoint_count();
+    if bp != ap_count {
+        serial::write_fmt(format_args!(
+            "WOLFOS_SMP_ERROR ap_breakpoints={} expected={}\n", bp, ap_count
+        ));
+        return false;
     }
     serial::write_fmt(format_args!(
-        "WOLFOS_SMP_ERROR ap_ack_timeout expected={}\n", ap_count
+        "WOLFOS_SMP_STACK_OK total={} switched={} stack_kib={}\n",
+        cpus.len(), ap_count, ap_stack::KERNEL_STACK_SIZE / 1024
     ));
-    false
+    serial::write_fmt(format_args!(
+        "WOLFOS_SMP_AP_IDT_OK total={} ap_idts={} ap_bp_returns={}\n",
+        cpus.len(), ap_count, bp
+    ));
+
+    // All APs have reached the barrier. Send one release event to begin
+    // independent CPU work on each permanent stack.
+    START_WORK.store(true, Ordering::Release);
+    if !wait_for(cpus, mp.bsp_lapic_id, &AP_DONE) {
+        serial::write_fmt(format_args!(
+            "WOLFOS_SMP_ERROR ap_work_timeout expected={}\n", ap_count
+        ));
+        return false;
+    }
+    for (index, cpu) in cpus.iter().enumerate() {
+        if cpu.lapic_id == mp.bsp_lapic_id { continue; }
+        let observed = AP_RESULT[index].load(Ordering::Acquire);
+        if observed != compute(index, cpu.lapic_id) {
+            serial::write_fmt(format_args!(
+                "WOLFOS_SMP_ERROR ap_work_mismatch index={}\n", index
+            ));
+            return false;
+        }
+    }
+    serial::write_fmt(format_args!(
+        "WOLFOS_SMP_WORK_OK total={} workers={} rounds={}\n",
+        cpus.len(), ap_count, WORK_ROUNDS
+    ));
+    serial::write_fmt(format_args!(
+        "WOLFOS_SMP_APS_OK total={} bsp_lapic={} ap_acks={}\n",
+        cpus.len(), mp.bsp_lapic_id, ap_count
+    ));
+    serial::write_fmt(format_args!(
+        "WOLFOS_SMP_PERCPU_OK total={} ap_tables={}\n",
+        cpus.len(), ap_count
+    ));
+    true
 }
