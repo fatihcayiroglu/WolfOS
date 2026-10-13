@@ -155,6 +155,23 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_SMP_APS_OK total=1", smoke)
         self.assertIn("aps != EXPECTED_CPUS - 1", topo)
 
+    def test_secondary_core_descriptor_isolation(self):
+        intr = (ROOT / "kernel/src/interrupts.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        topo = (ROOT / "scripts/topology_smoke.py").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        self.assertIn("pub fn initialize_secondary(index: usize)", intr)
+        self.assertIn("AP_TSS[index].initialize(tss)", intr)
+        self.assertIn("AP_GDT[index].initialize(gdt)", intr)
+        self.assertIn("AP_IST_BANK", intr)
+        self.assertIn("IDT_READY.store(true, Ordering::Release)", intr)
+        self.assertIn("IDT_READY.load(Ordering::Acquire)", intr)
+        self.assertIn("idt_ref.load();", intr)
+        self.assertIn("crate::interrupts::initialize_secondary(index)", smp)
+        self.assertIn("WOLFOS_SMP_PERCPU_OK", smp)
+        self.assertIn("WOLFOS_SMP_PERCPU_OK total=4 ap_tables=3", topo)
+        self.assertIn("WOLFOS_SMP_PERCPU_OK total=1 ap_tables=0", smoke)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
