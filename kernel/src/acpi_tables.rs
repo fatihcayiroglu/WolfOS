@@ -60,7 +60,8 @@ impl<'a> RootTable<'a> {
     pub fn len(&self) -> usize { self.bytes.len() / self.stride }
     pub fn physical_at(&self, index: usize) -> Option<u64> {
         let start = index.checked_mul(self.stride)?;
-        let entry = self.bytes.get(start..start+self.stride)?;
+        let end = start.checked_add(self.stride)?;
+        let entry = self.bytes.get(start..end)?;
         Some(if self.stride == 8 {
             u64::from_le_bytes(entry.try_into().ok()?)
         } else {

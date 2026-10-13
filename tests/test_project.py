@@ -113,6 +113,22 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("BadExtendedChecksum", parser)
         self.assertIn("acpi_layout_tests", (ROOT / "Makefile").read_text())
 
+    def test_acpi_topology_parser_contract(self):
+        kernel = (ROOT / "kernel/src/main.rs").read_text()
+        walker = (ROOT / "kernel/src/acpi_walk.rs").read_text()
+        parser = (ROOT / "kernel/src/acpi_tables.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        self.assertIn("acpi_walk::discover(acpi_info, hhdm.offset, entries)", kernel)
+        self.assertIn("allowed_firmware_region", walker)
+        self.assertIn("MEMMAP_ACPI_RECLAIMABLE", walker)
+        self.assertIn("WOLFOS_ACPI_ROOT_OK", walker)
+        self.assertIn("WOLFOS_ACPI_MADT_OK", walker)
+        self.assertIn("WOLFOS_ACPI_ROOT_OK", smoke)
+        self.assertIn("WOLFOS_ACPI_MADT_OK", smoke)
+        self.assertIn("fn parse_madt", parser)
+        self.assertIn("InvalidMadtEntry", parser)
+        self.assertIn("acpi_tables_tests", (ROOT / "Makefile").read_text())
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
