@@ -1,8 +1,9 @@
 # ADR-0007: RSDT/XSDT and MADT read-only discovery
 
-Status: Proposed until GitHub Actions QEMU tests pass.
+Status: Under review; CI tests passing.
 
 ## Decision
+- Require Limine base revision 4 for HHDM mapping of ACPI firmware regions.
 - Root: use XSDT when RSDP revision 2+ supplies nonzero XSDT,
   otherwise RSDT. Validate standard SDT 36-byte headers, bounded total
   lengths and full ACPI checksums before parsing entry pointers.

@@ -1,5 +1,5 @@
 //! Read-only ACPI firmware discovery using Limine's RSDP virtual pointer.
-//! Limine base revision 0 guarantees this is a virtual address on x86-64.
+//! Limine base revision 4 guarantees a virtual RSDP pointer and mapped ACPI regions.
 //! Firmware memory is read but never modified. Tables not yet enumerated.
 
 use crate::acpi_layout::{parse_rsdp, RsdpInfo, MAX_RSDP_SIZE, MIN_RSDP_SIZE, ACPI_V2_RSDP_SIZE};
