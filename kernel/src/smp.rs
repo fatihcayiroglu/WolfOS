@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use limine::mp::{MpInfo, MpRespData};
 
-use crate::serial;
+use crate::{ap_tables, serial};
 
 pub const MAX_BOOT_CPUS: usize = 256;
 const ACK_MAGIC: u64 = 0x574F_4C46_4150_0000;
@@ -38,6 +38,10 @@ unsafe extern "C" fn secondary_entry(info: &MpInfo) -> ! {
 
     let index = info.extra_argument() as usize;
     if index >= MAX_BOOT_CPUS {
+        crate::halt_forever();
+    }
+
+    if !ap_tables::initialize_ap(index) {
         crate::halt_forever();
     }
 
@@ -95,6 +99,18 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
                 || AP_ACK[index].load(Ordering::Acquire) == expected_ack(cpu)
         });
         if all_acked {
+            let breakpoints = ap_tables::breakpoint_count();
+            if breakpoints != ap_count {
+                serial::write_fmt(format_args!(
+                    "WOLFOS_SMP_ERROR per_cpu_breakpoints={} expected={}\n",
+                    breakpoints, ap_count
+                ));
+                return false;
+            }
+            serial::write_fmt(format_args!(
+                "WOLFOS_SMP_CPU_TABLES_OK total={} ap_gdt={} ap_idt={} ap_ist={} ap_bp={}\n",
+                cpus.len(), ap_count, ap_count, ap_count, breakpoints
+            ));
             serial::write_fmt(format_args!(
                 "WOLFOS_SMP_APS_OK total={} bsp_lapic={} ap_acks={}\n",
                 cpus.len(), mp.bsp_lapic_id, ap_count

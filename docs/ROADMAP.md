@@ -2,7 +2,7 @@
 
 P0: Rust no_std x86-64 kernel; QEMU serial, memory-map and framebuffer smoke checks.
 
-P1: CPUID (merged); physical frame allocator (merged), scalable HHDM-backed bitmap (merged); GDT/IDT, CPU exceptions (merged), paging map/unmap and #PF (merged), PCI read-only discovery (merged), ACPI RSDP read-only validation (merged); RSDT/XSDT checksum validation and MADT CPU count (merged), Limine AP Rust handshake (under review).
+P1: CPUID (merged); physical frame allocator (merged), scalable HHDM-backed bitmap (merged); GDT/IDT, CPU exceptions (merged), paging map/unmap and #PF (merged), PCI read-only discovery (merged), ACPI RSDP read-only validation (merged); RSDT/XSDT checksum validation and MADT CPU count (merged), Limine AP Rust handshake (merged); per-AP GDT/TSS/IDT and exception stack verification (under review).
 
 P2: Ring 3 user mode, syscalls, ELF loader, init, scheduler and RAM-backed file system.
 
@@ -12,4 +12,4 @@ Windows and Steam applications are aspirational milestones: Linux ABI / POSIX, W
 
 No milestone can be marked complete without reproducible build and run evidence.
 
-P1 topology validation: isolated QEMU MADT tests with 1 and 4 virtual CPUs; first handoff starts APs to acknowledge and park; SMP scheduling and per-CPU tables still pending.
+P1 topology validation: isolated QEMU MADT tests with 1 and 4 virtual CPUs; first handoff starts APs to acknowledge and park; SMP scheduling, timers, IPIs and full per-CPU kernel stack ownership are still pending.

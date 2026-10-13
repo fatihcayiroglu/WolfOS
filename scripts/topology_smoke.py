@@ -49,10 +49,21 @@ def main() -> int:
         if total_online != EXPECTED_CPUS or aps != EXPECTED_CPUS - 1:
             print(f"FAIL: expected 3 Rust AP acknowledgements; got total={total_online}, aps={aps}")
             return 1
+        tables = re.search(
+            r"WOLFOS_SMP_CPU_TABLES_OK total=(\d+) ap_gdt=(\d+) ap_idt=(\d+) ap_ist=(\d+) ap_bp=(\d+)",
+            output,
+        )
+        if tables is None:
+            print("FAIL: per-CPU tables or AP exception handlers did not finish")
+            return 1
+        counts = tuple(map(int, tables.groups()))
+        if counts != (EXPECTED_CPUS, 3, 3, 3, 3):
+            print(f"FAIL: incorrect AP CPU table and #BP acknowledgments: {counts}")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: MADT detected 4 CPUs and 3 APs executed Rust handshake; no SMP scheduler")
+        print("PASS: 3 APs installed independent GDT/TSS/IDT, DF IST, and handled INT3; no scheduler")
         return 0
 
 if __name__ == "__main__":

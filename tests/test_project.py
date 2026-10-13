@@ -155,6 +155,23 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_SMP_APS_OK total=1", smoke)
         self.assertIn("aps != EXPECTED_CPUS - 1", topo)
 
+    def test_ap_percpu_descriptors(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        ap = (ROOT / "kernel/src/ap_tables.rs").read_text()
+        topo = (ROOT / "scripts/topology_smoke.py").read_text()
+        self.assertIn("mod ap_tables;", main)
+        self.assertIn("ap_tables::initialize_ap(index)", smp)
+        self.assertIn("ap_tables::breakpoint_count()", smp)
+        self.assertIn("WOLFOS_SMP_CPU_TABLES_OK", smp)
+        self.assertIn("static AP_STORAGE: [ApStorage; MAX_BOOT_CPUS]", ap)
+        for symbol in ("load_tss(tr)", "gdt_ref.load()", "idt_ref.load()",
+                       "set_stack_index(DF_IST_INDEX)", "interrupts::int3()",
+                       "AP_BREAKPOINTS.fetch_add"):
+            self.assertIn(symbol, ap)
+        self.assertIn("ap_bp=(\\\\d+)", topo)
+        self.assertIn("counts != (EXPECTED_CPUS, 3, 3, 3, 3)", topo)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
