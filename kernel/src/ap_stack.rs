@@ -46,6 +46,18 @@ pub fn prepare(index: usize) -> Option<usize> {
     Some(top)
 }
 
+/// AP-only: fetch the already prepared stack without modifying its canary.
+/// BSP initializes it before publishing the Limine MP entrypoint.
+pub fn prepared_top(index: usize) -> Option<usize> {
+    let bottom = stack_bottom(index)?;
+    let top = bottom.checked_add(KERNEL_STACK_SIZE)?;
+    // SAFETY: BSP published the initialized stack before AP execution and
+    // will not modify it; this read is before the AP changes RSP.
+    let found = unsafe { (bottom as *const u64).read_volatile() };
+    if found != STACK_CANARY ^ index as u64 { return None; }
+    Some(top)
+}
+
 /// Called from the secondary Rust entry after the assembly stack switch.
 pub fn verify_active(index: usize) -> bool {
     let Some(bottom) = stack_bottom(index) else { return false; };
