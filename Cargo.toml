@@ -17,6 +17,7 @@ x86_64 = { version = "=0.15.5", features = ["abi_x86_interrupt"] }
 default = []
 smoke-exit = []
 exception-smoke = ["smoke-exit"]
+paging-fault-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"

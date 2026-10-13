@@ -16,6 +16,7 @@ mod pmm;
 mod pmm_layout;
 mod interrupts;
 mod pci;
+mod paging;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -100,6 +101,13 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_line("WOLFOS_PCI_TEST_OK");
+    if !paging::mapping_roundtrip(hhdm.offset) {
+        serial::write_line("WOLFOS_PAGING_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "paging-fault-smoke")]
+    paging::trigger_unmapped_read();
+
 
 
     let Some(fb_response) = FRAMEBUFFER_REQUEST.response() else {
