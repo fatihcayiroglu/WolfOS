@@ -305,7 +305,10 @@ class WolfP0ContractTests(unittest.TestCase):
         topo = (ROOT / "scripts/topology_smoke.py").read_text()
         self.assertIn("mod context_batch;", main)
         self.assertIn("context_batch::verify()", main)
-        self.assertIn("pub const CONTEXT_TASKS: usize = 16", source)
+        self.assertIn("pub const CONTEXT_TASKS: usize = 256", source)
+        self.assertIn("MAX_STACK_BANK_BYTES: usize = 4 * 1024 * 1024", source)
+        self.assertIn("const _: () = assert!(STACK_BANK_BYTES <= MAX_STACK_BANK_BYTES)", source)
+        self.assertIn("saved_stack_pointer_ok(id, tcb.saved_rsp)", source)
         self.assertIn("use crate::thread_scheduler::{ThreadState, THREAD_COUNT};", source)
         for expected in ("struct Tcb", "saved_rsp: usize",
                          "wolfos_batch_thread_start", "wolfos_batch_rust_entry",
@@ -316,7 +319,7 @@ class WolfP0ContractTests(unittest.TestCase):
                          "context_switch::switch_raw",
                          "WOLFOS_CTX_BATCH_ERROR scheduling_or_resume"):
             self.assertIn(expected, source)
-        marker = "WOLFOS_CTX_BATCH_OK threads=16 dispatches=64 switches=128 yields=47 blocked=1 woken=1 finished=16 stack_kib=16"
+        marker = "WOLFOS_CTX_BATCH_OK threads=256 dispatches=1024 switches=2048 yields=767 blocked=1 woken=1 finished=256 stack_kib=16 bank_kib=4096"
         self.assertIn(marker, smoke)
         self.assertIn(marker, topo)
         self.assertIn("WOLFOS_KTHREAD_OK threads=3", old_threads)

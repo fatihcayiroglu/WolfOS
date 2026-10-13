@@ -1,4 +1,4 @@
-//! Generic indexed, stack-backed kernel TCBs: 16-task BSP acceptance.
+//! Generic indexed, stack-backed kernel TCBs: 256-task BSP acceptance.
 //!
 //! Uses the same ThreadState lifecycle as the existing 256-task SMP
 //! state-machine scheduler, but every task here has its *own real* Rust
@@ -16,8 +16,14 @@ use crate::context_switch;
 use crate::serial;
 use crate::thread_scheduler::{ThreadState, THREAD_COUNT};
 
-pub const CONTEXT_TASKS: usize = 16;
+pub const CONTEXT_TASKS: usize = 256;
 const STACK_BYTES: usize = 16 * 1024;
+const STACK_BANK_BYTES: usize = CONTEXT_TASKS * STACK_BYTES;
+const MAX_STACK_BANK_BYTES: usize = 4 * 1024 * 1024;
+// Reject accidental static kernel-stack expansion, TCB overflow or event ID truncation.
+const _: () = assert!(STACK_BANK_BYTES <= MAX_STACK_BANK_BYTES);
+const _: () = assert!(CONTEXT_TASKS <= THREAD_COUNT);
+const _: () = assert!(CONTEXT_TASKS <= u8::MAX as usize + 1);
 const ROUNDS: usize = 4;
 const EXPECTED_EVENTS: usize = CONTEXT_TASKS * ROUNDS;
 const MAX_DISPATCHES: usize = EXPECTED_EVENTS + CONTEXT_TASKS;
@@ -187,6 +193,15 @@ fn prepare(id: usize) -> bool {
     true
 }
 
+fn saved_stack_pointer_ok(id: usize, saved: usize) -> bool {
+    if id >= CONTEXT_TASKS { return false; }
+    let bottom = stack_bottom(id);
+    let Some(top) = bottom.checked_add(STACK_BYTES) else { return false; };
+    // Context save happens inside the task's call frames and leaves headroom
+    // above the bottom canary. This rejects a pointer into any other TCB.
+    saved >= bottom + 1024 && saved < top
+}
+
 fn canary_ok(id: usize) -> bool {
     if id >= CONTEXT_TASKS { return false; }
     let bottom = stack_bottom(id);
@@ -326,7 +341,8 @@ pub fn verify() -> bool {
         for id in 0..CONTEXT_TASKS {
             let tcb = &d.tcbs[id];
             if tcb.state != ThreadState::Finished ||
-               tcb.progress != ROUNDS || tcb.saved_rsp == 0
+               tcb.progress != ROUNDS ||
+               !saved_stack_pointer_ok(id, tcb.saved_rsp)
             {
                 return false;
             }
@@ -347,9 +363,10 @@ pub fn verify() -> bool {
         return false;
     }
     serial::write_fmt(format_args!(
-        "WOLFOS_CTX_BATCH_OK threads={} dispatches={} switches={} yields={} blocked=1 woken=1 finished={} stack_kib=16\n",
+        "WOLFOS_CTX_BATCH_OK threads={} dispatches={} switches={} yields={} blocked=1 woken=1 finished={} stack_kib=16 bank_kib={}\n",
         CONTEXT_TASKS, EXPECTED_EVENTS, EXPECTED_EVENTS * 2,
-        CONTEXT_TASKS * (ROUNDS - 1) - 1, CONTEXT_TASKS
+        CONTEXT_TASKS * (ROUNDS - 1) - 1, CONTEXT_TASKS,
+        STACK_BANK_BYTES / 1024
     ));
     true
 }
