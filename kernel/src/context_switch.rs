@@ -77,6 +77,15 @@ unsafe extern "C" {
     fn wolfos_switch_context(previous: *mut usize, next: *const usize);
 }
 
+/// # Safety
+/// BSP-only, maskable interrupts disabled. Both raw slots must be distinct,
+/// live and exclusively owned. The destination contains a valid suspended or
+/// ABI-aligned initial switch frame. No mutable Rust borrow may span this call.
+pub(crate) unsafe fn switch_raw(previous: *mut usize, next: *const usize) {
+    // SAFETY: caller maintains the exclusive stack/context ownership contract.
+    unsafe { wolfos_switch_context(previous, next); }
+}
+
 fn bottom(index: usize) -> Option<usize> {
     if index >= 2 { return None; }
     // SAFETY: index is checked above and the static backing allocation
@@ -92,9 +101,10 @@ fn prepare(index: usize, start: extern "C" fn() -> !) -> Option<usize> {
     let base = bottom(index)?;
     let top = base.checked_add(STACK_BYTES)?;
     if base % 16 != 0 || top % 16 != 0 { return None; }
-    // Exactly 6 saved 64-bit registers followed by the entry PC. After
-    // popping six, RET enters start() with RSP % 16 == 8 as SysV expects.
-    const WORDS: usize = 7;
+    // Six saved nonvolatile registers + entry PC + dummy return address.
+    // Eight words place initial RSP % 16 == 8 after the final RET,
+    // satisfying the System V AMD64 ABI on entering the Rust function.
+    const WORDS: usize = 8;
     let sp = top.checked_sub(WORDS * core::mem::size_of::<usize>())?;
     // SAFETY: we own the full static stack, and this is before either
     // task executes. Writes are aligned and remain inside 16 KiB storage.
@@ -125,7 +135,7 @@ fn switch(previous: &SavedStack, next: &SavedStack) {
     // SAFETY: previous and next are distinct statically allocated RSP cells,
     // solely owned by the BSP. All target frames are initialized or were
     // suspended by this exact routine. Interrupts are disabled.
-    unsafe { wolfos_switch_context(previous.0.get(), next.0.get()); }
+    unsafe { switch_raw(previous.0.get(), next.0.get()); }
 }
 
 // Task A and B are separate real Rust call stacks. These functions never

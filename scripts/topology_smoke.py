@@ -91,10 +91,13 @@ def main() -> int:
         if "WOLFOS_CONTEXT_OK tasks=2 switches=7 events=6 stacks_kib=16" not in output:
             print("FAIL: BSP context-switch roundtrip did not resume each Rust stack")
             return 1
+        if "WOLFOS_KTHREAD_OK threads=3 dispatches=9 switches=18 yields=5 blocked=1 woken=1 finished=3 stack_kib=16" not in output:
+            print("FAIL: three context-backed kernel threads did not yield/block/wake and resume")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: four SMP task queues and BSP 2-stack/7-switch context roundtrip verified")
+        print("PASS: 4-vCPU SMP queue, real 2-stack switch and 3 context-backed TCBs verified")
         return 0
 
 if __name__ == "__main__":

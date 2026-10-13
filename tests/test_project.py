@@ -274,6 +274,29 @@ class WolfP0ContractTests(unittest.TestCase):
             self.assertIn(expected, smoke)
             self.assertIn(expected, topology)
 
+    def test_context_backed_kernel_thread_tcbs(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        raw = (ROOT / "kernel/src/context_switch.rs").read_text()
+        threads = (ROOT / "kernel/src/kernel_threads.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        topology = (ROOT / "scripts/topology_smoke.py").read_text()
+        self.assertIn("mod kernel_threads;", main)
+        self.assertIn("kernel_threads::verify()", main)
+        self.assertIn("pub(crate) unsafe fn switch_raw", raw)
+        self.assertIn("const WORDS: usize = 8", raw)
+        self.assertIn("const FRAME_WORDS: usize = 8", threads)
+        for symbol in ("struct Tcb", "saved_rsp: usize", "ThreadState::Ready",
+                       "ThreadState::Running", "ThreadState::Blocked",
+                       "ThreadState::Finished", "fn enqueue(", "fn dequeue(",
+                       "fn wake_if_due(", "fn context_to_bsp(", "fn thread_body(",
+                       "context_switch::switch_raw", "EXPECTED_EVENTS",
+                       "WOLFOS_KTHREAD_ERROR scheduling_or_resume",
+                       "WOLFOS_KTHREAD_OK threads=3"):
+            self.assertIn(symbol, threads)
+        marker = "WOLFOS_KTHREAD_OK threads=3 dispatches=9 switches=18 yields=5 blocked=1 woken=1 finished=3 stack_kib=16"
+        self.assertIn(marker, smoke)
+        self.assertIn(marker, topology)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
