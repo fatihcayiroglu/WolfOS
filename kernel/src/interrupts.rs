@@ -5,7 +5,7 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -52,13 +52,6 @@ impl<T> BootCell<T> {
         }
     }
 
-    /// # Safety
-    /// Only call after the publishing boot CPU has stored IDT_READY with
-    /// Release ordering and the current CPU observed it with Acquire.
-    unsafe fn assume_initialized(&'static self) -> &'static T {
-        // SAFETY: caller guarantees initial write precedes this immutable read.
-        unsafe { &*(*self.0.get()).as_ptr() }
-    }
 }
 
 static TSS_STORAGE: BootCell<TaskStateSegment> = BootCell::new();
@@ -79,9 +72,17 @@ static AP_TSS: [BootCell<TaskStateSegment>; MAX_BOOT_CPUS] =
     [const { BootCell::new() }; MAX_BOOT_CPUS];
 static AP_GDT: [BootCell<GlobalDescriptorTable>; MAX_BOOT_CPUS] =
     [const { BootCell::new() }; MAX_BOOT_CPUS];
+static AP_IDT: [BootCell<InterruptDescriptorTable>; MAX_BOOT_CPUS] =
+    [const { BootCell::new() }; MAX_BOOT_CPUS];
+static AP_BREAKPOINTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Install processor-local GDT, TSS and IST plus an immutable shared IDT.
-/// No IRQs, task scheduling, serial output, PMM access or APIC programming.
+/// BSP-only observation of the number of APs that completed #BP handlers.
+pub fn ap_breakpoint_count() -> usize {
+    AP_BREAKPOINTS.load(Ordering::Acquire)
+}
+
+/// Install private GDT, TSS, IST and IDT, and verify the AP's INT3 returns.
+/// No external IRQs, task scheduling, serial output, PMM access or APIC.
 /// Called exactly once on the unique AP owning index.
 pub fn initialize_secondary(index: usize) -> bool {
     x86_64::instructions::interrupts::disable();
@@ -118,10 +119,23 @@ pub fn initialize_secondary(index: usize) -> bool {
         load_tss(tss_selector);
     }
 
-    // SAFETY: BSP published IDT_READY only after initializing and loading
-    // the immutable static shared IDT. No subsequent IDT mutation occurs.
-    let idt_ref = unsafe { IDT_STORAGE.assume_initialized() };
+    let mut idt = InterruptDescriptorTable::new();
+    idt.divide_error.set_handler_fn(ap_divide_error);
+    idt.breakpoint.set_handler_fn(ap_breakpoint);
+    idt.invalid_opcode.set_handler_fn(ap_invalid_opcode);
+    idt.general_protection_fault.set_handler_fn(ap_general_protection_fault);
+    idt.page_fault.set_handler_fn(ap_page_fault);
+    // SAFETY: AP owns a unique, permanently reserved double-fault IST.
+    unsafe {
+        idt.double_fault.set_handler_fn(ap_double_fault)
+            .set_stack_index(DOUBLE_FAULT_IST_INDEX);
+    }
+    // SAFETY: each AP initializes and owns its own static IDT exactly once.
+    let idt_ref = unsafe { AP_IDT[index].initialize(idt) };
     idt_ref.load();
+
+    // No AP serial I/O: its own #BP handler records an atomic acknowledgment.
+    x86_64::instructions::interrupts::int3();
     CS::get_reg().0 == code.0 && SS::get_reg().0 == data.0
 }
 
@@ -236,4 +250,37 @@ pub fn trigger_invalid_opcode() -> ! {
     serial::write_line("WOLFOS_EXCEPTION_TEST_BEGIN vector=6");
     // SAFETY: only the isolated QEMU exception smoke test enables this.
     unsafe { core::arch::asm!("ud2", options(noreturn)); }
+}
+
+
+// Secondary processors must not use BSP's non-reentrant serial fault logger.
+// These AP handlers either acknowledge INT3 or fail-stop without unwinding.
+extern "x86-interrupt" fn ap_breakpoint(_frame: InterruptStackFrame) {
+    AP_BREAKPOINTS.fetch_add(1, Ordering::Release);
+}
+
+extern "x86-interrupt" fn ap_divide_error(_frame: InterruptStackFrame) {
+    crate::halt_forever();
+}
+
+extern "x86-interrupt" fn ap_invalid_opcode(_frame: InterruptStackFrame) {
+    crate::halt_forever();
+}
+
+extern "x86-interrupt" fn ap_general_protection_fault(
+    _frame: InterruptStackFrame, _code: u64
+) {
+    crate::halt_forever();
+}
+
+extern "x86-interrupt" fn ap_page_fault(
+    _frame: InterruptStackFrame, _code: PageFaultErrorCode
+) {
+    crate::halt_forever();
+}
+
+extern "x86-interrupt" fn ap_double_fault(
+    _frame: InterruptStackFrame, _code: u64
+) -> ! {
+    crate::halt_forever()
 }

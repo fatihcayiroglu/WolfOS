@@ -4,7 +4,7 @@
 //! entrypoint. Each AP executes Rust on a bootloader-provided stack, publishes
 //! its unique handshake, then parks forever with external IRQs disabled.
 //!
-//! This is NOT a working SMP scheduler. APs have private GDT/TSS and IST,
+//! This is NOT a working SMP scheduler. APs have private GDT/TSS/IST/IDT,
 //! but still do not use serial output or the dynamic allocator; no shared page-table
 //! modification occurs after releasing APs. Per-CPU working kernel stacks,
 //! IPI delivery and scheduler are required before running general tasks.
@@ -98,6 +98,20 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
                 || AP_ACK[index].load(Ordering::Acquire) == expected_ack(cpu)
         });
         if all_acked {
+            // Acquire of each AP_ACK observes its preceding breakpoint handler.
+            // Exactly one #BP must have returned through each AP's own IDT.
+            let ap_bp = crate::interrupts::ap_breakpoint_count();
+            if ap_bp != ap_count {
+                serial::write_fmt(format_args!(
+                    "WOLFOS_SMP_ERROR ap_breakpoints={} expected={}\n",
+                    ap_bp, ap_count
+                ));
+                return false;
+            }
+            serial::write_fmt(format_args!(
+                "WOLFOS_SMP_AP_IDT_OK total={} ap_idts={} ap_bp_returns={}\n",
+                cpus.len(), ap_count, ap_bp
+            ));
             serial::write_fmt(format_args!(
                 "WOLFOS_SMP_APS_OK total={} bsp_lapic={} ap_acks={}\n",
                 cpus.len(), mp.bsp_lapic_id, ap_count

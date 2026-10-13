@@ -172,6 +172,21 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_SMP_PERCPU_OK total=4 ap_tables=3", topo)
         self.assertIn("WOLFOS_SMP_PERCPU_OK total=1 ap_tables=0", smoke)
 
+    def test_ap_private_idt_and_breakpoint_return(self):
+        intr = (ROOT / "kernel/src/interrupts.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        topo = (ROOT / "scripts/topology_smoke.py").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        self.assertIn("static AP_IDT: [BootCell<InterruptDescriptorTable>; MAX_BOOT_CPUS]", intr)
+        self.assertIn("AP_IDT[index].initialize(idt)", intr)
+        self.assertIn("idt_ref.load()", intr)
+        self.assertIn("interrupts::int3()", intr)
+        self.assertIn("AP_BREAKPOINTS.fetch_add", intr)
+        self.assertIn("ap_breakpoint_count()", smp)
+        self.assertIn("WOLFOS_SMP_AP_IDT_OK", smp)
+        self.assertIn("ap_bp_returns=", topo)
+        self.assertIn("WOLFOS_SMP_AP_IDT_OK total=1", smoke)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

@@ -28,6 +28,7 @@ MARKERS = (
     "WOLFOS_PAGING_UNMAP_OK",
     "WOLFOS_FRAMEBUFFER_OK",
     "WOLFOS_SMP_APS_OK total=1",
+    "WOLFOS_SMP_AP_IDT_OK total=1 ap_idts=0 ap_bp_returns=0",
     "WOLFOS_SMP_PERCPU_OK total=1 ap_tables=0",
     "WOLFOS_BOOT_OK",
 )
