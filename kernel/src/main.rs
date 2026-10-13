@@ -24,6 +24,7 @@ mod acpi_walk;
 mod smp;
 mod ap_stack;
 mod scheduler;
+mod thread_scheduler;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
