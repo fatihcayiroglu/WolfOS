@@ -39,13 +39,20 @@ def main() -> int:
         if (vector, hz) != (32, 100) or ticks < 8:
             print(f"FAIL: timer configuration/ticks invalid {(vector, hz, ticks)}")
             return 1
+        tasks = re.search(
+            r"WOLFOS_TIMER_TASKS_OK threads=(\d+) dispatches=(\d+) switches=(\d+) stack_kib=(\d+) gated_by_irq=(\d+) preemptive=(\d+)",
+            output,
+        )
+        if tasks is None or tuple(map(int, tasks.groups())) != (2, 6, 12, 16, 1, 0):
+            print("FAIL: two real saved Rust contexts did not dispatch on later hardware ticks")
+            return 1
         if run.returncode != 33 or "WOLFOS_BOOT_OK" not in output:
             print(f"FAIL: kernel did not finish; QEMU exit={run.returncode}")
             return 1
         if "WOLFOS_TIMER_ERROR" in output or "WOLFOS_EXCEPTION_GP" in output:
             print("FAIL: timer caused fatal exception")
             return 1
-        print("PASS: 8259 PIC routed genuine PIT IRQ0 to BSP IDT, EOI and ticks verified")
+        print("PASS: PIT IRQ0 tick-gated two cooperative Rust contexts; preemption is NOT claimed")
         return 0
 
 if __name__ == "__main__":

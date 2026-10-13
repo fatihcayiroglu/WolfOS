@@ -19,6 +19,11 @@ const REQUIRED_TICKS: u64 = 8;
 const MAX_SPINS: u64 = 500_000_000;
 static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// IRQ0-published tick counter. Safe in BSP worker code with IRQs enabled.
+pub fn ticks() -> u64 {
+    TIMER_TICKS.load(Ordering::Relaxed)
+}
+
 #[inline]
 fn outb(port: u16, value: u8) {
     // SAFETY: isolated QEMU-only legacy PIC/PIT hardware ports.
@@ -78,6 +83,10 @@ pub fn verify() -> bool {
         }
         core::hint::spin_loop();
     }
+    // No Rust TCB mutability may overlap an IRQ handler. The handler only
+    // updates an atomic; all context switches occur with IF cleared.
+    x86_64::instructions::interrupts::disable();
+    let tasks_ok = success && crate::timer_tasks::verify();
     x86_64::instructions::interrupts::disable();
     outb(MASTER_DATA, 0xff);
     outb(SLAVE_DATA, 0xff);
@@ -89,6 +98,15 @@ pub fn verify() -> bool {
         ));
         return false;
     }
+    if !tasks_ok {
+        serial::write_line("WOLFOS_TIMER_TASKS_ERROR bad_tick_dispatch_or_resume");
+        return false;
+    }
+    serial::write_fmt(format_args!(
+        "WOLFOS_TIMER_TASKS_OK threads={} dispatches={} switches={} stack_kib={} gated_by_irq=1 preemptive=0\n",
+        crate::timer_tasks::THREAD_COUNT, crate::timer_tasks::DISPATCH_COUNT,
+        crate::timer_tasks::SWITCH_COUNT, crate::timer_tasks::STACK_KIB
+    ));
     serial::write_fmt(format_args!(
         "WOLFOS_TIMER_IRQ_OK vector={} hz={} ticks={}\n",
         TIMER_VECTOR, FREQUENCY_HZ, ticks

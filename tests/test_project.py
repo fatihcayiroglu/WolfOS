@@ -368,6 +368,24 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("timer-smoke:", make)
         self.assertIn("make timer-smoke", (ROOT / ".github/workflows/p0.yml").read_text())
 
+    def test_hardware_timer_gated_context_switch_contract(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        timer = (ROOT / "kernel/src/timer.rs").read_text()
+        tasks = (ROOT / "kernel/src/timer_tasks.rs").read_text()
+        acceptance = (ROOT / "scripts/timer_smoke.py").read_text()
+        self.assertIn("mod timer_tasks;", main)
+        self.assertIn("crate::timer_tasks::verify()", timer)
+        self.assertIn("pub fn ticks()", timer)
+        self.assertIn("WOLFOS_TIMER_TASKS_OK", timer)
+        self.assertIn("preemptive=0", timer)
+        for mark in ("wolfos_tick_worker_start", "wolfos_tick_worker_rust",
+                     "context_switch::switch_raw", "FRAME_WORDS: usize = 8",
+                     "timer::ticks()", "interrupts::enable()", "interrupts::disable()",
+                     "s.events != [0, 1, 0, 1, 0, 1]", "const STACK_BYTES: usize = 16 * 1024"):
+            self.assertIn(mark, tasks)
+        self.assertIn("WOLFOS_TIMER_TASKS_OK", acceptance)
+        self.assertIn("tuple(map(int, tasks.groups())) != (2, 6, 12, 16, 1, 0)", acceptance)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
