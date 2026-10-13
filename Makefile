@@ -55,6 +55,9 @@ smoke:
 
 test:
 	python3 -m unittest discover -s tests -v
+	mkdir -p $(OUT)
+	rustc --edition=2024 --test kernel/src/pmm_layout.rs -o $(OUT)/pmm_layout_tests
+	$(OUT)/pmm_layout_tests
 
 check: test
 	@echo 'Source/config checks completed; actual QEMU boot is separate.'
