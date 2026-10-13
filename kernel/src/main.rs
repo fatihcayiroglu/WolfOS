@@ -11,6 +11,7 @@ use limine::request::{FramebufferRequest, MemmapRequest};
 
 mod serial;
 mod cpu;
+mod pmm;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -61,6 +62,22 @@ pub extern "C" fn kmain() -> ! {
         "WOLFOS_MEMMAP_OK entries={} usable_mib={}\n",
         entries.len(), usable_bytes / 1_048_576
     ));
+    match pmm::initialize(entries) {
+        Ok(stats) => serial::write_fmt(format_args!(
+            "WOLFOS_PMM_OK regions={} total_frames={} free_frames={}\n",
+            stats.usable_regions, stats.total_frames, stats.free_frames()
+        )),
+        Err(error) => {
+            serial::write_fmt(format_args!("WOLFOS_PMM_ERROR {error:?}\n"));
+            halt_forever();
+        }
+    }
+    if !pmm::self_test() {
+        serial::write_line("WOLFOS_PMM_TEST_FAILED");
+        halt_forever();
+    }
+    serial::write_line("WOLFOS_PMM_TEST_OK iterations=10000 unique=128");
+
 
     let Some(fb_response) = FRAMEBUFFER_REQUEST.response() else {
         serial::write_line("WOLFOS_ERROR: framebuffer unavailable");
