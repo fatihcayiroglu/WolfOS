@@ -37,7 +37,7 @@ unsafe extern "C" fn secondary_entry(info: &MpInfo) -> ! {
     x86_64::instructions::interrupts::disable();
 
     let index = info.extra_argument() as usize;
-    if index >= MAX_BOOT_CPUS || index == 0 {
+    if index >= MAX_BOOT_CPUS {
         crate::halt_forever();
     }
 
@@ -80,13 +80,8 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
         if cpu.lapic_id == mp.bsp_lapic_id {
             continue;
         }
-        // Bootstrap slots can be zero, so shift by one and keep the last
-        // slot free. Enforce this limit before starting any APs.
-        let slot = index + 1;
-        if slot >= MAX_BOOT_CPUS {
-            serial::write_line("WOLFOS_SMP_ERROR too_many_aps");
-            return false;
-        }
+        // The AP's slot is its index in the immutable MP CPU directory.
+        let slot = index;
         // Limine's bootstrap publishes the AP entrypoint with a Release
         // atomic store. The secondary CPU then executes secondary_entry.
         cpu.bootstrap(secondary_entry, slot as u64);
@@ -97,7 +92,7 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
     for _ in 0..WAIT_ROUNDS {
         let all_acked = cpus.iter().enumerate().all(|(index, cpu)| {
             cpu.lapic_id == mp.bsp_lapic_id
-                || AP_ACK[index + 1].load(Ordering::Acquire) == expected_ack(cpu)
+                || AP_ACK[index].load(Ordering::Acquire) == expected_ack(cpu)
         });
         if all_acked {
             serial::write_fmt(format_args!(
