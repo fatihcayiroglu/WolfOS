@@ -81,10 +81,17 @@ def main() -> int:
         if bsp_jobs < 1 or ap_jobs < EXPECTED_CPUS - 1 or bsp_jobs + ap_jobs != tasks:
             print(f"FAIL: verified work must include BSP and 3 APs: {(bsp_jobs,ap_jobs)}")
             return 1
+        lifecycle = re.search(
+            r"WOLFOS_THREADS_OK threads=(\d+) cpus=(\d+) active=(\d+) yielded=(\d+) blocked=(\d+) woken=(\d+) finished=(\d+)",
+            output,
+        )
+        if lifecycle is None or tuple(map(int, lifecycle.groups())) != (256, EXPECTED_CPUS, EXPECTED_CPUS, 512, 256, 256, 256):
+            print("FAIL: kernel tasks did not yield, block, wake and finish on all CPUs")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: 4 CPUs executed an exactly-once 512-job cooperative queue; no preemption")
+        print("PASS: four per-CPU run queues drove 256 task lifecycles and 512 jobs; no context switch")
         return 0
 
 if __name__ == "__main__":

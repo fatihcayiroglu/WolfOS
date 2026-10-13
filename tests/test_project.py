@@ -232,6 +232,28 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_SCHED_OK tasks=", topo)
         self.assertIn("scheduler_tests", make)
 
+    def test_thread_lifecycle_and_per_cpu_queues(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        scheduler = (ROOT / "kernel/src/thread_scheduler.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        topo = (ROOT / "scripts/topology_smoke.py").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        make = (ROOT / "Makefile").read_text()
+        self.assertIn("mod thread_scheduler;", main)
+        for marker in ("struct Thread", "struct PerCpuQueue", "enum ThreadState",
+                       "Ready,", "Running,", "Blocked,", "Finished,",
+                       "fn run_step(", "fn push_ready(", "fn push_blocked(",
+                       "fn pop_ready(", "fn pop_blocked(", "fn verify(&self)"):
+            self.assertIn(marker, scheduler)
+        self.assertIn("thread_scheduler::BOOT_TASKS.configure(cpus.len())", smp)
+        self.assertIn("thread_scheduler::BOOT_TASKS.run_cpu(index)", smp)
+        self.assertIn("thread_scheduler::BOOT_TASKS.run_cpu(bsp_index)", smp)
+        self.assertIn("thread_scheduler::BOOT_TASKS.verify()", smp)
+        self.assertIn("WOLFOS_THREADS_OK threads=", smp)
+        self.assertIn("WOLFOS_THREADS_OK threads=256 cpus=1", smoke)
+        self.assertIn("WOLFOS_THREADS_OK threads=", topo)
+        self.assertIn("thread_scheduler_tests", make)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

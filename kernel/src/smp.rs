@@ -12,7 +12,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::mp::{MpInfo, MpRespData};
 
-use crate::{ap_stack, scheduler, serial};
+use crate::{ap_stack, scheduler, serial, thread_scheduler};
 
 pub const MAX_BOOT_CPUS: usize = 256;
 const ACK_MAGIC: u64 = 0x574F_4C46_4150_0000;
@@ -102,6 +102,9 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
     if !scheduler::BOOT_QUEUE.run_worker(index) {
         crate::halt_forever();
     }
+    if !thread_scheduler::BOOT_TASKS.run_cpu(index) {
+        crate::halt_forever();
+    }
     if !ap_stack::verify_active(index) {
         crate::halt_forever();
     }
@@ -144,6 +147,10 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
     // Configure before any AP can claim a queue item.
     if !scheduler::BOOT_QUEUE.configure(cpus.len()) {
         serial::write_line("WOLFOS_SCHED_ERROR invalid_initialization");
+        return false;
+    }
+    if !thread_scheduler::BOOT_TASKS.configure(cpus.len()) {
+        serial::write_line("WOLFOS_THREADS_ERROR invalid_initialization");
         return false;
     }
 
@@ -192,6 +199,10 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
         serial::write_line("WOLFOS_SCHED_ERROR bsp_worker_failed");
         return false;
     }
+    if !thread_scheduler::BOOT_TASKS.run_cpu(bsp_index) {
+        serial::write_line("WOLFOS_THREADS_ERROR bsp_worker_failed");
+        return false;
+    }
     if !wait_for(cpus, mp.bsp_lapic_id, &AP_DONE) {
         serial::write_fmt(format_args!(
             "WOLFOS_SMP_ERROR ap_work_timeout expected={}\n", ap_count
@@ -216,6 +227,15 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
         "WOLFOS_SCHED_OK tasks={} cpus={} active={} bsp_jobs={} ap_jobs={}\n",
         report.jobs, report.workers, report.active_cpus,
         report.bsp_jobs, report.ap_jobs
+    ));
+    let Some(tasks) = thread_scheduler::BOOT_TASKS.verify() else {
+        serial::write_line("WOLFOS_THREADS_ERROR state_verification_failed");
+        return false;
+    };
+    serial::write_fmt(format_args!(
+        "WOLFOS_THREADS_OK threads={} cpus={} active={} yielded={} blocked={} woken={} finished={}\n",
+        tasks.threads, tasks.cpus, tasks.active, tasks.yielded,
+        tasks.blocked, tasks.woken, tasks.finished
     ));
     serial::write_fmt(format_args!(
         "WOLFOS_SMP_WORK_OK total={} workers={} rounds={}\n",
