@@ -5,7 +5,7 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 
-use x86_64::instructions::segmentation::{CS, Segment};
+use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::idt::{
@@ -69,6 +69,7 @@ pub fn initialize() {
 
     let mut gdt = GlobalDescriptorTable::new();
     let kernel_cs = gdt.append(Descriptor::kernel_code_segment());
+    let kernel_ds = gdt.append(Descriptor::kernel_data_segment());
     let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));
     // SAFETY: object has static backing and is immutable after loading.
     let gdt_ref = unsafe { GDT_STORAGE.initialize(gdt) };
@@ -76,9 +77,15 @@ pub fn initialize() {
     // SAFETY: selectors are valid entries in the loaded, permanent GDT.
     unsafe {
         CS::set_reg(kernel_cs);
+        SS::set_reg(kernel_ds);
+        DS::set_reg(kernel_ds);
+        ES::set_reg(kernel_ds);
         load_tss(tss_sel);
     }
-    serial::write_line("WOLFOS_GDT_OK tss=loaded ist=0");
+    serial::write_fmt(format_args!(
+        "WOLFOS_GDT_OK tss=loaded ist=0 cs={:#x} ss={:#x}\n",
+        CS::get_reg().0, SS::get_reg().0
+    ));
 
     let mut idt = InterruptDescriptorTable::new();
     idt.divide_error.set_handler_fn(divide_error);
