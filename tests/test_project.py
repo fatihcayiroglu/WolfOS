@@ -207,8 +207,8 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_SMP_WORK_OK", smp)
         self.assertIn("WOLFOS_SMP_STACK_OK total=1", smoke)
         self.assertIn("WOLFOS_SMP_WORK_OK total=1", smoke)
-        self.assertIn("stack_kib=(\\\\d+)", topo)
-        self.assertIn("rounds=(\\\\d+)", topo)
+        self.assertIn(r"stack_kib=(\d+)", topo)
+        self.assertIn(r"rounds=(\d+)", topo)
 
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
