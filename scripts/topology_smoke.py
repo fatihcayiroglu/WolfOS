@@ -88,10 +88,13 @@ def main() -> int:
         if lifecycle is None or tuple(map(int, lifecycle.groups())) != (256, EXPECTED_CPUS, EXPECTED_CPUS, 512, 256, 256, 256):
             print("FAIL: kernel tasks did not yield, block, wake and finish on all CPUs")
             return 1
+        if "WOLFOS_CONTEXT_OK tasks=2 switches=7 events=6 stacks_kib=16" not in output:
+            print("FAIL: BSP context-switch roundtrip did not resume each Rust stack")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: four per-CPU run queues drove 256 task lifecycles and 512 jobs; no context switch")
+        print("PASS: four SMP task queues and BSP 2-stack/7-switch context roundtrip verified")
         return 0
 
 if __name__ == "__main__":

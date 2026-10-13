@@ -254,6 +254,26 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_THREADS_OK threads=", topo)
         self.assertIn("thread_scheduler_tests", make)
 
+    def test_real_bsp_context_switch_contract(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        module = (ROOT / "kernel/src/context_switch.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        topology = (ROOT / "scripts/topology_smoke.py").read_text()
+        self.assertIn("mod context_switch;", main)
+        self.assertIn("context_switch::verify_roundtrip()", main)
+        self.assertIn('".global wolfos_switch_context"', module)
+        for instruction in ("push rbx", "push rbp", "push r12", "push r13",
+                            "push r14", "push r15", "mov [rdi], rsp",
+                            "mov rsp, [rsi]", "pop r15", "pop rbx", '"ret"'):
+            self.assertIn(instruction, module)
+        self.assertIn("switch(&BSP_RSP, &A_RSP)", module)
+        self.assertIn("switch(&B_RSP, &BSP_RSP)", module)
+        self.assertIn("WOLFOS_CONTEXT_ERROR incorrect_resume_order", module)
+        self.assertIn("WOLFOS_CONTEXT_OK tasks=2 switches=", module)
+        for expected in ("WOLFOS_CONTEXT_OK tasks=2 switches=7 events=6 stacks_kib=16",):
+            self.assertIn(expected, smoke)
+            self.assertIn(expected, topology)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

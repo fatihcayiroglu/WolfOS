@@ -2,7 +2,7 @@
 
 P0: Rust no_std x86-64 kernel; QEMU serial, memory-map and framebuffer smoke checks.
 
-P1: CPUID (merged); physical frame allocator (merged), scalable HHDM-backed bitmap (merged); GDT/IDT, CPU exceptions (merged), paging map/unmap and #PF (merged), PCI read-only discovery (merged), ACPI RSDP read-only validation (merged); RSDT/XSDT checksum validation and MADT CPU count (merged), Limine AP Rust handshake (merged); AP-local GDT/TSS/IST/IDT, WolfOS-owned AP stacks and verified SMP CPU work (merged); cooperative exactly-once kernel job queue (merged); per-CPU task queues and Ready/Running/Blocked/Finished lifecycle (under review).
+P1: CPUID (merged); physical frame allocator (merged), scalable HHDM-backed bitmap (merged); GDT/IDT, CPU exceptions (merged), paging map/unmap and #PF (merged), PCI read-only discovery (merged), ACPI RSDP read-only validation (merged); RSDT/XSDT checksum validation and MADT CPU count (merged), Limine AP Rust handshake (merged); AP-local GDT/TSS/IST/IDT, WolfOS-owned AP stacks and verified SMP CPU work (merged); cooperative exactly-once kernel job queue (merged); per-CPU task queues and Ready/Running/Blocked/Finished lifecycle (merged); BSP-only cooperative assembly context-switch proof (under review).
 
 P2: Ring 3 user mode, syscalls, ELF loader, init, scheduler and RAM-backed file system.
 
