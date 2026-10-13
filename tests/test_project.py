@@ -350,6 +350,24 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_SMP_CTX_OK cpus=1 active=1 threads=2 switches=12", smoke)
         self.assertIn("WOLFOS_SMP_CTX_OK cpus=4 active=4 threads=8 switches=48", topology)
 
+    def test_isolated_hardware_timer_contract(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        intr = (ROOT / "kernel/src/interrupts.rs").read_text()
+        timer = (ROOT / "kernel/src/timer.rs").read_text()
+        smoke = (ROOT / "scripts/timer_smoke.py").read_text()
+        make = (ROOT / "Makefile").read_text()
+        self.assertIn('#[cfg(feature = "timer-smoke")]', main)
+        self.assertIn("timer::verify()", main)
+        self.assertIn("idt[crate::timer::TIMER_VECTOR].set_handler_fn", intr)
+        self.assertIn('pub extern "x86-interrupt" fn irq0', timer)
+        self.assertIn("TIMER_TICKS.fetch_add", timer)
+        self.assertIn("outb(MASTER_COMMAND, 0x20)", timer)
+        self.assertIn("WOLFOS_TIMER_IRQ_OK", timer)
+        self.assertIn("WOLFOS_TIMER_IRQ_OK", smoke)
+        self.assertIn("run.returncode != 33", smoke)
+        self.assertIn("timer-smoke:", make)
+        self.assertIn("make timer-smoke", (ROOT / ".github/workflows/p0.yml").read_text())
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

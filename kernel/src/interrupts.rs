@@ -179,6 +179,8 @@ pub fn initialize() {
     idt.invalid_opcode.set_handler_fn(invalid_opcode);
     idt.general_protection_fault.set_handler_fn(general_protection_fault);
     idt.page_fault.set_handler_fn(page_fault);
+    #[cfg(feature = "timer-smoke")]
+    idt[crate::timer::TIMER_VECTOR].set_handler_fn(crate::timer::irq0);
     // SAFETY: TSS IST 0 has a statically allocated, distinct 20 KiB stack.
     unsafe {
         idt.double_fault.set_handler_fn(double_fault)
