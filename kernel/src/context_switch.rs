@@ -79,8 +79,10 @@ unsafe extern "C" {
 
 fn bottom(index: usize) -> Option<usize> {
     if index >= 2 { return None; }
-    // SAFETY: no Rust reference to a stack is produced; only its address.
-    let ptr = core::ptr::addr_of_mut!((*STACKS.0.get())[index]);
+    // SAFETY: index is checked above and the static backing allocation
+    // stays live. We form a raw pointer without creating an aliasing Rust
+    // reference or dereferencing the stack's bytes.
+    let ptr = unsafe { core::ptr::addr_of_mut!((*STACKS.0.get())[index]) };
     Some(ptr.cast::<u8>() as usize)
 }
 
