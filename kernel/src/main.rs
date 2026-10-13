@@ -7,11 +7,12 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
-use limine::request::{FramebufferRequest, MemmapRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest};
 
 mod serial;
 mod cpu;
 mod pmm;
+mod pmm_layout;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -28,6 +29,10 @@ static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
@@ -62,10 +67,15 @@ pub extern "C" fn kmain() -> ! {
         "WOLFOS_MEMMAP_OK entries={} usable_mib={}\n",
         entries.len(), usable_bytes / 1_048_576
     ));
-    match pmm::initialize(entries) {
+    let Some(hhdm) = HHDM_REQUEST.response() else {
+        serial::write_line("WOLFOS_ERROR: HHDM unavailable");
+        halt_forever();
+    };
+    match pmm::initialize(entries, hhdm.offset) {
         Ok(stats) => serial::write_fmt(format_args!(
-            "WOLFOS_PMM_OK regions={} total_frames={} free_frames={}\n",
-            stats.usable_regions, stats.total_frames, stats.free_frames()
+            "WOLFOS_PMM_OK regions={} total_frames={} free_frames={} metadata_frames={} bitmap_bytes={}\n",
+            stats.usable_regions, stats.total_frames, stats.free_frames(),
+            stats.metadata_frames, stats.bitmap_bytes
         )),
         Err(error) => {
             serial::write_fmt(format_args!("WOLFOS_PMM_ERROR {error:?}\n"));
@@ -77,6 +87,7 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_line("WOLFOS_PMM_TEST_OK iterations=10000 unique=128");
+    serial::write_line("WOLFOS_PMM_DYNAMIC_OK");
 
 
     let Some(fb_response) = FRAMEBUFFER_REQUEST.response() else {
