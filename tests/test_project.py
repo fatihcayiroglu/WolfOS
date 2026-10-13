@@ -23,7 +23,7 @@ class WolfP0ContractTests(unittest.TestCase):
 
     def test_expected_boot_markers(self):
         main = (ROOT / "kernel/src/main.rs").read_text()
-        for marker in ("WOLFOS_LIMINE_OK", "WOLFOS_MEMMAP_OK", "WOLFOS_FRAMEBUFFER_OK", "WOLFOS_BOOT_OK"):
+        for marker in ("WOLFOS_CPU_OK", "WOLFOS_LIMINE_OK", "WOLFOS_MEMMAP_OK", "WOLFOS_FRAMEBUFFER_OK", "WOLFOS_BOOT_OK"):
             self.assertIn(marker, main)
         self.assertIn("returncode != 33", (ROOT / "scripts/smoke.py").read_text())
 

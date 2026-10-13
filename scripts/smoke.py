@@ -9,6 +9,7 @@ import tempfile
 MARKERS = (
     "WOLFOS: Rust kernel entered",
     "WOLFOS_LIMINE_OK",
+    "WOLFOS_CPU_OK",
     "WOLFOS_MEMMAP_OK",
     "WOLFOS_FRAMEBUFFER_OK",
     "WOLFOS_BOOT_OK",
