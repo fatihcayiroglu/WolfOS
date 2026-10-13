@@ -31,6 +31,8 @@ mod context_batch;
 mod percpu_context;
 #[cfg(feature = "timer-smoke")]
 mod timer;
+#[cfg(feature = "timer-smoke")]
+mod timer_tasks;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
