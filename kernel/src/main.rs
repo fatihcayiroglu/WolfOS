@@ -26,6 +26,7 @@ mod ap_stack;
 mod scheduler;
 mod thread_scheduler;
 mod context_switch;
+mod kernel_threads;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -187,6 +188,10 @@ pub extern "C" fn kmain() -> ! {
     }
     if !context_switch::verify_roundtrip() {
         serial::write_line("WOLFOS_CONTEXT_TEST_FAILED");
+        halt_forever();
+    }
+    if !kernel_threads::verify() {
+        serial::write_line("WOLFOS_KTHREAD_TEST_FAILED");
         halt_forever();
     }
     serial::write_line("WOLFOS_BOOT_OK");
