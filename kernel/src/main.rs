@@ -28,7 +28,8 @@ static START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
-static BASE_REVISION: BaseRevision = BaseRevision::with_revision(0);
+// Base revision 4 guarantees ACPI firmware tables are mapped in typed HHDM regions.
+static BASE_REVISION: BaseRevision = BaseRevision::with_revision(4);
 
 #[used]
 #[unsafe(link_section = ".requests")]
