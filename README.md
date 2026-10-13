@@ -20,7 +20,7 @@ On Ubuntu: sudo apt install build-essential git make xorriso qemu-system-x86 ovm
 
 Boot markers: WOLFOS_LIMINE_OK, WOLFOS_MEMMAP_OK, WOLFOS_FRAMEBUFFER_OK, WOLFOS_BOOT_OK.
 
-P0 shows colored screen bands and serial logs. It does NOT have a shell, network, GPU drivers, Windows program support, Steam, or filesystem.
+P0 shows colored screen bands and serial logs. P1 is adding a physical-frame allocation bitmap and QEMU allocation tests. It does NOT have a shell, network, GPU drivers, Windows program support, Steam, or filesystem.
 
 Safety: builds CD ISO under out/ and boots a VM, never operates on real Windows drives or backups.
 

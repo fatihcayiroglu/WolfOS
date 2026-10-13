@@ -30,6 +30,19 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_CPU_OK", (ROOT / "scripts/smoke.py").read_text())
         self.assertIn("returncode != 33", (ROOT / "scripts/smoke.py").read_text())
 
+    def test_physical_frame_allocator_contract(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        pmm = (ROOT / "kernel/src/pmm.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        self.assertIn("pmm::initialize(entries)", main)
+        self.assertIn("WOLFOS_PMM_TEST_OK", main)
+        self.assertIn("WOLFOS_PMM_TEST_OK", smoke)
+        self.assertIn("MEMMAP_USABLE", pmm)
+        self.assertIn("DoubleFree", pmm)
+        self.assertIn("10_000", pmm)
+        self.assertIn("MAX_FRAMES", pmm)
+        self.assertIn("unsafe impl Sync", pmm)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

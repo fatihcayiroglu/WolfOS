@@ -11,6 +11,8 @@ MARKERS = (
     "WOLFOS_LIMINE_OK",
     "WOLFOS_CPU_OK",
     "WOLFOS_MEMMAP_OK",
+    "WOLFOS_PMM_OK",
+    "WOLFOS_PMM_TEST_OK iterations=10000 unique=128",
     "WOLFOS_FRAMEBUFFER_OK",
     "WOLFOS_BOOT_OK",
 )
