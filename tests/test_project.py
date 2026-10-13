@@ -297,6 +297,30 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn(marker, smoke)
         self.assertIn(marker, topology)
 
+    def test_generic_context_backed_task_batch(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        source = (ROOT / "kernel/src/context_batch.rs").read_text()
+        old_threads = (ROOT / "kernel/src/kernel_threads.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        topo = (ROOT / "scripts/topology_smoke.py").read_text()
+        self.assertIn("mod context_batch;", main)
+        self.assertIn("context_batch::verify()", main)
+        self.assertIn("pub const CONTEXT_TASKS: usize = 16", source)
+        self.assertIn("use crate::thread_scheduler::{ThreadState, THREAD_COUNT};", source)
+        for expected in ("struct Tcb", "saved_rsp: usize",
+                         "wolfos_batch_thread_start", "wolfos_batch_rust_entry",
+                         '"mov rdi, r12"', '"sub rsp, 8"',
+                         "const FRAME_WORDS: usize = 8",
+                         ".add(3).write(id)", ".add(6).write(",
+                         "ThreadState::Blocked", "fn wake_if_due",
+                         "context_switch::switch_raw",
+                         "WOLFOS_CTX_BATCH_ERROR scheduling_or_resume"):
+            self.assertIn(expected, source)
+        marker = "WOLFOS_CTX_BATCH_OK threads=16 dispatches=64 switches=128 yields=47 blocked=1 woken=1 finished=16 stack_kib=16"
+        self.assertIn(marker, smoke)
+        self.assertIn(marker, topo)
+        self.assertIn("WOLFOS_KTHREAD_OK threads=3", old_threads)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

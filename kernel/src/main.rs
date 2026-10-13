@@ -27,6 +27,7 @@ mod scheduler;
 mod thread_scheduler;
 mod context_switch;
 mod kernel_threads;
+mod context_batch;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -192,6 +193,10 @@ pub extern "C" fn kmain() -> ! {
     }
     if !kernel_threads::verify() {
         serial::write_line("WOLFOS_KTHREAD_TEST_FAILED");
+        halt_forever();
+    }
+    if !context_batch::verify() {
+        serial::write_line("WOLFOS_CTX_BATCH_TEST_FAILED");
         halt_forever();
     }
     serial::write_line("WOLFOS_BOOT_OK");
