@@ -343,8 +343,9 @@ mod tests {
     use super::*;
     use std::thread;
 
-    fn verify_multicore(cpus: usize) {
-        let manager = TaskManager::new();
+    // Use permanent test fixtures like BOOT_TASKS: large static runqueue
+    // arrays must NOT be constructed on the Rust test harness's 2 MiB stack.
+    fn verify_multicore(cpus: usize, manager: &'static TaskManager) {
         assert!(manager.configure(cpus));
         assert_eq!(manager.thread_state(0), Some(ThreadState::Ready));
         assert!(manager.verify().is_none());
@@ -366,15 +367,25 @@ mod tests {
     }
 
     #[test]
-    fn runs_one_cpu() { verify_multicore(1); }
+    fn runs_one_cpu() {
+        static MANAGER: TaskManager = TaskManager::new();
+        verify_multicore(1, &MANAGER);
+    }
     #[test]
-    fn runs_four_cpus() { verify_multicore(4); }
+    fn runs_four_cpus() {
+        static MANAGER: TaskManager = TaskManager::new();
+        verify_multicore(4, &MANAGER);
+    }
     #[test]
-    fn runs_sixteen_cpus() { verify_multicore(16); }
+    fn runs_sixteen_cpus() {
+        static MANAGER: TaskManager = TaskManager::new();
+        verify_multicore(16, &MANAGER);
+    }
 
     #[test]
     fn refuses_invalid_and_incomplete_execution() {
-        let manager = TaskManager::new();
+        static MANAGER: TaskManager = TaskManager::new();
+        let manager = &MANAGER;
         assert!(!manager.run_cpu(0));
         assert!(!manager.configure(0));
         assert!(!manager.configure(MAX_CPUS + 1));
