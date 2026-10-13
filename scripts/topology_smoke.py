@@ -52,6 +52,13 @@ def main() -> int:
         if "WOLFOS_SMP_PERCPU_OK total=4 ap_tables=3" not in output:
             print("FAIL: APs did not finish per-core GDT/TSS/IST initialization")
             return 1
+        per_cpu = re.search(
+            r"WOLFOS_SMP_AP_IDT_OK total=(\d+) ap_idts=(\d+) ap_bp_returns=(\d+)",
+            output,
+        )
+        if per_cpu is None or tuple(map(int, per_cpu.groups())) != (EXPECTED_CPUS, 3, 3):
+            print("FAIL: AP-local IDT and exception return were not verified")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
