@@ -4,10 +4,10 @@
 //! entrypoint. Each AP executes Rust on a bootloader-provided stack, publishes
 //! its unique handshake, then parks forever with external IRQs disabled.
 //!
-//! This is NOT a working SMP scheduler. APs do not use the BSP's GDT/TSS,
-//! serial output, dynamic allocator or fault handlers; no shared page-table
-//! modification occurs after releasing APs. Per-core descriptors and stacks
-//! are required before accepting real kernel work on the APs.
+//! This is NOT a working SMP scheduler. APs have private GDT/TSS and IST,
+//! but still do not use serial output or the dynamic allocator; no shared page-table
+//! modification occurs after releasing APs. Per-CPU working kernel stacks,
+//! IPI delivery and scheduler are required before running general tasks.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,6 +41,9 @@ unsafe extern "C" fn secondary_entry(info: &MpInfo) -> ! {
         crate::halt_forever();
     }
 
+    if !crate::interrupts::initialize_secondary(index) {
+        crate::halt_forever();
+    }
     AP_ACK[index].store(expected_ack(info), Ordering::Release);
     crate::halt_forever();
 }
@@ -98,6 +101,10 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
             serial::write_fmt(format_args!(
                 "WOLFOS_SMP_APS_OK total={} bsp_lapic={} ap_acks={}\n",
                 cpus.len(), mp.bsp_lapic_id, ap_count
+            ));
+            serial::write_fmt(format_args!(
+                "WOLFOS_SMP_PERCPU_OK total={} ap_tables={}\n",
+                cpus.len(), ap_count
             ));
             return true;
         }

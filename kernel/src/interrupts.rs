@@ -1,9 +1,11 @@
 //! P1 x86-64 GDT, TSS/IST, IDT and CPU exception diagnostics.
-//! Single-core boot only. External IRQs stay masked; SMP is not initialized.
+//! Boot CPU and parked APs have independent GDT/TSS and double-fault IST stacks.
+//! External IRQs remain masked; an SMP scheduler and IPIs are not initialized.
 //! A dedicated double-fault IST stack protects against common stack failures.
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
@@ -15,6 +17,7 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::{VirtAddr, registers::control::Cr2};
 
 use crate::serial;
+use crate::smp::MAX_BOOT_CPUS;
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 const DOUBLE_FAULT_STACK_SIZE: usize = 4096 * 5;
@@ -48,11 +51,80 @@ impl<T> BootCell<T> {
             &*(*self.0.get()).as_ptr()
         }
     }
+
+    /// # Safety
+    /// Only call after the publishing boot CPU has stored IDT_READY with
+    /// Release ordering and the current CPU observed it with Acquire.
+    unsafe fn assume_initialized(&'static self) -> &'static T {
+        // SAFETY: caller guarantees initial write precedes this immutable read.
+        unsafe { &*(*self.0.get()).as_ptr() }
+    }
 }
 
 static TSS_STORAGE: BootCell<TaskStateSegment> = BootCell::new();
 static GDT_STORAGE: BootCell<GlobalDescriptorTable> = BootCell::new();
 static IDT_STORAGE: BootCell<InterruptDescriptorTable> = BootCell::new();
+static IDT_READY: AtomicBool = AtomicBool::new(false);
+
+/// AP stacks must be disjoint. Each processor owns exactly one distinct slot.
+struct ApIstBank(UnsafeCell<[AlignedStack; MAX_BOOT_CPUS]>);
+
+// SAFETY: only a uniquely assigned AP touches its IST slot. The BSP never
+// mutates AP stack storage after releasing any AP.
+unsafe impl Sync for ApIstBank {}
+
+static AP_IST_BANK: ApIstBank =
+    ApIstBank(UnsafeCell::new([const { AlignedStack([0; DOUBLE_FAULT_STACK_SIZE]) }; MAX_BOOT_CPUS]));
+static AP_TSS: [BootCell<TaskStateSegment>; MAX_BOOT_CPUS] =
+    [const { BootCell::new() }; MAX_BOOT_CPUS];
+static AP_GDT: [BootCell<GlobalDescriptorTable>; MAX_BOOT_CPUS] =
+    [const { BootCell::new() }; MAX_BOOT_CPUS];
+
+/// Install processor-local GDT, TSS and IST plus an immutable shared IDT.
+/// No IRQs, task scheduling, serial output, PMM access or APIC programming.
+/// Called exactly once on the unique AP owning index.
+pub fn initialize_secondary(index: usize) -> bool {
+    x86_64::instructions::interrupts::disable();
+    if index >= MAX_BOOT_CPUS || !IDT_READY.load(Ordering::Acquire) {
+        return false;
+    }
+
+    // SAFETY: index validated, each AP owns one slot and writes only its
+    // private exception stack. Address belongs to permanent kernel BSS.
+    let stack_address = unsafe {
+        core::ptr::addr_of_mut!((*AP_IST_BANK.0.get())[index]) as usize
+    };
+    let stack_top = stack_address + DOUBLE_FAULT_STACK_SIZE;
+    let mut tss = TaskStateSegment::new();
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+        VirtAddr::new(stack_top as u64);
+    // SAFETY: exactly one AP initializes the unique indexed TSS.
+    let tss_ref = unsafe { AP_TSS[index].initialize(tss) };
+
+    let mut gdt = GlobalDescriptorTable::new();
+    let code = gdt.append(Descriptor::kernel_code_segment());
+    let data = gdt.append(Descriptor::kernel_data_segment());
+    let tss_selector = gdt.append(Descriptor::tss_segment(tss_ref));
+    // SAFETY: each AP writes its private permanent GDT once.
+    let gdt_ref = unsafe { AP_GDT[index].initialize(gdt) };
+    gdt_ref.load();
+    // SAFETY: segment selectors belong to this processor's loaded GDT.
+    // TSS descriptor is unique, so the busy bit cannot race another CPU.
+    unsafe {
+        CS::set_reg(code);
+        SS::set_reg(data);
+        DS::set_reg(data);
+        ES::set_reg(data);
+        load_tss(tss_selector);
+    }
+
+    // SAFETY: BSP published IDT_READY only after initializing and loading
+    // the immutable static shared IDT. No subsequent IDT mutation occurs.
+    let idt_ref = unsafe { IDT_STORAGE.assume_initialized() };
+    idt_ref.load();
+    CS::get_reg().0 == code.0 && SS::get_reg().0 == data.0
+}
+
 
 pub fn initialize() {
     // Interrupts remain off until an APIC/PIC routing/EOI design exists.
@@ -101,6 +173,7 @@ pub fn initialize() {
     // SAFETY: table stays in permanent storage for the life of the kernel.
     let idt_ref = unsafe { IDT_STORAGE.initialize(idt) };
     idt_ref.load();
+    IDT_READY.store(true, Ordering::Release);
     serial::write_line("WOLFOS_IDT_OK");
 
     // Breakpoint returns through IRETQ, proving the installed IDT can

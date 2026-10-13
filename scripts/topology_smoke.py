@@ -49,10 +49,13 @@ def main() -> int:
         if total_online != EXPECTED_CPUS or aps != EXPECTED_CPUS - 1:
             print(f"FAIL: expected 3 Rust AP acknowledgements; got total={total_online}, aps={aps}")
             return 1
+        if "WOLFOS_SMP_PERCPU_OK total=4 ap_tables=3" not in output:
+            print("FAIL: APs did not finish per-core GDT/TSS/IST initialization")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: MADT detected 4 CPUs and 3 APs executed Rust handshake; no SMP scheduler")
+        print("PASS: 3 APs loaded private GDT/TSS/IST and shared IDT; no SMP scheduler")
         return 0
 
 if __name__ == "__main__":
