@@ -2,7 +2,7 @@
 
 P0: Rust no_std x86-64 kernel; QEMU serial, memory-map and framebuffer smoke checks.
 
-P1: CPUID (merged); physical frame allocator (merged), scalable HHDM-backed bitmap (under review); GDT/IDT, CPU exceptions (under review), paging, PCI/ACPI read-only discovery (planned).
+P1: CPUID (merged); physical frame allocator (merged), scalable HHDM-backed bitmap (under review); GDT/IDT, CPU exceptions (under review), paging, PCI read-only discovery (under review), ACPI parsing (planned).
 
 P2: Ring 3 user mode, syscalls, ELF loader, init, scheduler and RAM-backed file system.
 

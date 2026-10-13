@@ -15,6 +15,7 @@ mod cpu;
 mod pmm;
 mod pmm_layout;
 mod interrupts;
+mod pci;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -93,6 +94,12 @@ pub extern "C" fn kmain() -> ! {
     }
     serial::write_line("WOLFOS_PMM_TEST_OK iterations=10000 unique=128");
     serial::write_line("WOLFOS_PMM_DYNAMIC_OK");
+    let pci_summary = pci::discover();
+    if pci_summary.devices == 0 || pci_summary.displays == 0 {
+        serial::write_line("WOLFOS_PCI_TEST_FAILED no supported QEMU VGA/PCI devices");
+        halt_forever();
+    }
+    serial::write_line("WOLFOS_PCI_TEST_OK");
 
 
     let Some(fb_response) = FRAMEBUFFER_REQUEST.response() else {
