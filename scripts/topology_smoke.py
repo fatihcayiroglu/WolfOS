@@ -59,10 +59,18 @@ def main() -> int:
         if per_cpu is None or tuple(map(int, per_cpu.groups())) != (EXPECTED_CPUS, 3, 3):
             print("FAIL: AP-local IDT and exception return were not verified")
             return 1
+        stack = re.search(r"WOLFOS_SMP_STACK_OK total=(\d+) switched=(\d+) stack_kib=(\d+)", output)
+        if stack is None or tuple(map(int, stack.groups())) != (EXPECTED_CPUS, 3, 32):
+            print("FAIL: 3 APs did not switch to independent 32 KiB WolfOS kernel stacks")
+            return 1
+        work = re.search(r"WOLFOS_SMP_WORK_OK total=(\d+) workers=(\d+) rounds=(\d+)", output)
+        if work is None or tuple(map(int, work.groups())) != (EXPECTED_CPUS, 3, 32768):
+            print("FAIL: independent AP work did not finish with verified results")
+            return 1
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: 3 APs loaded independent IDTs and returned from INT3; no SMP scheduler")
+        print("PASS: 3 APs ran verified CPU work on WolfOS stacks after barrier; no SMP scheduler")
         return 0
 
 if __name__ == "__main__":
