@@ -8,7 +8,7 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, RsdpRequest};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest};
 
 mod serial;
 mod cpu;
@@ -21,6 +21,7 @@ mod acpi;
 mod acpi_layout;
 mod acpi_tables;
 mod acpi_walk;
+mod smp;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
@@ -46,6 +47,10 @@ static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".requests")]
 static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
+
+#[used]
+#[unsafe(link_section = ".requests")]
+static MP_REQUEST: MpRequest = MpRequest::new(0);
 
 #[used]
 #[unsafe(link_section = ".requests_end_marker")]
@@ -168,6 +173,14 @@ pub extern "C" fn kmain() -> ! {
         }
     }
     serial::write_fmt(format_args!("WOLFOS_FRAMEBUFFER_OK {}x{}\n", fb.width, fb.height));
+    let Some(mp) = MP_REQUEST.response() else {
+        serial::write_line("WOLFOS_SMP_ERROR no Limine MP response");
+        halt_forever();
+    };
+    if !smp::boot_aps(mp) {
+        serial::write_line("WOLFOS_SMP_TEST_FAILED");
+        halt_forever();
+    }
     serial::write_line("WOLFOS_BOOT_OK");
 
     #[cfg(feature = "smoke-exit")]
