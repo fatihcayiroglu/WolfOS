@@ -359,7 +359,7 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn('#[cfg(feature = "timer-smoke")]', main)
         self.assertIn("timer::verify()", main)
         self.assertIn("idt[crate::timer::TIMER_VECTOR].set_handler_fn", intr)
-        self.assertIn("pub extern \\"x86-interrupt\\" fn irq0", timer)
+        self.assertIn('pub extern "x86-interrupt" fn irq0', timer)
         self.assertIn("TIMER_TICKS.fetch_add", timer)
         self.assertIn("outb(MASTER_COMMAND, 0x20)", timer)
         self.assertIn("WOLFOS_TIMER_IRQ_OK", timer)
