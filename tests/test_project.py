@@ -324,6 +324,32 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn(marker, topo)
         self.assertIn("WOLFOS_KTHREAD_OK threads=3", old_threads)
 
+    def test_real_per_cpu_context_switches(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        module = (ROOT / "kernel/src/percpu_context.rs").read_text()
+        assembly = (ROOT / "kernel/src/context_switch.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        topology = (ROOT / "scripts/topology_smoke.py").read_text()
+        self.assertIn("mod percpu_context;", main)
+        self.assertIn("percpu_context::run(index)", smp)
+        self.assertIn("percpu_context::run(bsp_index)", smp)
+        self.assertIn("percpu_context::verify_all(cpus.len())", smp)
+        self.assertIn("WOLFOS_SMP_CTX_OK", smp)
+        self.assertIn("pub const MAX_BANK_KIB", module)
+        self.assertIn("const _: () = assert!(BANK_BYTES <= MAX_BANK_BYTES)", module)
+        self.assertIn("MAX_BOOT_CPUS", module)
+        for marker in ("struct CpuRun", "struct CpuSlot", "unsafe impl Sync for CpuSlot",
+                       "wolfos_percpu_context_start", "wolfos_percpu_context_rust",
+                       '"mov rdi, r12"', '"mov rsi, r13"', "const WORDS: usize = 8",
+                       "ThreadState::Blocked", "ThreadState::Finished",
+                       "context_switch::switch_raw", "resume_pointer_ok",
+                       "check_cpu(cpu, true)", "pub fn run(cpu: usize) -> bool"):
+            self.assertIn(marker, module)
+        self.assertIn("Calls on distinct CPUs may", assembly)
+        self.assertIn("WOLFOS_SMP_CTX_OK cpus=1 active=1 threads=2 switches=12", smoke)
+        self.assertIn("WOLFOS_SMP_CTX_OK cpus=4 active=4 threads=8 switches=48", topology)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

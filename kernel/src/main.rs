@@ -28,6 +28,7 @@ mod thread_scheduler;
 mod context_switch;
 mod kernel_threads;
 mod context_batch;
+mod percpu_context;
 
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]

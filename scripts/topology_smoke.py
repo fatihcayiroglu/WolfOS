@@ -49,6 +49,9 @@ def main() -> int:
         if total_online != EXPECTED_CPUS or aps != EXPECTED_CPUS - 1:
             print(f"FAIL: expected 3 Rust AP acknowledgements; got total={total_online}, aps={aps}")
             return 1
+        if "WOLFOS_SMP_CTX_OK cpus=4 active=4 threads=8 switches=48 yields=12 blocked=4 woken=4 finished=8 stack_kib=8 bank_kib=4096" not in output:
+            print("FAIL: four processors did not each resume their own two Rust stacks")
+            return 1
         if "WOLFOS_SMP_PERCPU_OK total=4 ap_tables=3" not in output:
             print("FAIL: APs did not finish per-core GDT/TSS/IST initialization")
             return 1
@@ -100,7 +103,7 @@ def main() -> int:
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: kernel not fully booted, QEMU exit={run.returncode}")
             return 1
-        print("PASS: four-vCPU SMP queues and 256 context-backed TCB stacks verified")
+        print("PASS: four CPUs each switched two private Rust contexts; 256 BSP TCBs remain verified")
         return 0
 
 if __name__ == "__main__":
