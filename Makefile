@@ -19,7 +19,7 @@ else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -64,6 +64,10 @@ exception-smoke:
 paging-fault-smoke:
 	$(MAKE) iso FLAVOR=paging-fault
 	python3 scripts/paging_fault_smoke.py $(OUT)/wolfos-paging-fault.iso
+
+topology-smoke:
+	$(MAKE) iso FLAVOR=smoke
+	python3 scripts/topology_smoke.py $(OUT)/wolfos-smoke.iso
 
 test:
 	python3 -m unittest discover -s tests -v

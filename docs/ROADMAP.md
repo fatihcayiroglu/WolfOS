@@ -11,3 +11,5 @@ P3+: graphics, audio, networking, tested driver packages, secure updates with ro
 Windows and Steam applications are aspirational milestones: Linux ABI / POSIX, Win32/NT API compatibility, Vulkan graphics, DRM and anti-cheat restrictions. No universal compatibility promise.
 
 No milestone can be marked complete without reproducible build and run evidence.
+
+P1 topology validation: isolated QEMU MADT tests with 1 and 4 virtual CPUs; this does not start secondary CPUs or enable SMP scheduling.

@@ -129,6 +129,17 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("InvalidMadtEntry", parser)
         self.assertIn("acpi_tables_tests", (ROOT / "Makefile").read_text())
 
+    def test_four_cpu_topology_acceptance(self):
+        script = (ROOT / "scripts/topology_smoke.py").read_text()
+        make = (ROOT / "Makefile").read_text()
+        workflow = (ROOT / ".github/workflows/p0.yml").read_text()
+        self.assertIn('"-smp", "4,sockets=1,cores=4,threads=1"', script)
+        self.assertIn("WOLFOS_ACPI_MADT_OK enabled_cpus=", script)
+        self.assertIn("WOLFOS_BOOT_OK", script)
+        self.assertIn("EXPECTED_CPUS = 4", script)
+        self.assertIn("topology-smoke:", make)
+        self.assertIn("make topology-smoke", workflow)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

@@ -25,6 +25,8 @@ jobs:
         run: make exception-smoke
       - name: Paging map/unmap and page-fault smoke test
         run: make paging-fault-smoke
+      - name: Four-vCPU ACPI MADT topology smoke test
+        run: make topology-smoke
       - name: Preserve ISO on failure
         if: failure()
         uses: actions/upload-artifact@v4
