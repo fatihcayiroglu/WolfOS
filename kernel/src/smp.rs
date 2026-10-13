@@ -63,7 +63,7 @@ unsafe extern "C" fn secondary_entry(info: &MpInfo) -> ! {
     let index = info.extra_argument() as usize;
     // Slot zero is not inherently reserved: BSP position is arbitrary.
     // BSP has already validated unique CPU IDs and assigned this index.
-    let Some(top) = ap_stack::prepareless_top(index) else {
+    let Some(top) = ap_stack::prepared_top(index) else {
         crate::halt_forever();
     };
     // SAFETY: BSP prepared this exact stack before releasing the AP, and
