@@ -127,7 +127,7 @@ unsafe fn apic_write(offset: usize, value: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn wolfos_apic_timer_irq_dispatch(
     frame_ptr: *const kernel_trap_frame::KernelTrapFrame,
-) {
+) -> *const kernel_trap_frame::KernelTrapFrame {
     // SAFETY: BSP-only installed assembly IRQ entry passes RSP after 15
     // aligned pushes on the active kernel stack. The pointer is valid only
     // during this dispatch and is never retained after the callback.
@@ -191,6 +191,13 @@ pub extern "C" fn wolfos_apic_timer_irq_dispatch(
     // IRQ proof. Issue precisely one EOI before returning to assembly IRETQ.
     unsafe { apic_write(lapic_irq_layout::EOI_OFFSET, lapic_irq_layout::EOI_VALUE); }
     ACKS.fetch_add(1, Ordering::Relaxed);
+
+    // Only the dedicated preemption smoke returns a *different* validated
+    // private kernel-stack frame. All existing tests IRETQ to same task.
+    #[cfg(feature = "apic-preempt-smoke")]
+    { crate::apic_preempt_smoke::select_frame(frame_ptr) }
+    #[cfg(not(feature = "apic-preempt-smoke"))]
+    { frame_ptr }
 }
 
 /// APIC spurious interrupt has NO in-service entry and must not receive EOI.
@@ -426,6 +433,14 @@ fn run_mapped_test(expected_id: u32) -> bool {
     // verify() expects IF=0 and enables IF only inside its worker stacks.
     let tasks_ok = delivered && frame_ok && gpr_ok && crate::timer_tasks::verify();
     x86_64::instructions::interrupts::disable();
+    // Exercise two *non-yielding* private-stack kernel tasks. The only
+    // task-to-task handoff is made by the hardware IRQ assembly entry.
+    // End-of-proof returns to the BSP once, IF=0, before timer teardown.
+    #[cfg(feature = "apic-preempt-smoke")]
+    let preempt_ok = tasks_ok && crate::apic_preempt_smoke::verify();
+    #[cfg(not(feature = "apic-preempt-smoke"))]
+    let preempt_ok = true;
+    x86_64::instructions::interrupts::disable();
     // Every timer handler has returned and EOI'd before this BSP proceeds.
     unsafe {
         apic_write(plan.mask.offset, plan.mask.value);
@@ -441,11 +456,12 @@ fn run_mapped_test(expected_id: u32) -> bool {
     let trap_frames = TRAP_FRAMES.load(Ordering::Relaxed);
     let trap_bad = TRAP_BAD.load(Ordering::Relaxed);
     if delivered && frame_ok && gpr_ok && ticks >= TICKS_REQUIRED && ticks == acks
-        && trap_frames == ticks && trap_bad == 0 && tasks_ok
+        && trap_frames == ticks && trap_bad == 0 && tasks_ok && preempt_ok
     {
         serial::write_fmt(format_args!(
-            "WOLFOS_APIC_ASM_TRAP_OK frames={} gprs=15 iretq=1 same_task=1 invalid={} preemptive=0\n",
-            trap_frames, trap_bad
+            "WOLFOS_APIC_ASM_TRAP_OK frames={} gprs=15 iretq=1 same_task={} invalid={} preemptive={}\n",
+            trap_frames, u8::from(!cfg!(feature = "apic-preempt-smoke")),
+            trap_bad, u8::from(cfg!(feature = "apic-preempt-smoke"))
         ));
         serial::write_fmt(format_args!(
             "WOLFOS_APIC_TIMER_TASKS_OK threads={} dispatches={} switches={} stack_kib={} gated_by_irq=1 preemptive=0\n",
@@ -453,14 +469,15 @@ fn run_mapped_test(expected_id: u32) -> bool {
             crate::timer_tasks::SWITCH_COUNT, crate::timer_tasks::STACK_KIB
         ));
         serial::write_fmt(format_args!(
-            "WOLFOS_APIC_TIMER_IRQ_OK vector={} ticks={} eoi={} spurious={} preemptive=0\n",
-            TIMER_VECTOR, ticks, acks, spurious
+            "WOLFOS_APIC_TIMER_IRQ_OK vector={} ticks={} eoi={} spurious={} preemptive={}\n",
+            TIMER_VECTOR, ticks, acks, spurious,
+            u8::from(cfg!(feature = "apic-preempt-smoke"))
         ));
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} frame_ok={} gpr_ok={} tasks_ok={} asm_frames={} asm_bad={}\n",
-            ticks, acks, spurious, frame_ok, gpr_ok, tasks_ok, trap_frames, trap_bad
+            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} frame_ok={} gpr_ok={} tasks_ok={} preempt_ok={} asm_frames={} asm_bad={}\n",
+            ticks, acks, spurious, frame_ok, gpr_ok, tasks_ok, preempt_ok, trap_frames, trap_bad
         ));
         false
     }
