@@ -1209,5 +1209,11 @@ pub fn verify() -> bool {
             "WOLFOS_APIC_RECYCLE_ERROR quiescence_or_generation_or_stack_invalid\n"
         ));
     }
-    ok && recycled.is_some()
+    // The recycled frame was deliberately kept OFF the run queue while
+    // wiping and validating it. Now execute it as a separate BSP-only
+    // single-worker epoch and prove actual IRETQ entry, live timer IRQs,
+    // SSE isolation, and a new Finished transition.
+    let reuse_ok = recycled.as_ref()
+        .is_some_and(prove_recycled_task_runs);
+    ok && recycled.is_some() && reuse_ok
 }
