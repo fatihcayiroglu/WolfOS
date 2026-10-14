@@ -27,7 +27,7 @@ const LIVE_REQUIRED_IRQS: u64 = 4;
 const LIVE_FROZEN_REQUIRED: u64 = 4;
 const LIVE_XMM0: u64 = 0x53a7_1199_cafe_f00d;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = 60;
+const STOP_AFTER: u64 = 78;
 const FINISH_AFTER_SWITCHES: u64 = 26;
 const FINISH_FREEZE_REQUIRED: u64 = 6;
 const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
@@ -770,6 +770,9 @@ fn busy_task(id: usize) -> ! {
         if id == 2 && !finished_once
             && BLOCK_PHASE.load(Ordering::Acquire) == 3
             && LIVE_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_POST_WAKE_IRQS.load(Ordering::Acquire) >= LIVE_POST_WAKE_MIN_IRQS
+            && LIVE_BLOCK_FROZEN.load(Ordering::Acquire) >= LIVE_WAKE_AFTER_IRQS
             && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
             && SWITCHES.load(Ordering::Relaxed) >= FINISH_AFTER_SWITCHES
             && POST_WAKE_VISITS.iter().all(|visit|
@@ -786,7 +789,7 @@ fn busy_task(id: usize) -> ! {
             let finished = RUNNABLE.fetch_update(
                 Ordering::AcqRel, Ordering::Acquire,
                 |mask| rr_policy::finish_runnable(
-                    mask, FINISHED.load(Ordering::Acquire), 2, TASK_COUNT
+                    mask, FINISHED.load(Ordering::Acquire), 2, SLOT_COUNT
                 ).ok().map(|(ready, _)| ready)
             ).is_ok();
             // SAFETY: the single BSP owns this table. Nestable preemption
@@ -802,7 +805,7 @@ fn busy_task(id: usize) -> ! {
                 }
             } else { false };
             if finished && ownership_finished {
-                FINISHED.store(1u64 << 2, Ordering::Release);
+                FINISHED.fetch_or(1u64 << 2, Ordering::AcqRel);
                 FINISH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                 FINISH_PHASE.store(1, Ordering::Release);
             } else {
@@ -822,6 +825,9 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_POST_WAKE_IRQS.load(Ordering::Acquire) >= LIVE_POST_WAKE_MIN_IRQS
+            && LIVE_BLOCK_FROZEN.load(Ordering::Acquire) >= LIVE_WAKE_AFTER_IRQS
             && LIVE_PHASE.load(Ordering::Acquire) == 3
             && LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
             && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
@@ -876,14 +882,58 @@ extern "C" fn task3() -> ! {
     unsafe { fx_state::set_test_xmm0(LIVE_XMM0); }
     XMM_READY[LIVE_TASK].store(true, Ordering::Release);
     LIVE_ENTRY_SEEN.store(true, Ordering::Release);
+    let mut blocked_once = false;
+    let mut resumed_once = false;
 
     for _ in 0..MAX_TASK_SPINS {
+        if !blocked_once
+            && LIVE_INTERRUPTED.load(Ordering::Acquire) >= 1
+            && LIVE_TASK_WORK.load(Ordering::Acquire) >= 128
+        {
+            // Real, newly admitted task3 blocks ITSELF on its own stack,
+            // with IF still enabled. Preemption is disabled only while
+            // changing Ready. No voluntary task-to-task yield occurs.
+            if PREEMPT_DEPTH.disable() != Ok(1) {
+                LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            let blocked = RUNNABLE.fetch_update(
+                Ordering::AcqRel, Ordering::Acquire,
+                |mask| rr_policy::block_runnable(
+                    mask, LIVE_TASK, SLOT_COUNT
+                ).ok(),
+            ).is_ok();
+            if blocked {
+                LIVE_BLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+                LIVE_BLOCK_PHASE.store(1, Ordering::Release);
+            } else {
+                LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            if PREEMPT_DEPTH.enable() != Ok(0) {
+                LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            blocked_once = true;
+        }
+        if blocked_once && !resumed_once
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 2
+        {
+            // Execution resumed from the EXACT suspended RIP/RSP and
+            // private FXSAVE64 image after timer IRQ wake. The SSE
+            // sentinel is independently checked just below.
+            LIVE_RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
+            LIVE_BLOCK_PHASE.store(3, Ordering::Release);
+            resumed_once = true;
+        }
         if unsafe { fx_state::read_test_xmm0() } != LIVE_XMM0 {
             LIVE_BAD.fetch_add(1, Ordering::Relaxed);
             break;
         }
         LIVE_TASK_WORK.fetch_add(1, Ordering::Relaxed);
         if LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
+            && LIVE_POST_WAKE_IRQS.load(Ordering::Acquire) >= LIVE_POST_WAKE_MIN_IRQS
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_BLOCK_FROZEN.load(Ordering::Acquire) >= LIVE_WAKE_AFTER_IRQS
             && LIVE_TASK_WORK.load(Ordering::Relaxed) > 512
         {
             break;
@@ -910,6 +960,10 @@ extern "C" fn task3() -> ! {
             )
         };
         if finished {
+            // Unlike PR #47, terminal state is recorded in FINISHED as
+            // well as the private slot owner. A subsequent wake must
+            // reject this generation; task2's later termination ORs bit2.
+            FINISHED.fetch_or(1u64 << LIVE_TASK, Ordering::AcqRel);
             LIVE_FINISHES.fetch_add(1, Ordering::Relaxed);
             LIVE_PHASE.store(2, Ordering::Release);
         } else {
