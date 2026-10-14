@@ -69,28 +69,44 @@ pub(crate) fn ap_slot(id: u32) -> Option<usize> {
 }
 
 /// Read-only BSP observation after an AP publishes its offline state.
-#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke"))]
+#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
+           feature = "ap-remote-work-smoke"))]
 pub(crate) fn is_offline(index: usize) -> bool {
     index < MAX_BOOT_CPUS && OFFLINE[index].load(Ordering::Acquire)
 }
 /// Reject any accidental directed IPI or spurious APIC interrupt during
 /// the standalone AP-local periodic timer test.
-#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke"))]
+#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
+           feature = "ap-remote-work-smoke"))]
 pub(crate) fn ipi_count() -> u64 {
     (0..COUNT.load(Ordering::Acquire))
         .map(|i| SEEN[i].load(Ordering::Acquire))
         .sum()
 }
-#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke"))]
+#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
+           feature = "ap-remote-work-smoke"))]
 pub(crate) fn spurious_count() -> u64 {
     SPURIOUS_COUNT.load(Ordering::Acquire)
 }
+
+#[cfg(feature = "ap-remote-work-smoke")]
+pub(crate) fn ipi_received(index: usize) -> u64 {
+    if index < MAX_BOOT_CPUS { SEEN[index].load(Ordering::Acquire) } else { 0 }
+}
+#[cfg(feature = "ap-remote-work-smoke")]
+pub(crate) fn ipi_eois(index: usize) -> u64 {
+    if index < MAX_BOOT_CPUS { EOIS[index].load(Ordering::Acquire) } else { 0 }
+}
+#[cfg(feature = "ap-remote-work-smoke")]
+pub(crate) fn bad_count() -> u64 { BAD.load(Ordering::Acquire) }
 
 /// Called on receiving AP, by its independent IDT and with IF=0. No
 /// serial output, heap allocation or BSP context is touched here.
 pub extern "x86-interrupt" fn irq(_frame: InterruptStackFrame) {
     let slot = ap_slot(local_id());
     if let Some(i) = slot {
+        #[cfg(feature = "ap-remote-work-smoke")]
+        crate::ap_remote_work_smoke::on_ipi(i);
         SEEN[i].fetch_add(1, Ordering::Relaxed);
     } else {
         BAD.fetch_add(1, Ordering::Relaxed);
@@ -177,6 +193,19 @@ pub fn secondary_wait(index: usize, expected_id: u32) -> bool {
         write(TIMER_LVT, old_timer | TIMER_MASK);
         write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, enabled);
     }
+    #[cfg(feature = "ap-remote-work-smoke")]
+    {
+        // Hardware IPI IRQ only claims one CPU-owned mailbox; this AP runs
+        // the new work AFTER IRETQ, on its ordinary permanent MP stack.
+        let result = crate::ap_remote_work_smoke::secondary_run(index);
+        x86_64::instructions::interrupts::disable();
+        unsafe {
+            write(TIMER_LVT, old_timer | TIMER_MASK);
+            write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr);
+        }
+        OFFLINE[index].store(true, Ordering::Release);
+        return result;
+    }
     #[cfg(feature = "ap-smp-preempt-smoke")]
     {
         // Timer-driven task switching stays strictly on this AP. The outer
@@ -205,11 +234,14 @@ pub fn secondary_wait(index: usize, expected_id: u32) -> bool {
         OFFLINE[index].store(true, Ordering::Release);
         return result;
     }
-    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke")))]
+    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
+               feature = "ap-remote-work-smoke")))]
     x86_64::instructions::interrupts::enable();
-    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke")))]
+    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
+               feature = "ap-remote-work-smoke")))]
     READY[index].store(true, Ordering::Release);
-    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke")))]
+    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
+               feature = "ap-remote-work-smoke")))]
     {
         // Spin rather than HLT to avoid a lost STOP wake-up race.
         while !STOP.load(Ordering::Acquire) { core::hint::spin_loop(); }
@@ -233,7 +265,7 @@ fn icr_idle() -> bool {
     wait(|| unsafe { read(ipi_layout::ICR_LOW_OFFSET) }
         & ipi_layout::DELIVERY_PENDING == 0, DELIVERY_SPINS)
 }
-fn send(bsp: u32, target: u32) -> bool {
+pub(crate) fn send(bsp: u32, target: u32) -> bool {
     if !icr_idle() { return false; }
     let icr = unsafe { read(ipi_layout::ICR_LOW_OFFSET) };
     let Ok(plan) = ipi_layout::directed_fixed_ipi(bsp, target, VECTOR, icr)

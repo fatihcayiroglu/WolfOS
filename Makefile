@@ -27,13 +27,15 @@ else ifeq ($(FLAVOR),ap-local-timer)
 FEATURES := --features ap-local-timer-smoke
 else ifeq ($(FLAVOR),ap-smp-preempt)
 FEATURES := --features ap-smp-preempt-smoke
+else ifeq ($(FLAVOR),ap-remote-work)
+FEATURES := --features ap-remote-work-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -111,6 +113,10 @@ ap-smp-preempt-smoke:
 	$(MAKE) iso FLAVOR=ap-smp-preempt
 	python3 scripts/ap_smp_preempt_smoke.py $(OUT)/wolfos-ap-smp-preempt.iso
 
+ap-remote-work-smoke:
+	$(MAKE) iso FLAVOR=ap-remote-work
+	python3 scripts/ap_remote_work_smoke.py $(OUT)/wolfos-ap-remote-work.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -134,6 +140,8 @@ test:
 	$(OUT)/lapic_irq_layout_tests
 	rustc --edition=2024 --test kernel/src/ipi_layout.rs -o $(OUT)/ipi_layout_tests
 	$(OUT)/ipi_layout_tests
+	rustc --edition=2024 --test kernel/src/remote_runqueue.rs -o $(OUT)/remote_runqueue_tests
+	$(OUT)/remote_runqueue_tests
 	rustc --edition=2024 --test kernel/src/irq_frame_observation.rs -o $(OUT)/irq_frame_observation_tests
 	$(OUT)/irq_frame_observation_tests
 	rustc --edition=2024 --test kernel/src/kernel_trap_frame.rs -o $(OUT)/kernel_trap_frame_tests

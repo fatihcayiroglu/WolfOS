@@ -128,7 +128,7 @@ pub fn initialize_secondary(index: usize) -> bool {
     // The isolated directed-IPI QEMU flavor installs two external vectors
     // only on secondary CPUs. Its handler EOIs the *receiving* local APIC.
     #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
-               feature = "ap-smp-preempt-smoke"))]
+               feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke"))]
     {
         idt[crate::ap_ipi_smoke::VECTOR].set_handler_fn(crate::ap_ipi_smoke::irq);
         idt[crate::ap_ipi_smoke::SPURIOUS]

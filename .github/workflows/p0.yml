@@ -29,6 +29,8 @@ jobs:
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
         run: make ap-ipi-smoke
+      - name: Directed IPIs wake three AP-owned remote work mailboxes (4 vCPUs)
+        run: make ap-remote-work-smoke
       - name: Independent local periodic xAPIC timer IRQs on three APs (4 vCPUs)
         run: make ap-local-timer-smoke
       - name: Three APs independently preempt two private kernel tasks by local IRQ (4 vCPUs)
