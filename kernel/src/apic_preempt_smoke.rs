@@ -242,6 +242,40 @@ fn timer_block_wake(current: usize) {
     }
 }
 
+/// The first timer interrupt after task2 requests Finished captures its
+/// final work count on the exact interrupted instruction frame. Subsequent
+/// IRQs must not schedule task2 and must find its counter unchanged.
+/// No stack memory is freed while its interrupted frame exists.
+fn timer_finished_task_observation(current: usize) {
+    match FINISH_PHASE.load(Ordering::Acquire) {
+        1 if current == 2 => {
+            FINISH_WORK_SNAPSHOT.store(
+                WORK[2].load(Ordering::Acquire), Ordering::Release
+            );
+            FINISH_PHASE.store(2, Ordering::Release);
+        }
+        2 => {
+            if current == 2 {
+                // A finished task must NEVER be dispatched again.
+                FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            if WORK[2].load(Ordering::Acquire)
+                == FINISH_WORK_SNAPSHOT.load(Ordering::Acquire)
+            {
+                FINISH_FROZEN_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            if current == 1 {
+                // With bit2 finished, RR must wrap directly from 1 to 0.
+                FINISH_SKIPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
 /// No allocations, logging, task changes inside Rust frame borrows, or
 /// scheduler lock acquisition. The returned pointer is a *different live
@@ -260,6 +294,7 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     // Hardware timer-driven wake happens before round-robin selection.
     // Nested preempt-disable sections were checked above and never switch.
     timer_block_wake(current);
+    timer_finished_task_observation(current);
     if current >= TASK_COUNT {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return frame_ptr;
@@ -274,6 +309,11 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
             return frame_ptr;
         }
     };
+    if FINISHED.load(Ordering::Acquire) & (1u64 << next) != 0 {
+        FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return frame_ptr;
+    }
     let old_rsp = frame_ptr as usize;
     let next_rsp = FRAME_RSP[next].load(Ordering::Relaxed);
     let cs = CODE_SELECTOR.load(Ordering::Relaxed) as u16;
@@ -321,7 +361,13 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
     CURRENT.store(next, Ordering::Relaxed);
     SWITCHES.fetch_add(1, Ordering::Relaxed);
-    if BLOCK_PHASE.load(Ordering::Acquire) >= 2 {
+    if FINISH_PHASE.load(Ordering::Acquire) >= 1 {
+        if next < 2 {
+            POST_FINISH_VISITS[next].fetch_add(1, Ordering::Relaxed);
+        } else {
+            FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+    } else if BLOCK_PHASE.load(Ordering::Acquire) >= 2 {
         POST_WAKE_VISITS[next].fetch_add(1, Ordering::Relaxed);
     }
     next_rsp as *const KernelTrapFrame
