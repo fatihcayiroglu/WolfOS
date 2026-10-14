@@ -231,7 +231,9 @@ fn timer_block_wake(current: usize) {
         }
         let result = RUNNABLE.fetch_update(
             Ordering::AcqRel, Ordering::Acquire,
-            |mask| rr_policy::wake_runnable(mask, 1, TASK_COUNT).ok()
+            |mask| rr_policy::wake_unfinished(
+                mask, FINISHED.load(Ordering::Acquire), 1, TASK_COUNT
+            ).ok()
         );
         if result.is_ok() {
             WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
