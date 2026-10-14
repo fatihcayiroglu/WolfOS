@@ -124,6 +124,8 @@ test:
 	$(OUT)/fx_state_tests
 	rustc --edition=2024 --test kernel/src/rr_policy.rs -o $(OUT)/rr_policy_tests
 	$(OUT)/rr_policy_tests
+	rustc --edition=2024 --test kernel/src/task_slot.rs -o $(OUT)/task_slot_tests
+	$(OUT)/task_slot_tests
 	rustc --edition=2024 --test kernel/src/scheduler.rs -o $(OUT)/scheduler_tests
 	$(OUT)/scheduler_tests
 	rustc --edition=2024 --test kernel/src/thread_scheduler.rs -o $(OUT)/thread_scheduler_tests
