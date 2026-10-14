@@ -70,34 +70,34 @@ pub(crate) fn ap_slot(id: u32) -> Option<usize> {
 
 /// Read-only BSP observation after an AP publishes its offline state.
 #[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
-           feature = "ap-remote-work-smoke"))]
+           feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke"))]
 pub(crate) fn is_offline(index: usize) -> bool {
     index < MAX_BOOT_CPUS && OFFLINE[index].load(Ordering::Acquire)
 }
 /// Reject any accidental directed IPI or spurious APIC interrupt during
 /// the standalone AP-local periodic timer test.
 #[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
-           feature = "ap-remote-work-smoke"))]
+           feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke"))]
 pub(crate) fn ipi_count() -> u64 {
     (0..COUNT.load(Ordering::Acquire))
         .map(|i| SEEN[i].load(Ordering::Acquire))
         .sum()
 }
 #[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
-           feature = "ap-remote-work-smoke"))]
+           feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke"))]
 pub(crate) fn spurious_count() -> u64 {
     SPURIOUS_COUNT.load(Ordering::Acquire)
 }
 
-#[cfg(feature = "ap-remote-work-smoke")]
+#[cfg(any(feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke"))]
 pub(crate) fn ipi_received(index: usize) -> u64 {
     if index < MAX_BOOT_CPUS { SEEN[index].load(Ordering::Acquire) } else { 0 }
 }
-#[cfg(feature = "ap-remote-work-smoke")]
+#[cfg(any(feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke"))]
 pub(crate) fn ipi_eois(index: usize) -> u64 {
     if index < MAX_BOOT_CPUS { EOIS[index].load(Ordering::Acquire) } else { 0 }
 }
-#[cfg(feature = "ap-remote-work-smoke")]
+#[cfg(any(feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke"))]
 pub(crate) fn bad_count() -> u64 { BAD.load(Ordering::Acquire) }
 
 /// Called on receiving AP, by its independent IDT and with IF=0. No
@@ -107,6 +107,8 @@ pub extern "x86-interrupt" fn irq(_frame: InterruptStackFrame) {
     if let Some(i) = slot {
         #[cfg(feature = "ap-remote-work-smoke")]
         crate::ap_remote_work_smoke::on_ipi(i);
+        #[cfg(feature = "ap-handoff-smoke")]
+        crate::ap_handoff_smoke::on_ipi(i);
         SEEN[i].fetch_add(1, Ordering::Relaxed);
     } else {
         BAD.fetch_add(1, Ordering::Relaxed);
@@ -193,6 +195,19 @@ pub fn secondary_wait(index: usize, expected_id: u32) -> bool {
         write(TIMER_LVT, old_timer | TIMER_MASK);
         write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, enabled);
     }
+    #[cfg(feature = "ap-handoff-smoke")]
+    {
+        // Claim a directed IPI inside AP's own IDT, but run the
+        // quiesced logical continuation only AFTER returning from IRQ.
+        let result = crate::ap_handoff_smoke::secondary_run(index);
+        x86_64::instructions::interrupts::disable();
+        unsafe {
+            write(TIMER_LVT, old_timer | TIMER_MASK);
+            write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr);
+        }
+        OFFLINE[index].store(true, Ordering::Release);
+        return result;
+    }
     #[cfg(feature = "ap-remote-work-smoke")]
     {
         // Hardware IPI IRQ only claims one CPU-owned mailbox; this AP runs
@@ -235,13 +250,13 @@ pub fn secondary_wait(index: usize, expected_id: u32) -> bool {
         return result;
     }
     #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
-               feature = "ap-remote-work-smoke")))]
+               feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke")))]
     x86_64::instructions::interrupts::enable();
     #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
-               feature = "ap-remote-work-smoke")))]
+               feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke")))]
     READY[index].store(true, Ordering::Release);
     #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
-               feature = "ap-remote-work-smoke")))]
+               feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke")))]
     {
         // Spin rather than HLT to avoid a lost STOP wake-up race.
         while !STOP.load(Ordering::Acquire) { core::hint::spin_loop(); }
