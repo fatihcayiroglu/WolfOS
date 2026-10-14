@@ -7,7 +7,7 @@
 
 use limine::memmap::{
     Entry, MEMMAP_USABLE, MEMMAP_BOOTLOADER_RECLAIMABLE,
-    MEMMAP_KERNEL_AND_MODULES, MEMMAP_ACPI_RECLAIMABLE, MEMMAP_ACPI_NVS,
+    MEMMAP_EXECUTABLE_AND_MODULES, MEMMAP_ACPI_RECLAIMABLE, MEMMAP_ACPI_NVS,
 };
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
@@ -37,7 +37,7 @@ fn safe_mmio_region(base: u64, entries: &[&Entry]) -> bool {
     for entry in entries.iter().copied() {
         let forbidden = matches!(entry.type_,
             MEMMAP_USABLE | MEMMAP_BOOTLOADER_RECLAIMABLE |
-            MEMMAP_KERNEL_AND_MODULES | MEMMAP_ACPI_RECLAIMABLE | MEMMAP_ACPI_NVS
+            MEMMAP_EXECUTABLE_AND_MODULES | MEMMAP_ACPI_RECLAIMABLE | MEMMAP_ACPI_NVS
         );
         if !forbidden { continue; }
         let Some(entry_end) = entry.base.checked_add(entry.length) else {
