@@ -17,13 +17,14 @@ use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 use crate::{context_switch, kernel_trap_frame::{
     HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume
-}, preempt_depth::PreemptDepth};
+}, preempt_depth::PreemptDepth, fx_state};
 
 const STACK_BYTES: usize = 16 * 1024;
 const STOP_AFTER: u64 = 8;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
 const CANARY: u64 = 0x574f_4c46_5052_454d;
+const TASK_XMM0: [u64; 2] = [0x1122_3344_5566_7788, 0x8877_6655_4433_2211];
 
 #[repr(align(16))]
 struct Stack([u8; STACK_BYTES]);
@@ -56,6 +57,11 @@ static CODE_SELECTOR: AtomicUsize = AtomicUsize::new(0);
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
+static XMM_READY: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+static FX_SWITCHES: AtomicU64 = AtomicU64::new(0);
+static FX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
+static FX_BAD: AtomicU64 = AtomicU64::new(0);
+static FX_WORK_CHECKS: AtomicU64 = AtomicU64::new(0);
 
 fn stack_bottom(id: usize) -> usize {
     // SAFETY: id is always 0 or 1, and no Rust reference to the stack is
@@ -178,6 +184,19 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
         return frame_ptr;
     }
 
+    // SAFETY: both full frames have been validated. Only BSP enters this
+    // IF=0 IRQ dispatcher; FX images are private, aligned and initialized.
+    let Some(saved_xmm) = (unsafe { fx_state::switch(current, next) }) else {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return frame_ptr;
+    };
+    FX_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    if XMM_READY[current].load(Ordering::Relaxed) {
+        FX_OBSERVATIONS.fetch_add(1, Ordering::Relaxed);
+        if saved_xmm != TASK_XMM0[current] {
+            FX_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     FRAME_RSP[current].store(old_rsp, Ordering::Relaxed);
     INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
     CURRENT.store(next, Ordering::Relaxed);
@@ -235,7 +254,17 @@ fn busy_task(id: usize) -> ! {
             crate::halt_forever()
         }
     }
+    // FXSAVE64 captures XMM0 at each genuine IRQ switch; FXRSTOR64 must
+    // return the expected lane even after the other task has run.
+    unsafe { fx_state::set_test_xmm0(TASK_XMM0[id]); }
+    XMM_READY[id].store(true, Ordering::Release);
     for _ in 0..MAX_TASK_SPINS {
+        let lane = unsafe { fx_state::read_test_xmm0() };
+        FX_WORK_CHECKS.fetch_add(1, Ordering::Relaxed);
+        if lane != TASK_XMM0[id] {
+            FX_BAD.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
             && WORK[0].load(Ordering::Relaxed) != 0
