@@ -129,7 +129,7 @@ pub fn initialize_secondary(index: usize) -> bool {
     // only on secondary CPUs. Its handler EOIs the *receiving* local APIC.
     #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
-               feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke"))]
+               feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
     {
         idt[crate::ap_ipi_smoke::VECTOR].set_handler_fn(crate::ap_ipi_smoke::irq);
         idt[crate::ap_ipi_smoke::SPURIOUS]
@@ -144,6 +144,13 @@ pub fn initialize_secondary(index: usize) -> bool {
     unsafe {
         idt[crate::ap_smp_preempt_smoke::VECTOR]
             .set_handler_addr(crate::ap_preempt_irq_entry::address());
+    }
+    // QEMU-only AP-local timer IRQ: interrupt *preempts* the shared task,
+    // and the assembly dispatch can IRETQ to a separate local escape stack.
+    #[cfg(feature = "ap-irq-migrate-smoke")]
+    unsafe {
+        idt[crate::ap_irq_migrate_smoke::TIMER_VECTOR]
+            .set_handler_addr(crate::ap_irq_migrate_entry::irq_address());
     }
     // SAFETY: AP owns a unique, permanently reserved double-fault IST.
     unsafe {
