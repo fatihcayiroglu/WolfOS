@@ -4,7 +4,7 @@
 //! page-table alias and all MMIO writes. No interrupt-time allocations/logging.
 
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::memmap::Entry;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::idt::InterruptStackFrame;
@@ -15,7 +15,7 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::{lapic_irq_layout, lapic_mmio, lapic_mmio_layout, lapic_probe,
-    lapic_timer_layout, lapic_timer_plan, pmm, serial};
+    lapic_timer_layout, lapic_timer_plan, irq_frame_observation, pmm, serial};
 
 pub const TIMER_VECTOR: u8 = 0xe0;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
@@ -44,6 +44,18 @@ const CALIBRATION_MAX_SPINS: u64 = 300_000_000;
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static ACKS: AtomicU64 = AtomicU64::new(0);
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
+
+// Read-only first-IRQ observations of non-yielding BSP work; NOT a saved task
+// context. GPR/SIMD, CR3, TLS and FPU state are deliberately NOT captured.
+static BUSY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static BUSY_STEPS: AtomicU64 = AtomicU64::new(0);
+static BUSY_STEPS_AT_IRQ: AtomicU64 = AtomicU64::new(0);
+static BUSY_IRQS: AtomicU64 = AtomicU64::new(0);
+static BUSY_RIP: AtomicU64 = AtomicU64::new(0);
+static BUSY_RSP: AtomicU64 = AtomicU64::new(0);
+static BUSY_CS: AtomicU64 = AtomicU64::new(0);
+static BUSY_RFLAGS: AtomicU64 = AtomicU64::new(0);
+
 
 /// IRQ-published BSP epoch; read by a worker with IRQs enabled.
 /// No timer frequency or wall-clock accuracy is implied.
@@ -93,7 +105,19 @@ unsafe fn apic_write(offset: usize, value: u32) {
 
 /// The only non-spurious APIC interrupt accepted by this isolated test.
 /// EOI must be written once per delivered timer interrupt, BEFORE IRETQ.
-pub extern "x86-interrupt" fn irq(_frame: InterruptStackFrame) {
+pub extern "x86-interrupt" fn irq(frame: InterruptStackFrame) {
+    // Single BSP: capture architectural fields as values, never retain a
+    // reference to the transient interrupt frame or switch stacks here.
+    if BUSY_ACTIVE.load(Ordering::Relaxed) {
+        if BUSY_IRQS.load(Ordering::Relaxed) == 0 {
+            BUSY_RIP.store(frame.instruction_pointer.as_u64(), Ordering::Relaxed);
+            BUSY_RSP.store(frame.stack_pointer.as_u64(), Ordering::Relaxed);
+            BUSY_CS.store(frame.code_segment, Ordering::Relaxed);
+            BUSY_RFLAGS.store(frame.cpu_flags, Ordering::Relaxed);
+            BUSY_STEPS_AT_IRQ.store(BUSY_STEPS.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        BUSY_IRQS.fetch_add(1, Ordering::Relaxed);
+    }
     TICKS.fetch_add(1, Ordering::Relaxed);
     // SAFETY: the BSP installs the fixed MMIO alias before enabling IF,
     // and disables IF before tearing it down. Only the BSP enables IRQs.
@@ -166,6 +190,45 @@ fn pit2_calibrated_initial_count() -> Option<(u64, u32)> {
     Some((effective_hz, initial_count))
 }
 
+/// No task yields here. A real BSP local-APIC interrupt observes the
+/// running function, EOIs and returns to the same frame via hardware IRETQ.
+/// Enters with IF=1; exits with IF=0, including on timeout.
+#[inline(never)]
+fn prove_read_only_interrupt_frame() -> bool {
+    if !x86_64::instructions::interrupts::are_enabled() { return false; }
+    BUSY_STEPS.store(1, Ordering::Relaxed);
+    BUSY_ACTIVE.store(true, Ordering::Relaxed);
+    for _ in 0..MAX_SPINS {
+        BUSY_STEPS.fetch_add(1, Ordering::Relaxed);
+        if BUSY_IRQS.load(Ordering::Relaxed) >= TICKS_REQUIRED { break; }
+        core::hint::spin_loop();
+    }
+    BUSY_ACTIVE.store(false, Ordering::Relaxed);
+    x86_64::instructions::interrupts::disable();
+    let busy_irqs = BUSY_IRQS.load(Ordering::Relaxed);
+    let steps = BUSY_STEPS.load(Ordering::Relaxed);
+    let irq_step = BUSY_STEPS_AT_IRQ.load(Ordering::Relaxed);
+    let rip = BUSY_RIP.load(Ordering::Relaxed);
+    let rsp = BUSY_RSP.load(Ordering::Relaxed);
+    let cs = BUSY_CS.load(Ordering::Relaxed);
+    let rflags = BUSY_RFLAGS.load(Ordering::Relaxed);
+    let frame = irq_frame_observation::validate_kernel_irq_frame(rip, rsp, cs, rflags);
+    let ok = busy_irqs >= TICKS_REQUIRED && irq_step > 0
+        && steps > irq_step && frame.is_ok();
+    if ok {
+        serial::write_fmt(format_args!(
+            "WOLFOS_APIC_IRQ_FRAME_OK busy_irqs={} work_steps={} irq_step={} rip={:#x} rsp={:#x} cs={:#x} rflags={:#x} preemptive=0\n",
+            busy_irqs, steps, irq_step, rip, rsp, cs, rflags
+        ));
+    } else {
+        serial::write_fmt(format_args!(
+            "WOLFOS_APIC_IRQ_FRAME_ERROR busy_irqs={} work_steps={} irq_step={} frame={:?}\n",
+            busy_irqs, steps, irq_step, frame.err()
+        ));
+    }
+    ok
+}
+
 fn run_mapped_test(expected_id: u32) -> bool {
     // Enter with IF=0, and leave with IF=0 on every path.
     // SAFETY: called only after the alias exists and is verified to point
@@ -214,6 +277,14 @@ fn run_mapped_test(expected_id: u32) -> bool {
     TICKS.store(0, Ordering::Relaxed);
     ACKS.store(0, Ordering::Relaxed);
     SPURIOUS.store(0, Ordering::Relaxed);
+    BUSY_ACTIVE.store(false, Ordering::Relaxed);
+    BUSY_STEPS.store(0, Ordering::Relaxed);
+    BUSY_STEPS_AT_IRQ.store(0, Ordering::Relaxed);
+    BUSY_IRQS.store(0, Ordering::Relaxed);
+    BUSY_RIP.store(0, Ordering::Relaxed);
+    BUSY_RSP.store(0, Ordering::Relaxed);
+    BUSY_CS.store(0, Ordering::Relaxed);
+    BUSY_RFLAGS.store(0, Ordering::Relaxed);
 
     // First mask the timer, then set divide/initial count. Only after
     // installing the SVR and IDT do we explicitly unmask the LVT.
@@ -229,19 +300,14 @@ fn run_mapped_test(expected_id: u32) -> bool {
         TIMER_VECTOR, initial_count, DIVISOR, TICKS_REQUIRED
     ));
     x86_64::instructions::interrupts::enable();
-    let mut delivered = false;
-    for _ in 0..MAX_SPINS {
-        if TICKS.load(Ordering::Relaxed) >= TICKS_REQUIRED {
-            delivered = true;
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    x86_64::instructions::interrupts::disable();
+    // Explicitly test asynchronous entry while work has no yield point.
+    // The handler does NOT implement a task switch or restore a new frame.
+    let frame_ok = prove_read_only_interrupt_frame();
+    let delivered = TICKS.load(Ordering::Relaxed) >= TICKS_REQUIRED;
     // Each separate worker dispatch must be gated by a fresh real local
     // APIC IRQ epoch. This is voluntarily yielded, never IRQ-frame preemption.
     // verify() expects IF=0 and enables IF only inside its worker stacks.
-    let tasks_ok = delivered && crate::timer_tasks::verify();
+    let tasks_ok = delivered && frame_ok && crate::timer_tasks::verify();
     x86_64::instructions::interrupts::disable();
     // Every timer handler has returned and EOI'd before this BSP proceeds.
     unsafe {
@@ -255,7 +321,7 @@ fn run_mapped_test(expected_id: u32) -> bool {
     let ticks = TICKS.load(Ordering::Relaxed);
     let acks = ACKS.load(Ordering::Relaxed);
     let spurious = SPURIOUS.load(Ordering::Relaxed);
-    if delivered && ticks >= TICKS_REQUIRED && ticks == acks && tasks_ok {
+    if delivered && frame_ok && ticks >= TICKS_REQUIRED && ticks == acks && tasks_ok {
         serial::write_fmt(format_args!(
             "WOLFOS_APIC_TIMER_TASKS_OK threads={} dispatches={} switches={} stack_kib={} gated_by_irq=1 preemptive=0\n",
             crate::timer_tasks::THREAD_COUNT, crate::timer_tasks::DISPATCH_COUNT,
@@ -268,8 +334,8 @@ fn run_mapped_test(expected_id: u32) -> bool {
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} tasks_ok={}\n",
-            ticks, acks, spurious, tasks_ok
+            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} frame_ok={} tasks_ok={}\n",
+            ticks, acks, spurious, frame_ok, tasks_ok
         ));
         false
     }
