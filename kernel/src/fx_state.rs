@@ -16,7 +16,7 @@ use core::cell::UnsafeCell;
 use core::mem::{align_of, size_of};
 
 pub const FX_BYTES: usize = 512;
-pub const FX_TASKS: usize = 3;
+pub const FX_TASKS: usize = 4;
 pub const XMM_OFFSET: usize = 160;
 pub const XMM_STRIDE: usize = 16;
 pub const XMM_COUNT: usize = 16;
@@ -55,7 +55,7 @@ unsafe impl<T> Sync for Owned<T> {}
 static ORIGINAL: Owned<FxImage> = Owned(UnsafeCell::new(FxImage::empty()));
 static TASK_IMAGES: Owned<[FxImage; FX_TASKS]> =
     Owned(UnsafeCell::new([
-        FxImage::empty(), FxImage::empty(), FxImage::empty()
+        FxImage::empty(), FxImage::empty(), FxImage::empty(), FxImage::empty()
     ]));
 
 #[derive(Clone, Copy)]
@@ -128,6 +128,7 @@ unsafe fn configure_on_bsp(initialize_task_images: bool) -> Option<OriginalContr
             core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[0]), 1);
             core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[1]), 1);
             core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[2]), 1);
+            core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[3]), 1);
         }
     }
     Some(OriginalControl { cr0, cr4 })
@@ -296,14 +297,19 @@ mod tests {
 
     #[test]
     fn distinct_context_images_never_alias() {
-        let task = [FxImage::empty(), FxImage::empty(), FxImage::empty()];
+        let task = [
+            FxImage::empty(), FxImage::empty(), FxImage::empty(), FxImage::empty()
+        ];
         let a = core::ptr::addr_of!(task[0]) as usize;
         let b = core::ptr::addr_of!(task[1]) as usize;
         let c = core::ptr::addr_of!(task[2]) as usize;
+        let d = core::ptr::addr_of!(task[3]) as usize;
         assert_eq!(b - a, FX_BYTES);
         assert_eq!(c - b, FX_BYTES);
+        assert_eq!(d - c, FX_BYTES);
         assert_eq!(a & 15, 0);
         assert_eq!(b & 15, 0);
         assert_eq!(c & 15, 0);
+        assert_eq!(d & 15, 0);
     }
 }
