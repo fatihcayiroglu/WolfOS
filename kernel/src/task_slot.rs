@@ -14,7 +14,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState {
     Vacant,
-    Ready,
+    Allocated,
     Finished,
 }
 
@@ -38,7 +38,7 @@ pub struct SlotTable<const N: usize> {
 pub enum SlotError {
     InvalidSlot,
     Occupied,
-    NotRunning,
+    NotAllocated,
     NotFinished,
     StaleHandle,
     GenerationOverflow,
@@ -85,6 +85,16 @@ impl<const N: usize> SlotTable<N> {
         Ok(self.checked(handle)?.state)
     }
 
+    /// Ownership state is independent of the scheduler's Ready bitmap.
+    /// The caller must initialize a safe trap frame/xstate before enqueueing.
+    pub fn handle(&self, slot_id: usize) -> Result<TaskHandle, SlotError> {
+        let slot = self.entries.get(slot_id).ok_or(SlotError::InvalidSlot)?;
+        if slot.state == SlotState::Vacant {
+            return Err(SlotError::NotAllocated);
+        }
+        Ok(TaskHandle { slot: slot_id, generation: slot.generation })
+    }
+
     pub fn spawn(&mut self, slot_id: usize) -> Result<TaskHandle, SlotError> {
         let slot = self.entries.get_mut(slot_id).ok_or(SlotError::InvalidSlot)?;
         if slot.state != SlotState::Vacant {
@@ -94,14 +104,15 @@ impl<const N: usize> SlotTable<N> {
             .ok_or(SlotError::GenerationOverflow)?;
         // Generation is updated only when the slot has been fully detached
         // and placed into Vacant. Never wrap to reuse an ancient identity.
+        // Allocated alone does NOT put a task in the runnable bitmap.
         slot.generation = generation;
-        slot.state = SlotState::Ready;
+        slot.state = SlotState::Allocated;
         Ok(TaskHandle { slot: slot_id, generation })
     }
 
     pub fn finish(&mut self, handle: TaskHandle) -> Result<(), SlotError> {
-        if self.checked(handle)?.state != SlotState::Ready {
-            return Err(SlotError::NotRunning);
+        if self.checked(handle)?.state != SlotState::Allocated {
+            return Err(SlotError::NotAllocated);
         }
         self.entries[handle.slot].state = SlotState::Finished;
         Ok(())
@@ -157,14 +168,14 @@ mod tests {
         assert_eq!(slots.spawn(2), Err(SlotError::Occupied));
         assert_eq!(slots.retire(old, safe_gate()), Err(SlotError::NotFinished));
         slots.finish(old).unwrap();
-        assert_eq!(slots.finish(old), Err(SlotError::NotRunning));
+        assert_eq!(slots.finish(old), Err(SlotError::NotAllocated));
         assert_eq!(slots.state(old), Ok(SlotState::Finished));
         slots.retire(old, safe_gate()).unwrap();
         assert_eq!(slots.state(old), Ok(SlotState::Vacant));
         let renewed = slots.spawn(2).unwrap();
         assert_eq!(renewed.slot, 2);
         assert_eq!(renewed.generation, old.generation + 1);
-        assert_eq!(slots.state(renewed), Ok(SlotState::Ready));
+        assert_eq!(slots.state(renewed), Ok(SlotState::Allocated));
         assert_eq!(slots.state(old), Err(SlotError::StaleHandle));
         assert_eq!(slots.finish(old), Err(SlotError::StaleHandle));
         assert_eq!(slots.retire(old, safe_gate()), Err(SlotError::StaleHandle));
@@ -243,6 +254,6 @@ mod tests {
         assert_eq!(slots.retire(a, safe_gate()), Err(SlotError::NotFinished));
         slots.finish(b).unwrap();
         assert_eq!(slots.retire(b, safe_gate()), Ok(()));
-        assert_eq!(slots.state(a), Ok(SlotState::Ready));
+        assert_eq!(slots.state(a), Ok(SlotState::Allocated));
     }
 }
