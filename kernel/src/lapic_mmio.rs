@@ -31,7 +31,7 @@ unsafe impl FrameAllocator<Size4KiB> for TableAllocator {
     }
 }
 
-fn safe_mmio_region(base: u64, entries: &[&Entry]) -> bool {
+pub(crate) fn safe_mmio_region(base: u64, entries: &[&Entry]) -> bool {
     if base == 0 || base % PAGE_SIZE != 0 { return false; }
     let Some(end) = base.checked_add(PAGE_SIZE) else { return false; };
     for entry in entries.iter().copied() {
