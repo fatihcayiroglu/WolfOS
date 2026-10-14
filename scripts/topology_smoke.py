@@ -42,7 +42,7 @@ def main() -> int:
             print(f"FAIL: expected four enabled CPUs, MADT reported {total}")
             return 1
         lapic = re.search(
-            r"WOLFOS_LAPIC_ID_OK cpus=(\\d+) verified=(\\d+) base=(0x[0-9a-f]+) x2apic=(\\d+) readonly=1",
+            r"WOLFOS_LAPIC_ID_OK cpus=(\d+) verified=(\d+) base=(0x[0-9a-f]+) x2apic=(\d+) readonly=1",
             output,
         )
         if lapic is None:
