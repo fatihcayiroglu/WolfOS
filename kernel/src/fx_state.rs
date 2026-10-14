@@ -94,6 +94,21 @@ unsafe fn restore_raw(image: *const FxImage) {
 /// user tasks, kernel XSAVE ownership, or SMP FPU management are active.
 /// The caller MUST invoke leave() exactly once after all tasks stop.
 pub unsafe fn enter() -> Option<OriginalControl> {
+    unsafe { configure_on_bsp(true) }
+}
+
+/// Re-enable BSP FX instructions and save the current BSP image without
+/// overwriting task images already safely scrubbed and reseeded after a
+/// completed quiescent task generation.
+///
+/// # Safety
+/// BSP IF=0, scheduler inactive and task images exclusively BSP-owned;
+/// the caller must eventually invoke leave() with the returned control.
+pub unsafe fn enter_preserving_prepared_images() -> Option<OriginalControl> {
+    unsafe { configure_on_bsp(false) }
+}
+
+unsafe fn configure_on_bsp(initialize_task_images: bool) -> Option<OriginalControl> {
     if !supported() { return None; }
     let cr0: u64;
     let cr4: u64;
@@ -108,10 +123,12 @@ pub unsafe fn enter() -> Option<OriginalControl> {
         asm!("mov cr4, {}", in(reg) next_cr4, options(nostack));
         let original = ORIGINAL.0.get();
         save_raw(original);
-        let tasks = TASK_IMAGES.0.get();
-        core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[0]), 1);
-        core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[1]), 1);
-        core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[2]), 1);
+        if initialize_task_images {
+            let tasks = TASK_IMAGES.0.get();
+            core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[0]), 1);
+            core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[1]), 1);
+            core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[2]), 1);
+        }
     }
     Some(OriginalControl { cr0, cr4 })
 }
@@ -134,6 +151,41 @@ pub unsafe fn switch(current: usize, next: usize) -> Option<u64> {
         let observed = (*source).xmm_low(0)?;
         restore_raw(destination);
         Some(observed)
+    }
+}
+
+/// Activate a prepared FX image before a BSP-only, direct IRETQ task
+/// bootstrap. Returns the image's XMM0 low lane before it is loaded.
+///
+/// # Safety
+/// IF=0, x87/SSE enabled by enter(), the indexed task owns a valid image,
+/// and no other CPU or runnable task may reference this FX context.
+pub unsafe fn activate_prepared_task(task: usize) -> Option<u64> {
+    if task >= FX_TASKS { return None; }
+    unsafe {
+        let images = TASK_IMAGES.0.get();
+        let image = core::ptr::addr_of!((*images)[task]);
+        let baseline = (*image).xmm_low(0)?;
+        restore_raw(image);
+        Some(baseline)
+    }
+}
+
+/// Save the presently executing BSP's FX state into one now-paused task
+/// image before restoring the original BSP's own context. Does not switch
+/// task or load another image.
+///
+/// # Safety
+/// IF=0, x87/SSE still enabled, and the most recent active task is exactly
+/// the task named here. It has returned to BSP via ABI-only stack switching,
+/// leaving its live x87/SSE registers in the CPU.
+pub unsafe fn snapshot_active_task(task: usize) -> Option<u64> {
+    if task >= FX_TASKS { return None; }
+    unsafe {
+        let images = TASK_IMAGES.0.get();
+        let image = core::ptr::addr_of_mut!((*images)[task]);
+        save_raw(image);
+        (*image).xmm_low(0)
     }
 }
 

@@ -118,6 +118,33 @@ static FX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static FX_BAD: AtomicU64 = AtomicU64::new(0);
 static FX_WORK_CHECKS: AtomicU64 = AtomicU64::new(0);
 
+// Second-generation task2 runs as a single IRQ-interruptible kernel worker
+// after the original fixed 3-task scheduler has stopped on the BSP stack.
+// Its execution starts from the *recycled synthetic GPR+IRETQ frame*.
+// ACTIVE remains false: no retired first-generation task may be resumed.
+const RECYCLE_MIN_IRQS: u64 = 4;
+const RECYCLE_R12: u64 = 0x1234_5678_cafe_f001;
+const RECYCLE_R15: u64 = 0xface_b00c_7654_3210;
+const RECYCLE_XMM0: u64 = 0xa55a_f00d_9e37_cafe;
+static RECYCLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECYCLE_RETURNED: AtomicBool = AtomicBool::new(false);
+static RECYCLE_WORK: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_IRQS: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_BAD: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_IRQ_FIRST_WORK: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_BASELINE_XMM: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_OBSERVED_XMM: AtomicU64 = AtomicU64::new(0);
+
+// Written by assembly before the new Rust worker function's prologue.
+// The exact initial values are restored by IRETQ, not passed as arguments.
+#[unsafe(no_mangle)]
+pub static WOLFOS_RECYCLE_ENTRY_R12: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+pub static WOLFOS_RECYCLE_ENTRY_R15: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_BSP_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
+static RECYCLE_TASK_EXIT_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
+
 fn stack_bottom(id: usize) -> usize {
     // SAFETY: id is always 0 or 1, and no Rust reference to the stack is
     // created, only the stable static allocation's raw address.
@@ -296,7 +323,39 @@ fn timer_finished_task_observation(current: usize) {
 ///
 /// The assembly IRQ entry restores all GPRs and IRETQs using this pointer.
 pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame {
-    if !ACTIVE.load(Ordering::Relaxed) { return frame_ptr; }
+    if !ACTIVE.load(Ordering::Relaxed) {
+        // After the original three-task run has ended, a second-generation
+        // task2 may be bootstrapped straight from its freshly rebuilt
+        // IRETQ frame. The scheduler stays INACTIVE; the genuine xAPIC IRQ
+        // must inspect its frame, EOI, and return to that SAME new task.
+        if RECYCLE_ACTIVE.load(Ordering::Acquire) {
+            let addr = frame_ptr as usize;
+            let bottom = stack_bottom(2);
+            let top = stack_top(2);
+            let cs = CODE_SELECTOR.load(Ordering::Acquire) as u16;
+            let in_stack = addr & 7 == 0
+                && addr >= bottom + 512
+                && addr.checked_add(size_of::<KernelTrapFrame>())
+                    .is_some_and(|end| end <= top);
+            let valid = in_stack && unsafe {
+                validate_kernel_resume(
+                    addr as u64, bottom as u64, top as u64, cs, &*frame_ptr
+                ).is_ok()
+            };
+            if !valid {
+                RECYCLE_BAD.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let earlier = RECYCLE_IRQS.fetch_add(1, Ordering::Relaxed);
+                if earlier == 0 {
+                    RECYCLE_IRQ_FIRST_WORK.store(
+                        RECYCLE_WORK.load(Ordering::Relaxed),
+                        Ordering::Relaxed
+                    );
+                }
+            }
+        }
+        return frame_ptr;
+    }
     // The local APIC IRQ and its EOI still occur, but a held critical
     // section must NOT trigger a kernel stack switch, even when nested.
     if !PREEMPT_DEPTH.can_preempt() {
@@ -713,9 +772,13 @@ fn recycle_quiescent_task2() -> Option<RecycleProof> {
     // test; future work must implement controlled task creation/enqueue.
     let new_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
     let next = KernelTrapFrame {
-        registers: SavedGprs::default(),
+        registers: SavedGprs {
+            r12: RECYCLE_R12,
+            r15: RECYCLE_R15,
+            ..SavedGprs::default()
+        },
         hardware: HardwareReturnFrame {
-            rip: task2 as usize as u64,
+            rip: crate::apic_irq_entry::recycled_entry_address(),
             cs: u64::from(cs),
             rflags: 0x202,
             rsp: (top - 8) as u64,
@@ -747,6 +810,214 @@ fn recycle_quiescent_task2() -> Option<RecycleProof> {
         old_handle_refused_while_running,
         grace_refused,
     })
+}
+
+/// New task generation's entry point. Hand-written assembly captures its
+/// initially restored r12/r15 at the very first instruction BEFORE jumping
+/// here. This task never uses the first generation task2 control flow.
+///
+/// Unlike the old task2, this worker runs with only its OWN bit admitted
+/// to the test's ready mask. The old task0/1 contexts are retired from the
+/// runnable epoch, and ACTIVE remains false: every IRQ returns to this
+/// worker, never to a first-generation saved stack or FX image.
+#[unsafe(no_mangle)]
+pub extern "C" fn wolfos_recycled_task_entry() -> ! {
+    let baseline = unsafe { fx_state::read_test_xmm0() };
+    RECYCLE_OBSERVED_XMM.store(baseline, Ordering::Release);
+    if WOLFOS_RECYCLE_ENTRY_R12.load(Ordering::Acquire) != RECYCLE_R12
+        || WOLFOS_RECYCLE_ENTRY_R15.load(Ordering::Acquire) != RECYCLE_R15
+        || baseline != RECYCLE_BASELINE_XMM.load(Ordering::Acquire)
+        || RECYCLE_GENERATION.load(Ordering::Acquire) < 2
+    {
+        RECYCLE_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { fx_state::set_test_xmm0(RECYCLE_XMM0); }
+    // Establish nonzero real work before arming the IRQ capture, so an
+    // immediately delivered APIC timer IRQ cannot fake worker progress.
+    for _ in 0..256 {
+        RECYCLE_WORK.fetch_add(1, Ordering::Relaxed);
+        core::hint::spin_loop();
+    }
+    RECYCLE_ACTIVE.store(true, Ordering::Release);
+    for _ in 0..MAX_TASK_SPINS {
+        if unsafe { fx_state::read_test_xmm0() } != RECYCLE_XMM0 {
+            RECYCLE_BAD.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        let work = RECYCLE_WORK.fetch_add(1, Ordering::Relaxed) + 1;
+        let first = RECYCLE_IRQ_FIRST_WORK.load(Ordering::Acquire);
+        if RECYCLE_IRQS.load(Ordering::Acquire) >= RECYCLE_MIN_IRQS
+            && first > 0 && work > first + 512
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    x86_64::instructions::interrupts::disable();
+    RECYCLE_ACTIVE.store(false, Ordering::Release);
+    RECYCLE_RETURNED.store(true, Ordering::Release);
+    // SAFETY: BSP only, IF=0. The original caller context is waiting on
+    // its own disjoint BSP stack with six SysV callee-saved registers.
+    // This worker's stack is not overwritten before the return completes.
+    unsafe {
+        context_switch::switch_raw(
+            RECYCLE_TASK_EXIT_RSP.0.get(), RECYCLE_BSP_RSP.0.get()
+        );
+    }
+    crate::halt_forever()
+}
+
+/// Dispatch the initialized second-generation task2's actual GPR+IRETQ
+/// frame ONCE, observe >=4 live APIC timer IRQs on its recycled stack and
+/// return to the BSP with IF=0. No other task is runnable in this epoch.
+fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
+    let fail = |reason| {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_REUSE_EXEC_ERROR stage={}\n", reason
+        ));
+        false
+    };
+    if x86_64::instructions::interrupts::are_enabled()
+        || ACTIVE.load(Ordering::Acquire)
+        || RECYCLE_ACTIVE.load(Ordering::Acquire)
+        || PREEMPT_DEPTH.depth() != 0
+        || proof.old_generation.checked_add(1) != Some(proof.new_generation)
+        || FINISHED.load(Ordering::Acquire) != 0b100
+        || RUNNABLE.load(Ordering::Acquire) != 0b011
+    {
+        return fail("not_quiescent");
+    }
+    let frame_rsp = FRAME_RSP[2].load(Ordering::Acquire);
+    let bottom = stack_bottom(2);
+    let top = stack_top(2);
+    let cs = CODE_SELECTOR.load(Ordering::Acquire) as u16;
+    let bounded = frame_rsp >= bottom + 512
+        && frame_rsp & 7 == 0
+        && frame_rsp.checked_add(size_of::<KernelTrapFrame>())
+            .is_some_and(|end| end <= top);
+    let valid = bounded && unsafe {
+        let frame = &*(frame_rsp as *const KernelTrapFrame);
+        validate_kernel_resume(
+            frame_rsp as u64, bottom as u64, top as u64, cs, frame
+        ).is_ok()
+            && frame.hardware.rip == crate::apic_irq_entry::recycled_entry_address()
+            && frame.registers.r12 == RECYCLE_R12
+            && frame.registers.r15 == RECYCLE_R15
+    };
+    if !valid || !canary_ok(2) {
+        return fail("invalid_recycled_frame");
+    }
+    let handle = task_slot::TaskHandle {
+        slot: 2, generation: proof.new_generation
+    };
+    // SAFETY: BSP alone, IF=0, no ISR borrows the ownership table.
+    let owner_valid = unsafe {
+        let table = &*SLOT_OWNERS.0.get();
+        table.state(handle) == Ok(SlotState::Allocated)
+            && table.state(task_slot::TaskHandle {
+                slot: 2, generation: proof.old_generation
+            }) == Err(SlotError::StaleHandle)
+    };
+    if !owner_valid { return fail("stale_or_unallocated"); }
+
+    RECYCLE_ACTIVE.store(false, Ordering::Relaxed);
+    RECYCLE_RETURNED.store(false, Ordering::Relaxed);
+    RECYCLE_WORK.store(0, Ordering::Relaxed);
+    RECYCLE_IRQS.store(0, Ordering::Relaxed);
+    RECYCLE_BAD.store(0, Ordering::Relaxed);
+    RECYCLE_IRQ_FIRST_WORK.store(0, Ordering::Relaxed);
+    RECYCLE_OBSERVED_XMM.store(0, Ordering::Relaxed);
+    RECYCLE_BASELINE_XMM.store(0, Ordering::Relaxed);
+    RECYCLE_GENERATION.store(proof.new_generation, Ordering::Release);
+    WOLFOS_RECYCLE_ENTRY_R12.store(0, Ordering::Relaxed);
+    WOLFOS_RECYCLE_ENTRY_R15.store(0, Ordering::Relaxed);
+
+    // Re-enable the original BSP's x87/SSE controls for this separate
+    // task bootstrap, and load ONLY the prepared new task FX image.
+    // The old first-generation task2 XMM0 sentinel cannot reappear.
+    let Some(original_fx) = (unsafe {
+        fx_state::enter_preserving_prepared_images()
+    }) else {
+        return fail("fx_unsupported");
+    };
+    let Some(initial_xmm) = (unsafe { fx_state::activate_prepared_task(2) })
+    else {
+        unsafe { fx_state::leave(original_fx); }
+        return fail("fx_activate");
+    };
+    RECYCLE_BASELINE_XMM.store(initial_xmm, Ordering::Release);
+    if initial_xmm == TASK_XMM0[2] {
+        unsafe { fx_state::leave(original_fx); }
+        return fail("stale_xmm_exposed");
+    }
+
+    // Retire first-generation READY bitmap, keeping all its stack frames
+    // unreachable. Admit ONLY this new generation's validated task slot.
+    // There is no active generic task scheduler; IRQs simply IRETQ to
+    // the new worker, which returns once to its saved BSP caller.
+    RUNNABLE.store(1 << 2, Ordering::Release);
+    FINISHED.store(0, Ordering::Release);
+    // SAFETY: BSP, IF=0 and valid isolated private x86-64 kernel frame.
+    // IRETQ enables IF *on the worker's stack*, not on the BSP. The worker
+    // returns via the paired context_switch primitive with IF=0.
+    unsafe {
+        crate::apic_irq_entry::enter_recycled_frame(
+            RECYCLE_BSP_RSP.0.get(), frame_rsp
+        );
+    }
+    x86_64::instructions::interrupts::disable();
+
+    let returned = RECYCLE_RETURNED.load(Ordering::Acquire);
+    let live_irqs = RECYCLE_IRQS.load(Ordering::Acquire);
+    let bad = RECYCLE_BAD.load(Ordering::Acquire);
+    let work = RECYCLE_WORK.load(Ordering::Acquire);
+    let first_irq_work = RECYCLE_IRQ_FIRST_WORK.load(Ordering::Acquire);
+    let entry_r12 = WOLFOS_RECYCLE_ENTRY_R12.load(Ordering::Acquire);
+    let entry_r15 = WOLFOS_RECYCLE_ENTRY_R15.load(Ordering::Acquire);
+    let observed_baseline = RECYCLE_OBSERVED_XMM.load(Ordering::Acquire);
+    let observed_final = unsafe { fx_state::snapshot_active_task(2) };
+    // SAFETY: IF=0 on the BSP, second-generation task has returned on
+    // another stack, and the timer ISR will no longer restore this FX state.
+    unsafe { fx_state::leave(original_fx); }
+    RUNNABLE.store(0, Ordering::Release);
+    FINISHED.store(1 << 2, Ordering::Release);
+    // SAFETY: BSP IF=0, the old handle cannot be mistaken for the new one.
+    let state_ok = unsafe {
+        let table = &mut *SLOT_OWNERS.0.get();
+        table.finish(handle).is_ok()
+            && table.state(handle) == Ok(SlotState::Finished)
+            && table.state(task_slot::TaskHandle {
+                slot: 2, generation: proof.old_generation
+            }) == Err(SlotError::StaleHandle)
+    };
+    let ok = returned && !RECYCLE_ACTIVE.load(Ordering::Acquire)
+        && live_irqs >= RECYCLE_MIN_IRQS && bad == 0
+        && first_irq_work > 0 && work > first_irq_work + 512
+        && entry_r12 == RECYCLE_R12 && entry_r15 == RECYCLE_R15
+        && observed_baseline == initial_xmm
+        && observed_final == Some(RECYCLE_XMM0)
+        && initial_xmm != TASK_XMM0[2]
+        && state_ok && canary_ok(2)
+        && !x86_64::instructions::interrupts::are_enabled()
+        && !ACTIVE.load(Ordering::Acquire)
+        && RUNNABLE.load(Ordering::Acquire) == 0
+        && FINISHED.load(Ordering::Acquire) == 0b100;
+    if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_REUSE_EXEC_OK task=2 old_gen={} new_gen={} via_iretq=1 entry_r12={:#x} entry_r15={:#x} irq={} work={} first_irq_work={} xmm_initial={:#x} xmm_final={:#x} xmm_old={:#x} corrupt={} stale=1 finished_new=1 ready=0 bsp_only=1\n",
+            proof.old_generation, proof.new_generation,
+            entry_r12, entry_r15, live_irqs, work, first_irq_work,
+            initial_xmm, observed_final.unwrap_or(0), TASK_XMM0[2], bad
+        ));
+    } else {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_REUSE_EXEC_ERROR stage=validation returned={} irq={} work={} first_irq_work={} r12={:#x} r15={:#x} xmm_initial={:#x} xmm_observed={:#x} xmm_final={:?} corrupt={} ownership={}\n",
+            returned, live_irqs, work, first_irq_work, entry_r12,
+            entry_r15, initial_xmm, observed_baseline, observed_final,
+            bad, state_ok
+        ));
+    }
+    ok
 }
 
 /// BSP only; enter and leave with IRQs disabled. APIC timer hardware remains
@@ -940,5 +1211,11 @@ pub fn verify() -> bool {
             "WOLFOS_APIC_RECYCLE_ERROR quiescence_or_generation_or_stack_invalid\n"
         ));
     }
-    ok && recycled.is_some()
+    // The recycled frame was deliberately kept OFF the run queue while
+    // wiping and validating it. Now execute it as a separate BSP-only
+    // single-worker epoch and prove actual IRETQ entry, live timer IRQs,
+    // SSE isolation, and a new Finished transition.
+    let reuse_ok = recycled.as_ref()
+        .is_some_and(prove_recycled_task_runs);
+    ok && recycled.is_some() && reuse_ok
 }

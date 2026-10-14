@@ -216,6 +216,40 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
                 or new_task_executed != 0):
                 print(f"FAIL: recycled stack/FX or generation ownership unsafe: {recycle.groups()}")
                 return False
+            executed = re.search(
+                r"WOLFOS_APIC_REUSE_EXEC_OK task=(\d+) old_gen=(\d+) new_gen=(\d+) via_iretq=(\d+) entry_r12=0x([0-9a-f]+) entry_r15=0x([0-9a-f]+) irq=(\d+) work=(\d+) first_irq_work=(\d+) xmm_initial=0x([0-9a-f]+) xmm_final=0x([0-9a-f]+) xmm_old=0x([0-9a-f]+) corrupt=(\d+) stale=(\d+) finished_new=(\d+) ready=(\d+) bsp_only=(\d+)",
+                output,
+            )
+            if executed is None:
+                print("FAIL: second-generation task2 never entered actual IRETQ worker")
+                return False
+            (task_id, old_gen, new_gen, via_iretq, r12_hex, r15_hex,
+             worker_irqs, worker_work, first_irq_work,
+             xmm_initial_hex, xmm_final_hex, xmm_old_hex,
+             corrupt, stale, finished_new, ready, bsp_only) = executed.groups()
+            (task_id, old_gen, new_gen, via_iretq,
+             worker_irqs, worker_work, first_irq_work,
+             corrupt, stale, finished_new, ready, bsp_only) = map(
+                int, (task_id, old_gen, new_gen, via_iretq,
+                      worker_irqs, worker_work, first_irq_work,
+                      corrupt, stale, finished_new, ready, bsp_only)
+            )
+            xmm_initial = int(xmm_initial_hex, 16)
+            xmm_final = int(xmm_final_hex, 16)
+            xmm_old = int(xmm_old_hex, 16)
+            if (task_id != 2 or old_gen != old_generation
+                or new_gen != new_generation or via_iretq != 1
+                or int(r12_hex, 16) != 0x12345678cafef001
+                or int(r15_hex, 16) != 0xfaceb00c76543210
+                or worker_irqs < 4 or first_irq_work <= 0
+                or worker_work <= first_irq_work + 512
+                or xmm_initial == xmm_old
+                or xmm_old != 0x0f0e0d0c0b0a0908
+                or xmm_final != 0xa55af00d9e37cafe
+                or corrupt != 0 or stale != 1 or finished_new != 1
+                or ready != 0 or bsp_only != 1):
+                print(f"FAIL: recycled task ran with stale GPR/SSE or no real IRQs: {executed.groups()}")
+                return False
             fx = re.search(
                 r"WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=(\d+) xmm0=(\d+) fx_switches=(\d+) fx_observations=(\d+) work_checks=(\d+) corrupt=(\d+) original_restored=(\d+) avx=(\d+)",
                 output,
@@ -244,6 +278,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             "WOLFOS_APIC_BLOCK_WAKE_ERROR",
             "WOLFOS_APIC_FINISHED_ERROR",
             "WOLFOS_APIC_RECYCLE_ERROR",
+            "WOLFOS_APIC_REUSE_EXEC_ERROR",
             "WOLFOS_APIC_FXSTATE_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):
