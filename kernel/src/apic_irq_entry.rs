@@ -143,3 +143,79 @@ unsafe extern "C" {
 pub unsafe fn run_gpr_probe() -> bool {
     unsafe { wolfos_apic_gpr_probe() == 1 }
 }
+
+
+/// Separate from the timer IRQ entry. BSP IF=0, runs only once after
+/// generation-safe retirement and initialization of the recycled slot.
+/// Saves the *ordinary* BSP SysV callee-saved context so a finished worker
+/// can switch back from its own stack using context_switch::switch_raw.
+/// Then restores all 15 GPRs from the validated, synthesized x86-64 frame,
+/// and IRETQs directly into the NEW task generation with IF=1.
+///
+/// No task-to-task scheduling occurs here. The APIC IRQ timer will interrupt
+/// this single recycled worker and return to its SAME frame (ACTIVE=false).
+global_asm!(
+    ".section .text",
+    ".global wolfos_enter_recycled_frame",
+    ".type wolfos_enter_recycled_frame, @function",
+    "wolfos_enter_recycled_frame:",
+    "push rbx",
+    "push rbp",
+    "push r12",
+    "push r13",
+    "push r14",
+    "push r15",
+    // rdi: BSP return-RSP cell; rsi: already validated new task trap RSP
+    "mov [rdi], rsp",
+    "mov rsp, rsi",
+    "pop r15",
+    "pop r14",
+    "pop r13",
+    "pop r12",
+    "pop r11",
+    "pop r10",
+    "pop r9",
+    "pop r8",
+    "pop rbp",
+    "pop rdi",
+    "pop rsi",
+    "pop rdx",
+    "pop rcx",
+    "pop rbx",
+    "pop rax",
+    "iretq",
+    ".size wolfos_enter_recycled_frame, .-wolfos_enter_recycled_frame",
+);
+
+// On *actual* IRETQ entry (before Rust prologue), observe two initially
+// restored callee-saved GPRs. These values are written once on the BSP;
+// no concurrent Rust reader exists until the worker has returned to BSP.
+global_asm!(
+    ".section .text",
+    ".global wolfos_recycled_frame_entry_probe",
+    ".type wolfos_recycled_frame_entry_probe, @function",
+    "wolfos_recycled_frame_entry_probe:",
+    "mov qword ptr [rip + WOLFOS_RECYCLE_ENTRY_R12], r12",
+    "mov qword ptr [rip + WOLFOS_RECYCLE_ENTRY_R15], r15",
+    "jmp wolfos_recycled_task_entry",
+    ".size wolfos_recycled_frame_entry_probe, .-wolfos_recycled_frame_entry_probe",
+);
+
+unsafe extern "C" {
+    fn wolfos_enter_recycled_frame(bsp_saved_rsp: *mut usize, next_frame_rsp: usize);
+    fn wolfos_recycled_frame_entry_probe();
+}
+
+pub fn recycled_entry_address() -> u64 {
+    wolfos_recycled_frame_entry_probe as usize as u64
+}
+
+/// # Safety
+/// BSP IF=0, timer MMIO and IDT handler installed, APs parked; the destination
+/// belongs exclusively to a newly allocated task generation and contains a
+/// validated full kernel-only GPR+IRETQ frame. The saved BSP-RSP cell is
+/// disjoint from all task stacks. Worker exits exactly once via the paired
+/// cooperative context_switch::switch_raw with IF=0, returning here.
+pub unsafe fn enter_recycled_frame(bsp_saved_rsp: *mut usize, next_frame_rsp: usize) {
+    unsafe { wolfos_enter_recycled_frame(bsp_saved_rsp, next_frame_rsp); }
+}
