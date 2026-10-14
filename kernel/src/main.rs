@@ -34,24 +34,32 @@ mod lapic_probe;
 mod lapic_mmio_layout;
 mod lapic_timer_layout;
 mod lapic_mmio;
-#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+           feature = "apic-preempt-smoke"))]
 mod lapic_timer_plan;
-#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+           feature = "apic-preempt-smoke"))]
 mod lapic_irq_layout;
-#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+           feature = "apic-preempt-smoke"))]
 mod apic_timer_smoke;
-#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+           feature = "apic-preempt-smoke"))]
 mod irq_frame_observation;
-#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+           feature = "apic-preempt-smoke"))]
 mod kernel_trap_frame;
-#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+           feature = "apic-preempt-smoke"))]
 mod apic_irq_entry;
+#[cfg(feature = "apic-preempt-smoke")]
+mod apic_preempt_smoke;
 #[cfg(feature = "apic-calibration-smoke")]
 mod lapic_timer_calibration;
 #[cfg(feature = "timer-smoke")]
 mod timer;
 #[cfg(any(feature = "timer-smoke", feature = "apic-timer-smoke",
-          feature = "apic-calibration-smoke"))]
+          feature = "apic-calibration-smoke", feature = "apic-preempt-smoke"))]
 mod timer_tasks;
 
 #[used]
@@ -233,7 +241,8 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_TIMER_TEST_FAILED");
         halt_forever();
     }
-    #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+    #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+           feature = "apic-preempt-smoke"))]
     if !apic_timer_smoke::verify(mp.bsp_lapic_id, hhdm.offset, entries) {
         serial::write_line("WOLFOS_APIC_TIMER_TEST_FAILED");
         halt_forever();
