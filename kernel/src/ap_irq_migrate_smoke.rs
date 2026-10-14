@@ -514,7 +514,7 @@ pub fn secondary_run(cpu: usize) -> bool {
                     || s.epoch != job.token - 1 || s.steps != job.token)
                 { bad |= 64; }
                 if bad != 0 {
-                    COORD_BAD[cpu].store(bad, Ordering::Release);
+                    COORD_BAD.store(bad, Ordering::Release);
                     good = false; break;
                 }
                 let Some(snap) = LEASE.snapshot().ok()
@@ -612,7 +612,7 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
                 "WOLFOS_AP_IRQ_MIGRATE_TRACE diag worker={} irq={} coord={} xmm_saved={:#x} xmm_expected={:#x}\n",
                 WORKER_BAD.load(Ordering::Acquire),
                 IRQ_BAD.load(Ordering::Acquire),
-                COORD_BAD[next_cpu].load(Ordering::Acquire),
+                COORD_BAD.load(Ordering::Acquire),
                 SAVED_XMM0.load(Ordering::Acquire),
                 XMM_TAG,
             ));
