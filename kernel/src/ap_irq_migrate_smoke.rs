@@ -504,8 +504,8 @@ pub fn secondary_run(cpu: usize) -> bool {
                 if !good { bad |= 1; }
                 if !stopped { bad |= 2; }
                 if ACTIVE[cpu].load(Ordering::Acquire) { bad |= 4; }
-                if TIMER_IRQS[cpu].load(Ordering::Acquire) != generation { bad |= 8; }
-                if TIMER_EOIS[cpu].load(Ordering::Acquire) != generation { bad |= 16; }
+                if TIMER_IRQS[cpu].load(Ordering::Acquire) != job.sequence { bad |= 8; }
+                if TIMER_EOIS[cpu].load(Ordering::Acquire) != job.sequence { bad |= 16; }
                 if captured < bottom() + 512
                     || captured.checked_add(size_of::<KernelTrapFrame>())
                         .is_none_or(|end| end > top())
