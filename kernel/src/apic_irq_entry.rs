@@ -154,6 +154,7 @@ pub unsafe fn run_gpr_probe() -> bool {
 ///
 /// No task-to-task scheduling occurs here. The APIC IRQ timer will interrupt
 /// this single recycled worker and return to its SAME frame (ACTIVE=false).
+#[cfg(feature = "apic-preempt-smoke")]
 global_asm!(
     ".section .text",
     ".global wolfos_enter_recycled_frame",
@@ -190,6 +191,7 @@ global_asm!(
 // On *actual* IRETQ entry (before Rust prologue), observe two initially
 // restored callee-saved GPRs. These values are written once on the BSP;
 // no concurrent Rust reader exists until the worker has returned to BSP.
+#[cfg(feature = "apic-preempt-smoke")]
 global_asm!(
     ".section .text",
     ".global wolfos_recycled_frame_entry_probe",
@@ -201,11 +203,13 @@ global_asm!(
     ".size wolfos_recycled_frame_entry_probe, .-wolfos_recycled_frame_entry_probe",
 );
 
+#[cfg(feature = "apic-preempt-smoke")]
 unsafe extern "C" {
     fn wolfos_enter_recycled_frame(bsp_saved_rsp: *mut usize, next_frame_rsp: usize);
     fn wolfos_recycled_frame_entry_probe();
 }
 
+#[cfg(feature = "apic-preempt-smoke")]
 pub fn recycled_entry_address() -> u64 {
     wolfos_recycled_frame_entry_probe as usize as u64
 }
@@ -216,6 +220,7 @@ pub fn recycled_entry_address() -> u64 {
 /// validated full kernel-only GPR+IRETQ frame. The saved BSP-RSP cell is
 /// disjoint from all task stacks. Worker exits exactly once via the paired
 /// cooperative context_switch::switch_raw with IF=0, returning here.
+#[cfg(feature = "apic-preempt-smoke")]
 pub unsafe fn enter_recycled_frame(bsp_saved_rsp: *mut usize, next_frame_rsp: usize) {
     unsafe { wolfos_enter_recycled_frame(bsp_saved_rsp, next_frame_rsp); }
 }
