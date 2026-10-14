@@ -7,7 +7,7 @@ import sys
 import tempfile
 
 
-def exercise(iso: Path, cpus: int) -> bool:
+def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
     with tempfile.TemporaryDirectory(prefix=f"wolfos-apic-timer-{cpus}cpu-") as tmp:
         serial = Path(tmp) / "serial.log"
         cmd = [
@@ -33,6 +33,28 @@ def exercise(iso: Path, cpus: int) -> bool:
             print(f"FAIL: {cpus}-CPU SMP completion marker missing")
             print(run.stderr.decode(errors="replace"))
             return False
+        if calibrated:
+            calibration = re.search(
+                r"WOLFOS_APIC_CALIBRATION_OK effective_hz=(\\d+) initial_count=(\\d+) pit_hz=(\\d+) pit_ticks=(\\d+) divisor=(\\d+) target_hz=(\\d+)",
+                output,
+            )
+            if calibration is None:
+                print("FAIL: PIT2-to-xAPIC hardware calibration marker missing")
+                return False
+            effective_hz, initial_count, pit_hz, pit_ticks, divisor, target = (
+                map(int, calibration.groups())
+            )
+            if (
+                not 1_000 <= effective_hz <= 1_000_000_000
+                or initial_count == 0 or pit_hz != 1_193_182
+                or pit_ticks != 23_864 or divisor != 16 or target != 100
+                or abs(initial_count * target - effective_hz) > target
+            ):
+                print(f"FAIL: invalid calibration result: {calibration.groups()}")
+                return False
+            if f"WOLFOS_APIC_TIMER_BEGIN vector=224 count={initial_count} " not in output:
+                print("FAIL: calibrated count was not programmed into periodic timer")
+                return False
         if "WOLFOS_APIC_TIMER_BEGIN vector=224" not in output:
             print("FAIL: APIC timer hardware start marker missing")
             print(run.stderr.decode(errors="replace"))
@@ -66,12 +88,15 @@ def exercise(iso: Path, cpus: int) -> bool:
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
-        print("Usage: apic_timer_smoke.py out/wolfos-apic-timer.iso")
+    calibrated = len(sys.argv) == 3 and sys.argv[2] == "--calibrated"
+    if (len(sys.argv) not in (2, 3) or
+        (len(sys.argv) == 3 and not calibrated) or
+        not Path(sys.argv[1]).is_file()):
+        print("Usage: apic_timer_smoke.py ISO [--calibrated]")
         return 2
     iso = Path(sys.argv[1])
     for cpus in (1, 4):
-        if not exercise(iso, cpus):
+        if not exercise(iso, cpus, calibrated):
             return 1
     return 0
 
