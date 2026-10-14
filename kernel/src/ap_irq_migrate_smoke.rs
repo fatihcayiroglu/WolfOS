@@ -108,6 +108,10 @@ static RESUMES: AtomicU64 = AtomicU64::new(0);
 static CROSS_AP: AtomicU64 = AtomicU64::new(0);
 static FX_SAVES: AtomicU64 = AtomicU64::new(0);
 static FX_RESTORES: AtomicU64 = AtomicU64::new(0);
+static WORKER_BAD: AtomicU64 = AtomicU64::new(0);
+static IRQ_BAD: AtomicU64 = AtomicU64::new(0);
+static COORD_BAD: AtomicU64 = AtomicU64::new(0);
+static SAVED_XMM0: AtomicU64 = AtomicU64::new(0);
 
 fn bottom() -> usize { TASK_STACK.0.get().cast::<u8>() as usize }
 fn top() -> usize { bottom() + STACK_BYTES }
@@ -266,6 +270,7 @@ extern "C" fn worker() -> ! {
                     core::ptr::read_volatile(core::ptr::addr_of!((*ptr).cookie))
                 } != LOCAL_COOKIE
             {
+                WORKER_BAD.fetch_or(1, Ordering::Relaxed);
                 ERROR.fetch_add(1, Ordering::Relaxed);
             }
             if count == 0 {
@@ -273,7 +278,10 @@ extern "C" fn worker() -> ! {
             } else {
                 let live: u64;
                 unsafe { asm!("movq {}, xmm0", out(reg) live, options(nostack, preserves_flags)); }
-                if live != XMM_TAG { ERROR.fetch_add(1, Ordering::Relaxed); }
+                if live != XMM_TAG {
+                    WORKER_BAD.fetch_or(2, Ordering::Relaxed);
+                    ERROR.fetch_add(1, Ordering::Relaxed);
+                }
                 CROSS_AP.fetch_add(1, Ordering::Relaxed);
             }
             unsafe {
@@ -319,6 +327,7 @@ pub extern "C" fn wolfos_ap_migrate_timer_irq_dispatch(
         let progress = WORK[cpu].load(Ordering::Relaxed);
         let previous = LAST_WORK[cpu].swap(progress, Ordering::Relaxed);
         if !valid || progress <= previous {
+            IRQ_BAD.fetch_or(if !valid { 1 } else { 2 }, Ordering::Relaxed);
             ERROR.fetch_add(1, Ordering::Relaxed);
         } else {
             // The task is the only running owner; save the entire legacy
@@ -327,7 +336,12 @@ pub extern "C" fn wolfos_ap_migrate_timer_irq_dispatch(
                 let bank = FX.0.get();
                 let task = core::ptr::addr_of_mut!((*bank).0);
                 fxsave(task);
-                if xmm_low(task) != XMM_TAG { ERROR.fetch_add(1, Ordering::Relaxed); }
+                let actual = xmm_low(task);
+                SAVED_XMM0.store(actual, Ordering::Relaxed);
+                if actual != XMM_TAG {
+                    IRQ_BAD.fetch_or(4, Ordering::Relaxed);
+                    ERROR.fetch_add(1, Ordering::Relaxed);
+                }
                 fxrstor(core::ptr::addr_of!((*bank).1[cpu]));
             }
             FX_SAVES.fetch_add(1, Ordering::Relaxed);
@@ -336,11 +350,13 @@ pub extern "C" fn wolfos_ap_migrate_timer_irq_dispatch(
             if snap.ok().is_none_or(|s| s.steps != epoch + 1)
                 || !stop_local_timer()
             {
+                IRQ_BAD.fetch_or(8, Ordering::Relaxed);
                 ERROR.fetch_add(1, Ordering::Relaxed);
             } else {
                 CAPTURED.store(frame as usize, Ordering::Release);
                 let fake = unsafe { (*RSP.0.get()).1[cpu] };
                 if fake == 0 {
+                    IRQ_BAD.fetch_or(16, Ordering::Relaxed);
                     ERROR.fetch_add(1, Ordering::Relaxed);
                 } else {
                     next_frame = fake as *const KernelTrapFrame;
@@ -480,15 +496,25 @@ pub fn secondary_run(cpu: usize) -> bool {
                 fx_leave(cpu);
                 let captured = CAPTURED.load(Ordering::Acquire);
                 let snap = LEASE.snapshot();
-                if !good || !stopped || ACTIVE[cpu].load(Ordering::Acquire)
-                    || TIMER_IRQS[cpu].load(Ordering::Acquire) != generation
-                    || TIMER_EOIS[cpu].load(Ordering::Acquire) != generation
-                    || captured < bottom() + 512
+                // Record every failed post-escape invariant independently:
+                // 1=prior failure, 2=timer teardown, 4=still-active task,
+                // 8=tick count, 16=EOI count, 32=captured bounds,
+                // 64=owner/epoch/step not quiesced.
+                let mut bad = 0u64;
+                if !good { bad |= 1; }
+                if !stopped { bad |= 2; }
+                if ACTIVE[cpu].load(Ordering::Acquire) { bad |= 4; }
+                if TIMER_IRQS[cpu].load(Ordering::Acquire) != generation { bad |= 8; }
+                if TIMER_EOIS[cpu].load(Ordering::Acquire) != generation { bad |= 16; }
+                if captured < bottom() + 512
                     || captured.checked_add(size_of::<KernelTrapFrame>())
                         .is_none_or(|end| end > top())
-                    || snap.ok().is_none_or(|s| s.owner != cpu
-                        || s.epoch != job.token - 1 || s.steps != job.token)
-                {
+                { bad |= 32; }
+                if snap.ok().is_none_or(|s| s.owner != cpu
+                    || s.epoch != job.token - 1 || s.steps != job.token)
+                { bad |= 64; }
+                if bad != 0 {
+                    COORD_BAD[cpu].store(bad, Ordering::Release);
                     good = false; break;
                 }
                 let Some(snap) = LEASE.snapshot().ok()
@@ -581,6 +607,14 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
                 CAPTURED.load(Ordering::Acquire),
                 WORK[next_cpu].load(Ordering::Acquire),
                 ERROR.load(Ordering::Acquire),
+            ));
+            serial::write_fmt(format_args!(
+                "WOLFOS_AP_IRQ_MIGRATE_TRACE diag worker={} irq={} coord={} xmm_saved={:#x} xmm_expected={:#x}\\n",
+                WORKER_BAD.load(Ordering::Acquire),
+                IRQ_BAD.load(Ordering::Acquire),
+                COORD_BAD[next_cpu].load(Ordering::Acquire),
+                SAVED_XMM0.load(Ordering::Acquire),
+                XMM_TAG,
             ));
             valid = false;
             break 'steps;
