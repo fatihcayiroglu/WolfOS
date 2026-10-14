@@ -1276,6 +1276,19 @@ pub fn verify() -> bool {
     FINISH_SKIPS.store(0, Ordering::Relaxed);
     FINISH_ERRORS.store(0, Ordering::Relaxed);
     for visit in &POST_FINISH_VISITS { visit.store(0, Ordering::Relaxed); }
+    LIVE_PHASE.store(0, Ordering::Relaxed);
+    LIVE_HANDLE_GEN.store(0, Ordering::Relaxed);
+    LIVE_ADMISSIONS.store(0, Ordering::Relaxed);
+    LIVE_TASK_WORK.store(0, Ordering::Relaxed);
+    LIVE_INTERRUPTED.store(0, Ordering::Relaxed);
+    LIVE_BAD.store(0, Ordering::Relaxed);
+    LIVE_INITIAL_XMM.store(0, Ordering::Relaxed);
+    LIVE_ENTRY_SEEN.store(false, Ordering::Relaxed);
+    LIVE_FINISHES.store(0, Ordering::Relaxed);
+    LIVE_STOP_WORK.store(0, Ordering::Relaxed);
+    LIVE_FROZEN.store(0, Ordering::Relaxed);
+    LIVE_SURVIVOR_SWITCHES.store(0, Ordering::Relaxed);
+    FRAME_RSP[LIVE_TASK].store(0, Ordering::Relaxed);
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
@@ -1309,6 +1322,17 @@ pub fn verify() -> bool {
     let first = INTERRUPTED[0].load(Ordering::Acquire);
     let second = INTERRUPTED[1].load(Ordering::Acquire);
     let third = INTERRUPTED[2].load(Ordering::Acquire);
+    let fourth = LIVE_INTERRUPTED.load(Ordering::Acquire);
+    let live_phase = LIVE_PHASE.load(Ordering::Acquire);
+    let live_gen = LIVE_HANDLE_GEN.load(Ordering::Acquire);
+    let live_admits = LIVE_ADMISSIONS.load(Ordering::Acquire);
+    let live_finishes = LIVE_FINISHES.load(Ordering::Acquire);
+    let live_work = LIVE_TASK_WORK.load(Ordering::Acquire);
+    let live_bad = LIVE_BAD.load(Ordering::Acquire);
+    let live_first_xmm = LIVE_INITIAL_XMM.load(Ordering::Acquire);
+    let live_frozen = LIVE_FROZEN.load(Ordering::Acquire);
+    let live_survivors = LIVE_SURVIVOR_SWITCHES.load(Ordering::Acquire);
+    let live_entry = LIVE_ENTRY_SEEN.load(Ordering::Acquire);
     let work0 = WORK[0].load(Ordering::Acquire);
     let work1 = WORK[1].load(Ordering::Acquire);
     let work2 = WORK[2].load(Ordering::Acquire);
@@ -1354,7 +1378,15 @@ pub fn verify() -> bool {
     let ok = !unexpected_interrupt_state && switches >= STOP_AFTER
         && min_irqs >= MIN_EPOCHS_PER_TASK
         && post_min >= MIN_EPOCHS_PER_TASK && post_max - post_min <= 1
-        && first + second + third == switches
+        && first + second + third + fourth == switches
+        && fourth >= LIVE_REQUIRED_IRQS
+        && live_phase == 3
+        && live_admits == 1 && live_finishes == 1
+        && live_gen == 1 && live_work > 512
+        && live_bad == 0 && live_entry
+        && live_first_xmm != TASK_XMM0[2]
+        && live_frozen >= LIVE_FROZEN_REQUIRED
+        && live_survivors >= LIVE_FROZEN_REQUIRED
         && work0 > 0 && work1 > 0 && work2 > 0
         && rejected == 0 && exit_task < TASK_COUNT
         && deferred >= 4 && nested_ok && depth == 0
@@ -1374,8 +1406,14 @@ pub fn verify() -> bool {
         && survivor0 >= MIN_EPOCHS_PER_TASK
         && survivor1 >= MIN_EPOCHS_PER_TASK
         && survivor0.abs_diff(survivor1) <= 1
-        && (0..TASK_COUNT).all(canary_ok);
+        && (0..SLOT_COUNT).all(canary_ok);
     if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_LIVE_ENQUEUE_OK slot=3 generation={} admissions={} executions=1 irq={} work={} xmm_initial={:#x} xmm_final={:#x} corrupt={} finished={} parked={} frozen_irqs={} survivor_switches={} gpr_frame=1 fx_private=1 bsp_only=1\n",
+            live_gen, live_admits, fourth, live_work, live_first_xmm,
+            LIVE_XMM0, live_bad, live_finishes, u8::from(live_phase == 3),
+            live_frozen, live_survivors
+        ));
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_FINISHED_OK task=2 mask=4 ready=3 finish=1 frozen_irqs={} skipped={} errors={} frozen_work={} survivor0={} survivor1={} never_rescheduled=1 fx_still_owned=1\n",
             finish_freezes, finish_skips, finish_errors, finish_work,
@@ -1391,19 +1429,20 @@ pub fn verify() -> bool {
             fx_switches, fx_observations, fx_work_checks, fx_bad
         ));
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_OK tasks=3 involuntary_switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={} fairness_max_delta={}\n",
+            "WOLFOS_APIC_PREEMPT_OK tasks=3 involuntary_switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={} fairness_max_delta={} task3_irqs={} live_admitted=1\n",
             switches, first, second, third, work0, work1, work2,
-            exit_task, rejected, deferred, depth, post_max - post_min
+            exit_task, rejected, deferred, depth, post_max - post_min, fourth
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={} phase={} block_irqs={} frozen={} skipped={} wakes={} resumed={} block_errors={} postwake={}/{}/{} finish_phase={} finish_mask={} finish_freezes={} finish_skips={} finish_errors={} survivors={}/{}\n",
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={} phase={} block_irqs={} frozen={} skipped={} wakes={} resumed={} block_errors={} postwake={}/{}/{} finish_phase={} finish_mask={} finish_freezes={} finish_skips={} finish_errors={} survivors={}/{} live_phase={} live_admits={} live_ends={} live_irq={} live_work={} live_bad={} live_frozen={}\n",
             switches, first, second, third, work0, work1, work2, exit_task, rejected,
             deferred, nested_ok, depth, fx_switches, fx_observations, fx_bad,
             fx_work_checks, xmm_ready, !unexpected_interrupt_state, block_phase,
             block_irqs, freeze_checks, block_skips, wakes, resumed, block_errors,
             post0, post1, post2, finish_phase, finished_mask, finish_freezes,
-            finish_skips, finish_errors, survivor0, survivor1
+            finish_skips, finish_errors, survivor0, survivor1, live_phase,
+            live_admits, live_finishes, fourth, live_work, live_bad, live_frozen
         ));
     }
     // Keep the original finished/IRQ/SSE evidence tied to the *live*
