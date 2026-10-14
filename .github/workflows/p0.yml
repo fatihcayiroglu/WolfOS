@@ -29,6 +29,8 @@ jobs:
         run: make topology-smoke
       - name: PIT IRQ0 hardware timer smoke (single BSP only)
         run: make timer-smoke
+      - name: xAPIC periodic timer hardware IRQ smoke (single BSP only)
+        run: make apic-timer-smoke
       - name: Preserve ISO on failure
         if: failure()
         uses: actions/upload-artifact@v4
