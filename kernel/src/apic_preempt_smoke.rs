@@ -430,6 +430,63 @@ fn admit_live_task3() -> bool {
     result
 }
 
+/// Hardware-only wakeup of task3 while the three original kernel workers
+/// remain runnable. The first xAPIC IRQ after the self-block captures the
+/// exact suspended task3 work counter; all later IRQs while it is Blocked
+/// must observe that value frozen, proving no illegal dispatch occurred.
+/// Only when >=6 real IRQs have elapsed does the timer make it Ready.
+fn observe_live_block_and_wake(current: usize) {
+    if LIVE_PHASE.load(Ordering::Acquire) != 1
+        || LIVE_BLOCK_PHASE.load(Ordering::Acquire) != 1
+    {
+        return;
+    }
+    if current == LIVE_TASK {
+        if !LIVE_BLOCK_CAPTURED.swap(true, Ordering::AcqRel) {
+            LIVE_BLOCK_WORK.store(LIVE_TASK_WORK.load(Ordering::Acquire), Ordering::Release);
+            LIVE_BLOCK_OTHER_WORK.store(
+                WORK.iter().map(|w| w.load(Ordering::Acquire)).sum(),
+                Ordering::Release,
+            );
+        }
+        return;
+    }
+    if !LIVE_BLOCK_CAPTURED.load(Ordering::Acquire) {
+        LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if LIVE_TASK_WORK.load(Ordering::Acquire)
+        == LIVE_BLOCK_WORK.load(Ordering::Acquire)
+    {
+        LIVE_BLOCK_FROZEN.fetch_add(1, Ordering::Relaxed);
+    } else {
+        LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    if current == 2 {
+        // With bit3 Blocked, the next RR task after slot2 must be slot0.
+        LIVE_BLOCK_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    let count = LIVE_BLOCKED_IRQS.fetch_add(1, Ordering::AcqRel) + 1;
+    if count >= LIVE_WAKE_AFTER_IRQS {
+        let other_work: u64 = WORK.iter().map(|w| w.load(Ordering::Acquire)).sum();
+        if other_work <= LIVE_BLOCK_OTHER_WORK.load(Ordering::Acquire) {
+            LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        let wake = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::wake_unfinished(
+                mask, FINISHED.load(Ordering::Acquire), LIVE_TASK, SLOT_COUNT
+            ).ok(),
+        );
+        if wake.is_ok() {
+            LIVE_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            LIVE_BLOCK_PHASE.store(2, Ordering::Release);
+        } else {
+            LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The fourth worker was Finished on its own stack. A timer IRQ must
 /// involuntarily switch AWAY from it before we can claim it is parked.
 /// All subsequent hardware interrupts verify no further work on task3.
@@ -501,6 +558,7 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     // Nested preempt-disable sections were checked above and never switch.
     timer_block_wake(current);
     timer_finished_task_observation(current);
+    observe_live_block_and_wake(current);
     observe_live_retirement(current);
     let available_count = if LIVE_PHASE.load(Ordering::Acquire) == 0 {
         TASK_COUNT
@@ -572,6 +630,11 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     FRAME_RSP[current].store(old_rsp, Ordering::Relaxed);
     if current == LIVE_TASK {
         LIVE_INTERRUPTED.fetch_add(1, Ordering::Relaxed);
+        if LIVE_BLOCK_PHASE.load(Ordering::Acquire) >= 3
+            && LIVE_PHASE.load(Ordering::Acquire) == 1
+        {
+            LIVE_POST_WAKE_IRQS.fetch_add(1, Ordering::Relaxed);
+        }
     } else {
         INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
     }
