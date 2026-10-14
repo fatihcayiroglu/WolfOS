@@ -7,7 +7,7 @@ import sys
 import tempfile
 
 
-def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
+def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
     with tempfile.TemporaryDirectory(prefix=f"wolfos-apic-timer-{cpus}cpu-") as tmp:
         serial = Path(tmp) / "serial.log"
         cmd = [
@@ -106,7 +106,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             print(run.stderr.decode(errors="replace"))
             return False
         vector, ticks, eoi, spurious, preemptive = map(int, match.groups())
-        if vector != 224 or ticks < 4 or eoi != ticks or preemptive != 0:
+        if vector != 224 or ticks < 4 or eoi != ticks or preemptive != int(preemptive):
             print(f"FAIL: invalid delivery/EOI evidence: {match.groups()}")
             return False
         asm = re.search(
@@ -117,9 +117,31 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             print("FAIL: real all-GPR xAPIC IRQ assembly entry and IRETQ proof missing")
             return False
         frames, gprs, iretq, same_task, invalid, asm_preemptive = map(int, asm.groups())
+        expected_preemption = int(preemptive)
         if (frames != ticks or frames != eoi or gprs != 15 or iretq != 1
-            or same_task != 1 or invalid != 0 or asm_preemptive != 0):
+            or same_task != 1 - expected_preemption or invalid != 0
+            or asm_preemptive != expected_preemption):
             print(f"FAIL: assembly GPR/trap return proof invalid: {asm.groups()}")
+            return False
+        if preemptive:
+            handoff = re.search(
+                r"WOLFOS_APIC_PREEMPT_OK tasks=(\d+) involuntary_switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) work0=(\d+) work1=(\d+) exit_task=(\d+) rejected=(\d+) stack_kib=(\d+) bsp_only=(\d+) user_mode=(\d+)",
+                output,
+            )
+            if handoff is None:
+                print("FAIL: genuine BSP hardware timer two-task involuntary handoff marker missing")
+                return False
+            tasks, switches, a_irq, b_irq, work0, work1, exit_task, rejected, stack_kib, bsp, userspace = map(
+                int, handoff.groups()
+            )
+            if (tasks != 2 or switches < 8 or a_irq < 4 or b_irq < 4
+                or a_irq + b_irq != switches or not work0 or not work1
+                or exit_task not in (0, 1) or rejected != 0
+                or stack_kib != 16 or bsp != 1 or userspace != 0):
+                print(f"FAIL: invalid involuntary context switching evidence: {handoff.groups()}")
+                return False
+        elif "WOLFOS_APIC_PREEMPT_OK" in output:
+            print("FAIL: normal APIC smoke unexpectedly claims task preemption")
             return False
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: boot did not finish successfully: exit={run.returncode}")
@@ -127,27 +149,29 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
         if any(s in output for s in (
             "WOLFOS_APIC_TIMER_ERROR", "WOLFOS_APIC_TIMER_TEST_FAILED",
             "WOLFOS_APIC_IRQ_FRAME_ERROR", "WOLFOS_APIC_GPR_ERROR",
+            "WOLFOS_APIC_PREEMPT_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):
             print("FAIL: fatal APIC-related kernel diagnostic")
             return False
         print(
             f"PASS: {cpus} CPUs; BSP xAPIC IRQs={ticks}, EOIs={eoi}, "
-            f"spurious={spurious}; no preemption asserted"
+            f"spurious={spurious}; preemptive={int(preemptive)}"
         )
         return True
 
 
 def main() -> int:
     calibrated = len(sys.argv) == 3 and sys.argv[2] == "--calibrated"
+    preemptive = len(sys.argv) == 3 and sys.argv[2] == "--preemptive"
     if (len(sys.argv) not in (2, 3) or
-        (len(sys.argv) == 3 and not calibrated) or
+        (len(sys.argv) == 3 and not (calibrated or preemptive)) or
         not Path(sys.argv[1]).is_file()):
-        print("Usage: apic_timer_smoke.py ISO [--calibrated]")
+        print("Usage: apic_timer_smoke.py ISO [--calibrated|--preemptive]")
         return 2
     iso = Path(sys.argv[1])
     for cpus in (1, 4):
-        if not exercise(iso, cpus, calibrated):
+        if not exercise(iso, cpus, calibrated, preemptive):
             return 1
     return 0
 
