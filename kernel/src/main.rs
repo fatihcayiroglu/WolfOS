@@ -22,10 +22,16 @@ mod acpi_layout;
 mod acpi_tables;
 mod acpi_walk;
 mod smp;
-#[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke"))]
+#[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
+           feature = "ap-smp-preempt-smoke"))]
 mod ipi_layout;
-#[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke"))]
+#[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
+           feature = "ap-smp-preempt-smoke"))]
 mod ap_ipi_smoke;
+#[cfg(feature = "ap-smp-preempt-smoke")]
+mod ap_preempt_irq_entry;
+#[cfg(feature = "ap-smp-preempt-smoke")]
+mod ap_smp_preempt_smoke;
 #[cfg(feature = "ap-local-timer-smoke")]
 mod ap_local_timer_smoke;
 mod ap_stack;
@@ -41,11 +47,12 @@ mod lapic_mmio_layout;
 mod lapic_timer_layout;
 mod lapic_mmio;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
-           feature = "apic-preempt-smoke", feature = "ap-local-timer-smoke"))]
+           feature = "apic-preempt-smoke", feature = "ap-local-timer-smoke",
+           feature = "ap-smp-preempt-smoke"))]
 mod lapic_timer_plan;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke", feature = "ap-ipi-smoke",
-           feature = "ap-local-timer-smoke"))]
+           feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke"))]
 mod lapic_irq_layout;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke"))]
@@ -54,7 +61,7 @@ mod apic_timer_smoke;
            feature = "apic-preempt-smoke"))]
 mod irq_frame_observation;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
-           feature = "apic-preempt-smoke"))]
+           feature = "apic-preempt-smoke", feature = "ap-smp-preempt-smoke"))]
 mod kernel_trap_frame;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke"))]
@@ -237,13 +244,19 @@ pub extern "C" fn kmain() -> ! {
     }
     // Feature-isolated BSP mapping exists BEFORE AP startup: APs inherit
     // a writable UC local-APIC alias for private IRQ acknowledgement.
-    #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke"))]
+    #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
+               feature = "ap-smp-preempt-smoke"))]
     if !ap_ipi_smoke::prepare_bsp(mp.bsp_lapic_id, hhdm.offset, entries, mp.cpus()) {
         serial::write_line("WOLFOS_AP_IPI_ERROR cannot_prepare_xapic");
         halt_forever();
     }
     if !smp::boot_aps(mp) {
         serial::write_line("WOLFOS_SMP_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "ap-smp-preempt-smoke")]
+    if !ap_smp_preempt_smoke::verify_bsp(mp.bsp_lapic_id, mp.cpus()) {
+        serial::write_line("WOLFOS_AP_SMP_PREEMPT_TEST_FAILED");
         halt_forever();
     }
     #[cfg(feature = "ap-local-timer-smoke")]

@@ -127,7 +127,8 @@ pub fn initialize_secondary(index: usize) -> bool {
     idt.page_fault.set_handler_fn(ap_page_fault);
     // The isolated directed-IPI QEMU flavor installs two external vectors
     // only on secondary CPUs. Its handler EOIs the *receiving* local APIC.
-    #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke"))]
+    #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
+               feature = "ap-smp-preempt-smoke"))]
     {
         idt[crate::ap_ipi_smoke::VECTOR].set_handler_fn(crate::ap_ipi_smoke::irq);
         idt[crate::ap_ipi_smoke::SPURIOUS]
@@ -136,6 +137,13 @@ pub fn initialize_secondary(index: usize) -> bool {
     #[cfg(feature = "ap-local-timer-smoke")]
     idt[crate::ap_local_timer_smoke::VECTOR]
         .set_handler_fn(crate::ap_local_timer_smoke::irq);
+    // Only the QEMU per-AP preemption flavor uses a custom assembly
+    // 15-GPR IRQ entry with a validated alternative per-AP task stack.
+    #[cfg(feature = "ap-smp-preempt-smoke")]
+    unsafe {
+        idt[crate::ap_smp_preempt_smoke::VECTOR]
+            .set_handler_addr(crate::ap_preempt_irq_entry::address());
+    }
     // SAFETY: AP owns a unique, permanently reserved double-fault IST.
     unsafe {
         idt.double_fault.set_handler_fn(ap_double_fault)
