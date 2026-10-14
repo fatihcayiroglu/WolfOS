@@ -266,4 +266,27 @@ mod tests {
         assert_eq!(wake_unfinished(0b011, 0b100, 2, 3), Err(RunnableError::AlreadyFinished));
     }
 
+    #[test]
+    fn live_enqueue_fourth_worker_rotates_and_can_be_retired_without_affecting_original_three() {
+        let original = 0b0111;
+        let admitted = wake_runnable(original, 3, 4).unwrap();
+        assert_eq!(admitted, 0b1111);
+        assert_eq!(next_runnable(2, 4, admitted), Ok(3));
+        assert_eq!(next_runnable(3, 4, admitted), Ok(0));
+        let mut visits = [0usize; 4];
+        let mut current = 0;
+        for _ in 0..40 {
+            current = next_runnable(current, 4, admitted).unwrap();
+            visits[current] += 1;
+        }
+        assert_eq!(visits, [10, 10, 10, 10]);
+        let (ready, finished) = finish_runnable(admitted, 0, 3, 4).unwrap();
+        assert_eq!((ready, finished), (original, 0b1000));
+        assert_eq!(next_runnable(2, 4, ready), Ok(0));
+        assert_eq!(
+            wake_unfinished(ready, finished, 3, 4),
+            Err(RunnableError::AlreadyFinished)
+        );
+    }
+
 }
