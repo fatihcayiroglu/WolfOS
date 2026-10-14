@@ -3,9 +3,10 @@
 //! Hardware pushes the architectural 64-bit interrupt return frame. The
 //! assembly saves all 15 general-purpose registers in exactly the push order
 //! modeled by kernel_trap_frame::SavedGprs, calls Rust with a stack pointer,
-//! restores every GPR and performs IRETQ to the SAME interrupted task.
+//! restores every GPR and IRETQs to the interrupted task, except in
+//! the isolated preemption smoke where it may resume a second kernel stack.
 //!
-//! No context switching, timer-induced scheduling, alternate stack, XSAVE,
+//! Outside the dedicated preemption feature: no context switching, XSAVE,
 //! CR3 switching, ring-3 support or cross-CPU use. Rust must not save a
 //! pointer to this ephemeral frame. The local APIC handler must EOI.
 //!
@@ -37,16 +38,16 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    // rbx was already saved: it can hold the original stack address
-    // through the SysV Rust call (callee-saved under the ABI).
+    // Rust returns the saved trap-frame RSP to resume. Normally it
+    // returns the same frame. Only the isolated preemption smoke may
+    // select another already-validated task's private stack.
     "mov rdi, rsp",
-    "mov rbx, rsp",
     "and rsp, -16",
     // A kernel IRQ may interrupt with DF set; SysV Rust requires DF cleared.
     // IRETQ restores the original RFLAGS including DF and IF.
     "cld",
     "call wolfos_apic_timer_irq_dispatch",
-    "mov rsp, rbx",
+    "mov rsp, rax",
     "pop r15",
     "pop r14",
     "pop r13",
