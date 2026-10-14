@@ -90,6 +90,8 @@ test:
 	$(OUT)/lapic_mmio_layout_tests
 	rustc --edition=2024 --test kernel/src/lapic_timer_layout.rs -o $(OUT)/lapic_timer_layout_tests
 	$(OUT)/lapic_timer_layout_tests
+	rustc --edition=2024 --test kernel/src/lapic_timer_calibration.rs -o $(OUT)/lapic_timer_calibration_tests
+	$(OUT)/lapic_timer_calibration_tests
 	rustc --edition=2024 --test kernel/src/scheduler.rs -o $(OUT)/scheduler_tests
 	$(OUT)/scheduler_tests
 	rustc --edition=2024 --test kernel/src/thread_scheduler.rs -o $(OUT)/thread_scheduler_tests
