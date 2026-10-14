@@ -12,7 +12,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use limine::mp::{MpInfo, MpRespData};
 
-use crate::{ap_stack, scheduler, serial, thread_scheduler, percpu_context};
+use crate::{ap_stack, scheduler, serial, thread_scheduler, percpu_context, lapic_probe};
 
 pub const MAX_BOOT_CPUS: usize = 256;
 const ACK_MAGIC: u64 = 0x574F_4C46_4150_0000;
@@ -92,6 +92,8 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
         crate::halt_forever();
     }
 
+    // A failed read-only probe is published, then the BSP fails closed.
+    let _ = lapic_probe::capture(index, info.lapic_id, false);
     AP_READY[index].store(expected_ack(info), Ordering::Release);
     // Every secondary waits until ALL workers reached this barrier.
     while !START_WORK.load(Ordering::Acquire) {
@@ -149,6 +151,10 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
     else {
         return false;
     };
+    if !lapic_probe::capture(bsp_index, mp.bsp_lapic_id, true) {
+        serial::write_line("WOLFOS_LAPIC_ERROR bsp_msr_or_identity_invalid");
+        return false;
+    }
     // Configure before any AP can claim a queue item.
     if !scheduler::BOOT_QUEUE.configure(cpus.len()) {
         serial::write_line("WOLFOS_SCHED_ERROR invalid_initialization");
@@ -179,6 +185,14 @@ pub fn boot_aps(mp: &MpRespData) -> bool {
         ));
         return false;
     }
+    let Some(apic) = lapic_probe::verify(cpus, bsp_index) else {
+        serial::write_line("WOLFOS_LAPIC_ERROR ap_msr_or_identity_invalid");
+        return false;
+    };
+    serial::write_fmt(format_args!(
+        "WOLFOS_LAPIC_ID_OK cpus={} verified={} base={:#x} x2apic={} readonly=1\n",
+        apic.cpus, apic.cpus, apic.base, apic.x2apic
+    ));
     // Acquire of AP_READY makes all per-AP GDT/TSS/IDT and #BP work visible.
     let bp = crate::interrupts::ap_breakpoint_count();
     if bp != ap_count {

@@ -41,6 +41,17 @@ def main() -> int:
         if (total, lapic+x2apic) != (EXPECTED_CPUS, EXPECTED_CPUS):
             print(f"FAIL: expected four enabled CPUs, MADT reported {total}")
             return 1
+        lapic = re.search(
+            r"WOLFOS_LAPIC_ID_OK cpus=(\d+) verified=(\d+) base=(0x[0-9a-f]+) x2apic=(\d+) readonly=1",
+            output,
+        )
+        if lapic is None:
+            print("FAIL: missing read-only LAPIC MSR/CPUID verification")
+            return 1
+        apic_total, verified, base, x2apic = lapic.groups()
+        if (int(apic_total), int(verified)) != (EXPECTED_CPUS, EXPECTED_CPUS) or int(base, 16) == 0 or int(x2apic) > EXPECTED_CPUS:
+            print(f"FAIL: incorrect read-only LAPIC report {lapic.groups()}")
+            return 1
         ack = re.search(r"WOLFOS_SMP_APS_OK total=(\d+) bsp_lapic=(\d+) ap_acks=(\d+)", output)
         if ack is None:
             print("FAIL: four secondary CPUs were enumerated but Rust AP handoff did not complete")

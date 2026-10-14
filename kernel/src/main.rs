@@ -29,6 +29,8 @@ mod context_switch;
 mod kernel_threads;
 mod context_batch;
 mod percpu_context;
+mod lapic_layout;
+mod lapic_probe;
 #[cfg(feature = "timer-smoke")]
 mod timer;
 #[cfg(feature = "timer-smoke")]

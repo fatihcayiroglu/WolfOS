@@ -14,4 +14,6 @@ No milestone can be marked complete without reproducible build and run evidence.
 
 P1 topology validation: isolated QEMU MADT tests with 1 and 4 virtual CPUs; APs now execute verified Rust work on dedicated stacks; task preemption, timers, IPIs and full SMP scheduling still pending.
 
-P1 timer milestone: isolated single-BSP PIT/8259 IRQ0 delivery and EOI acceptance in QEMU (merged); tick-gated safe-point context dispatch on two kernel stacks (under review). APIC timer, clocksource calibration, genuine interrupt-driven preemption and IRQ-safe scheduler remain planned.
+P1 timer milestone: isolated single-BSP PIT/8259 IRQ0 delivery and EOI acceptance in QEMU (merged); tick-gated safe-point context dispatch on two kernel stacks (merged). APIC timer, clocksource calibration, genuine interrupt-driven preemption and IRQ-safe scheduler remain planned.
+
+P1 local APIC: read-only per-CPU IA32_APIC_BASE MSR + CPUID APIC ID validation for BSP and APs (under review). No LAPIC MMIO mapping, timer programming, IPIs or preemption yet.
