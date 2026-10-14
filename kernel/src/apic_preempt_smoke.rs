@@ -568,6 +568,182 @@ extern "C" fn task0() -> ! { busy_task(0) }
 extern "C" fn task1() -> ! { busy_task(1) }
 extern "C" fn task2() -> ! { busy_task(2) }
 
+/// Proof of safe reuse of an INACTIVE slot: the original task 2 was
+/// interrupted, marked Finished, and left off the runnable list for >=6
+/// genuine timer IRQ observations. Only after all task contexts have exited
+/// to the disjoint BSP stack and IF=0 do we scrub its physical stack memory.
+/// There is NO actual new task execution in this test.
+struct RecycleProof {
+    old_generation: u64,
+    new_generation: u64,
+    scrubbed_stack: bool,
+    fx: fx_state::FxRecycleProof,
+    valid_new_frame: bool,
+    stale_rejected: bool,
+    old_handle_refused_while_running: bool,
+    grace_refused: bool,
+}
+
+fn recycle_quiescent_task2() -> Option<RecycleProof> {
+    let interrupts_disabled = !x86_64::instructions::interrupts::are_enabled();
+    // SAFETY: read the real BSP RSP register; this does not access any
+    // memory, change flags or modify the current execution context.
+    let bsp_rsp: usize;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, rsp",
+            out(reg) bsp_rsp,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    let disjoint_bsp = (0..TASK_COUNT).all(|id|
+        bsp_rsp < stack_bottom(id) || bsp_rsp >= stack_top(id)
+    );
+    let scheduler_inactive = !ACTIVE.load(Ordering::Acquire)
+        && PREEMPT_DEPTH.depth() == 0;
+    let old_task_not_current =
+        CURRENT.load(Ordering::Acquire) != 2;
+    let ready_mask = RUNNABLE.load(Ordering::Acquire);
+    let finished_mask = FINISHED.load(Ordering::Acquire);
+    let frozen = FINISH_FROZEN_SAMPLES.load(Ordering::Acquire);
+    let saved_rsp = FRAME_RSP[2].load(Ordering::Acquire);
+    let bottom = stack_bottom(2);
+    let top = stack_top(2);
+
+    // Never touch a live or uncleared task stack. This is BSP-only; all APs
+    // remain parked with their maskable interrupts disabled throughout QEMU
+    // smoke. No cross-CPU reclamation is possible with this prototype.
+    if !interrupts_disabled || !scheduler_inactive || !disjoint_bsp
+        || !old_task_not_current || ready_mask != 0b011
+        || finished_mask != 0b100
+        || FINISH_PHASE.load(Ordering::Acquire) != 2
+        || FINISH_ERRORS.load(Ordering::Acquire) != 0
+        || frozen < task_slot::MIN_GRACE_IRQS
+        || !canary_ok(2) || saved_rsp & 7 != 0
+        || saved_rsp < bottom + 512
+        || saved_rsp.checked_add(size_of::<KernelTrapFrame>())
+            .is_none_or(|end| end > top)
+    {
+        return None;
+    }
+    let cs = CODE_SELECTOR.load(Ordering::Acquire) as u16;
+    // SAFETY: bounds and alignment were explicitly verified above.
+    // This is a suspended kernel task's still-owned IRQ trap frame, and IF=0.
+    let old_valid = unsafe {
+        validate_kernel_resume(
+            saved_rsp as u64, bottom as u64, top as u64, cs,
+            &*(saved_rsp as *const KernelTrapFrame)
+        ).is_ok()
+    };
+    if !old_valid { return None; }
+
+    let gate = ReclaimGate {
+        interrupts_disabled,
+        scheduler_inactive,
+        bsp_on_disjoint_stack: disjoint_bsp,
+        old_task_not_current,
+        ready_mask,
+        finished_mask,
+        frozen_irq_observations: frozen,
+    };
+    // SAFETY: IF=0 on BSP and task execution has stopped. Timer IRQ Rust
+    // dispatcher never reads the ownership table, and no AP accesses it.
+    let table = unsafe { &mut *SLOT_OWNERS.0.get() };
+    let old_handle = table.handle(2).ok()?;
+    if table.state(old_handle).ok()? != SlotState::Finished {
+        return None;
+    }
+    let running_gate = ReclaimGate {
+        interrupts_disabled: false,
+        ..gate
+    };
+    let early_gate = ReclaimGate {
+        frozen_irq_observations: task_slot::MIN_GRACE_IRQS - 1,
+        ..gate
+    };
+    let old_handle_refused_while_running =
+        table.retire(old_handle, running_gate) == Err(SlotError::NotQuiescent);
+    let grace_refused = table.retire(old_handle, early_gate)
+        == Err(SlotError::InsufficientObservedGrace);
+    if !old_handle_refused_while_running || !grace_refused
+        || table.state(old_handle).ok()? != SlotState::Finished
+    {
+        return None;
+    }
+    table.retire(old_handle, gate).ok()?;
+
+    // Task2 cannot be selected with its finished runnable mask. Invalidate
+    // the saved return-frame pointer BEFORE wiping the dead stack.
+    if FRAME_RSP[2].swap(0, Ordering::AcqRel) != saved_rsp {
+        return None;
+    }
+    // SAFETY: IF=0, real CPU RSP is on a different BSP stack and the only
+    // APs are parked; task2 is fully retired and cannot resume. The 16 KiB
+    // region is private to slot2 and does not overlap other task stacks.
+    let scrubbed_stack = unsafe {
+        core::ptr::write_bytes(bottom as *mut u8, 0, STACK_BYTES);
+        core::slice::from_raw_parts(bottom as *const u8, STACK_BYTES)
+            .iter().all(|byte| *byte == 0)
+    };
+    if !scrubbed_stack { return None; }
+
+    // SAFETY: image is inactive after the real preemption proof, and the
+    // original BSP FX state has already been restored by leave().
+    let fx = unsafe { fx_state::recycle_task_image(2) }?;
+    if !fx.aligned || !fx.fully_scrubbed || !fx.baseline_reseeded
+        || fx.old_xmm0 != TASK_XMM0[2]
+    {
+        return None;
+    }
+
+    let new_handle = table.spawn(2).ok()?;
+    let stale_rejected =
+        table.state(old_handle) == Err(SlotError::StaleHandle)
+        && table.finish(old_handle) == Err(SlotError::StaleHandle)
+        && table.state(new_handle).ok()? == SlotState::Allocated
+        && new_handle.generation == old_handle.generation.checked_add(1)?;
+
+    // Reinitialize a fresh, unqueued kernel-only IRETQ frame on the same
+    // wiped physical stack. It is validated but NEVER dispatched in this
+    // test; future work must implement controlled task creation/enqueue.
+    let new_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
+    let next = KernelTrapFrame {
+        registers: SavedGprs::default(),
+        hardware: HardwareReturnFrame {
+            rip: task2 as usize as u64,
+            cs: u64::from(cs),
+            rflags: 0x202,
+            rsp: (top - 8) as u64,
+            ss: u64::from(SS::get_reg().0),
+        },
+    };
+    // SAFETY: this new frame lies inside the now-unowned, cleared stack2;
+    // task2 remains NOT RUNNABLE and no IRQ can attempt to restore it.
+    let valid_new_frame = unsafe {
+        (bottom as *mut u64).write_volatile(CANARY ^ 2);
+        (new_rsp as *mut KernelTrapFrame).write(next);
+        validate_kernel_resume(
+            new_rsp as u64, bottom as u64, top as u64, cs,
+            &*(new_rsp as *const KernelTrapFrame)
+        ).is_ok()
+    } && canary_ok(2)
+        && RUNNABLE.load(Ordering::Acquire) & (1u64 << 2) == 0;
+    FRAME_RSP[2].store(new_rsp, Ordering::Release);
+    if !stale_rejected || !valid_new_frame {
+        return None;
+    }
+    Some(RecycleProof {
+        old_generation: old_handle.generation,
+        new_generation: new_handle.generation,
+        scrubbed_stack,
+        fx,
+        valid_new_frame,
+        stale_rejected,
+        old_handle_refused_while_running,
+        grace_refused,
+    })
+}
+
 /// BSP only; enter and leave with IRQs disabled. APIC timer hardware remains
 /// mapped and programmed by the caller; APs are parked (IF=0).
 pub fn verify() -> bool {
