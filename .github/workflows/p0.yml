@@ -35,6 +35,8 @@ jobs:
         run: make ap-handoff-smoke
       - name: One real saved-RSP and FXSAVE64 kernel task resumes on other APs (4 vCPUs)
         run: make ap-stack-migrate-smoke
+      - name: IRQ-preempted full-GPR and FX kernel frame resumes on another AP (4 vCPUs)
+        run: make ap-irq-migrate-smoke
       - name: Independent local periodic xAPIC timer IRQs on three APs (4 vCPUs)
         run: make ap-local-timer-smoke
       - name: Three APs independently preempt two private kernel tasks by local IRQ (4 vCPUs)
