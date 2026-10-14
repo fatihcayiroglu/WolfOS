@@ -609,7 +609,7 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
                 ERROR.load(Ordering::Acquire),
             ));
             serial::write_fmt(format_args!(
-                "WOLFOS_AP_IRQ_MIGRATE_TRACE diag worker={} irq={} coord={} xmm_saved={:#x} xmm_expected={:#x}\\n",
+                "WOLFOS_AP_IRQ_MIGRATE_TRACE diag worker={} irq={} coord={} xmm_saved={:#x} xmm_expected={:#x}\n",
                 WORKER_BAD.load(Ordering::Acquire),
                 IRQ_BAD.load(Ordering::Acquire),
                 COORD_BAD[next_cpu].load(Ordering::Acquire),
