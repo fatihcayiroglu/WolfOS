@@ -21,7 +21,9 @@ use crate::{context_switch, kernel_trap_frame::{
 
 const TASK_COUNT: usize = 3;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = 26;
+const STOP_AFTER: u64 = 36;
+const FINISH_AFTER_SWITCHES: u64 = 26;
+const FINISH_FREEZE_REQUIRED: u64 = 6;
 const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
@@ -82,6 +84,19 @@ static RESUME_COUNT: AtomicU64 = AtomicU64::new(0);
 static BLOCK_ERRORS: AtomicU64 = AtomicU64::new(0);
 static POST_WAKE_VISITS: [AtomicU64; TASK_COUNT] =
     [const { AtomicU64::new(0) }; TASK_COUNT];
+
+// Proof-only finished-task lifecycle. 0=not requested; 1=task2 marks
+// Finished while still running; 2=first genuine IRQ switches away.
+// The stack and FXSAVE image remain allocated for diagnostic inspection.
+static FINISH_PHASE: AtomicUsize = AtomicUsize::new(0);
+static FINISHED: AtomicU64 = AtomicU64::new(0);
+static FINISH_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static FINISH_WORK_SNAPSHOT: AtomicU64 = AtomicU64::new(0);
+static FINISH_FROZEN_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static FINISH_SKIPS: AtomicU64 = AtomicU64::new(0);
+static FINISH_ERRORS: AtomicU64 = AtomicU64::new(0);
+static POST_FINISH_VISITS: [AtomicU64; 2] =
+    [const { AtomicU64::new(0) }; 2];
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
