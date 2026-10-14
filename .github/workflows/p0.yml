@@ -33,6 +33,8 @@ jobs:
         run: make apic-timer-smoke
       - name: PIT2-referenced xAPIC periodic timer calibration smoke (1 and 4 vCPUs)
         run: make apic-calibration-smoke
+      - name: BSP genuine two-stack involuntary xAPIC timer preemption proof (1 and 4 vCPUs)
+        run: make apic-preempt-smoke
       - name: Preserve ISO on failure
         if: failure()
         uses: actions/upload-artifact@v4

@@ -1,0 +1,263 @@
+//! QEMU-only BSP proof of *involuntary* kernel-to-kernel task handoff.
+//!
+//! Two private kernel stacks run CPU-bound tasks that NEVER yield to one
+//! another. An actual periodic xAPIC interrupt stores the interrupted
+//! 15-GPR + hardware trap-frame RSP and selects the other task's saved RSP.
+//! Assembly pops the selected task's GPRs and IRETQs onto its stack.
+//!
+//! The task finishing the bounded proof voluntarily returns to the original
+//! BSP test harness ONCE, with IF=0. This is not a production scheduler:
+//! no arbitrary tasks, IRQ-safe locking, XSAVE/FPU state, CR3/TLS, ring 3,
+//! migration, guard pages or AP-local interrupts. All work is BSP-owned.
+
+use core::cell::UnsafeCell;
+use core::mem::size_of;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use x86_64::instructions::segmentation::{CS, SS, Segment};
+
+use crate::{context_switch, kernel_trap_frame::{
+    HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume
+}};
+
+const STACK_BYTES: usize = 16 * 1024;
+const STOP_AFTER: u64 = 8;
+const MIN_EPOCHS_PER_TASK: u64 = 4;
+const MAX_TASK_SPINS: u64 = 200_000_000;
+const CANARY: u64 = 0x574f_4c46_5052_454d;
+
+#[repr(align(16))]
+struct Stack([u8; STACK_BYTES]);
+struct PrivateStacks(UnsafeCell<[Stack; 2]>);
+// SAFETY: only BSP runs; tasks own disjoint stacks. The interrupt handler
+// observes saved frame addresses atomically but does not mutate live Rust
+// data borrowed across an IRQ or context switch.
+unsafe impl Sync for PrivateStacks {}
+static STACKS: PrivateStacks =
+    PrivateStacks(UnsafeCell::new([const { Stack([0; STACK_BYTES]) }; 2]));
+
+struct BspSlot(UnsafeCell<usize>);
+// SAFETY: only BSP accesses these raw RSP slots while IF=0 and with all
+// mutable Rust borrows ended. IRQ handler never reads or modifies them.
+unsafe impl Sync for BspSlot {}
+static BSP_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
+static START_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
+static EXIT_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
+
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+static STARTED: AtomicBool = AtomicBool::new(false);
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+static FRAME_RSP: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
+static WORK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static INTERRUPTED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static SWITCHES: AtomicU64 = AtomicU64::new(0);
+static REJECTED: AtomicU64 = AtomicU64::new(0);
+static EXIT_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
+static CODE_SELECTOR: AtomicUsize = AtomicUsize::new(0);
+
+fn stack_bottom(id: usize) -> usize {
+    // SAFETY: id is always 0 or 1, and no Rust reference to the stack is
+    // created, only the stable static allocation's raw address.
+    let ptr = unsafe { core::ptr::addr_of_mut!((*STACKS.0.get())[id]) };
+    ptr.cast::<u8>() as usize
+}
+
+fn stack_top(id: usize) -> usize {
+    stack_bottom(id) + STACK_BYTES
+}
+
+fn canary_ok(id: usize) -> bool {
+    // SAFETY: only called from BSP after both tasks are stopped with IF=0.
+    unsafe {
+        (stack_bottom(id) as *const u64).read_volatile() == (CANARY ^ id as u64)
+    }
+}
+
+fn prepare() -> bool {
+    let cs = CS::get_reg().0;
+    let ss = SS::get_reg().0;
+    if cs == 0 || cs & 3 != 0 || ss == 0 || ss & 3 != 0 {
+        return false;
+    }
+    CODE_SELECTOR.store(usize::from(cs), Ordering::Relaxed);
+
+    let a_bottom = stack_bottom(0);
+    let b_bottom = stack_bottom(1);
+    let a_top = stack_top(0);
+    let b_top = stack_top(1);
+    if a_bottom & 15 != 0 || b_bottom & 15 != 0
+        || a_top & 15 != 0 || b_top & 15 != 0 { return false; }
+
+    // First task enters through existing cooperative context_switch from
+    // the BSP. It does NOT switch cooperatively to the other task.
+    // Six callee-saved registers, return-to-entry PC, dummy return address.
+    let a_start_rsp = a_top - 8 * size_of::<usize>();
+    let b_saved_rsp = b_top - 8 - 64 - size_of::<KernelTrapFrame>();
+    if b_saved_rsp & 7 != 0 { return false; }
+    // SAFETY: these memory locations lie within distinct private inactive
+    // stacks. Only the BSP initializes them before any task executes.
+    unsafe {
+        (a_bottom as *mut u64).write_volatile(CANARY);
+        (b_bottom as *mut u64).write_volatile(CANARY ^ 1);
+        core::ptr::write_bytes(a_start_rsp as *mut u8, 0, 64);
+        ((a_start_rsp as *mut usize).add(6)).write(task0 as usize);
+        let b_frame = KernelTrapFrame {
+            registers: SavedGprs::default(),
+            hardware: HardwareReturnFrame {
+                rip: task1 as usize as u64,
+                cs: u64::from(cs),
+                rflags: 0x202,
+                rsp: (b_top - 8) as u64,
+                ss: u64::from(ss),
+            },
+        };
+        (b_saved_rsp as *mut KernelTrapFrame).write(b_frame);
+        *START_RSP.0.get() = a_start_rsp;
+    }
+    FRAME_RSP[0].store(0, Ordering::Relaxed);
+    FRAME_RSP[1].store(b_saved_rsp, Ordering::Relaxed);
+    // SAFETY: no task has run; synthetic frame lies within stack bounds,
+    // points to the correct code segment, and is 8-byte aligned.
+    unsafe {
+        validate_kernel_resume(
+            b_saved_rsp as u64, b_bottom as u64, b_top as u64, cs,
+            &*(b_saved_rsp as *const KernelTrapFrame)
+        ).is_ok()
+    }
+}
+
+/// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
+/// No allocations, logging, task changes inside Rust frame borrows, or
+/// scheduler lock acquisition. The returned pointer is a *different live
+/// private stack* only when both frames pass validation.
+///
+/// The assembly IRQ entry restores all GPRs and IRETQs using this pointer.
+pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame {
+    if !ACTIVE.load(Ordering::Relaxed) { return frame_ptr; }
+    let current = CURRENT.load(Ordering::Relaxed);
+    if current >= 2 {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return frame_ptr;
+    }
+    let next = 1 - current;
+    let old_rsp = frame_ptr as usize;
+    let next_rsp = FRAME_RSP[next].load(Ordering::Relaxed);
+    let cs = CODE_SELECTOR.load(Ordering::Relaxed) as u16;
+    let old_ok = old_rsp >= stack_bottom(current) + 512
+        && old_rsp.checked_add(size_of::<KernelTrapFrame>())
+            .is_some_and(|end| end <= stack_top(current));
+    let new_ok = next_rsp >= stack_bottom(next) + 512
+        && next_rsp.checked_add(size_of::<KernelTrapFrame>())
+            .is_some_and(|end| end <= stack_top(next));
+    if !old_ok || !new_ok {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return frame_ptr;
+    }
+    // SAFETY: both bounded, stable and sufficiently aligned BSP-owned frames;
+    // only the currently interrupted task's frame is written by the CPU.
+    // Other task is suspended; its frame remains immutable until resumed.
+    let valid = unsafe {
+        validate_kernel_resume(
+            old_rsp as u64, stack_bottom(current) as u64,
+            stack_top(current) as u64, cs, &*frame_ptr
+        ).is_ok() && validate_kernel_resume(
+            next_rsp as u64, stack_bottom(next) as u64,
+            stack_top(next) as u64, cs, &*(next_rsp as *const KernelTrapFrame)
+        ).is_ok()
+    };
+    if !valid {
+        REJECTED.fetch_add(1, Ordering::Relaxed);
+        return frame_ptr;
+    }
+
+    FRAME_RSP[current].store(old_rsp, Ordering::Relaxed);
+    INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
+    CURRENT.store(next, Ordering::Relaxed);
+    SWITCHES.fetch_add(1, Ordering::Relaxed);
+    next_rsp as *const KernelTrapFrame
+}
+
+#[inline(never)]
+fn busy_task(id: usize) -> ! {
+    // Set IF only AFTER entering this private stack. Each task spins doing
+    // independent atomic work and NEVER calls yield to the other task.
+    x86_64::instructions::interrupts::enable();
+    for _ in 0..MAX_TASK_SPINS {
+        WORK[id].fetch_add(1, Ordering::Relaxed);
+        if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
+            && WORK[0].load(Ordering::Relaxed) != 0
+            && WORK[1].load(Ordering::Relaxed) != 0
+            && INTERRUPTED[0].load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            && INTERRUPTED[1].load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    // Exactly ONE task exits after enough *involuntary* two-task switches.
+    // The other remains suspended on its private stack. No future IRQ can
+    // select it after ACTIVE clears and IF=0.
+    x86_64::instructions::interrupts::disable();
+    ACTIVE.store(false, Ordering::Relaxed);
+    EXIT_TASK.store(id, Ordering::Release);
+    // SAFETY: only BSP, IF=0, task's current context and saved BSP context
+    // are different, live and disjoint; no Rust borrow spans this switch.
+    unsafe { context_switch::switch_raw(EXIT_RSP.0.get(), BSP_RSP.0.get()); }
+    crate::halt_forever()
+}
+
+extern "C" fn task0() -> ! { busy_task(0) }
+extern "C" fn task1() -> ! { busy_task(1) }
+
+/// BSP only; enter and leave with IRQs disabled. APIC timer hardware remains
+/// mapped and programmed by the caller; APs are parked (IF=0).
+pub fn verify() -> bool {
+    if x86_64::instructions::interrupts::are_enabled()
+        || STARTED.swap(true, Ordering::AcqRel) || !prepare()
+    {
+        return false;
+    }
+    CURRENT.store(0, Ordering::Relaxed);
+    WORK[0].store(0, Ordering::Relaxed);
+    WORK[1].store(0, Ordering::Relaxed);
+    INTERRUPTED[0].store(0, Ordering::Relaxed);
+    INTERRUPTED[1].store(0, Ordering::Relaxed);
+    SWITCHES.store(0, Ordering::Relaxed);
+    REJECTED.store(0, Ordering::Relaxed);
+    EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
+    ACTIVE.store(true, Ordering::Release);
+
+    // SAFETY: starts first task at normal ABI boundary, IF=0 on BSP.
+    // From now on, ONLY APIC hardware interrupts transfer task0<->task1.
+    unsafe { context_switch::switch_raw(BSP_RSP.0.get(), START_RSP.0.get()); }
+
+    if x86_64::instructions::interrupts::are_enabled()
+        || ACTIVE.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    let switches = SWITCHES.load(Ordering::Acquire);
+    let first = INTERRUPTED[0].load(Ordering::Acquire);
+    let second = INTERRUPTED[1].load(Ordering::Acquire);
+    let work0 = WORK[0].load(Ordering::Acquire);
+    let work1 = WORK[1].load(Ordering::Acquire);
+    let rejected = REJECTED.load(Ordering::Acquire);
+    let exit_task = EXIT_TASK.load(Ordering::Acquire);
+    let ok = switches >= STOP_AFTER
+        && first >= MIN_EPOCHS_PER_TASK && second >= MIN_EPOCHS_PER_TASK
+        && first + second == switches
+        && work0 > 0 && work1 > 0
+        && rejected == 0 && exit_task < 2
+        && canary_ok(0) && canary_ok(1);
+    if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_PREEMPT_OK tasks=2 involuntary_switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0\n",
+            switches, first, second, work0, work1, exit_task, rejected
+        ));
+    } else {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={}\n",
+            switches, first, second, work0, work1, exit_task, rejected
+        ));
+    }
+    ok
+}

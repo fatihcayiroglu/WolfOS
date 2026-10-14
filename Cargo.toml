@@ -21,6 +21,7 @@ paging-fault-smoke = ["smoke-exit"]
 timer-smoke = ["smoke-exit"]
 apic-timer-smoke = ["smoke-exit"]
 apic-calibration-smoke = ["smoke-exit"]
+apic-preempt-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
