@@ -137,6 +137,41 @@ pub unsafe fn switch(current: usize, next: usize) -> Option<u64> {
     }
 }
 
+/// Activate a prepared FX image before a BSP-only, direct IRETQ task
+/// bootstrap. Returns the image's XMM0 low lane before it is loaded.
+///
+/// # Safety
+/// IF=0, x87/SSE enabled by enter(), the indexed task owns a valid image,
+/// and no other CPU or runnable task may reference this FX context.
+pub unsafe fn activate_prepared_task(task: usize) -> Option<u64> {
+    if task >= FX_TASKS { return None; }
+    unsafe {
+        let images = TASK_IMAGES.0.get();
+        let image = core::ptr::addr_of!((*images)[task]);
+        let baseline = (*image).xmm_low(0)?;
+        restore_raw(image);
+        Some(baseline)
+    }
+}
+
+/// Save the presently executing BSP's FX state into one now-paused task
+/// image before restoring the original BSP's own context. Does not switch
+/// task or load another image.
+///
+/// # Safety
+/// IF=0, x87/SSE still enabled, and the most recent active task is exactly
+/// the task named here. It has returned to BSP via ABI-only stack switching,
+/// leaving its live x87/SSE registers in the CPU.
+pub unsafe fn snapshot_active_task(task: usize) -> Option<u64> {
+    if task >= FX_TASKS { return None; }
+    unsafe {
+        let images = TASK_IMAGES.0.get();
+        let image = core::ptr::addr_of_mut!((*images)[task]);
+        save_raw(image);
+        (*image).xmm_low(0)
+    }
+}
+
 /// Load a distinctive low 64-bit XMM0 lane while a task is running.
 /// Unsafe because the caller must own this BSP task's live FX state.
 pub unsafe fn set_test_xmm0(value: u64) {
