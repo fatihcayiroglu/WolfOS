@@ -33,13 +33,15 @@ else ifeq ($(FLAVOR),ap-handoff)
 FEATURES := --features ap-handoff-smoke
 else ifeq ($(FLAVOR),ap-stack-migrate)
 FEATURES := --features ap-stack-migrate-smoke
+else ifeq ($(FLAVOR),ap-irq-migrate)
+FEATURES := --features ap-irq-migrate-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -128,6 +130,10 @@ ap-handoff-smoke:
 ap-stack-migrate-smoke:
 	$(MAKE) iso FLAVOR=ap-stack-migrate
 	python3 scripts/ap_stack_migrate_smoke.py $(OUT)/wolfos-ap-stack-migrate.iso
+
+ap-irq-migrate-smoke:
+	$(MAKE) iso FLAVOR=ap-irq-migrate
+	python3 scripts/ap_irq_migrate_smoke.py $(OUT)/wolfos-ap-irq-migrate.iso
 
 test:
 	python3 -m unittest discover -s tests -v
