@@ -121,7 +121,7 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
     // briefly, accepts directed fixed IPIs, EOI-acks and reparks with IF=0.
     #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
-               feature = "ap-handoff-smoke"))]
+               feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke"))]
     if !crate::ap_ipi_smoke::secondary_wait(index, info.lapic_id) {
         crate::halt_forever();
     }
