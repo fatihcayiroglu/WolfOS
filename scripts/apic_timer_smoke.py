@@ -60,7 +60,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             print(run.stderr.decode(errors="replace"))
             return False
         task_proof = re.search(
-            r"WOLFOS_APIC_TIMER_TASKS_OK threads=(\\d+) dispatches=(\\d+) switches=(\\d+) stack_kib=(\\d+) gated_by_irq=(\\d+) preemptive=(\\d+)",
+            r"WOLFOS_APIC_TIMER_TASKS_OK threads=(\d+) dispatches=(\d+) switches=(\d+) stack_kib=(\d+) gated_by_irq=(\d+) preemptive=(\d+)",
             output,
         )
         if task_proof is None or tuple(map(int, task_proof.groups())) != (2, 6, 12, 16, 1, 0):
