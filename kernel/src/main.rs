@@ -54,6 +54,8 @@ mod kernel_trap_frame;
 mod apic_irq_entry;
 #[cfg(feature = "apic-preempt-smoke")]
 mod apic_preempt_smoke;
+#[cfg(feature = "apic-preempt-smoke")]
+mod preempt_depth;
 #[cfg(feature = "apic-calibration-smoke")]
 mod lapic_timer_calibration;
 #[cfg(feature = "timer-smoke")]
