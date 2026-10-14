@@ -256,4 +256,30 @@ mod tests {
         assert_eq!(slots.retire(b, safe_gate()), Ok(()));
         assert_eq!(slots.state(a), Ok(SlotState::Allocated));
     }
+    #[test]
+    fn recycled_generation_can_execute_then_finish_without_reviving_old_owner() {
+        let mut slots = SlotTable::<3>::new();
+        let old = slots.spawn(2).unwrap();
+        slots.finish(old).unwrap();
+        slots.retire(old, safe_gate()).unwrap();
+
+        let fresh = slots.spawn(2).unwrap();
+        assert_eq!(fresh.generation, 2);
+        assert_eq!(slots.state(fresh), Ok(SlotState::Allocated));
+        assert_eq!(slots.finish(old), Err(SlotError::StaleHandle));
+        // The *new generation*, and only it, may finish after actual work.
+        slots.finish(fresh).unwrap();
+        assert_eq!(slots.state(fresh), Ok(SlotState::Finished));
+        assert_eq!(slots.state(old), Err(SlotError::StaleHandle));
+        assert_eq!(slots.finish(fresh), Err(SlotError::NotAllocated));
+        assert_eq!(slots.spawn(2), Err(SlotError::Occupied));
+
+        slots.retire(fresh, safe_gate()).unwrap();
+        let third = slots.spawn(2).unwrap();
+        assert_eq!(third.generation, 3);
+        assert_eq!(slots.state(old), Err(SlotError::StaleHandle));
+        assert_eq!(slots.state(fresh), Err(SlotError::StaleHandle));
+        assert_eq!(slots.state(third), Ok(SlotState::Allocated));
+    }
+
 }
