@@ -1025,7 +1025,7 @@ fn recycle_quiescent_task2() -> Option<RecycleProof> {
     // smoke. No cross-CPU reclamation is possible with this prototype.
     if !interrupts_disabled || !scheduler_inactive || !disjoint_bsp
         || !old_task_not_current || ready_mask != 0b011
-        || finished_mask != 0b100
+        || finished_mask != 0b1100
         || FINISH_PHASE.load(Ordering::Acquire) != 2
         || FINISH_ERRORS.load(Ordering::Acquire) != 0
         || frozen < task_slot::MIN_GRACE_IRQS
@@ -1233,7 +1233,7 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
         || RECYCLE_ACTIVE.load(Ordering::Acquire)
         || PREEMPT_DEPTH.depth() != 0
         || proof.old_generation.checked_add(1) != Some(proof.new_generation)
-        || FINISHED.load(Ordering::Acquire) != 0b100
+        || FINISHED.load(Ordering::Acquire) != 0b1100
         || RUNNABLE.load(Ordering::Acquire) != 0b011
     {
         return fail("not_quiescent");
@@ -1307,7 +1307,8 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
     // There is no active generic task scheduler; IRQs simply IRETQ to
     // the new worker, which returns once to its saved BSP caller.
     RUNNABLE.store(1 << 2, Ordering::Release);
-    FINISHED.store(0, Ordering::Release);
+    // The first-generation task3 remains terminal throughout reuse.
+    FINISHED.store(1u64 << LIVE_TASK, Ordering::Release);
     // SAFETY: BSP, IF=0 and valid isolated private x86-64 kernel frame.
     // IRETQ enables IF *on the worker's stack*, not on the BSP. The worker
     // returns via the paired context_switch primitive with IF=0.
@@ -1331,7 +1332,7 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
     // another stack, and the timer ISR will no longer restore this FX state.
     unsafe { fx_state::leave(original_fx); }
     RUNNABLE.store(0, Ordering::Release);
-    FINISHED.store(1 << 2, Ordering::Release);
+    FINISHED.store((1 << LIVE_TASK) | (1 << 2), Ordering::Release);
     // SAFETY: BSP IF=0, the old handle cannot be mistaken for the new one.
     let state_ok = unsafe {
         let table = &mut *SLOT_OWNERS.0.get();
@@ -1352,7 +1353,7 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
         && !x86_64::instructions::interrupts::are_enabled()
         && !ACTIVE.load(Ordering::Acquire)
         && RUNNABLE.load(Ordering::Acquire) == 0
-        && FINISHED.load(Ordering::Acquire) == 0b100;
+        && FINISHED.load(Ordering::Acquire) == 0b1100;
     if ok {
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_REUSE_EXEC_OK task=2 old_gen={} new_gen={} via_iretq=1 entry_r12={:#x} entry_r15={:#x} irq={} work={} first_irq_work={} xmm_initial={:#x} xmm_final={:#x} xmm_old={:#x} corrupt={} stale=1 finished_new=1 ready=0 bsp_only=1\n",
@@ -1533,7 +1534,7 @@ pub fn verify() -> bool {
         && freeze_checks == block_irqs && block_skips >= 2
         && frozen_work > 0 && block_errors == 0
         && RUNNABLE.load(Ordering::Acquire) == 0b011
-        && finish_phase == 2 && finished_mask == 0b100
+        && finish_phase == 2 && finished_mask == 0b1100
         && finish_attempts == 1 && finish_work > 0
         && finish_freezes >= FINISH_FREEZE_REQUIRED
         && finish_skips >= 2 && finish_errors == 0
@@ -1549,7 +1550,7 @@ pub fn verify() -> bool {
             live_frozen, live_survivors
         ));
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_FINISHED_OK task=2 mask=4 ready=3 finish=1 frozen_irqs={} skipped={} errors={} frozen_work={} survivor0={} survivor1={} never_rescheduled=1 fx_still_owned=1\n",
+            "WOLFOS_APIC_FINISHED_OK task=2 mask=12 ready=3 finish=1 frozen_irqs={} skipped={} errors={} frozen_work={} survivor0={} survivor1={} never_rescheduled=1 fx_still_owned=1\n",
             finish_freezes, finish_skips, finish_errors, finish_work,
             survivor0, survivor1
         ));
