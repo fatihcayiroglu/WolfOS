@@ -244,6 +244,9 @@ extern "C" fn worker() -> ! {
         last_cpu: usize::MAX,
     };
     let ptr = core::ptr::addr_of_mut!(local);
+    // The initial task enters by ABI-only stack switch with IF=0.
+    // Later migrations resume via a captured IRETQ with saved IF=1.
+    x86_64::instructions::interrupts::enable();
     loop {
         let Some(cpu) = ap_ipi_smoke::ap_slot(ap_ipi_smoke::local_id())
         else { crate::halt_forever(); };
