@@ -192,7 +192,7 @@ fn run_mapped_test(expected_id: u32) -> bool {
     };
     #[cfg(feature = "apic-calibration-smoke")]
     serial::write_fmt(format_args!(
-        "WOLFOS_APIC_CALIBRATION_OK effective_hz={} initial_count={} pit_hz={} pit_ticks={} divisor={} target_hz=100\\n",
+        "WOLFOS_APIC_CALIBRATION_OK effective_hz={} initial_count={} pit_hz={} pit_ticks={} divisor={} target_hz=100\n",
         effective_hz, initial_count, PIT_CLOCK_HZ, PIT_INTERVAL_TICKS, DIVISOR
     ));
 
