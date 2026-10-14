@@ -41,6 +41,62 @@ pub fn next_runnable(
     Err(SelectError::NoRunnableTask)
 }
 
+/// Invalid lifecycle operations are fail-closed. Callers that mutate a
+/// runnable mask from an IRQ must use atomic CAS/fetch_update and rerun these
+/// pure checks against the then-current mask; a stale read is not a lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnableError {
+    InvalidTaskCount,
+    InvalidTask,
+    InvalidMask,
+    AlreadyBlocked,
+    AlreadyReady,
+    WouldBlockLastRunnable,
+}
+
+fn valid_bit(mask: u64, task: usize, count: usize)
+    -> Result<u64, RunnableError>
+{
+    if count == 0 || count > 64 {
+        return Err(RunnableError::InvalidTaskCount);
+    }
+    if task >= count {
+        return Err(RunnableError::InvalidTask);
+    }
+    if count < 64 && mask >> count != 0 {
+        return Err(RunnableError::InvalidMask);
+    }
+    Ok(1u64 << task)
+}
+
+/// Remove one task from the runnable set. The current task may be blocked
+/// only while there remains another runnable task for its next IRQ handoff.
+pub fn block_runnable(mask: u64, task: usize, count: usize)
+    -> Result<u64, RunnableError>
+{
+    let bit = valid_bit(mask, task, count)?;
+    if mask & bit == 0 {
+        return Err(RunnableError::AlreadyBlocked);
+    }
+    let remaining = mask & !bit;
+    if remaining == 0 {
+        return Err(RunnableError::WouldBlockLastRunnable);
+    }
+    Ok(remaining)
+}
+
+/// Wake exactly one currently blocked task; cannot silently insert an invalid
+/// task index, or accidentally wake an already runnable task.
+pub fn wake_runnable(mask: u64, task: usize, count: usize)
+    -> Result<u64, RunnableError>
+{
+    let bit = valid_bit(mask, task, count)?;
+    if mask & bit != 0 {
+        return Err(RunnableError::AlreadyReady);
+    }
+    Ok(mask | bit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,4 +138,43 @@ mod tests {
         assert_eq!(next_runnable(63, 64, 1), Ok(0));
         assert_eq!(next_runnable(0, 64, 1 << 63), Ok(63));
     }
+    #[test]
+    fn blocked_task_is_skipped_then_returns_to_fair_rotation_after_wake() {
+        let original = 0b111_u64;
+        let blocked = block_runnable(original, 1, 3).unwrap();
+        assert_eq!(blocked, 0b101);
+        assert_eq!(next_runnable(0, 3, blocked), Ok(2));
+        assert_eq!(next_runnable(2, 3, blocked), Ok(0));
+        assert_eq!(next_runnable(1, 3, blocked), Ok(2));
+        let restored = wake_runnable(blocked, 1, 3).unwrap();
+        assert_eq!(restored, original);
+        let mut current = 0;
+        let mut visits = [0; 3];
+        for _ in 0..36 {
+            current = next_runnable(current, 3, restored).unwrap();
+            visits[current] += 1;
+        }
+        assert_eq!(visits, [12, 12, 12]);
+    }
+
+    #[test]
+    fn lifecycle_refuses_double_block_double_wake_and_last_ready_removal() {
+        assert_eq!(block_runnable(0b111, 1, 3), Ok(0b101));
+        assert_eq!(block_runnable(0b101, 1, 3), Err(RunnableError::AlreadyBlocked));
+        assert_eq!(wake_runnable(0b111, 1, 3), Err(RunnableError::AlreadyReady));
+        assert_eq!(block_runnable(0b010, 1, 3), Err(RunnableError::WouldBlockLastRunnable));
+        assert_eq!(wake_runnable(0b000, 2, 3), Ok(0b100));
+    }
+
+    #[test]
+    fn lifecycle_refuses_invalid_indices_and_out_of_range_bits() {
+        assert_eq!(block_runnable(1, 0, 0), Err(RunnableError::InvalidTaskCount));
+        assert_eq!(wake_runnable(1, 0, 65), Err(RunnableError::InvalidTaskCount));
+        assert_eq!(block_runnable(0b111, 3, 3), Err(RunnableError::InvalidTask));
+        assert_eq!(wake_runnable(0b1000, 1, 3), Err(RunnableError::InvalidMask));
+        assert_eq!(block_runnable(0b1000, 1, 3), Err(RunnableError::InvalidMask));
+        assert_eq!(wake_runnable(0b101, 0, 3), Err(RunnableError::AlreadyReady));
+        assert_eq!(wake_runnable(0, 63, 64), Ok(1u64 << 63));
+    }
+
 }
