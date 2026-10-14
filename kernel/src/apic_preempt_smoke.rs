@@ -170,6 +170,63 @@ fn prepare() -> bool {
     true
 }
 
+/// Called only from a genuine BSP timer IRQ with IF=0. The current
+/// blocked task remains executing until its first IRQ: take the WORK[1]
+/// snapshot on that IRQ, not at the earlier block() call, to avoid falsely
+/// treating pre-IRQ work as a scheduling violation.
+///
+/// While task1 is suspended and not runnable, every additional IRQ must
+/// observe a frozen work counter. After a finite number of such IRQs,
+/// the timer wakes task1 by restoring its runnable bit. Its original
+/// saved trap frame and FX image remain untouched until selected again.
+fn timer_block_wake(current: usize) {
+    if BLOCK_PHASE.load(Ordering::Acquire) != 1 {
+        return;
+    }
+    if current == 1 {
+        if !BLOCK_ENTRY_CAPTURED.swap(true, Ordering::AcqRel) {
+            BLOCK_SAVED_WORK.store(WORK[1].load(Ordering::Acquire), Ordering::Release);
+            BLOCK_OTHER_WORK.store(
+                WORK[0].load(Ordering::Acquire)
+                    + WORK[2].load(Ordering::Acquire),
+                Ordering::Release
+            );
+        }
+        return;
+    }
+    if !BLOCK_ENTRY_CAPTURED.load(Ordering::Acquire) {
+        BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if WORK[1].load(Ordering::Acquire) != BLOCK_SAVED_WORK.load(Ordering::Acquire) {
+        BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        BLOCK_FROZEN_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    }
+    // With bit1 masked, a tick on task0 must skip task1 and select task2.
+    if current == 0 {
+        BLOCK_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    let ticks = BLOCKED_TIMER_IRQS.fetch_add(1, Ordering::AcqRel) + 1;
+    if ticks >= WAKE_AFTER_BLOCKED_IRQS {
+        let other_work = WORK[0].load(Ordering::Acquire)
+            + WORK[2].load(Ordering::Acquire);
+        if other_work <= BLOCK_OTHER_WORK.load(Ordering::Acquire) {
+            BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        let result = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::wake_runnable(mask, 1, TASK_COUNT).ok()
+        );
+        if result.is_ok() {
+            WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            BLOCK_PHASE.store(2, Ordering::Release);
+        } else {
+            BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
 /// No allocations, logging, task changes inside Rust frame borrows, or
 /// scheduler lock acquisition. The returned pointer is a *different live
@@ -185,6 +242,9 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
         return frame_ptr;
     }
     let current = CURRENT.load(Ordering::Relaxed);
+    // Hardware timer-driven wake happens before round-robin selection.
+    // Nested preempt-disable sections were checked above and never switch.
+    timer_block_wake(current);
     if current >= TASK_COUNT {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return frame_ptr;
@@ -246,6 +306,9 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
     CURRENT.store(next, Ordering::Relaxed);
     SWITCHES.fetch_add(1, Ordering::Relaxed);
+    if BLOCK_PHASE.load(Ordering::Acquire) >= 2 {
+        POST_WAKE_VISITS[next].fetch_add(1, Ordering::Relaxed);
+    }
     next_rsp as *const KernelTrapFrame
 }
 
