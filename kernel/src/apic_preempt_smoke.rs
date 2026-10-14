@@ -21,8 +21,13 @@ use crate::{context_switch, kernel_trap_frame::{
     task_slot::{self, SlotTable, SlotState, SlotError, ReclaimGate}};
 
 const TASK_COUNT: usize = 3;
+const SLOT_COUNT: usize = 4; // fourth slot is NOT runnable at boot
+const LIVE_TASK: usize = 3;
+const LIVE_REQUIRED_IRQS: u64 = 4;
+const LIVE_FROZEN_REQUIRED: u64 = 4;
+const LIVE_XMM0: u64 = 0x53a7_1199_cafe_f00d;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = 36;
+const STOP_AFTER: u64 = 60;
 const FINISH_AFTER_SWITCHES: u64 = 26;
 const FINISH_FREEZE_REQUIRED: u64 = 6;
 const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
@@ -37,21 +42,21 @@ const TASK_XMM0: [u64; TASK_COUNT] = [
 
 #[repr(align(16))]
 struct Stack([u8; STACK_BYTES]);
-struct PrivateStacks(UnsafeCell<[Stack; TASK_COUNT]>);
+struct PrivateStacks(UnsafeCell<[Stack; SLOT_COUNT]>);
 // SAFETY: only BSP runs; tasks own disjoint stacks. The interrupt handler
 // observes saved frame addresses atomically but does not mutate live Rust
 // data borrowed across an IRQ or context switch.
 unsafe impl Sync for PrivateStacks {}
 static STACKS: PrivateStacks =
     PrivateStacks(UnsafeCell::new([
-        const { Stack([0; STACK_BYTES]) }; TASK_COUNT
+        const { Stack([0; STACK_BYTES]) }; SLOT_COUNT
     ]));
 
 /// Pure ownership metadata, separate from ready/finished IRQ bitmap state.
 /// Only BSP mutates it when creating the smoke slots, under task2's
 /// preemption-disabled Finished transition, and after BSP quiescence.
 /// The IRQ callback NEVER accesses this UnsafeCell.
-struct OwnedSlots(UnsafeCell<SlotTable<TASK_COUNT>>);
+struct OwnedSlots(UnsafeCell<SlotTable<SLOT_COUNT>>);
 // SAFETY: only BSP; the ISR never touches OwnedSlots, and APs are parked.
 // Mutations do not overlap with another Rust reference to this allocation.
 unsafe impl Sync for OwnedSlots {}
@@ -68,8 +73,8 @@ static EXIT_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
-static FRAME_RSP: [AtomicUsize; TASK_COUNT] =
-    [const { AtomicUsize::new(0) }; TASK_COUNT];
+static FRAME_RSP: [AtomicUsize; SLOT_COUNT] =
+    [const { AtomicUsize::new(0) }; SLOT_COUNT];
 static WORK: [AtomicU64; TASK_COUNT] =
     [const { AtomicU64::new(0) }; TASK_COUNT];
 static INTERRUPTED: [AtomicU64; TASK_COUNT] =
@@ -111,12 +116,28 @@ static POST_FINISH_VISITS: [AtomicU64; 2] =
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
-static XMM_READY: [AtomicBool; TASK_COUNT] =
-    [const { AtomicBool::new(false) }; TASK_COUNT];
+static XMM_READY: [AtomicBool; SLOT_COUNT] =
+    [const { AtomicBool::new(false) }; SLOT_COUNT];
 static FX_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static FX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static FX_BAD: AtomicU64 = AtomicU64::new(0);
 static FX_WORK_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+// New slot3 is created and becomes Ready WHILE first-generation tasks0/1/2
+// are executing with real IRQ-driven preemption. Epoch 0: absent, 1:
+// admitted, 2: worker3 requested finish, 3: actual timer IRQ suspended it.
+static LIVE_PHASE: AtomicUsize = AtomicUsize::new(0);
+static LIVE_HANDLE_GEN: AtomicU64 = AtomicU64::new(0);
+static LIVE_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
+static LIVE_TASK_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_INTERRUPTED: AtomicU64 = AtomicU64::new(0);
+static LIVE_BAD: AtomicU64 = AtomicU64::new(0);
+static LIVE_INITIAL_XMM: AtomicU64 = AtomicU64::new(0);
+static LIVE_ENTRY_SEEN: AtomicBool = AtomicBool::new(false);
+static LIVE_FINISHES: AtomicU64 = AtomicU64::new(0);
+static LIVE_STOP_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_FROZEN: AtomicU64 = AtomicU64::new(0);
+static LIVE_SURVIVOR_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 // Second-generation task2 runs as a single IRQ-interruptible kernel worker
 // after the original fixed 3-task scheduler has stopped on the BSP stack.
