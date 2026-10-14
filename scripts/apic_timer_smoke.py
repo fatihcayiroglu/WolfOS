@@ -185,6 +185,37 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
                 or never_rescheduled != 1 or fx_still_owned != 1):
                 print(f"FAIL: task marked Finished was rescheduled, progressed or revived: {finished.groups()}")
                 return False
+            recycle = re.search(
+                r"WOLFOS_APIC_RECYCLE_OK task=(\d+) old_gen=(\d+) new_gen=(\d+) scrubbed_kib=(\d+) fx_bytes=(\d+) fx_scrub=(\d+) fx_reseed=(\d+) prior_xmm0=0x([0-9a-f]+) stale=(\d+) early_denied=(\d+) grace_denied=(\d+) frame_valid=(\d+) runnable=(\d+) bsp_only=(\d+) executed_new_task=(\d+)",
+                output,
+            )
+            if recycle is None:
+                print("FAIL: quiescent finished-slot stack/FX recycling proof missing")
+                return False
+            (slot, old_generation, new_generation, stack_kib, fx_size,
+             fx_scrub, fx_reseed, old_xmm_hex, stale_rejected,
+             premature_rejected, grace_rejected, frame_valid,
+             runnable, bsp_only, new_task_executed) = recycle.groups()
+            (slot, old_generation, new_generation, stack_kib, fx_size,
+             fx_scrub, fx_reseed, stale_rejected, premature_rejected,
+             grace_rejected, frame_valid, runnable,
+             bsp_only, new_task_executed) = map(
+                int, (slot, old_generation, new_generation, stack_kib, fx_size,
+                      fx_scrub, fx_reseed, stale_rejected, premature_rejected,
+                      grace_rejected, frame_valid, runnable, bsp_only,
+                      new_task_executed)
+            )
+            if (slot != 2 or old_generation < 1
+                or new_generation != old_generation + 1
+                or stack_kib != 16 or fx_size != 512
+                or fx_scrub != 1 or fx_reseed != 1
+                or int(old_xmm_hex, 16) != 0x0f0e0d0c0b0a0908
+                or stale_rejected != 1 or premature_rejected != 1
+                or grace_rejected != 1 or frame_valid != 1
+                or runnable != 0 or bsp_only != 1
+                or new_task_executed != 0):
+                print(f"FAIL: recycled stack/FX or generation ownership unsafe: {recycle.groups()}")
+                return False
             fx = re.search(
                 r"WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=(\d+) xmm0=(\d+) fx_switches=(\d+) fx_observations=(\d+) work_checks=(\d+) corrupt=(\d+) original_restored=(\d+) avx=(\d+)",
                 output,
@@ -212,6 +243,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             "WOLFOS_APIC_PREEMPT_ERROR",
             "WOLFOS_APIC_BLOCK_WAKE_ERROR",
             "WOLFOS_APIC_FINISHED_ERROR",
+            "WOLFOS_APIC_RECYCLE_ERROR",
             "WOLFOS_APIC_FXSTATE_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):

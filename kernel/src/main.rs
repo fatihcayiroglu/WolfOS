@@ -60,6 +60,8 @@ mod preempt_depth;
 mod fx_state;
 #[cfg(feature = "apic-preempt-smoke")]
 mod rr_policy;
+#[cfg(feature = "apic-preempt-smoke")]
+mod task_slot;
 #[cfg(feature = "apic-calibration-smoke")]
 mod lapic_timer_calibration;
 #[cfg(feature = "timer-smoke")]
