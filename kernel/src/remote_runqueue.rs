@@ -187,17 +187,17 @@ mod tests {
     fn full_lifecycle_and_generations() {
         let q = RemoteMailbox::new(3);
         assert!(q.is_idle_generation(0));
-        for gen in 1..=20 {
-            let token = (gen << 32) | 0x55aa;
-            assert_eq!(q.publish(3, gen, token), Ok(()));
+        for generation in 1..=20 {
+            let token = (generation << 32) | 0x55aa;
+            assert_eq!(q.publish(3, generation, token), Ok(()));
             assert_eq!(q.claimed_work(3), Ok(None));
-            assert_eq!(q.claim_from_irq(3), Ok(gen));
-            assert_eq!(q.claimed_work(3), Ok(Some(Job { sequence: gen, token })));
-            let digest = compute_digest(3, gen, token);
-            assert_eq!(q.finish(3, gen, digest), Ok(()));
-            assert_eq!(q.completed(3, gen), Ok(Some(digest)));
-            assert_eq!(q.retire(3, gen), Ok(()));
-            assert!(q.is_idle_generation(gen));
+            assert_eq!(q.claim_from_irq(3), Ok(generation));
+            assert_eq!(q.claimed_work(3), Ok(Some(Job { sequence: generation, token })));
+            let digest = compute_digest(3, generation, token);
+            assert_eq!(q.finish(3, generation, digest), Ok(()));
+            assert_eq!(q.completed(3, generation), Ok(Some(digest)));
+            assert_eq!(q.retire(3, generation), Ok(()));
+            assert!(q.is_idle_generation(generation));
         }
     }
 
