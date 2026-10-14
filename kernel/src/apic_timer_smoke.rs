@@ -60,6 +60,19 @@ static TRAP_FRAMES: AtomicU64 = AtomicU64::new(0);
 static TRAP_BAD: AtomicU64 = AtomicU64::new(0);
 static TRAP_GPR_CHECKSUM: AtomicU64 = AtomicU64::new(0);
 
+// Symbols consumed directly by the QEMU-only global assembly probe.
+// All probe state belongs exclusively to the BSP. APs stay parked.
+// The counter is never read or written concurrently by Rust or an IRQ:
+ // assembly decrements it after Rust's one-time initialization.
+#[unsafe(no_mangle)]
+pub static WOLFOS_PROBE_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[unsafe(no_mangle)]
+pub static WOLFOS_PROBE_MATCH: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+pub static mut WOLFOS_PROBE_SPINS: u64 = 0;
+static PROBE_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static PROBE_MISMATCH: AtomicU64 = AtomicU64::new(0);
+
 
 /// IRQ-published BSP epoch; read by a worker with IRQs enabled.
 /// No timer frequency or wall-clock accuracy is implied.
@@ -138,6 +151,30 @@ pub extern "C" fn wolfos_apic_timer_irq_dispatch(
         ^ regs.r10 ^ regs.r11 ^ regs.r12 ^ regs.r13 ^ regs.r14 ^ regs.r15;
     TRAP_GPR_CHECKSUM.fetch_xor(checksum, Ordering::Relaxed);
     TRAP_FRAMES.fetch_add(1, Ordering::Relaxed);
+
+    if WOLFOS_PROBE_ACTIVE.load(Ordering::Relaxed) {
+        PROBE_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        let preserved = regs.rax == 0x101
+            && regs.rbx == 0x102
+            && regs.rcx == 0x103
+            && regs.rdx == 0x104
+            && regs.rsi == 0x105
+            && regs.rdi == 0x106
+            && regs.rbp == 0x107
+            && regs.r8 == 0x108
+            && regs.r9 == 0x109
+            && regs.r10 == 0x10a
+            && regs.r11 == 0x10b
+            && regs.r12 == 0x10c
+            && regs.r13 == 0x10d
+            && regs.r14 == 0x10e
+            && regs.r15 == 0x10f;
+        if preserved {
+            WOLFOS_PROBE_MATCH.fetch_add(1, Ordering::Relaxed);
+        } else {
+            PROBE_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     if BUSY_ACTIVE.load(Ordering::Relaxed) {
         if BUSY_IRQS.load(Ordering::Relaxed) == 0 {
@@ -219,6 +256,42 @@ fn pit2_calibrated_initial_count() -> Option<(u64, u32)> {
         return None;
     }
     Some((effective_hz, initial_count))
+}
+
+/// Verify all 15 architectural general-purpose registers survive real
+/// timer IRQ entry and IRETQ. The assembly code itself holds unique sentinels
+/// across the interrupt and checks for at least four acknowledged IRQs.
+fn prove_all_gprs_preserved() -> bool {
+    // The timer has already been enabled, APs have finished/parked.
+    if !x86_64::instructions::interrupts::are_enabled() { return false; }
+    WOLFOS_PROBE_ACTIVE.store(false, Ordering::Relaxed);
+    WOLFOS_PROBE_MATCH.store(0, Ordering::Relaxed);
+    PROBE_SAMPLES.store(0, Ordering::Relaxed);
+    PROBE_MISMATCH.store(0, Ordering::Relaxed);
+    // SAFETY: assembly owns the following memory word exclusively until
+    // run_gpr_probe returns. No Rust/IRQ observer accesses the spin counter.
+    unsafe { WOLFOS_PROBE_SPINS = MAX_SPINS; }
+    // SAFETY: timer and writable APIC MMIO mapping are currently installed,
+    // interrupts enabled on BSP, and no other CPU can access the probe.
+    let returned = unsafe { crate::apic_irq_entry::run_gpr_probe() };
+    let samples = PROBE_SAMPLES.load(Ordering::Relaxed);
+    let matches = WOLFOS_PROBE_MATCH.load(Ordering::Relaxed);
+    let mismatches = PROBE_MISMATCH.load(Ordering::Relaxed);
+    let ok = returned && samples >= TICKS_REQUIRED
+        && matches == samples && mismatches == 0
+        && !WOLFOS_PROBE_ACTIVE.load(Ordering::Relaxed);
+    if ok {
+        serial::write_fmt(format_args!(
+            "WOLFOS_APIC_GPR_OK samples={} matches={} mismatches={} restored=1\n",
+            samples, matches, mismatches
+        ));
+    } else {
+        serial::write_fmt(format_args!(
+            "WOLFOS_APIC_GPR_ERROR samples={} matches={} mismatches={} returned={}\n",
+            samples, matches, mismatches, returned
+        ));
+    }
+    ok
 }
 
 /// No task yields here. A real BSP local-APIC interrupt observes the
@@ -319,6 +392,10 @@ fn run_mapped_test(expected_id: u32) -> bool {
     TRAP_FRAMES.store(0, Ordering::Relaxed);
     TRAP_BAD.store(0, Ordering::Relaxed);
     TRAP_GPR_CHECKSUM.store(0, Ordering::Relaxed);
+    WOLFOS_PROBE_ACTIVE.store(false, Ordering::Relaxed);
+    WOLFOS_PROBE_MATCH.store(0, Ordering::Relaxed);
+    PROBE_SAMPLES.store(0, Ordering::Relaxed);
+    PROBE_MISMATCH.store(0, Ordering::Relaxed);
 
     // First mask the timer, then set divide/initial count. Only after
     // installing the SVR and IDT do we explicitly unmask the LVT.
@@ -334,14 +411,20 @@ fn run_mapped_test(expected_id: u32) -> bool {
         TIMER_VECTOR, initial_count, DIVISOR, TICKS_REQUIRED
     ));
     x86_64::instructions::interrupts::enable();
-    // Explicitly test asynchronous entry while work has no yield point.
-    // The handler does NOT implement a task switch or restore a new frame.
-    let frame_ok = prove_read_only_interrupt_frame();
+    // Prove *all 15 GPRs* survive involuntary IRQs in a register-only
+    // assembly busy loop, then independently observe the Rust worker's frame.
+    let gpr_ok = prove_all_gprs_preserved();
+    let frame_ok = if gpr_ok {
+        prove_read_only_interrupt_frame()
+    } else {
+        x86_64::instructions::interrupts::disable();
+        false
+    };
     let delivered = TICKS.load(Ordering::Relaxed) >= TICKS_REQUIRED;
     // Each separate worker dispatch must be gated by a fresh real local
     // APIC IRQ epoch. This is voluntarily yielded, never IRQ-frame preemption.
     // verify() expects IF=0 and enables IF only inside its worker stacks.
-    let tasks_ok = delivered && frame_ok && crate::timer_tasks::verify();
+    let tasks_ok = delivered && frame_ok && gpr_ok && crate::timer_tasks::verify();
     x86_64::instructions::interrupts::disable();
     // Every timer handler has returned and EOI'd before this BSP proceeds.
     unsafe {
@@ -357,7 +440,7 @@ fn run_mapped_test(expected_id: u32) -> bool {
     let spurious = SPURIOUS.load(Ordering::Relaxed);
     let trap_frames = TRAP_FRAMES.load(Ordering::Relaxed);
     let trap_bad = TRAP_BAD.load(Ordering::Relaxed);
-    if delivered && frame_ok && ticks >= TICKS_REQUIRED && ticks == acks
+    if delivered && frame_ok && gpr_ok && ticks >= TICKS_REQUIRED && ticks == acks
         && trap_frames == ticks && trap_bad == 0 && tasks_ok
     {
         serial::write_fmt(format_args!(
@@ -376,8 +459,8 @@ fn run_mapped_test(expected_id: u32) -> bool {
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} frame_ok={} tasks_ok={} asm_frames={} asm_bad={}\n",
-            ticks, acks, spurious, frame_ok, tasks_ok, trap_frames, trap_bad
+            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} frame_ok={} gpr_ok={} tasks_ok={} asm_frames={} asm_bad={}\n",
+            ticks, acks, spurious, frame_ok, gpr_ok, tasks_ok, trap_frames, trap_bad
         ));
         false
     }
