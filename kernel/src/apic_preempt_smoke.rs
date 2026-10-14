@@ -367,7 +367,45 @@ fn busy_task(id: usize) -> ! {
     // return the expected lane even after the other task has run.
     unsafe { fx_state::set_test_xmm0(TASK_XMM0[id]); }
     XMM_READY[id].store(true, Ordering::Release);
+    // This local variable is saved in the task's genuine suspended stack
+    // and GPR frame. The loop never yields to another task voluntarily.
+    let mut blocked_once = false;
+    let mut resumed_once = false;
     for _ in 0..MAX_TASK_SPINS {
+        if id == 1 && !blocked_once && WORK[1].load(Ordering::Acquire) >= 128 {
+            // The task itself requests Blocked; nested preempt-disable
+            // prevents an IRQ handoff across the bitmap+phase update.
+            // Hardware interrupts still execute and receive EOI.
+            if PREEMPT_DEPTH.disable() != Ok(1) {
+                BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            let blocked = RUNNABLE.fetch_update(
+                Ordering::AcqRel, Ordering::Acquire,
+                |mask| rr_policy::block_runnable(mask, 1, TASK_COUNT).ok()
+            ).is_ok();
+            if blocked {
+                BLOCK_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                BLOCK_PHASE.store(1, Ordering::Release);
+            } else {
+                BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            if PREEMPT_DEPTH.enable() != Ok(0) {
+                BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            blocked_once = true;
+        }
+        if id == 1 && blocked_once && !resumed_once
+            && BLOCK_PHASE.load(Ordering::Acquire) == 2
+        {
+            // We returned from the original interrupted RIP and task stack
+            // only after the timer woke us. XMM0 is checked immediately
+            // below to verify saved/restored floating-point ownership.
+            RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
+            BLOCK_PHASE.store(3, Ordering::Release);
+            resumed_once = true;
+        }
         let lane = unsafe { fx_state::read_test_xmm0() };
         FX_WORK_CHECKS.fetch_add(1, Ordering::Relaxed);
         if lane != TASK_XMM0[id] {
@@ -376,6 +414,10 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
+            && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && POST_WAKE_VISITS.iter().all(|count|
+                count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            )
             && WORK.iter().all(|work| work.load(Ordering::Relaxed) != 0)
             && INTERRUPTED.iter().all(|count|
                 count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
