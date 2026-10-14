@@ -251,6 +251,7 @@ fn check_nested_irq_deferral() -> bool {
         }
         if !observed || SWITCHES.load(Ordering::Relaxed) != 0
             || WORK[1].load(Ordering::Relaxed) != 0
+            || WORK[2].load(Ordering::Relaxed) != 0
         {
             return false;
         }
@@ -329,10 +330,9 @@ pub fn verify() -> bool {
         return false;
     }
     CURRENT.store(0, Ordering::Relaxed);
-    WORK[0].store(0, Ordering::Relaxed);
-    WORK[1].store(0, Ordering::Relaxed);
-    INTERRUPTED[0].store(0, Ordering::Relaxed);
-    INTERRUPTED[1].store(0, Ordering::Relaxed);
+    for work in &WORK { work.store(0, Ordering::Relaxed); }
+    for interrupted in &INTERRUPTED { interrupted.store(0, Ordering::Relaxed); }
+    RUNNABLE.store((1 << TASK_COUNT) - 1, Ordering::Release);
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
@@ -354,7 +354,7 @@ pub fn verify() -> bool {
     ACTIVE.store(true, Ordering::Release);
 
     // SAFETY: starts first task at normal ABI boundary, IF=0 on BSP.
-    // From now on, ONLY APIC hardware interrupts transfer task0<->task1.
+    // From now on, ONLY hardware interrupts rotate tasks 0 -> 1 -> 2.
     unsafe { context_switch::switch_raw(BSP_RSP.0.get(), START_RSP.0.get()); }
 
     let unexpected_interrupt_state = x86_64::instructions::interrupts::are_enabled()
@@ -365,8 +365,10 @@ pub fn verify() -> bool {
     let switches = SWITCHES.load(Ordering::Acquire);
     let first = INTERRUPTED[0].load(Ordering::Acquire);
     let second = INTERRUPTED[1].load(Ordering::Acquire);
+    let third = INTERRUPTED[2].load(Ordering::Acquire);
     let work0 = WORK[0].load(Ordering::Acquire);
     let work1 = WORK[1].load(Ordering::Acquire);
+    let work2 = WORK[2].load(Ordering::Acquire);
     let rejected = REJECTED.load(Ordering::Acquire);
     let deferred = DEFERRED_IRQS.load(Ordering::Acquire);
     let depth = PREEMPT_DEPTH.depth();
@@ -380,30 +382,32 @@ pub fn verify() -> bool {
     // SAFETY: no further private task or APIC handler uses FX state,
     // interrupts disabled. Recover the original BSP xstate and CR0/CR4.
     unsafe { fx_state::leave(original_fx); }
+    let min_irqs = first.min(second).min(third);
+    let max_irqs = first.max(second).max(third);
     let ok = !unexpected_interrupt_state && switches >= STOP_AFTER
-        && first >= MIN_EPOCHS_PER_TASK && second >= MIN_EPOCHS_PER_TASK
-        && first + second == switches
-        && work0 > 0 && work1 > 0
-        && rejected == 0 && exit_task < 2
+        && min_irqs >= MIN_EPOCHS_PER_TASK && max_irqs - min_irqs <= 1
+        && first + second + third == switches
+        && work0 > 0 && work1 > 0 && work2 > 0
+        && rejected == 0 && exit_task < TASK_COUNT
         && deferred >= 4 && nested_ok && depth == 0
         && fx_switches == switches
-        && fx_observations >= MIN_EPOCHS_PER_TASK * 2 - 1
+        && fx_observations >= STOP_AFTER - 1
         && fx_work_checks > 0 && xmm_ready && fx_bad == 0
-        && canary_ok(0) && canary_ok(1);
+        && (0..TASK_COUNT).all(canary_ok);
     if ok {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=512 xmm0=2 fx_switches={} fx_observations={} work_checks={} corrupt={} original_restored=1 avx=0\n",
+            "WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=512 xmm0=3 fx_switches={} fx_observations={} work_checks={} corrupt={} original_restored=1 avx=0\n",
             fx_switches, fx_observations, fx_work_checks, fx_bad
         ));
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_OK tasks=2 involuntary_switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={}\n",
-            switches, first, second, work0, work1, exit_task, rejected,
-            deferred, depth
+            "WOLFOS_APIC_PREEMPT_OK tasks=3 involuntary_switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={} fairness_max_delta={}\n",
+            switches, first, second, third, work0, work1, work2,
+            exit_task, rejected, deferred, depth, max_irqs - min_irqs
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={}\n",
-            switches, first, second, work0, work1, exit_task, rejected,
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={}\n",
+            switches, first, second, third, work0, work1, work2, exit_task, rejected,
             deferred, nested_ok, depth, fx_switches, fx_observations, fx_bad,
             fx_work_checks, xmm_ready, !unexpected_interrupt_state
         ));
