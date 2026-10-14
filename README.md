@@ -1,29 +1,37 @@
-# WolfOS P0 — Independent Rust Kernel
+# WolfOS — Independent Rust x86-64 Kernel
 
-WolfOS is an original experimental x86-64 OS kernel written in Rust (no_std). It is **not Linux**. Limine is used only as an initial bootloader.
+WolfOS is an original experimental x86-64 OS kernel written in Rust (`no_std`). It is **not Linux**. Limine is currently used as the bootloader, not as the WolfOS kernel.
 
-**Status:** P0 boot and initial P1 frame allocation passed QEMU CI; scalable memory metadata remains under review. Not for installation on real hardware.
+**Current status (October 2026):** Boot, frame allocation, paging, CPU exceptions, PCI/ACPI discovery and cooperative per-CPU saved-context kernel threads have reproducible QEMU tests. Legacy PIT IRQ0 and genuine BSP-local xAPIC timer IRQ delivery with EOI have both been verified. PIT channel 2 can be used in an *isolated smoke test* to estimate the effective local APIC timer rate. **No kernel task preemption, system clocksource or AP-local timer scheduling yet.** Not ready to install on physical hardware.
 
 ## Requirements
 
-Linux or WSL2 with internet; rustup (nightly target x86_64-unknown-none), Git, GNU Make, xorriso, qemu-system-x86_64, Python 3.
+Linux or WSL2 with internet; rustup (nightly + `x86_64-unknown-none` target), Git, GNU Make, xorriso, qemu-system-x86_64, Python 3.
 
-On Ubuntu: sudo apt install build-essential git make xorriso qemu-system-x86 ovmf python3
+On Ubuntu: `sudo apt install build-essential git make xorriso qemu-system-x86 ovmf python3`
 
-## Commands
+## Build and tests
 
-- make doctor: list missing tools
-- make test: Python source/config tests plus native Rust metadata layout tests
-- make smoke: builds boot ISO and verifies QEMU serial markers plus exit code 33
-- make run-graphics: boot in QEMU with framebuffer window
-- make run-uefi: optional OVMF test
+- `make doctor`: list missing tools
+- `make test`: Python source/config tests plus Rust host unit tests
+- `make smoke`: boot and serial assertions in QEMU
+- `make exception-smoke`: CPU exception dispatch
+- `make paging-fault-smoke`: mapping/unmapping and fault dispatch
+- `make topology-smoke`: ACPI/MADT plus 1/4-vCPU SMP and saved-context checks
+- `make timer-smoke`: isolated PIT IRQ0 and tick-gated *cooperative* context dispatch
+- `make apic-timer-smoke`: real BSP xAPIC periodic IRQ delivery and matching EOI checks in QEMU with 1 and 4 vCPUs
+- `make apic-calibration-smoke`: separate PIT-channel-2-referenced xAPIC calibration and real IRQ delivery checks in QEMU with 1 and 4 vCPUs
+- `make run-graphics`: QEMU boot with framebuffer window
+- `make run-uefi`: optional OVMF boot
 
-Boot markers: WOLFOS_LIMINE_OK, WOLFOS_MEMMAP_OK, WOLFOS_FRAMEBUFFER_OK, WOLFOS_BOOT_OK.
+All smoke targets build CD ISO files under `out/`. They do not write physical disks. Example serial markers include `WOLFOS_LIMINE_OK`, `WOLFOS_SMP_APS_OK`, `WOLFOS_APIC_TIMER_IRQ_OK`, `WOLFOS_APIC_CALIBRATION_OK` and `WOLFOS_BOOT_OK`.
 
-P0 shows colored screen bands and serial logs. P1 is replacing the static 64-GiB bitmap cap with RAM-sized, HHDM-backed metadata. Synthetic layout tests cover 128 GiB, 1 TiB and 4 TiB; these are not full-RAM QEMU tests. It does NOT have a shell, network, GPU drivers, Windows program support, Steam, or filesystem.
+## What is and is not implemented
 
-Safety: builds CD ISO under out/ and boots a VM, never operates on real Windows drives or backups.
+The currently verified scope is an early kernel: Rust-owned boot execution, frame allocator, CPU tables/exceptions, basic paging, ACPI topology, kernel-only cooperative scheduling/context switches and BSP timer interrupt smoke tests. The reference-clock calibration runs only in a QEMU test variant; measured rate is not a validated clocksource for general scheduling or accurate wall-clock time.
 
-See docs/ROADMAP.md, docs/SECURITY.md and docs/BASLANGIC_TR.md.
+WolfOS does **not** yet have Ring 3 user processes, ELF process loading, a shell, a usable filesystem, production drivers, network, GPU acceleration, a preemptive scheduler, or support for Windows programs, Steam and GTA V. Windows compatibility is a long-term goal, not a present feature. Physical-machine driver safety and cross-platform application compatibility require separate engineering and test gates.
 
-Copyright 2026 WolfOS Contributors. MIT-licensed for the project code. The external Limine bootloader and limine crate have their own licenses.
+See [the roadmap](docs/ROADMAP.md), [security guidance](docs/SECURITY.md) and [Turkish getting-started guide](docs/BASLANGIC_TR.md).
+
+Copyright 2026 WolfOS Contributors. WolfOS project code is MIT-licensed. Limine and the external Rust crates have their own licenses.
