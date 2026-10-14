@@ -21,7 +21,8 @@ use crate::{context_switch, kernel_trap_frame::{
 
 const TASK_COUNT: usize = 3;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = MIN_EPOCHS_PER_TASK * TASK_COUNT as u64;
+const STOP_AFTER: u64 = 26;
+const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
 const CANARY: u64 = 0x574f_4c46_5052_454d;
@@ -65,6 +66,22 @@ static REJECTED: AtomicU64 = AtomicU64::new(0);
 static EXIT_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CODE_SELECTOR: AtomicUsize = AtomicUsize::new(0);
 static RUNNABLE: AtomicU64 = AtomicU64::new(0);
+// Lifecycle phases: 0=not armed, 1=task1 blocked on its stack,
+// 2=timer woke task1 (runnable), 3=task1 actually resumed on same stack.
+// All test-owned by BSP; atomic so IRQ handler can observe without locks.
+static BLOCK_PHASE: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_ENTRY_CAPTURED: AtomicBool = AtomicBool::new(false);
+static BLOCK_SAVED_WORK: AtomicU64 = AtomicU64::new(0);
+static BLOCK_OTHER_WORK: AtomicU64 = AtomicU64::new(0);
+static BLOCKED_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_FROZEN_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static BLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+static RESUME_COUNT: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ERRORS: AtomicU64 = AtomicU64::new(0);
+static POST_WAKE_VISITS: [AtomicU64; TASK_COUNT] =
+    [const { AtomicU64::new(0) }; TASK_COUNT];
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
@@ -153,6 +170,63 @@ fn prepare() -> bool {
     true
 }
 
+/// Called only from a genuine BSP timer IRQ with IF=0. The current
+/// blocked task remains executing until its first IRQ: take the WORK[1]
+/// snapshot on that IRQ, not at the earlier block() call, to avoid falsely
+/// treating pre-IRQ work as a scheduling violation.
+///
+/// While task1 is suspended and not runnable, every additional IRQ must
+/// observe a frozen work counter. After a finite number of such IRQs,
+/// the timer wakes task1 by restoring its runnable bit. Its original
+/// saved trap frame and FX image remain untouched until selected again.
+fn timer_block_wake(current: usize) {
+    if BLOCK_PHASE.load(Ordering::Acquire) != 1 {
+        return;
+    }
+    if current == 1 {
+        if !BLOCK_ENTRY_CAPTURED.swap(true, Ordering::AcqRel) {
+            BLOCK_SAVED_WORK.store(WORK[1].load(Ordering::Acquire), Ordering::Release);
+            BLOCK_OTHER_WORK.store(
+                WORK[0].load(Ordering::Acquire)
+                    + WORK[2].load(Ordering::Acquire),
+                Ordering::Release
+            );
+        }
+        return;
+    }
+    if !BLOCK_ENTRY_CAPTURED.load(Ordering::Acquire) {
+        BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if WORK[1].load(Ordering::Acquire) != BLOCK_SAVED_WORK.load(Ordering::Acquire) {
+        BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        BLOCK_FROZEN_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    }
+    // With bit1 masked, a tick on task0 must skip task1 and select task2.
+    if current == 0 {
+        BLOCK_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    let ticks = BLOCKED_TIMER_IRQS.fetch_add(1, Ordering::AcqRel) + 1;
+    if ticks >= WAKE_AFTER_BLOCKED_IRQS {
+        let other_work = WORK[0].load(Ordering::Acquire)
+            + WORK[2].load(Ordering::Acquire);
+        if other_work <= BLOCK_OTHER_WORK.load(Ordering::Acquire) {
+            BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        let result = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::wake_runnable(mask, 1, TASK_COUNT).ok()
+        );
+        if result.is_ok() {
+            WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            BLOCK_PHASE.store(2, Ordering::Release);
+        } else {
+            BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
 /// No allocations, logging, task changes inside Rust frame borrows, or
 /// scheduler lock acquisition. The returned pointer is a *different live
@@ -168,6 +242,9 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
         return frame_ptr;
     }
     let current = CURRENT.load(Ordering::Relaxed);
+    // Hardware timer-driven wake happens before round-robin selection.
+    // Nested preempt-disable sections were checked above and never switch.
+    timer_block_wake(current);
     if current >= TASK_COUNT {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return frame_ptr;
@@ -229,6 +306,9 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
     CURRENT.store(next, Ordering::Relaxed);
     SWITCHES.fetch_add(1, Ordering::Relaxed);
+    if BLOCK_PHASE.load(Ordering::Acquire) >= 2 {
+        POST_WAKE_VISITS[next].fetch_add(1, Ordering::Relaxed);
+    }
     next_rsp as *const KernelTrapFrame
 }
 
@@ -287,7 +367,45 @@ fn busy_task(id: usize) -> ! {
     // return the expected lane even after the other task has run.
     unsafe { fx_state::set_test_xmm0(TASK_XMM0[id]); }
     XMM_READY[id].store(true, Ordering::Release);
+    // This local variable is saved in the task's genuine suspended stack
+    // and GPR frame. The loop never yields to another task voluntarily.
+    let mut blocked_once = false;
+    let mut resumed_once = false;
     for _ in 0..MAX_TASK_SPINS {
+        if id == 1 && !blocked_once && WORK[1].load(Ordering::Acquire) >= 128 {
+            // The task itself requests Blocked; nested preempt-disable
+            // prevents an IRQ handoff across the bitmap+phase update.
+            // Hardware interrupts still execute and receive EOI.
+            if PREEMPT_DEPTH.disable() != Ok(1) {
+                BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            let blocked = RUNNABLE.fetch_update(
+                Ordering::AcqRel, Ordering::Acquire,
+                |mask| rr_policy::block_runnable(mask, 1, TASK_COUNT).ok()
+            ).is_ok();
+            if blocked {
+                BLOCK_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                BLOCK_PHASE.store(1, Ordering::Release);
+            } else {
+                BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            if PREEMPT_DEPTH.enable() != Ok(0) {
+                BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            blocked_once = true;
+        }
+        if id == 1 && blocked_once && !resumed_once
+            && BLOCK_PHASE.load(Ordering::Acquire) == 2
+        {
+            // We returned from the original interrupted RIP and task stack
+            // only after the timer woke us. XMM0 is checked immediately
+            // below to verify saved/restored floating-point ownership.
+            RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
+            BLOCK_PHASE.store(3, Ordering::Release);
+            resumed_once = true;
+        }
         let lane = unsafe { fx_state::read_test_xmm0() };
         FX_WORK_CHECKS.fetch_add(1, Ordering::Relaxed);
         if lane != TASK_XMM0[id] {
@@ -296,6 +414,10 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
+            && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && POST_WAKE_VISITS.iter().all(|count|
+                count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            )
             && WORK.iter().all(|work| work.load(Ordering::Relaxed) != 0)
             && INTERRUPTED.iter().all(|count|
                 count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
@@ -333,6 +455,18 @@ pub fn verify() -> bool {
     for work in &WORK { work.store(0, Ordering::Relaxed); }
     for interrupted in &INTERRUPTED { interrupted.store(0, Ordering::Relaxed); }
     RUNNABLE.store((1 << TASK_COUNT) - 1, Ordering::Release);
+    BLOCK_PHASE.store(0, Ordering::Relaxed);
+    BLOCK_ENTRY_CAPTURED.store(false, Ordering::Relaxed);
+    BLOCK_SAVED_WORK.store(0, Ordering::Relaxed);
+    BLOCK_OTHER_WORK.store(0, Ordering::Relaxed);
+    BLOCKED_TIMER_IRQS.store(0, Ordering::Relaxed);
+    BLOCK_FROZEN_SAMPLES.store(0, Ordering::Relaxed);
+    BLOCK_SKIPPED.store(0, Ordering::Relaxed);
+    BLOCK_ATTEMPTS.store(0, Ordering::Relaxed);
+    WAKE_COUNT.store(0, Ordering::Relaxed);
+    RESUME_COUNT.store(0, Ordering::Relaxed);
+    BLOCK_ERRORS.store(0, Ordering::Relaxed);
+    for visit in &POST_WAKE_VISITS { visit.store(0, Ordering::Relaxed); }
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
@@ -379,13 +513,29 @@ pub fn verify() -> bool {
     let fx_bad = FX_BAD.load(Ordering::Acquire);
     let fx_work_checks = FX_WORK_CHECKS.load(Ordering::Acquire);
     let xmm_ready = XMM_READY.iter().all(|x| x.load(Ordering::Acquire));
+    let block_phase = BLOCK_PHASE.load(Ordering::Acquire);
+    let block_irqs = BLOCKED_TIMER_IRQS.load(Ordering::Acquire);
+    let freeze_checks = BLOCK_FROZEN_SAMPLES.load(Ordering::Acquire);
+    let block_skips = BLOCK_SKIPPED.load(Ordering::Acquire);
+    let block_attempts = BLOCK_ATTEMPTS.load(Ordering::Acquire);
+    let wakes = WAKE_COUNT.load(Ordering::Acquire);
+    let resumed = RESUME_COUNT.load(Ordering::Acquire);
+    let block_errors = BLOCK_ERRORS.load(Ordering::Acquire);
+    let frozen_work = BLOCK_SAVED_WORK.load(Ordering::Acquire);
+    let post0 = POST_WAKE_VISITS[0].load(Ordering::Acquire);
+    let post1 = POST_WAKE_VISITS[1].load(Ordering::Acquire);
+    let post2 = POST_WAKE_VISITS[2].load(Ordering::Acquire);
+    let post_min = post0.min(post1).min(post2);
+    let post_max = post0.max(post1).max(post2);
     // SAFETY: no further private task or APIC handler uses FX state,
     // interrupts disabled. Recover the original BSP xstate and CR0/CR4.
     unsafe { fx_state::leave(original_fx); }
     let min_irqs = first.min(second).min(third);
-    let max_irqs = first.max(second).max(third);
+    // Blocking is intentionally unfair during its bounded sleep. Measure
+    // round-robin fairness ONLY after task1 is made runnable again.
     let ok = !unexpected_interrupt_state && switches >= STOP_AFTER
-        && min_irqs >= MIN_EPOCHS_PER_TASK && max_irqs - min_irqs <= 1
+        && min_irqs >= MIN_EPOCHS_PER_TASK
+        && post_min >= MIN_EPOCHS_PER_TASK && post_max - post_min <= 1
         && first + second + third == switches
         && work0 > 0 && work1 > 0 && work2 > 0
         && rejected == 0 && exit_task < TASK_COUNT
@@ -393,8 +543,19 @@ pub fn verify() -> bool {
         && fx_switches == switches
         && fx_observations >= STOP_AFTER - 1
         && fx_work_checks > 0 && xmm_ready && fx_bad == 0
+        && block_phase == 3
+        && block_attempts == 1 && wakes == 1 && resumed == 1
+        && block_irqs >= WAKE_AFTER_BLOCKED_IRQS
+        && freeze_checks == block_irqs && block_skips >= 2
+        && frozen_work > 0 && block_errors == 0
+        && RUNNABLE.load(Ordering::Acquire) == 0b111
         && (0..TASK_COUNT).all(canary_ok);
     if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_BLOCK_WAKE_OK task=1 blocked_irqs={} frozen_samples={} skipped={} attempts={} wakes={} resumed={} errors={} frozen_work={} postwake0={} postwake1={} postwake2={} stack_resumed=1\n",
+            block_irqs, freeze_checks, block_skips, block_attempts, wakes,
+            resumed, block_errors, frozen_work, post0, post1, post2
+        ));
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=512 xmm0=3 fx_switches={} fx_observations={} work_checks={} corrupt={} original_restored=1 avx=0\n",
             fx_switches, fx_observations, fx_work_checks, fx_bad
@@ -402,14 +563,16 @@ pub fn verify() -> bool {
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_PREEMPT_OK tasks=3 involuntary_switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={} fairness_max_delta={}\n",
             switches, first, second, third, work0, work1, work2,
-            exit_task, rejected, deferred, depth, max_irqs - min_irqs
+            exit_task, rejected, deferred, depth, post_max - post_min
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={}\n",
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={} phase={} block_irqs={} frozen={} skipped={} wakes={} resumed={} block_errors={} postwake={}/{}/{}\n",
             switches, first, second, third, work0, work1, work2, exit_task, rejected,
             deferred, nested_ok, depth, fx_switches, fx_observations, fx_bad,
-            fx_work_checks, xmm_ready, !unexpected_interrupt_state
+            fx_work_checks, xmm_ready, !unexpected_interrupt_state, block_phase,
+            block_irqs, freeze_checks, block_skips, wakes, resumed, block_errors,
+            post0, post1, post2
         ));
     }
     ok
