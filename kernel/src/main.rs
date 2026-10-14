@@ -34,6 +34,12 @@ mod lapic_probe;
 mod lapic_mmio_layout;
 mod lapic_timer_layout;
 mod lapic_mmio;
+#[cfg(feature = "apic-timer-smoke")]
+mod lapic_timer_plan;
+#[cfg(feature = "apic-timer-smoke")]
+mod lapic_irq_layout;
+#[cfg(feature = "apic-timer-smoke")]
+mod apic_timer_smoke;
 #[cfg(feature = "timer-smoke")]
 mod timer;
 #[cfg(feature = "timer-smoke")]
@@ -216,6 +222,11 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "timer-smoke")]
     if !timer::verify() {
         serial::write_line("WOLFOS_TIMER_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "apic-timer-smoke")]
+    if !apic_timer_smoke::verify(mp.bsp_lapic_id, hhdm.offset, entries) {
+        serial::write_line("WOLFOS_APIC_TIMER_TEST_FAILED");
         halt_forever();
     }
     serial::write_line("WOLFOS_BOOT_OK");
