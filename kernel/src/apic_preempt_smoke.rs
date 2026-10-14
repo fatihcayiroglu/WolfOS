@@ -139,6 +139,23 @@ static LIVE_FINISHES: AtomicU64 = AtomicU64::new(0);
 static LIVE_STOP_WORK: AtomicU64 = AtomicU64::new(0);
 static LIVE_FROZEN: AtomicU64 = AtomicU64::new(0);
 static LIVE_SURVIVOR_SWITCHES: AtomicU64 = AtomicU64::new(0);
+// Additional lifecycle for *in-flight admitted* task3: 0 not blocked,
+// 1=task3 removed itself from Ready, 2=timer has woken task3,
+// 3=task3 has actually resumed on the original suspended stack.
+const LIVE_WAKE_AFTER_IRQS: u64 = 6;
+const LIVE_POST_WAKE_MIN_IRQS: u64 = 4;
+static LIVE_BLOCK_PHASE: AtomicUsize = AtomicUsize::new(0);
+static LIVE_BLOCK_CAPTURED: AtomicBool = AtomicBool::new(false);
+static LIVE_BLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_OTHER_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCKED_IRQS: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_FROZEN: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static LIVE_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_RESUME_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_POST_WAKE_IRQS: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 // Second-generation task2 runs as a single IRQ-interruptible kernel worker
 // after the original fixed 3-task scheduler has stopped on the BSP stack.
