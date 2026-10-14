@@ -432,6 +432,7 @@ fn busy_task(id: usize) -> ! {
     // and GPR frame. The loop never yields to another task voluntarily.
     let mut blocked_once = false;
     let mut resumed_once = false;
+    let mut finished_once = false;
     for _ in 0..MAX_TASK_SPINS {
         if id == 1 && !blocked_once && WORK[1].load(Ordering::Acquire) >= 128 {
             // The task itself requests Blocked; nested preempt-disable
@@ -467,6 +468,39 @@ fn busy_task(id: usize) -> ! {
             BLOCK_PHASE.store(3, Ordering::Release);
             resumed_once = true;
         }
+        if id == 2 && !finished_once
+            && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && SWITCHES.load(Ordering::Relaxed) >= FINISH_AFTER_SWITCHES
+            && POST_WAKE_VISITS.iter().all(|visit|
+                visit.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            )
+        {
+            // Task 2 completes on its actual private kernel stack. No
+            // task-to-task yield is involved; it runs until the next xAPIC
+            // IRQ then remains permanently excluded from runnable masks.
+            if PREEMPT_DEPTH.disable() != Ok(1) {
+                FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            let finished = RUNNABLE.fetch_update(
+                Ordering::AcqRel, Ordering::Acquire,
+                |mask| rr_policy::finish_runnable(
+                    mask, FINISHED.load(Ordering::Acquire), 2, TASK_COUNT
+                ).ok().map(|(ready, _)| ready)
+            ).is_ok();
+            if finished {
+                FINISHED.store(1u64 << 2, Ordering::Release);
+                FINISH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                FINISH_PHASE.store(1, Ordering::Release);
+            } else {
+                FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            if PREEMPT_DEPTH.enable() != Ok(0) {
+                FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            finished_once = true;
+        }
         let lane = unsafe { fx_state::read_test_xmm0() };
         FX_WORK_CHECKS.fetch_add(1, Ordering::Relaxed);
         if lane != TASK_XMM0[id] {
@@ -476,6 +510,11 @@ fn busy_task(id: usize) -> ! {
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
             && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && FINISH_PHASE.load(Ordering::Acquire) == 2
+            && FINISH_FROZEN_SAMPLES.load(Ordering::Relaxed) >= FINISH_FREEZE_REQUIRED
+            && POST_FINISH_VISITS.iter().all(|count|
+                count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            )
             && POST_WAKE_VISITS.iter().all(|count|
                 count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
             )
