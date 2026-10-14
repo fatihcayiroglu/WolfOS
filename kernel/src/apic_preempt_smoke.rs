@@ -17,24 +17,31 @@ use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 use crate::{context_switch, kernel_trap_frame::{
     HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume
-}, preempt_depth::PreemptDepth, fx_state};
+}, preempt_depth::PreemptDepth, fx_state, rr_policy};
 
+const TASK_COUNT: usize = 3;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = 8;
+const STOP_AFTER: u64 = MIN_EPOCHS_PER_TASK * TASK_COUNT as u64;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
 const CANARY: u64 = 0x574f_4c46_5052_454d;
-const TASK_XMM0: [u64; 2] = [0x1122_3344_5566_7788, 0x8877_6655_4433_2211];
+const TASK_XMM0: [u64; TASK_COUNT] = [
+    0x1122_3344_5566_7788,
+    0x8877_6655_4433_2211,
+    0x0f0e_0d0c_0b0a_0908,
+];
 
 #[repr(align(16))]
 struct Stack([u8; STACK_BYTES]);
-struct PrivateStacks(UnsafeCell<[Stack; 2]>);
+struct PrivateStacks(UnsafeCell<[Stack; TASK_COUNT]>);
 // SAFETY: only BSP runs; tasks own disjoint stacks. The interrupt handler
 // observes saved frame addresses atomically but does not mutate live Rust
 // data borrowed across an IRQ or context switch.
 unsafe impl Sync for PrivateStacks {}
 static STACKS: PrivateStacks =
-    PrivateStacks(UnsafeCell::new([const { Stack([0; STACK_BYTES]) }; 2]));
+    PrivateStacks(UnsafeCell::new([
+        const { Stack([0; STACK_BYTES]) }; TASK_COUNT
+    ]));
 
 struct BspSlot(UnsafeCell<usize>);
 // SAFETY: only BSP accesses these raw RSP slots while IF=0 and with all
@@ -47,17 +54,22 @@ static EXIT_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
-static FRAME_RSP: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
-static WORK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-static INTERRUPTED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static FRAME_RSP: [AtomicUsize; TASK_COUNT] =
+    [const { AtomicUsize::new(0) }; TASK_COUNT];
+static WORK: [AtomicU64; TASK_COUNT] =
+    [const { AtomicU64::new(0) }; TASK_COUNT];
+static INTERRUPTED: [AtomicU64; TASK_COUNT] =
+    [const { AtomicU64::new(0) }; TASK_COUNT];
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
 static EXIT_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CODE_SELECTOR: AtomicUsize = AtomicUsize::new(0);
+static RUNNABLE: AtomicU64 = AtomicU64::new(0);
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
-static XMM_READY: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+static XMM_READY: [AtomicBool; TASK_COUNT] =
+    [const { AtomicBool::new(false) }; TASK_COUNT];
 static FX_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static FX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static FX_BAD: AtomicU64 = AtomicU64::new(0);
