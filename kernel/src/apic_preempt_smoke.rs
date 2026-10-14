@@ -1,13 +1,13 @@
 //! QEMU-only BSP proof of *involuntary* kernel-to-kernel task handoff.
 //!
-//! Two private kernel stacks run CPU-bound tasks that NEVER yield to one
-//! another. An actual periodic xAPIC interrupt stores the interrupted
+//! Three private kernel stacks run CPU-bound tasks that NEVER yield to one
+//! another. A real periodic xAPIC interrupt stores the interrupted
 //! 15-GPR + hardware trap-frame RSP and selects the other task's saved RSP.
 //! Assembly pops the selected task's GPRs and IRETQs onto its stack.
 //!
 //! The task finishing the bounded proof voluntarily returns to the original
 //! BSP test harness ONCE, with IF=0. This is not a production scheduler:
-//! no arbitrary tasks, IRQ-safe locking, XSAVE/FPU state, CR3/TLS, ring 3,
+//! no dynamic tasks, IRQ-safe locking, XSAVE/AVX, CR3/TLS, ring 3,
 //! migration, guard pages or AP-local interrupts. All work is BSP-owned.
 
 use core::cell::UnsafeCell;
