@@ -142,6 +142,21 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
                 or deferred < 4 or nested != 1 or depth != 0):
                 print(f"FAIL: invalid involuntary context switching evidence: {handoff.groups()}")
                 return False
+            fx = re.search(
+                r"WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=(\d+) xmm0=(\d+) fx_switches=(\d+) fx_observations=(\d+) work_checks=(\d+) corrupt=(\d+) original_restored=(\d+) avx=(\d+)",
+                output,
+            )
+            if fx is None:
+                print("FAIL: real BSP x87/SSE task context-switch proof missing")
+                return False
+            fx_bytes, fx_tasks, fx_switches, fx_observations, work_checks, bad, restored, avx = map(
+                int, fx.groups()
+            )
+            if (fx_bytes != 512 or fx_tasks != 2 or fx_switches != switches
+                or fx_observations < 7 or work_checks < 2 or bad != 0
+                or restored != 1 or avx != 0):
+                print(f"FAIL: x87/SSE state lost across preemption: {fx.groups()}")
+                return False
         elif "WOLFOS_APIC_PREEMPT_OK" in output:
             print("FAIL: normal APIC smoke unexpectedly claims task preemption")
             return False
@@ -152,6 +167,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             "WOLFOS_APIC_TIMER_ERROR", "WOLFOS_APIC_TIMER_TEST_FAILED",
             "WOLFOS_APIC_IRQ_FRAME_ERROR", "WOLFOS_APIC_GPR_ERROR",
             "WOLFOS_APIC_PREEMPT_ERROR",
+            "WOLFOS_APIC_FXSTATE_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):
             print("FAIL: fatal APIC-related kernel diagnostic")
