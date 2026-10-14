@@ -81,12 +81,12 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             return False
         busy_irqs, work, irq_step = map(int, frame.groups()[:3])
         rip, rsp, cs, rflags = (int(field, 16) for field in frame.groups()[3:7])
-        preemptive = int(frame.group(8))
+        frame_preemptive = int(frame.group(8))
         if (
             busy_irqs < 4 or work <= irq_step or irq_step == 0
             or rip == 0 or rsp == 0 or rsp % 8 != 0
             or cs == 0 or cs & 3 or rflags & 0x202 != 0x202
-            or preemptive != 0
+            or frame_preemptive != 0
         ):
             print(f"FAIL: invalid interrupted-worker frame evidence: {frame.groups()}")
             return False
@@ -105,8 +105,9 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             print("FAIL: APIC timer hardware completion marker missing")
             print(run.stderr.decode(errors="replace"))
             return False
-        vector, ticks, eoi, spurious, preemptive = map(int, match.groups())
-        if vector != 224 or ticks < 4 or eoi != ticks or preemptive != int(preemptive):
+        vector, ticks, eoi, spurious, irq_preemptive = map(int, match.groups())
+        if (vector != 224 or ticks < 4 or eoi != ticks
+            or irq_preemptive != int(preemptive)):
             print(f"FAIL: invalid delivery/EOI evidence: {match.groups()}")
             return False
         asm = re.search(
@@ -134,9 +135,8 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             (tasks, switches, a_irq, b_irq, c_irq, work0, work1, work2,
              exit_task, rejected, stack_kib, bsp, userspace, deferred,
              nested, depth, fairness_max_delta) = map(int, handoff.groups())
-            if (tasks != 3 or switches < 12
+            if (tasks != 3 or switches < 26
                 or min(a_irq, b_irq, c_irq) < 4
-                or max(a_irq, b_irq, c_irq) - min(a_irq, b_irq, c_irq) > 1
                 or a_irq + b_irq + c_irq != switches
                 or not all((work0, work1, work2))
                 or exit_task not in (0, 1, 2) or rejected != 0
@@ -144,6 +144,26 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
                 or deferred < 4 or nested != 1 or depth != 0
                 or fairness_max_delta > 1):
                 print(f"FAIL: invalid three-task IRQ fairness evidence: {handoff.groups()}")
+                return False
+            lifecycle = re.search(
+                r"WOLFOS_APIC_BLOCK_WAKE_OK task=(\d+) blocked_irqs=(\d+) frozen_samples=(\d+) skipped=(\d+) attempts=(\d+) wakes=(\d+) resumed=(\d+) errors=(\d+) frozen_work=(\d+) postwake0=(\d+) postwake1=(\d+) postwake2=(\d+) stack_resumed=(\d+)",
+                output,
+            )
+            if lifecycle is None:
+                print("FAIL: missing hardware-observed Blocked -> Ready -> Resumed lifecycle")
+                return False
+            (blocked_task, blocked_irqs, frozen, skips, attempts, wakes,
+             resumed, lifecycle_errors, frozen_work, post0, post1,
+             post2, stack_resumed) = map(int, lifecycle.groups())
+            if (blocked_task != 1 or blocked_irqs < 6
+                or frozen != blocked_irqs or skips < 2
+                or attempts != 1 or wakes != 1 or resumed != 1
+                or lifecycle_errors != 0 or frozen_work == 0
+                or stack_resumed != 1
+                or min(post0, post1, post2) < 4
+                or max(post0, post1, post2) - min(post0, post1, post2) > 1
+                or fairness_max_delta != max(post0, post1, post2) - min(post0, post1, post2)):
+                print(f"FAIL: blocked task advanced before wake, did not resume, or post-wake RR unfair: {lifecycle.groups()}")
                 return False
             fx = re.search(
                 r"WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=(\d+) xmm0=(\d+) fx_switches=(\d+) fx_observations=(\d+) work_checks=(\d+) corrupt=(\d+) original_restored=(\d+) avx=(\d+)",
@@ -170,6 +190,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             "WOLFOS_APIC_TIMER_ERROR", "WOLFOS_APIC_TIMER_TEST_FAILED",
             "WOLFOS_APIC_IRQ_FRAME_ERROR", "WOLFOS_APIC_GPR_ERROR",
             "WOLFOS_APIC_PREEMPT_ERROR",
+            "WOLFOS_APIC_BLOCK_WAKE_ERROR",
             "WOLFOS_APIC_FXSTATE_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):
