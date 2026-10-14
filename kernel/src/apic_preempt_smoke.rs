@@ -34,10 +34,11 @@ const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
 const CANARY: u64 = 0x574f_4c46_5052_454d;
-const TASK_XMM0: [u64; TASK_COUNT] = [
+const TASK_XMM0: [u64; SLOT_COUNT] = [
     0x1122_3344_5566_7788,
     0x8877_6655_4433_2211,
     0x0f0e_0d0c_0b0a_0908,
+    LIVE_XMM0,
 ];
 
 #[repr(align(16))]
@@ -483,12 +484,18 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     // Nested preempt-disable sections were checked above and never switch.
     timer_block_wake(current);
     timer_finished_task_observation(current);
-    if current >= TASK_COUNT {
+    observe_live_retirement(current);
+    let available_count = if LIVE_PHASE.load(Ordering::Acquire) == 0 {
+        TASK_COUNT
+    } else {
+        SLOT_COUNT
+    };
+    if current >= available_count {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return frame_ptr;
     }
     let next = match rr_policy::next_runnable(
-        current, TASK_COUNT, RUNNABLE.load(Ordering::Relaxed)
+        current, available_count, RUNNABLE.load(Ordering::Relaxed)
     ) {
         Ok(id) if id != current => id,
         Ok(_) => return frame_ptr, // no alternative ready; keep running
@@ -546,16 +553,25 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
         }
     }
     FRAME_RSP[current].store(old_rsp, Ordering::Relaxed);
-    INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
+    if current == LIVE_TASK {
+        LIVE_INTERRUPTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
+    }
     CURRENT.store(next, Ordering::Relaxed);
     SWITCHES.fetch_add(1, Ordering::Relaxed);
+    if LIVE_PHASE.load(Ordering::Acquire) == 3 && next != LIVE_TASK {
+        LIVE_SURVIVOR_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    }
     if FINISH_PHASE.load(Ordering::Acquire) >= 1 {
         if next < 2 {
             POST_FINISH_VISITS[next].fetch_add(1, Ordering::Relaxed);
         } else {
             FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
-    } else if BLOCK_PHASE.load(Ordering::Acquire) >= 2 {
+    } else if BLOCK_PHASE.load(Ordering::Acquire) >= 2
+        && next < TASK_COUNT
+    {
         POST_WAKE_VISITS[next].fetch_add(1, Ordering::Relaxed);
     }
     next_rsp as *const KernelTrapFrame
