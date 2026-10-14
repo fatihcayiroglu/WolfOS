@@ -59,6 +59,26 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             print("FAIL: APIC timer hardware start marker missing")
             print(run.stderr.decode(errors="replace"))
             return False
+        # Four or more hardware timer IRQs must interrupt a non-yielding
+        # BSP function; the first architectural frame is captured read-only.
+        frame = re.search(
+            r"WOLFOS_APIC_IRQ_FRAME_OK busy_irqs=(\d+) work_steps=(\d+) irq_step=(\d+) rip=0x([0-9a-f]+) rsp=0x([0-9a-f]+) cs=0x([0-9a-f]+) rflags=0x([0-9a-f]+) preemptive=(\d+)",
+            output,
+        )
+        if frame is None:
+            print("FAIL: no genuine IRQ-frame snapshot during non-yielding work")
+            return False
+        busy_irqs, work, irq_step = map(int, frame.groups()[:3])
+        rip, rsp, cs, rflags = (int(field, 16) for field in frame.groups()[3:7])
+        preemptive = int(frame.group(8))
+        if (
+            busy_irqs < 4 or work <= irq_step or irq_step == 0
+            or rip == 0 or rsp == 0 or rsp % 8 != 0
+            or cs == 0 or cs & 3 or rflags & 0x202 != 0x202
+            or preemptive != 0
+        ):
+            print(f"FAIL: invalid interrupted-worker frame evidence: {frame.groups()}")
+            return False
         task_proof = re.search(
             r"WOLFOS_APIC_TIMER_TASKS_OK threads=(\d+) dispatches=(\d+) switches=(\d+) stack_kib=(\d+) gated_by_irq=(\d+) preemptive=(\d+)",
             output,
@@ -83,6 +103,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             return False
         if any(s in output for s in (
             "WOLFOS_APIC_TIMER_ERROR", "WOLFOS_APIC_TIMER_TEST_FAILED",
+            "WOLFOS_APIC_IRQ_FRAME_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):
             print("FAIL: fatal APIC-related kernel diagnostic")
