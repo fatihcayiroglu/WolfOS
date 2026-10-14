@@ -89,7 +89,7 @@ pub extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {
     SPURIOUS.fetch_add(1, Ordering::Relaxed);
 }
 
-fn run_mapped_test() -> bool {
+fn run_mapped_test(expected_id: u32) -> bool {
     // Enter with IF=0, and leave with IF=0 on every path.
     let plan = match lapic_timer_plan::periodic_timer_plan(
         TIMER_VECTOR, DIVISOR, INITIAL_COUNT
@@ -103,7 +103,7 @@ fn run_mapped_test() -> bool {
     let id = unsafe { apic_read(lapic_mmio_layout::XAPIC_ID_OFFSET) };
     let version = unsafe { apic_read(lapic_mmio_layout::XAPIC_VERSION_OFFSET) };
     if lapic_mmio_layout::decode_version(version).is_err()
-        || lapic_mmio_layout::decode_id(id) > 255
+        || lapic_mmio_layout::verify_identity(id, expected_id).is_err()
     {
         return false;
     }
@@ -223,7 +223,7 @@ pub fn verify(expected_id: u32, hhdm: u64, entries: &[&Entry]) -> bool {
     let correct_mapping = mapper.translate_addr(virtual_addr)
         .map(|a| a.as_u64()) == Some(base);
     let result = if correct_mapping {
-        run_mapped_test()
+        run_mapped_test(expected_id)
     } else {
         serial::write_line("WOLFOS_APIC_TIMER_ERROR map_mismatch");
         false
