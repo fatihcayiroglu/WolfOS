@@ -50,22 +50,40 @@ unsafe impl FrameAllocator<Size4KiB> for TableAllocator {
     }
 }
 #[inline]
-unsafe fn read(offset: usize) -> u32 {
+pub(crate) unsafe fn read(offset: usize) -> u32 {
     unsafe { ((VA as usize + offset) as *const u32).read_volatile() }
 }
 #[inline]
-unsafe fn write(offset: usize, value: u32) {
+pub(crate) unsafe fn write(offset: usize, value: u32) {
     unsafe { ((VA as usize + offset) as *mut u32).write_volatile(value) }
 }
-fn local_id() -> u32 {
+pub(crate) fn local_id() -> u32 {
     (unsafe { read(ipi_layout::APIC_ID_OFFSET) } >> 24) & 0xff
 }
-fn ap_slot(id: u32) -> Option<usize> {
+pub(crate) fn ap_slot(id: u32) -> Option<usize> {
     let count = COUNT.load(Ordering::Acquire);
     if id == BSP_ID.load(Ordering::Relaxed) || count > MAX_BOOT_CPUS {
         return None;
     }
     (0..count).find(|i| IDS[*i].load(Ordering::Relaxed) == id)
+}
+
+/// Read-only BSP observation after an AP publishes its offline state.
+#[cfg(feature = "ap-local-timer-smoke")]
+pub(crate) fn is_offline(index: usize) -> bool {
+    index < MAX_BOOT_CPUS && OFFLINE[index].load(Ordering::Acquire)
+}
+/// Reject any accidental directed IPI or spurious APIC interrupt during
+/// the standalone AP-local periodic timer test.
+#[cfg(feature = "ap-local-timer-smoke")]
+pub(crate) fn ipi_count() -> u64 {
+    (0..COUNT.load(Ordering::Acquire))
+        .map(|i| SEEN[i].load(Ordering::Acquire))
+        .sum()
+}
+#[cfg(feature = "ap-local-timer-smoke")]
+pub(crate) fn spurious_count() -> u64 {
+    SPURIOUS_COUNT.load(Ordering::Acquire)
 }
 
 /// Called on receiving AP, by its independent IDT and with IF=0. No
@@ -159,17 +177,36 @@ pub fn secondary_wait(index: usize, expected_id: u32) -> bool {
         write(TIMER_LVT, old_timer | TIMER_MASK);
         write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, enabled);
     }
-    x86_64::instructions::interrupts::enable();
-    READY[index].store(true, Ordering::Release);
-    // Spin rather than HLT to avoid a lost STOP wake-up race.
-    while !STOP.load(Ordering::Acquire) { core::hint::spin_loop(); }
-    x86_64::instructions::interrupts::disable();
-    unsafe {
-        write(TIMER_LVT, old_timer);
-        write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr);
+    #[cfg(feature = "ap-local-timer-smoke")]
+    {
+        // The AP-only timer proof controls IF, its own SVR/LVT/divide/count,
+        // masks+stops its timer and reparks. It deliberately sends NO IPI.
+        // The caller already masked the original AP timer and enabled SVR.
+        let result = crate::ap_local_timer_smoke::secondary_run(index);
+        x86_64::instructions::interrupts::disable();
+        unsafe {
+            write(TIMER_LVT, old_timer | TIMER_MASK);
+            write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr);
+        }
+        OFFLINE[index].store(true, Ordering::Release);
+        return result;
     }
-    OFFLINE[index].store(true, Ordering::Release);
-    true
+    #[cfg(not(feature = "ap-local-timer-smoke"))]
+    x86_64::instructions::interrupts::enable();
+    #[cfg(not(feature = "ap-local-timer-smoke"))]
+    READY[index].store(true, Ordering::Release);
+    #[cfg(not(feature = "ap-local-timer-smoke"))]
+    {
+        // Spin rather than HLT to avoid a lost STOP wake-up race.
+        while !STOP.load(Ordering::Acquire) { core::hint::spin_loop(); }
+        x86_64::instructions::interrupts::disable();
+        unsafe {
+            write(TIMER_LVT, old_timer);
+            write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr);
+        }
+        OFFLINE[index].store(true, Ordering::Release);
+        true
+    }
 }
 fn wait(mut f: impl FnMut() -> bool, limit: usize) -> bool {
     for _ in 0..limit {
