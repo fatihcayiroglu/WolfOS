@@ -125,6 +125,14 @@ pub fn initialize_secondary(index: usize) -> bool {
     idt.invalid_opcode.set_handler_fn(ap_invalid_opcode);
     idt.general_protection_fault.set_handler_fn(ap_general_protection_fault);
     idt.page_fault.set_handler_fn(ap_page_fault);
+    // The isolated directed-IPI QEMU flavor installs two external vectors
+    // only on secondary CPUs. Its handler EOIs the *receiving* local APIC.
+    #[cfg(feature = "ap-ipi-smoke")]
+    {
+        idt[crate::ap_ipi_smoke::VECTOR].set_handler_fn(crate::ap_ipi_smoke::irq);
+        idt[crate::ap_ipi_smoke::SPURIOUS]
+            .set_handler_fn(crate::ap_ipi_smoke::spurious);
+    }
     // SAFETY: AP owns a unique, permanently reserved double-fault IST.
     unsafe {
         idt.double_fault.set_handler_fn(ap_double_fault)
