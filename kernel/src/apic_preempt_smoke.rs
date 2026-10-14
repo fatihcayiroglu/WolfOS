@@ -637,7 +637,22 @@ fn busy_task(id: usize) -> ! {
     let mut blocked_once = false;
     let mut resumed_once = false;
     let mut finished_once = false;
+    let mut live_admission_attempted = false;
     for _ in 0..MAX_TASK_SPINS {
+        if id == 0 && !live_admission_attempted
+            && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && SWITCHES.load(Ordering::Acquire) >= 18
+            && POST_WAKE_VISITS.iter().all(|visit|
+                visit.load(Ordering::Relaxed) >= 2
+            )
+        {
+            // This is a LIVE scheduler admission, not a BSP-only startup:
+            // two other workers stay runnable and the hardware timer is
+            // still active. Preemption is suppressed only while publishing
+            // a complete initial trap frame, FX ownership and Ready bit.
+            let _ = admit_live_task3();
+            live_admission_attempted = true;
+        }
         if id == 1 && !blocked_once && WORK[1].load(Ordering::Acquire) >= 128 {
             // The task itself requests Blocked; nested preempt-disable
             // prevents an IRQ handoff across the bitmap+phase update.
@@ -674,6 +689,8 @@ fn busy_task(id: usize) -> ! {
         }
         if id == 2 && !finished_once
             && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
             && SWITCHES.load(Ordering::Relaxed) >= FINISH_AFTER_SWITCHES
             && POST_WAKE_VISITS.iter().all(|visit|
                 visit.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
@@ -725,6 +742,9 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
+            && LIVE_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
+            && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
             && BLOCK_PHASE.load(Ordering::Acquire) == 3
             && FINISH_PHASE.load(Ordering::Acquire) == 2
             && FINISH_FROZEN_SAMPLES.load(Ordering::Relaxed) >= FINISH_FREEZE_REQUIRED
@@ -758,6 +778,71 @@ fn busy_task(id: usize) -> ! {
 extern "C" fn task0() -> ! { busy_task(0) }
 extern "C" fn task1() -> ! { busy_task(1) }
 extern "C" fn task2() -> ! { busy_task(2) }
+
+/// Spawned only by the running task0, *after* hardware IRQ round-robin
+/// scheduling has started. No cooperative yield to any other worker.
+/// It owns the fourth FXSAVE64 image and separate 16 KiB private stack.
+extern "C" fn task3() -> ! {
+    if !x86_64::instructions::interrupts::are_enabled()
+        || LIVE_PHASE.load(Ordering::Acquire) != 1
+    {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    let initial_xmm = unsafe { fx_state::read_test_xmm0() };
+    LIVE_INITIAL_XMM.store(initial_xmm, Ordering::Release);
+    if initial_xmm == TASK_XMM0[2] {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { fx_state::set_test_xmm0(LIVE_XMM0); }
+    XMM_READY[LIVE_TASK].store(true, Ordering::Release);
+    LIVE_ENTRY_SEEN.store(true, Ordering::Release);
+
+    for _ in 0..MAX_TASK_SPINS {
+        if unsafe { fx_state::read_test_xmm0() } != LIVE_XMM0 {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        LIVE_TASK_WORK.fetch_add(1, Ordering::Relaxed);
+        if LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
+            && LIVE_TASK_WORK.load(Ordering::Relaxed) > 512
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    if PREEMPT_DEPTH.disable() != Ok(1) {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let changed = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::finish_runnable(
+                mask, FINISHED.load(Ordering::Acquire), LIVE_TASK, SLOT_COUNT
+            ).ok().map(|(ready, _)| ready)
+        ).is_ok();
+        // SAFETY: BSP-only task and task-owned table; preemption disabled
+        // for this entire mutation. The IRQ handler never reads SLOT_OWNERS.
+        let finished = changed && unsafe {
+            let table = &mut *SLOT_OWNERS.0.get();
+            table.handle(LIVE_TASK).ok().is_some_and(|handle|
+                handle.generation == LIVE_HANDLE_GEN.load(Ordering::Acquire)
+                    && table.finish(handle).is_ok()
+            )
+        };
+        if finished {
+            LIVE_FINISHES.fetch_add(1, Ordering::Relaxed);
+            LIVE_PHASE.store(2, Ordering::Release);
+        } else {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+        if PREEMPT_DEPTH.enable() != Ok(0) {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // IRQ will save this suspended stack and resume a DIFFERENT runnable
+    // worker. We intentionally never free, zero or resume this live frame.
+    loop { core::hint::spin_loop(); }
+}
 
 /// Proof of safe reuse of an INACTIVE slot: the original task 2 was
 /// interrupted, marked Finished, and left off the runnable list for >=6
