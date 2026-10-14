@@ -125,19 +125,21 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             return False
         if preemptive:
             handoff = re.search(
-                r"WOLFOS_APIC_PREEMPT_OK tasks=(\d+) involuntary_switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) work0=(\d+) work1=(\d+) exit_task=(\d+) rejected=(\d+) stack_kib=(\d+) bsp_only=(\d+) user_mode=(\d+)",
+                r"WOLFOS_APIC_PREEMPT_OK tasks=(\d+) involuntary_switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) work0=(\d+) work1=(\d+) exit_task=(\d+) rejected=(\d+) stack_kib=(\d+) bsp_only=(\d+) user_mode=(\d+) deferred=(\d+) nested=(\d+) guard_depth=(\d+)",
                 output,
             )
             if handoff is None:
                 print("FAIL: genuine BSP hardware timer two-task involuntary handoff marker missing")
                 return False
-            tasks, switches, a_irq, b_irq, work0, work1, exit_task, rejected, stack_kib, bsp, userspace = map(
+            (tasks, switches, a_irq, b_irq, work0, work1, exit_task,
+             rejected, stack_kib, bsp, userspace, deferred, nested, depth) = map(
                 int, handoff.groups()
             )
             if (tasks != 2 or switches < 8 or a_irq < 4 or b_irq < 4
                 or a_irq + b_irq != switches or not work0 or not work1
                 or exit_task not in (0, 1) or rejected != 0
-                or stack_kib != 16 or bsp != 1 or userspace != 0):
+                or stack_kib != 16 or bsp != 1 or userspace != 0
+                or deferred < 4 or nested != 1 or depth != 0):
                 print(f"FAIL: invalid involuntary context switching evidence: {handoff.groups()}")
                 return False
         elif "WOLFOS_APIC_PREEMPT_OK" in output:
