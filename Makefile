@@ -23,13 +23,15 @@ else ifeq ($(FLAVOR),apic-preempt)
 FEATURES := --features apic-preempt-smoke
 else ifeq ($(FLAVOR),ap-ipi)
 FEATURES := --features ap-ipi-smoke
+else ifeq ($(FLAVOR),ap-local-timer)
+FEATURES := --features ap-local-timer-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -98,6 +100,10 @@ apic-preempt-smoke:
 ap-ipi-smoke:
 	$(MAKE) iso FLAVOR=ap-ipi
 	python3 scripts/ap_ipi_smoke.py $(OUT)/wolfos-ap-ipi.iso
+
+ap-local-timer-smoke:
+	$(MAKE) iso FLAVOR=ap-local-timer
+	python3 scripts/ap_local_timer_smoke.py $(OUT)/wolfos-ap-local-timer.iso
 
 test:
 	python3 -m unittest discover -s tests -v
