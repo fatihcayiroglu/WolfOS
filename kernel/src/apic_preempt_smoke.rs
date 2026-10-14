@@ -17,7 +17,7 @@ use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 use crate::{context_switch, kernel_trap_frame::{
     HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume
-}};
+}, preempt_depth::PreemptDepth};
 
 const STACK_BYTES: usize = 16 * 1024;
 const STOP_AFTER: u64 = 8;
@@ -53,6 +53,9 @@ static SWITCHES: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
 static EXIT_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CODE_SELECTOR: AtomicUsize = AtomicUsize::new(0);
+static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
+static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
+static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
 
 fn stack_bottom(id: usize) -> usize {
     // SAFETY: id is always 0 or 1, and no Rust reference to the stack is
@@ -133,6 +136,12 @@ fn prepare() -> bool {
 /// The assembly IRQ entry restores all GPRs and IRETQs using this pointer.
 pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame {
     if !ACTIVE.load(Ordering::Relaxed) { return frame_ptr; }
+    // The local APIC IRQ and its EOI still occur, but a held critical
+    // section must NOT trigger a kernel stack switch, even when nested.
+    if !PREEMPT_DEPTH.can_preempt() {
+        DEFERRED_IRQS.fetch_add(1, Ordering::Relaxed);
+        return frame_ptr;
+    }
     let current = CURRENT.load(Ordering::Relaxed);
     if current >= 2 {
         REJECTED.fetch_add(1, Ordering::Relaxed);
@@ -176,11 +185,56 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     next_rsp as *const KernelTrapFrame
 }
 
+/// Prove that two nested task-owned critical sections suppress involuntary
+/// switching but NOT timer IRQ/EOI delivery. Task 0 alone owns the depth;
+/// task 1 cannot start until the outermost enable releases preemption.
+fn check_nested_irq_deferral() -> bool {
+    if PREEMPT_DEPTH.depth() != 2 || SWITCHES.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
+    for phase in 0..2 {
+        let target = (phase as u64 + 1) * 2;
+        let mut observed = false;
+        for _ in 0..MAX_TASK_SPINS {
+            if DEFERRED_IRQS.load(Ordering::Relaxed) >= target {
+                observed = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !observed || SWITCHES.load(Ordering::Relaxed) != 0
+            || WORK[1].load(Ordering::Relaxed) != 0
+        {
+            return false;
+        }
+        if PREEMPT_DEPTH.enable() != Ok(1 - phase) {
+            return false;
+        }
+    }
+    PREEMPT_DEPTH.can_preempt()
+        && PREEMPT_DEPTH.depth() == 0
+        && DEFERRED_IRQS.load(Ordering::Relaxed) >= 4
+        && SWITCHES.load(Ordering::Relaxed) == 0
+}
+
 #[inline(never)]
 fn busy_task(id: usize) -> ! {
     // Set IF only AFTER entering this private stack. Each task spins doing
     // independent atomic work and NEVER calls yield to the other task.
     x86_64::instructions::interrupts::enable();
+    if id == 0 {
+        let nested_ok = check_nested_irq_deferral();
+        NESTED_GUARD_OK.store(nested_ok, Ordering::Release);
+        if !nested_ok {
+            // Fail closed; return to the BSP instead of spinning forever in
+            // a permanently preempt-disabled state.
+            x86_64::instructions::interrupts::disable();
+            ACTIVE.store(false, Ordering::Relaxed);
+            EXIT_TASK.store(id, Ordering::Release);
+            unsafe { context_switch::switch_raw(EXIT_RSP.0.get(), BSP_RSP.0.get()); }
+            crate::halt_forever()
+        }
+    }
     for _ in 0..MAX_TASK_SPINS {
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
@@ -224,6 +278,11 @@ pub fn verify() -> bool {
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
+    DEFERRED_IRQS.store(0, Ordering::Relaxed);
+    NESTED_GUARD_OK.store(false, Ordering::Relaxed);
+    if PREEMPT_DEPTH.disable() != Ok(1) || PREEMPT_DEPTH.disable() != Ok(2) {
+        return false;
+    }
     ACTIVE.store(true, Ordering::Release);
 
     // SAFETY: starts first task at normal ABI boundary, IF=0 on BSP.
@@ -241,22 +300,28 @@ pub fn verify() -> bool {
     let work0 = WORK[0].load(Ordering::Acquire);
     let work1 = WORK[1].load(Ordering::Acquire);
     let rejected = REJECTED.load(Ordering::Acquire);
+    let deferred = DEFERRED_IRQS.load(Ordering::Acquire);
+    let depth = PREEMPT_DEPTH.depth();
+    let nested_ok = NESTED_GUARD_OK.load(Ordering::Acquire);
     let exit_task = EXIT_TASK.load(Ordering::Acquire);
     let ok = switches >= STOP_AFTER
         && first >= MIN_EPOCHS_PER_TASK && second >= MIN_EPOCHS_PER_TASK
         && first + second == switches
         && work0 > 0 && work1 > 0
         && rejected == 0 && exit_task < 2
+        && deferred >= 4 && nested_ok && depth == 0
         && canary_ok(0) && canary_ok(1);
     if ok {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_OK tasks=2 involuntary_switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0\n",
-            switches, first, second, work0, work1, exit_task, rejected
+            "WOLFOS_APIC_PREEMPT_OK tasks=2 involuntary_switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={}\n",
+            switches, first, second, work0, work1, exit_task, rejected,
+            deferred, depth
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={}\n",
-            switches, first, second, work0, work1, exit_task, rejected
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={}\n",
+            switches, first, second, work0, work1, exit_task, rejected,
+            deferred, nested_ok, depth
         ));
     }
     ok
