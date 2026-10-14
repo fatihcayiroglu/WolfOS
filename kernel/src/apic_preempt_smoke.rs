@@ -120,11 +120,11 @@ fn prepare() -> bool {
             }
             FRAME_RSP[id].store(0, Ordering::Relaxed);
         } else {
-            let Some(start): Option<extern "C" fn() -> !> = (match id {
-                1 => Some(task1),
-                2 => Some(task2),
-                _ => None,
-            }) else { return false; };
+            let start: extern "C" fn() -> ! = match id {
+                1 => task1,
+                2 => task2,
+                _ => return false,
+            };
             let saved_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
             if saved_rsp & 7 != 0 { return false; }
             let frame = KernelTrapFrame {
@@ -168,11 +168,20 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
         return frame_ptr;
     }
     let current = CURRENT.load(Ordering::Relaxed);
-    if current >= 2 {
+    if current >= TASK_COUNT {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return frame_ptr;
     }
-    let next = 1 - current;
+    let next = match rr_policy::next_runnable(
+        current, TASK_COUNT, RUNNABLE.load(Ordering::Relaxed)
+    ) {
+        Ok(id) if id != current => id,
+        Ok(_) => return frame_ptr, // no alternative ready; keep running
+        Err(_) => {
+            REJECTED.fetch_add(1, Ordering::Relaxed);
+            return frame_ptr;
+        }
+    };
     let old_rsp = frame_ptr as usize;
     let next_rsp = FRAME_RSP[next].load(Ordering::Relaxed);
     let cs = CODE_SELECTOR.load(Ordering::Relaxed) as u16;
@@ -286,10 +295,10 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
-            && WORK[0].load(Ordering::Relaxed) != 0
-            && WORK[1].load(Ordering::Relaxed) != 0
-            && INTERRUPTED[0].load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
-            && INTERRUPTED[1].load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            && WORK.iter().all(|work| work.load(Ordering::Relaxed) != 0)
+            && INTERRUPTED.iter().all(|count|
+                count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            )
         {
             break;
         }
@@ -309,6 +318,7 @@ fn busy_task(id: usize) -> ! {
 
 extern "C" fn task0() -> ! { busy_task(0) }
 extern "C" fn task1() -> ! { busy_task(1) }
+extern "C" fn task2() -> ! { busy_task(2) }
 
 /// BSP only; enter and leave with IRQs disabled. APIC timer hardware remains
 /// mapped and programmed by the caller; APs are parked (IF=0).
