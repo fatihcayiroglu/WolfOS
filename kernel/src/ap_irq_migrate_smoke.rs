@@ -565,14 +565,14 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
         { valid = false; break 'steps; }
         sends += 1;
         serial::write_fmt(format_args!(
-            "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=sent step={} cpu={} generation={}\\n",
+            "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=sent step={} cpu={} generation={}\n",
             step, next_cpu, generation,
         ));
         if !wait(|| MAIL[next_cpu].completed(next_cpu, generation)
             .ok().flatten().is_some())
         {
             serial::write_fmt(format_args!(
-                "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=timeout step={} cpu={} ipi={} timer={} eoi={} active={} captured={:#x} work={} errors={}\\n",
+                "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=timeout step={} cpu={} ipi={} timer={} eoi={} active={} captured={:#x} work={} errors={}\n",
                 step, next_cpu,
                 ap_ipi_smoke::ipi_received(next_cpu),
                 TIMER_IRQS[next_cpu].load(Ordering::Acquire),
@@ -586,7 +586,7 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
             break 'steps;
         }
         serial::write_fmt(format_args!(
-            "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=completed step={} cpu={}\\n",
+            "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=completed step={} cpu={}\n",
             step, next_cpu,
         ));
         digest = advance_digest(digest, step);
