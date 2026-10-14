@@ -100,50 +100,57 @@ fn prepare() -> bool {
         return false;
     }
     CODE_SELECTOR.store(usize::from(cs), Ordering::Relaxed);
-
-    let a_bottom = stack_bottom(0);
-    let b_bottom = stack_bottom(1);
-    let a_top = stack_top(0);
-    let b_top = stack_top(1);
-    if a_bottom & 15 != 0 || b_bottom & 15 != 0
-        || a_top & 15 != 0 || b_top & 15 != 0 { return false; }
-
-    // First task enters through existing cooperative context_switch from
-    // the BSP. It does NOT switch cooperatively to the other task.
-    // Six callee-saved registers, return-to-entry PC, dummy return address.
-    let a_start_rsp = a_top - 8 * size_of::<usize>();
-    let b_saved_rsp = b_top - 8 - 64 - size_of::<KernelTrapFrame>();
-    if b_saved_rsp & 7 != 0 { return false; }
-    // SAFETY: these memory locations lie within distinct private inactive
-    // stacks. Only the BSP initializes them before any task executes.
-    unsafe {
-        (a_bottom as *mut u64).write_volatile(CANARY);
-        (b_bottom as *mut u64).write_volatile(CANARY ^ 1);
-        core::ptr::write_bytes(a_start_rsp as *mut u8, 0, 64);
-        ((a_start_rsp as *mut usize).add(6)).write(task0 as usize);
-        let b_frame = KernelTrapFrame {
-            registers: SavedGprs::default(),
-            hardware: HardwareReturnFrame {
-                rip: task1 as usize as u64,
-                cs: u64::from(cs),
-                rflags: 0x202,
-                rsp: (b_top - 8) as u64,
-                ss: u64::from(ss),
-            },
-        };
-        (b_saved_rsp as *mut KernelTrapFrame).write(b_frame);
-        *START_RSP.0.get() = a_start_rsp;
+    // Task 0 is entered once from a normal ABI call-switch boundary.
+    // Task 1 and 2 start from validated fabricated IRETQ frames, then
+    // execute on three independent kernel stacks. No task-to-task yield.
+    for id in 0..TASK_COUNT {
+        let bottom = stack_bottom(id);
+        let top = stack_top(id);
+        if bottom & 15 != 0 || top & 15 != 0 { return false; }
+        // SAFETY: only BSP initializes inactive private stack storage before
+        // any worker is runnable or interrupt delivery has been enabled.
+        unsafe { (bottom as *mut u64).write_volatile(CANARY ^ id as u64); }
+        if id == 0 {
+            let rsp = top - 8 * size_of::<usize>();
+            // Six nonvolatile GPRs + return-to-entry + dummy return address.
+            unsafe {
+                core::ptr::write_bytes(rsp as *mut u8, 0, 64);
+                (rsp as *mut usize).add(6).write(task0 as usize);
+                *START_RSP.0.get() = rsp;
+            }
+            FRAME_RSP[id].store(0, Ordering::Relaxed);
+        } else {
+            let Some(start): Option<extern "C" fn() -> !> = (match id {
+                1 => Some(task1),
+                2 => Some(task2),
+                _ => None,
+            }) else { return false; };
+            let saved_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
+            if saved_rsp & 7 != 0 { return false; }
+            let frame = KernelTrapFrame {
+                registers: SavedGprs::default(),
+                hardware: HardwareReturnFrame {
+                    rip: start as usize as u64,
+                    cs: u64::from(cs),
+                    rflags: 0x202,
+                    rsp: (top - 8) as u64,
+                    ss: u64::from(ss),
+                },
+            };
+            // SAFETY: saved_rsp is 8-byte aligned and lies entirely inside
+            // task id's dedicated 16 KiB kernel stack.
+            let good = unsafe {
+                (saved_rsp as *mut KernelTrapFrame).write(frame);
+                validate_kernel_resume(
+                    saved_rsp as u64, bottom as u64, top as u64, cs,
+                    &*(saved_rsp as *const KernelTrapFrame)
+                ).is_ok()
+            };
+            if !good { return false; }
+            FRAME_RSP[id].store(saved_rsp, Ordering::Relaxed);
+        }
     }
-    FRAME_RSP[0].store(0, Ordering::Relaxed);
-    FRAME_RSP[1].store(b_saved_rsp, Ordering::Relaxed);
-    // SAFETY: no task has run; synthetic frame lies within stack bounds,
-    // points to the correct code segment, and is 8-byte aligned.
-    unsafe {
-        validate_kernel_resume(
-            b_saved_rsp as u64, b_bottom as u64, b_top as u64, cs,
-            &*(b_saved_rsp as *const KernelTrapFrame)
-        ).is_ok()
-    }
+    true
 }
 
 /// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
