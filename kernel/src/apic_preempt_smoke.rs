@@ -21,7 +21,8 @@ use crate::{context_switch, kernel_trap_frame::{
 
 const TASK_COUNT: usize = 3;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = MIN_EPOCHS_PER_TASK * TASK_COUNT as u64;
+const STOP_AFTER: u64 = 26;
+const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
 const CANARY: u64 = 0x574f_4c46_5052_454d;
@@ -65,6 +66,22 @@ static REJECTED: AtomicU64 = AtomicU64::new(0);
 static EXIT_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CODE_SELECTOR: AtomicUsize = AtomicUsize::new(0);
 static RUNNABLE: AtomicU64 = AtomicU64::new(0);
+// Lifecycle phases: 0=not armed, 1=task1 blocked on its stack,
+// 2=timer woke task1 (runnable), 3=task1 actually resumed on same stack.
+// All test-owned by BSP; atomic so IRQ handler can observe without locks.
+static BLOCK_PHASE: AtomicUsize = AtomicUsize::new(0);
+static BLOCK_ENTRY_CAPTURED: AtomicBool = AtomicBool::new(false);
+static BLOCK_SAVED_WORK: AtomicU64 = AtomicU64::new(0);
+static BLOCK_OTHER_WORK: AtomicU64 = AtomicU64::new(0);
+static BLOCKED_TIMER_IRQS: AtomicU64 = AtomicU64::new(0);
+static BLOCK_FROZEN_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static BLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+static RESUME_COUNT: AtomicU64 = AtomicU64::new(0);
+static BLOCK_ERRORS: AtomicU64 = AtomicU64::new(0);
+static POST_WAKE_VISITS: [AtomicU64; TASK_COUNT] =
+    [const { AtomicU64::new(0) }; TASK_COUNT];
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
