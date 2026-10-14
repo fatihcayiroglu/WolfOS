@@ -913,5 +913,27 @@ pub fn verify() -> bool {
             finish_skips, finish_errors, survivor0, survivor1
         ));
     }
-    ok
+    // Keep the original finished/IRQ/SSE evidence tied to the *live*
+    // pre-reclaim task state above. Only now, back in the disjoint BSP
+    // context with IF=0, is it safe to wipe and prepare a reused slot.
+    // The new generation is deliberately NOT added to RUNNABLE.
+    let recycled = if ok { recycle_quiescent_task2() } else { None };
+    if let Some(proof) = &recycled {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_RECYCLE_OK task=2 old_gen={} new_gen={} scrubbed_kib=16 fx_bytes=512 fx_scrub={} fx_reseed={} prior_xmm0={:#x} stale={} early_denied={} grace_denied={} frame_valid={} runnable=0 bsp_only=1 executed_new_task=0\n",
+            proof.old_generation, proof.new_generation,
+            u8::from(proof.fx.fully_scrubbed),
+            u8::from(proof.fx.baseline_reseeded),
+            proof.fx.old_xmm0,
+            u8::from(proof.stale_rejected),
+            u8::from(proof.old_handle_refused_while_running),
+            u8::from(proof.grace_refused),
+            u8::from(proof.valid_new_frame)
+        ));
+    } else if ok {
+        crate::serial::write_str(
+            "WOLFOS_APIC_RECYCLE_ERROR quiescence_or_generation_or_stack_invalid\n"
+        );
+    }
+    ok && recycled.is_some()
 }
