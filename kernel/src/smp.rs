@@ -117,6 +117,12 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
     }
     AP_RESULT[index].store(result, Ordering::Release);
     AP_DONE[index].store(expected_ack(info), Ordering::Release);
+    // Dedicated QEMU IPI proof only: AP installs its own SVR, enables IF
+    // briefly, accepts directed fixed IPIs, EOI-acks and reparks with IF=0.
+    #[cfg(feature = "ap-ipi-smoke")]
+    if !crate::ap_ipi_smoke::secondary_wait(index, info.lapic_id) {
+        crate::halt_forever();
+    }
     crate::halt_forever();
 }
 

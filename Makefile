@@ -21,13 +21,15 @@ else ifeq ($(FLAVOR),apic-calibration)
 FEATURES := --features apic-calibration-smoke
 else ifeq ($(FLAVOR),apic-preempt)
 FEATURES := --features apic-preempt-smoke
+else ifeq ($(FLAVOR),ap-ipi)
+FEATURES := --features ap-ipi-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -93,6 +95,10 @@ apic-preempt-smoke:
 	$(MAKE) iso FLAVOR=apic-preempt
 	python3 scripts/apic_timer_smoke.py $(OUT)/wolfos-apic-preempt.iso --preemptive
 
+ap-ipi-smoke:
+	$(MAKE) iso FLAVOR=ap-ipi
+	python3 scripts/ap_ipi_smoke.py $(OUT)/wolfos-ap-ipi.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -114,6 +120,8 @@ test:
 	$(OUT)/lapic_timer_plan_tests
 	rustc --edition=2024 --test kernel/src/lapic_irq_layout.rs -o $(OUT)/lapic_irq_layout_tests
 	$(OUT)/lapic_irq_layout_tests
+	rustc --edition=2024 --test kernel/src/ipi_layout.rs -o $(OUT)/ipi_layout_tests
+	$(OUT)/ipi_layout_tests
 	rustc --edition=2024 --test kernel/src/irq_frame_observation.rs -o $(OUT)/irq_frame_observation_tests
 	$(OUT)/irq_frame_observation_tests
 	rustc --edition=2024 --test kernel/src/kernel_trap_frame.rs -o $(OUT)/kernel_trap_frame_tests
