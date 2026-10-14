@@ -12,10 +12,16 @@ Windows and Steam applications are aspirational milestones: Linux ABI / POSIX, W
 
 No milestone can be marked complete without reproducible build and run evidence.
 
-P1 topology validation: isolated QEMU MADT tests with 1 and 4 virtual CPUs; APs now execute verified Rust work on dedicated stacks; task preemption, timers, IPIs and full SMP scheduling still pending.
+P1 topology validation (merged): isolated QEMU MADT tests with 1 and 4 virtual CPUs. APs execute verified Rust work on dedicated stacks, with independent GDT/TSS/IST/IDT and real per-CPU cooperative kernel context switching. APs park with interrupts disabled after the boot proof. No preemptive or fully dynamic SMP scheduler yet.
 
-P1 timer milestone: isolated single-BSP PIT/8259 IRQ0 delivery and EOI acceptance in QEMU (merged); tick-gated safe-point context dispatch on two kernel stacks (merged). APIC timer, clocksource calibration, genuine interrupt-driven preemption and IRQ-safe scheduler remain planned.
+P1 legacy timer (merged): isolated single-BSP PIT/8259 IRQ0 delivery, PIC EOI and tick-gated **safe-point/cooperative** dispatch between kernel contexts in QEMU. This is not asynchronous task preemption.
 
-P1 local APIC: read-only per-CPU IA32_APIC_BASE MSR + CPUID APIC ID validation for BSP and APs (under review). Read-only BSP xAPIC MMIO mapping/identity test (under review); no APIC timer programming, IPIs or preemption yet.
+P1 local APIC discovery (merged): per-CPU read-only IA32_APIC_BASE MSR and CPUID APIC-ID validation for BSP/APs; temporary, read-only uncached BSP xAPIC MMIO mapping for ID/version observation. Normal kernel boot still does not enable APIC timer IRQs.
 
-P1 xAPIC local timer: pure register LVT/vector, mode and divide-configuration decoding and validation (under review), no MMIO writes or IRQ activation. Next: separate BSP-only safe MMIO timer experiment, calibration, and full preemption semantics.
+P1 xAPIC timer hardware proof (merged, PRs #26–#31): pure LVT/divisor/vector validation, masked timer programming plan and EOI/SVR validation, plus *isolated QEMU smoke-mode* writable MMIO, genuine periodic BSP APIC timer interrupts and matching EOIs. The IRQ path passed 1- and 4-vCPU QEMU tests; no AP timer delivery is claimed. Test tears down the temporary mapping, masks LVT and leaves CPU interrupts disabled.
+
+P1 reference calibration proof (merged, PR #32): isolated BSP PIT channel 2 terminal-count polling (~20 ms) measures the decrement of a masked xAPIC one-shot timer, then uses checked integer arithmetic to estimate a 100 Hz periodic initial count. Full QEMU acceptance verifies both calibration results and actual IRQ/EOI delivery with 1 and 4 vCPUs (Actions #213, 14 October 2026). PIT2 does not establish general-purpose clock precision, drift bounds or cross-hardware portability.
+
+P1 **still pending**: monotonic production clocksource and validated calibration across hardware, safe interrupt-frame capture/restoration, IRQ-safe preemptive scheduler with real involuntary context switches, timer lifecycle/drivers, AP-local timer/EOI handling and IPIs, coordinated full SMP scheduling, real-device regression testing. These are acceptance-gated separately.
+
+P2 remains unimplemented: ring-3 address-space isolation, syscalls, ELF user loader/init, process lifecycle, RAM filesystem and protection checks. Later Windows/Steam compatibility work must not be confused with current kernel smoke proofs.
