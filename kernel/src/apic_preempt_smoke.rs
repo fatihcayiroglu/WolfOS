@@ -1,13 +1,13 @@
 //! QEMU-only BSP proof of *involuntary* kernel-to-kernel task handoff.
 //!
-//! Two private kernel stacks run CPU-bound tasks that NEVER yield to one
-//! another. An actual periodic xAPIC interrupt stores the interrupted
+//! Three private kernel stacks run CPU-bound tasks that NEVER yield to one
+//! another. A real periodic xAPIC interrupt stores the interrupted
 //! 15-GPR + hardware trap-frame RSP and selects the other task's saved RSP.
 //! Assembly pops the selected task's GPRs and IRETQs onto its stack.
 //!
 //! The task finishing the bounded proof voluntarily returns to the original
 //! BSP test harness ONCE, with IF=0. This is not a production scheduler:
-//! no arbitrary tasks, IRQ-safe locking, XSAVE/FPU state, CR3/TLS, ring 3,
+//! no dynamic tasks, IRQ-safe locking, XSAVE/AVX, CR3/TLS, ring 3,
 //! migration, guard pages or AP-local interrupts. All work is BSP-owned.
 
 use core::cell::UnsafeCell;
@@ -17,24 +17,31 @@ use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 use crate::{context_switch, kernel_trap_frame::{
     HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume
-}, preempt_depth::PreemptDepth, fx_state};
+}, preempt_depth::PreemptDepth, fx_state, rr_policy};
 
+const TASK_COUNT: usize = 3;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = 8;
+const STOP_AFTER: u64 = MIN_EPOCHS_PER_TASK * TASK_COUNT as u64;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
 const CANARY: u64 = 0x574f_4c46_5052_454d;
-const TASK_XMM0: [u64; 2] = [0x1122_3344_5566_7788, 0x8877_6655_4433_2211];
+const TASK_XMM0: [u64; TASK_COUNT] = [
+    0x1122_3344_5566_7788,
+    0x8877_6655_4433_2211,
+    0x0f0e_0d0c_0b0a_0908,
+];
 
 #[repr(align(16))]
 struct Stack([u8; STACK_BYTES]);
-struct PrivateStacks(UnsafeCell<[Stack; 2]>);
+struct PrivateStacks(UnsafeCell<[Stack; TASK_COUNT]>);
 // SAFETY: only BSP runs; tasks own disjoint stacks. The interrupt handler
 // observes saved frame addresses atomically but does not mutate live Rust
 // data borrowed across an IRQ or context switch.
 unsafe impl Sync for PrivateStacks {}
 static STACKS: PrivateStacks =
-    PrivateStacks(UnsafeCell::new([const { Stack([0; STACK_BYTES]) }; 2]));
+    PrivateStacks(UnsafeCell::new([
+        const { Stack([0; STACK_BYTES]) }; TASK_COUNT
+    ]));
 
 struct BspSlot(UnsafeCell<usize>);
 // SAFETY: only BSP accesses these raw RSP slots while IF=0 and with all
@@ -47,17 +54,22 @@ static EXIT_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
-static FRAME_RSP: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
-static WORK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
-static INTERRUPTED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static FRAME_RSP: [AtomicUsize; TASK_COUNT] =
+    [const { AtomicUsize::new(0) }; TASK_COUNT];
+static WORK: [AtomicU64; TASK_COUNT] =
+    [const { AtomicU64::new(0) }; TASK_COUNT];
+static INTERRUPTED: [AtomicU64; TASK_COUNT] =
+    [const { AtomicU64::new(0) }; TASK_COUNT];
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
 static REJECTED: AtomicU64 = AtomicU64::new(0);
 static EXIT_TASK: AtomicUsize = AtomicUsize::new(usize::MAX);
 static CODE_SELECTOR: AtomicUsize = AtomicUsize::new(0);
+static RUNNABLE: AtomicU64 = AtomicU64::new(0);
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
-static XMM_READY: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+static XMM_READY: [AtomicBool; TASK_COUNT] =
+    [const { AtomicBool::new(false) }; TASK_COUNT];
 static FX_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static FX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static FX_BAD: AtomicU64 = AtomicU64::new(0);
@@ -88,50 +100,57 @@ fn prepare() -> bool {
         return false;
     }
     CODE_SELECTOR.store(usize::from(cs), Ordering::Relaxed);
-
-    let a_bottom = stack_bottom(0);
-    let b_bottom = stack_bottom(1);
-    let a_top = stack_top(0);
-    let b_top = stack_top(1);
-    if a_bottom & 15 != 0 || b_bottom & 15 != 0
-        || a_top & 15 != 0 || b_top & 15 != 0 { return false; }
-
-    // First task enters through existing cooperative context_switch from
-    // the BSP. It does NOT switch cooperatively to the other task.
-    // Six callee-saved registers, return-to-entry PC, dummy return address.
-    let a_start_rsp = a_top - 8 * size_of::<usize>();
-    let b_saved_rsp = b_top - 8 - 64 - size_of::<KernelTrapFrame>();
-    if b_saved_rsp & 7 != 0 { return false; }
-    // SAFETY: these memory locations lie within distinct private inactive
-    // stacks. Only the BSP initializes them before any task executes.
-    unsafe {
-        (a_bottom as *mut u64).write_volatile(CANARY);
-        (b_bottom as *mut u64).write_volatile(CANARY ^ 1);
-        core::ptr::write_bytes(a_start_rsp as *mut u8, 0, 64);
-        ((a_start_rsp as *mut usize).add(6)).write(task0 as usize);
-        let b_frame = KernelTrapFrame {
-            registers: SavedGprs::default(),
-            hardware: HardwareReturnFrame {
-                rip: task1 as usize as u64,
-                cs: u64::from(cs),
-                rflags: 0x202,
-                rsp: (b_top - 8) as u64,
-                ss: u64::from(ss),
-            },
-        };
-        (b_saved_rsp as *mut KernelTrapFrame).write(b_frame);
-        *START_RSP.0.get() = a_start_rsp;
+    // Task 0 is entered once from a normal ABI call-switch boundary.
+    // Task 1 and 2 start from validated fabricated IRETQ frames, then
+    // execute on three independent kernel stacks. No task-to-task yield.
+    for id in 0..TASK_COUNT {
+        let bottom = stack_bottom(id);
+        let top = stack_top(id);
+        if bottom & 15 != 0 || top & 15 != 0 { return false; }
+        // SAFETY: only BSP initializes inactive private stack storage before
+        // any worker is runnable or interrupt delivery has been enabled.
+        unsafe { (bottom as *mut u64).write_volatile(CANARY ^ id as u64); }
+        if id == 0 {
+            let rsp = top - 8 * size_of::<usize>();
+            // Six nonvolatile GPRs + return-to-entry + dummy return address.
+            unsafe {
+                core::ptr::write_bytes(rsp as *mut u8, 0, 64);
+                (rsp as *mut usize).add(6).write(task0 as usize);
+                *START_RSP.0.get() = rsp;
+            }
+            FRAME_RSP[id].store(0, Ordering::Relaxed);
+        } else {
+            let start: extern "C" fn() -> ! = match id {
+                1 => task1,
+                2 => task2,
+                _ => return false,
+            };
+            let saved_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
+            if saved_rsp & 7 != 0 { return false; }
+            let frame = KernelTrapFrame {
+                registers: SavedGprs::default(),
+                hardware: HardwareReturnFrame {
+                    rip: start as usize as u64,
+                    cs: u64::from(cs),
+                    rflags: 0x202,
+                    rsp: (top - 8) as u64,
+                    ss: u64::from(ss),
+                },
+            };
+            // SAFETY: saved_rsp is 8-byte aligned and lies entirely inside
+            // task id's dedicated 16 KiB kernel stack.
+            let good = unsafe {
+                (saved_rsp as *mut KernelTrapFrame).write(frame);
+                validate_kernel_resume(
+                    saved_rsp as u64, bottom as u64, top as u64, cs,
+                    &*(saved_rsp as *const KernelTrapFrame)
+                ).is_ok()
+            };
+            if !good { return false; }
+            FRAME_RSP[id].store(saved_rsp, Ordering::Relaxed);
+        }
     }
-    FRAME_RSP[0].store(0, Ordering::Relaxed);
-    FRAME_RSP[1].store(b_saved_rsp, Ordering::Relaxed);
-    // SAFETY: no task has run; synthetic frame lies within stack bounds,
-    // points to the correct code segment, and is 8-byte aligned.
-    unsafe {
-        validate_kernel_resume(
-            b_saved_rsp as u64, b_bottom as u64, b_top as u64, cs,
-            &*(b_saved_rsp as *const KernelTrapFrame)
-        ).is_ok()
-    }
+    true
 }
 
 /// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
@@ -149,11 +168,20 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
         return frame_ptr;
     }
     let current = CURRENT.load(Ordering::Relaxed);
-    if current >= 2 {
+    if current >= TASK_COUNT {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return frame_ptr;
     }
-    let next = 1 - current;
+    let next = match rr_policy::next_runnable(
+        current, TASK_COUNT, RUNNABLE.load(Ordering::Relaxed)
+    ) {
+        Ok(id) if id != current => id,
+        Ok(_) => return frame_ptr, // no alternative ready; keep running
+        Err(_) => {
+            REJECTED.fetch_add(1, Ordering::Relaxed);
+            return frame_ptr;
+        }
+    };
     let old_rsp = frame_ptr as usize;
     let next_rsp = FRAME_RSP[next].load(Ordering::Relaxed);
     let cs = CODE_SELECTOR.load(Ordering::Relaxed) as u16;
@@ -223,6 +251,7 @@ fn check_nested_irq_deferral() -> bool {
         }
         if !observed || SWITCHES.load(Ordering::Relaxed) != 0
             || WORK[1].load(Ordering::Relaxed) != 0
+            || WORK[2].load(Ordering::Relaxed) != 0
         {
             return false;
         }
@@ -267,10 +296,10 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
-            && WORK[0].load(Ordering::Relaxed) != 0
-            && WORK[1].load(Ordering::Relaxed) != 0
-            && INTERRUPTED[0].load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
-            && INTERRUPTED[1].load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            && WORK.iter().all(|work| work.load(Ordering::Relaxed) != 0)
+            && INTERRUPTED.iter().all(|count|
+                count.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
+            )
         {
             break;
         }
@@ -290,6 +319,7 @@ fn busy_task(id: usize) -> ! {
 
 extern "C" fn task0() -> ! { busy_task(0) }
 extern "C" fn task1() -> ! { busy_task(1) }
+extern "C" fn task2() -> ! { busy_task(2) }
 
 /// BSP only; enter and leave with IRQs disabled. APIC timer hardware remains
 /// mapped and programmed by the caller; APs are parked (IF=0).
@@ -300,10 +330,9 @@ pub fn verify() -> bool {
         return false;
     }
     CURRENT.store(0, Ordering::Relaxed);
-    WORK[0].store(0, Ordering::Relaxed);
-    WORK[1].store(0, Ordering::Relaxed);
-    INTERRUPTED[0].store(0, Ordering::Relaxed);
-    INTERRUPTED[1].store(0, Ordering::Relaxed);
+    for work in &WORK { work.store(0, Ordering::Relaxed); }
+    for interrupted in &INTERRUPTED { interrupted.store(0, Ordering::Relaxed); }
+    RUNNABLE.store((1 << TASK_COUNT) - 1, Ordering::Release);
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
@@ -325,7 +354,7 @@ pub fn verify() -> bool {
     ACTIVE.store(true, Ordering::Release);
 
     // SAFETY: starts first task at normal ABI boundary, IF=0 on BSP.
-    // From now on, ONLY APIC hardware interrupts transfer task0<->task1.
+    // From now on, ONLY hardware interrupts rotate tasks 0 -> 1 -> 2.
     unsafe { context_switch::switch_raw(BSP_RSP.0.get(), START_RSP.0.get()); }
 
     let unexpected_interrupt_state = x86_64::instructions::interrupts::are_enabled()
@@ -336,8 +365,10 @@ pub fn verify() -> bool {
     let switches = SWITCHES.load(Ordering::Acquire);
     let first = INTERRUPTED[0].load(Ordering::Acquire);
     let second = INTERRUPTED[1].load(Ordering::Acquire);
+    let third = INTERRUPTED[2].load(Ordering::Acquire);
     let work0 = WORK[0].load(Ordering::Acquire);
     let work1 = WORK[1].load(Ordering::Acquire);
+    let work2 = WORK[2].load(Ordering::Acquire);
     let rejected = REJECTED.load(Ordering::Acquire);
     let deferred = DEFERRED_IRQS.load(Ordering::Acquire);
     let depth = PREEMPT_DEPTH.depth();
@@ -351,30 +382,32 @@ pub fn verify() -> bool {
     // SAFETY: no further private task or APIC handler uses FX state,
     // interrupts disabled. Recover the original BSP xstate and CR0/CR4.
     unsafe { fx_state::leave(original_fx); }
+    let min_irqs = first.min(second).min(third);
+    let max_irqs = first.max(second).max(third);
     let ok = !unexpected_interrupt_state && switches >= STOP_AFTER
-        && first >= MIN_EPOCHS_PER_TASK && second >= MIN_EPOCHS_PER_TASK
-        && first + second == switches
-        && work0 > 0 && work1 > 0
-        && rejected == 0 && exit_task < 2
+        && min_irqs >= MIN_EPOCHS_PER_TASK && max_irqs - min_irqs <= 1
+        && first + second + third == switches
+        && work0 > 0 && work1 > 0 && work2 > 0
+        && rejected == 0 && exit_task < TASK_COUNT
         && deferred >= 4 && nested_ok && depth == 0
         && fx_switches == switches
-        && fx_observations >= MIN_EPOCHS_PER_TASK * 2 - 1
+        && fx_observations >= STOP_AFTER - 1
         && fx_work_checks > 0 && xmm_ready && fx_bad == 0
-        && canary_ok(0) && canary_ok(1);
+        && (0..TASK_COUNT).all(canary_ok);
     if ok {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=512 xmm0=2 fx_switches={} fx_observations={} work_checks={} corrupt={} original_restored=1 avx=0\n",
+            "WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=512 xmm0=3 fx_switches={} fx_observations={} work_checks={} corrupt={} original_restored=1 avx=0\n",
             fx_switches, fx_observations, fx_work_checks, fx_bad
         ));
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_OK tasks=2 involuntary_switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={}\n",
-            switches, first, second, work0, work1, exit_task, rejected,
-            deferred, depth
+            "WOLFOS_APIC_PREEMPT_OK tasks=3 involuntary_switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={} fairness_max_delta={}\n",
+            switches, first, second, third, work0, work1, work2,
+            exit_task, rejected, deferred, depth, max_irqs - min_irqs
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={}\n",
-            switches, first, second, work0, work1, exit_task, rejected,
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={}\n",
+            switches, first, second, third, work0, work1, work2, exit_task, rejected,
             deferred, nested_ok, depth, fx_switches, fx_observations, fx_bad,
             fx_work_checks, xmm_ready, !unexpected_interrupt_state
         ));

@@ -125,37 +125,40 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             return False
         if preemptive:
             handoff = re.search(
-                r"WOLFOS_APIC_PREEMPT_OK tasks=(\d+) involuntary_switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) work0=(\d+) work1=(\d+) exit_task=(\d+) rejected=(\d+) stack_kib=(\d+) bsp_only=(\d+) user_mode=(\d+) deferred=(\d+) nested=(\d+) guard_depth=(\d+)",
+                r"WOLFOS_APIC_PREEMPT_OK tasks=(\d+) involuntary_switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) task2_irqs=(\d+) work0=(\d+) work1=(\d+) work2=(\d+) exit_task=(\d+) rejected=(\d+) stack_kib=(\d+) bsp_only=(\d+) user_mode=(\d+) deferred=(\d+) nested=(\d+) guard_depth=(\d+) fairness_max_delta=(\d+)",
                 output,
             )
             if handoff is None:
-                print("FAIL: genuine BSP hardware timer two-task involuntary handoff marker missing")
+                print("FAIL: three-task kernel IRQ round-robin proof marker missing")
                 return False
-            (tasks, switches, a_irq, b_irq, work0, work1, exit_task,
-             rejected, stack_kib, bsp, userspace, deferred, nested, depth) = map(
-                int, handoff.groups()
-            )
-            if (tasks != 2 or switches < 8 or a_irq < 4 or b_irq < 4
-                or a_irq + b_irq != switches or not work0 or not work1
-                or exit_task not in (0, 1) or rejected != 0
+            (tasks, switches, a_irq, b_irq, c_irq, work0, work1, work2,
+             exit_task, rejected, stack_kib, bsp, userspace, deferred,
+             nested, depth, fairness_max_delta) = map(int, handoff.groups())
+            if (tasks != 3 or switches < 12
+                or min(a_irq, b_irq, c_irq) < 4
+                or max(a_irq, b_irq, c_irq) - min(a_irq, b_irq, c_irq) > 1
+                or a_irq + b_irq + c_irq != switches
+                or not all((work0, work1, work2))
+                or exit_task not in (0, 1, 2) or rejected != 0
                 or stack_kib != 16 or bsp != 1 or userspace != 0
-                or deferred < 4 or nested != 1 or depth != 0):
-                print(f"FAIL: invalid involuntary context switching evidence: {handoff.groups()}")
+                or deferred < 4 or nested != 1 or depth != 0
+                or fairness_max_delta > 1):
+                print(f"FAIL: invalid three-task IRQ fairness evidence: {handoff.groups()}")
                 return False
             fx = re.search(
                 r"WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=(\d+) xmm0=(\d+) fx_switches=(\d+) fx_observations=(\d+) work_checks=(\d+) corrupt=(\d+) original_restored=(\d+) avx=(\d+)",
                 output,
             )
             if fx is None:
-                print("FAIL: real BSP x87/SSE task context-switch proof missing")
+                print("FAIL: three private task FX images not observed")
                 return False
             fx_bytes, fx_tasks, fx_switches, fx_observations, work_checks, bad, restored, avx = map(
                 int, fx.groups()
             )
-            if (fx_bytes != 512 or fx_tasks != 2 or fx_switches != switches
-                or fx_observations < 7 or work_checks < 2 or bad != 0
+            if (fx_bytes != 512 or fx_tasks != 3 or fx_switches != switches
+                or fx_observations < 11 or work_checks < 3 or bad != 0
                 or restored != 1 or avx != 0):
-                print(f"FAIL: x87/SSE state lost across preemption: {fx.groups()}")
+                print(f"FAIL: x87/SSE state corrupted in three-task preemption: {fx.groups()}")
                 return False
         elif "WOLFOS_APIC_PREEMPT_OK" in output:
             print("FAIL: normal APIC smoke unexpectedly claims task preemption")
