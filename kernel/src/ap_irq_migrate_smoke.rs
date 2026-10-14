@@ -35,7 +35,9 @@ const QUANTA: u64 = 12;
 const PER_AP: u64 = 4;
 const COUNT: u32 = 262_144;
 const DIVISOR: u32 = 16;
-const WAIT_SPINS: usize = 200_000_000;
+// During hardware bring-up, fail fast with state evidence rather than
+// masking a missing IRQ/IRET by a 55-second QEMU outer timeout.
+const WAIT_SPINS: usize = 20_000_000;
 const CANARY: u64 = 0x4952_515f_4d49_4752;
 const LOCAL_COOKIE: u64 = 0x4350_555f_4c4f_434b;
 const XMM_TAG: u64 = 0xabcd_4455_66ef_7788;
@@ -525,6 +527,7 @@ fn wait(mut f: impl FnMut() -> bool) -> bool {
 /// own coordinator and published an Acquire-visible mailbox completion
 /// BEFORE the owner+epoch transfer and directed IPI to the new AP.
 pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
+    serial::write_line("WOLFOS_AP_IRQ_MIGRATE_TRACE stage=bsp_enter");
     if cpus.len() != CORES || cpus[0].lapic_id != bsp
         || cpus.iter().filter(|c| c.lapic_id == bsp).count() != 1
         || x86_64::instructions::interrupts::are_enabled()
@@ -534,6 +537,7 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
         serial::write_line("WOLFOS_AP_IRQ_MIGRATE_ERROR setup");
         return false;
     }
+    serial::write_line("WOLFOS_AP_IRQ_MIGRATE_TRACE stage=aps_ready");
     let mut owner = 1usize;
     let mut epoch = 0u64;
     let mut digest = INITIAL_DIGEST;
@@ -560,9 +564,31 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
             || !ap_ipi_smoke::send(bsp, cpus[next_cpu].lapic_id)
         { valid = false; break 'steps; }
         sends += 1;
+        serial::write_fmt(format_args!(
+            "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=sent step={} cpu={} generation={}\\n",
+            step, next_cpu, generation,
+        ));
         if !wait(|| MAIL[next_cpu].completed(next_cpu, generation)
             .ok().flatten().is_some())
-        { valid = false; break 'steps; }
+        {
+            serial::write_fmt(format_args!(
+                "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=timeout step={} cpu={} ipi={} timer={} eoi={} active={} captured={:#x} work={} errors={}\\n",
+                step, next_cpu,
+                ap_ipi_smoke::ipi_received(next_cpu),
+                TIMER_IRQS[next_cpu].load(Ordering::Acquire),
+                TIMER_EOIS[next_cpu].load(Ordering::Acquire),
+                ACTIVE[next_cpu].load(Ordering::Acquire),
+                CAPTURED.load(Ordering::Acquire),
+                WORK[next_cpu].load(Ordering::Acquire),
+                ERROR.load(Ordering::Acquire),
+            ));
+            valid = false;
+            break 'steps;
+        }
+        serial::write_fmt(format_args!(
+            "WOLFOS_AP_IRQ_MIGRATE_TRACE stage=completed step={} cpu={}\\n",
+            step, next_cpu,
+        ));
         digest = advance_digest(digest, step);
         let snap = LEASE.snapshot();
         if snap.ok().is_none_or(|s| s.epoch != epoch
