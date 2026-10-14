@@ -309,20 +309,30 @@ pub fn verify() -> bool {
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
     DEFERRED_IRQS.store(0, Ordering::Relaxed);
     NESTED_GUARD_OK.store(false, Ordering::Relaxed);
+    FX_SWITCHES.store(0, Ordering::Relaxed);
+    FX_OBSERVATIONS.store(0, Ordering::Relaxed);
+    FX_BAD.store(0, Ordering::Relaxed);
+    FX_WORK_CHECKS.store(0, Ordering::Relaxed);
+    for ready in &XMM_READY { ready.store(false, Ordering::Relaxed); }
     if PREEMPT_DEPTH.disable() != Ok(1) || PREEMPT_DEPTH.disable() != Ok(2) {
         return false;
     }
+    // SAFETY: BSP IF=0, APs parked. Save the original CPU x87/SSE
+    // context and CR0/CR4 before any private kernel task runs.
+    let Some(original_fx) = (unsafe { fx_state::enter() }) else {
+        return false;
+    };
     ACTIVE.store(true, Ordering::Release);
 
     // SAFETY: starts first task at normal ABI boundary, IF=0 on BSP.
     // From now on, ONLY APIC hardware interrupts transfer task0<->task1.
     unsafe { context_switch::switch_raw(BSP_RSP.0.get(), START_RSP.0.get()); }
 
-    if x86_64::instructions::interrupts::are_enabled()
-        || ACTIVE.load(Ordering::Acquire)
-    {
-        return false;
-    }
+    let unexpected_interrupt_state = x86_64::instructions::interrupts::are_enabled()
+        || ACTIVE.load(Ordering::Acquire);
+    // Restore even on failure; no task remains runnable after returning
+    // from the one-time BSP exit switch.
+    x86_64::instructions::interrupts::disable();
     let switches = SWITCHES.load(Ordering::Acquire);
     let first = INTERRUPTED[0].load(Ordering::Acquire);
     let second = INTERRUPTED[1].load(Ordering::Acquire);
@@ -333,14 +343,29 @@ pub fn verify() -> bool {
     let depth = PREEMPT_DEPTH.depth();
     let nested_ok = NESTED_GUARD_OK.load(Ordering::Acquire);
     let exit_task = EXIT_TASK.load(Ordering::Acquire);
-    let ok = switches >= STOP_AFTER
+    let fx_switches = FX_SWITCHES.load(Ordering::Acquire);
+    let fx_observations = FX_OBSERVATIONS.load(Ordering::Acquire);
+    let fx_bad = FX_BAD.load(Ordering::Acquire);
+    let fx_work_checks = FX_WORK_CHECKS.load(Ordering::Acquire);
+    let xmm_ready = XMM_READY.iter().all(|x| x.load(Ordering::Acquire));
+    // SAFETY: no further private task or APIC handler uses FX state,
+    // interrupts disabled. Recover the original BSP xstate and CR0/CR4.
+    unsafe { fx_state::leave(original_fx); }
+    let ok = !unexpected_interrupt_state && switches >= STOP_AFTER
         && first >= MIN_EPOCHS_PER_TASK && second >= MIN_EPOCHS_PER_TASK
         && first + second == switches
         && work0 > 0 && work1 > 0
         && rejected == 0 && exit_task < 2
         && deferred >= 4 && nested_ok && depth == 0
+        && fx_switches == switches
+        && fx_observations >= MIN_EPOCHS_PER_TASK * 2 - 1
+        && fx_work_checks > 0 && xmm_ready && fx_bad == 0
         && canary_ok(0) && canary_ok(1);
     if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=512 xmm0=2 fx_switches={} fx_observations={} work_checks={} corrupt={} original_restored=1 avx=0\n",
+            fx_switches, fx_observations, fx_work_checks, fx_bad
+        ));
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_PREEMPT_OK tasks=2 involuntary_switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={}\n",
             switches, first, second, work0, work1, exit_task, rejected,
@@ -348,9 +373,10 @@ pub fn verify() -> bool {
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={}\n",
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} work0={} work1={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={}\n",
             switches, first, second, work0, work1, exit_task, rejected,
-            deferred, nested_ok, depth
+            deferred, nested_ok, depth, fx_switches, fx_observations, fx_bad,
+            fx_work_checks, xmm_ready, !unexpected_interrupt_state
         ));
     }
     ok
