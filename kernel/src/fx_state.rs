@@ -165,6 +165,49 @@ pub unsafe fn leave(original: OriginalControl) {
     }
 }
 
+/// Evidence from quiescent FX image recycling. This is a memory operation,
+/// not a CPU FXRSTOR: the scheduler has already restored its original BSP
+/// state, and the next occupant of this slot has NOT been made runnable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FxRecycleProof {
+    pub old_xmm0: u64,
+    pub fully_scrubbed: bool,
+    pub baseline_reseeded: bool,
+    pub aligned: bool,
+}
+
+/// Scrub an inactive finished task's full 512-byte FX image, then reseed it
+/// from the original, valid BSP FXSAVE64 image. No live XMM state is changed.
+/// 
+/// # Safety
+/// BSP IF=0; APs parked. The interrupt scheduler has stopped, exited onto a
+/// disjoint stack, and finished task's xstate image has no remaining users.
+/// The caller MUST verify these conditions before calling. No cross-CPU
+/// reclamation guarantee is provided here.
+pub unsafe fn recycle_task_image(task: usize) -> Option<FxRecycleProof> {
+    if task >= FX_TASKS { return None; }
+    unsafe {
+        let images = TASK_IMAGES.0.get();
+        let target = core::ptr::addr_of_mut!((*images)[task]);
+        let original = ORIGINAL.0.get();
+        let previous = (*target).xmm_low(0)?;
+        let aligned = (target as usize) & 15 == 0;
+        if !aligned { return None; }
+        // No FXSAVE/FXRSTOR executes during image recycling; this is an
+        // explicit scrubbing operation on a logically dead task image.
+        core::ptr::write_bytes(target.cast::<u8>(), 0, FX_BYTES);
+        let cleared = (*target).bytes.iter().all(|byte| *byte == 0);
+        core::ptr::copy_nonoverlapping(original, target, 1);
+        let reseeded = (*target).bytes == (*original).bytes;
+        Some(FxRecycleProof {
+            old_xmm0: previous,
+            fully_scrubbed: cleared,
+            baseline_reseeded: reseeded,
+            aligned,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
