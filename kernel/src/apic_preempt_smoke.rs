@@ -118,6 +118,33 @@ static FX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static FX_BAD: AtomicU64 = AtomicU64::new(0);
 static FX_WORK_CHECKS: AtomicU64 = AtomicU64::new(0);
 
+// Second-generation task2 runs as a single IRQ-interruptible kernel worker
+// after the original fixed 3-task scheduler has stopped on the BSP stack.
+// Its execution starts from the *recycled synthetic GPR+IRETQ frame*.
+// ACTIVE remains false: no retired first-generation task may be resumed.
+const RECYCLE_MIN_IRQS: u64 = 4;
+const RECYCLE_R12: u64 = 0x1234_5678_cafe_f001;
+const RECYCLE_R15: u64 = 0xface_b00c_7654_3210;
+const RECYCLE_XMM0: u64 = 0xa55a_f00d_9e37_cafe;
+static RECYCLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RECYCLE_RETURNED: AtomicBool = AtomicBool::new(false);
+static RECYCLE_WORK: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_IRQS: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_BAD: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_IRQ_FIRST_WORK: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_BASELINE_XMM: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_OBSERVED_XMM: AtomicU64 = AtomicU64::new(0);
+
+// Written by assembly before the new Rust worker function's prologue.
+// The exact initial values are restored by IRETQ, not passed as arguments.
+#[unsafe(no_mangle)]
+pub static WOLFOS_RECYCLE_ENTRY_R12: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+pub static WOLFOS_RECYCLE_ENTRY_R15: AtomicU64 = AtomicU64::new(0);
+static RECYCLE_BSP_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
+static RECYCLE_TASK_EXIT_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
+
 fn stack_bottom(id: usize) -> usize {
     // SAFETY: id is always 0 or 1, and no Rust reference to the stack is
     // created, only the stable static allocation's raw address.
@@ -713,9 +740,13 @@ fn recycle_quiescent_task2() -> Option<RecycleProof> {
     // test; future work must implement controlled task creation/enqueue.
     let new_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
     let next = KernelTrapFrame {
-        registers: SavedGprs::default(),
+        registers: SavedGprs {
+            r12: RECYCLE_R12,
+            r15: RECYCLE_R15,
+            ..SavedGprs::default()
+        },
         hardware: HardwareReturnFrame {
-            rip: task2 as usize as u64,
+            rip: crate::apic_irq_entry::recycled_entry_address(),
             cs: u64::from(cs),
             rflags: 0x202,
             rsp: (top - 8) as u64,
