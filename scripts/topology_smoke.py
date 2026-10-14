@@ -52,6 +52,13 @@ def main() -> int:
         if (int(apic_total), int(verified)) != (EXPECTED_CPUS, EXPECTED_CPUS) or int(base, 16) == 0 or int(x2apic) > EXPECTED_CPUS:
             print(f"FAIL: incorrect read-only LAPIC report {lapic.groups()}")
             return 1
+        mmio = re.search(
+            r"WOLFOS_LAPIC_MMIO_OK id=(\d+) base=(0x[0-9a-f]+) version=(0x[0-9a-f]+) max_lvt=(\d+) readonly=1 uncached=1",
+            output,
+        )
+        if mmio is None or int(mmio.group(1)) > 255 or int(mmio.group(2), 16) == 0 or int(mmio.group(3), 16) < 0x10 or int(mmio.group(4)) < 3:
+            print("FAIL: BSP xAPIC MMIO identity/version was not verified read-only")
+            return 1
         ack = re.search(r"WOLFOS_SMP_APS_OK total=(\d+) bsp_lapic=(\d+) ap_acks=(\d+)", output)
         if ack is None:
             print("FAIL: four secondary CPUs were enumerated but Rust AP handoff did not complete")

@@ -119,3 +119,15 @@ pub fn verify(cpus: &[&MpInfo], bsp_index: usize) -> Option<Summary> {
     }
     Some(Summary { cpus: cpus.len(), x2apic, base: expected_base? })
 }
+
+
+/// BSP-only identity snapshot used to map legacy xAPIC MMIO safely.
+/// The x2APIC interface is MSR-only; do not attempt MMIO in that mode.
+pub fn bsp_mmio_base(expected_apic_id: u32) -> Option<u64> {
+    let (id, raw) = read_snapshot()?;
+    let base = lapic_layout::parse_apic_base(raw).ok()?;
+    if id != expected_apic_id || !base.bsp || base.x2apic {
+        return None;
+    }
+    Some(base.physical_address)
+}

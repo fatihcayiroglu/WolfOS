@@ -86,6 +86,8 @@ test:
 	$(OUT)/pmm_layout_tests
 	rustc --edition=2024 --test kernel/src/lapic_layout.rs -o $(OUT)/lapic_layout_tests
 	$(OUT)/lapic_layout_tests
+	rustc --edition=2024 --test kernel/src/lapic_mmio_layout.rs -o $(OUT)/lapic_mmio_layout_tests
+	$(OUT)/lapic_mmio_layout_tests
 	rustc --edition=2024 --test kernel/src/scheduler.rs -o $(OUT)/scheduler_tests
 	$(OUT)/scheduler_tests
 	rustc --edition=2024 --test kernel/src/thread_scheduler.rs -o $(OUT)/thread_scheduler_tests
