@@ -323,7 +323,39 @@ fn timer_finished_task_observation(current: usize) {
 ///
 /// The assembly IRQ entry restores all GPRs and IRETQs using this pointer.
 pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame {
-    if !ACTIVE.load(Ordering::Relaxed) { return frame_ptr; }
+    if !ACTIVE.load(Ordering::Relaxed) {
+        // After the original three-task run has ended, a second-generation
+        // task2 may be bootstrapped straight from its freshly rebuilt
+        // IRETQ frame. The scheduler stays INACTIVE; the genuine xAPIC IRQ
+        // must inspect its frame, EOI, and return to that SAME new task.
+        if RECYCLE_ACTIVE.load(Ordering::Acquire) {
+            let addr = frame_ptr as usize;
+            let bottom = stack_bottom(2);
+            let top = stack_top(2);
+            let cs = CODE_SELECTOR.load(Ordering::Acquire) as u16;
+            let in_stack = addr & 7 == 0
+                && addr >= bottom + 512
+                && addr.checked_add(size_of::<KernelTrapFrame>())
+                    .is_some_and(|end| end <= top);
+            let valid = in_stack && unsafe {
+                validate_kernel_resume(
+                    addr as u64, bottom as u64, top as u64, cs, &*frame_ptr
+                ).is_ok()
+            };
+            if !valid {
+                RECYCLE_BAD.fetch_add(1, Ordering::Relaxed);
+            } else {
+                let earlier = RECYCLE_IRQS.fetch_add(1, Ordering::Relaxed);
+                if earlier == 0 {
+                    RECYCLE_IRQ_FIRST_WORK.store(
+                        RECYCLE_WORK.load(Ordering::Relaxed),
+                        Ordering::Relaxed
+                    );
+                }
+            }
+        }
+        return frame_ptr;
+    }
     // The local APIC IRQ and its EOI still occur, but a held critical
     // section must NOT trigger a kernel stack switch, even when nested.
     if !PREEMPT_DEPTH.can_preempt() {
