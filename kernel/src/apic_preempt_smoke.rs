@@ -935,7 +935,9 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
     // Re-enable the original BSP's x87/SSE controls for this separate
     // task bootstrap, and load ONLY the prepared new task FX image.
     // The old first-generation task2 XMM0 sentinel cannot reappear.
-    let Some(original_fx) = (unsafe { fx_state::enter() }) else {
+    let Some(original_fx) = (unsafe {
+        fx_state::enter_preserving_prepared_images()
+    }) else {
         return fail("fx_unsupported");
     };
     let Some(initial_xmm) = (unsafe { fx_state::activate_prepared_task(2) })
