@@ -108,6 +108,8 @@ test:
 	$(OUT)/lapic_timer_plan_tests
 	rustc --edition=2024 --test kernel/src/lapic_irq_layout.rs -o $(OUT)/lapic_irq_layout_tests
 	$(OUT)/lapic_irq_layout_tests
+	rustc --edition=2024 --test kernel/src/irq_frame_observation.rs -o $(OUT)/irq_frame_observation_tests
+	$(OUT)/irq_frame_observation_tests
 	rustc --edition=2024 --test kernel/src/scheduler.rs -o $(OUT)/scheduler_tests
 	$(OUT)/scheduler_tests
 	rustc --edition=2024 --test kernel/src/thread_scheduler.rs -o $(OUT)/thread_scheduler_tests
