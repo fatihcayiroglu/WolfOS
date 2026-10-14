@@ -195,8 +195,14 @@ pub unsafe fn recycle_task_image(task: usize) -> Option<FxRecycleProof> {
         if !aligned { return None; }
         // No FXSAVE/FXRSTOR executes during image recycling; this is an
         // explicit scrubbing operation on a logically dead task image.
-        core::ptr::write_bytes(target.cast::<u8>(), 0, FX_BYTES);
-        let cleared = (*target).bytes.iter().all(|byte| *byte == 0);
+        // Volatile stores/readback prevent the optimizer eliminating the
+        // intermediate security wipe before the valid baseline is copied.
+        for index in 0..FX_BYTES / size_of::<u64>() {
+            core::ptr::write_volatile(target.cast::<u64>().add(index), 0);
+        }
+        let cleared = (0..FX_BYTES / size_of::<u64>()).all(|index|
+            core::ptr::read_volatile(target.cast::<u64>().add(index)) == 0
+        );
         core::ptr::copy_nonoverlapping(original, target, 1);
         let reseeded = (*target).bytes == (*original).bytes;
         Some(FxRecycleProof {
