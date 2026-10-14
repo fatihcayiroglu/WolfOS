@@ -936,9 +936,9 @@ pub fn verify() -> bool {
             u8::from(proof.valid_new_frame)
         ));
     } else if ok {
-        crate::serial::write_str(
+        crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_RECYCLE_ERROR quiescence_or_generation_or_stack_invalid\n"
-        );
+        ));
     }
     ok && recycled.is_some()
 }
