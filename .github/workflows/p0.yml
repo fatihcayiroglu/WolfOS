@@ -31,6 +31,8 @@ jobs:
         run: make timer-smoke
       - name: xAPIC periodic timer hardware IRQ smoke (single BSP only)
         run: make apic-timer-smoke
+      - name: PIT2-referenced xAPIC periodic timer calibration smoke (1 and 4 vCPUs)
+        run: make apic-calibration-smoke
       - name: Preserve ISO on failure
         if: failure()
         uses: actions/upload-artifact@v4
