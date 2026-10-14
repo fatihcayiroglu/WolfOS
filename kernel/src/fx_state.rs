@@ -16,6 +16,7 @@ use core::cell::UnsafeCell;
 use core::mem::{align_of, size_of};
 
 pub const FX_BYTES: usize = 512;
+pub const FX_TASKS: usize = 3;
 pub const XMM_OFFSET: usize = 160;
 pub const XMM_STRIDE: usize = 16;
 pub const XMM_COUNT: usize = 16;
@@ -52,8 +53,10 @@ struct Owned<T>(UnsafeCell<T>);
 // interrupt gate and runs on the same BSP. APs are parked with IF=0.
 unsafe impl<T> Sync for Owned<T> {}
 static ORIGINAL: Owned<FxImage> = Owned(UnsafeCell::new(FxImage::empty()));
-static TASK_IMAGES: Owned<[FxImage; 2]> =
-    Owned(UnsafeCell::new([FxImage::empty(), FxImage::empty()]));
+static TASK_IMAGES: Owned<[FxImage; FX_TASKS]> =
+    Owned(UnsafeCell::new([
+        FxImage::empty(), FxImage::empty(), FxImage::empty()
+    ]));
 
 #[derive(Clone, Copy)]
 pub struct OriginalControl {
@@ -85,7 +88,7 @@ unsafe fn restore_raw(image: *const FxImage) {
 }
 
 /// Configure the BSP only, save its original x87/SSE image and initialize
-/// BOTH task images with the same valid baseline. CALL WITH IF=0.
+/// THREE task images with the same valid baseline. CALL WITH IF=0.
 ///
 /// Safety: only the BSP can execute this after all APs have parked; no
 /// user tasks, kernel XSAVE ownership, or SMP FPU management are active.
@@ -108,6 +111,7 @@ pub unsafe fn enter() -> Option<OriginalControl> {
         let tasks = TASK_IMAGES.0.get();
         core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[0]), 1);
         core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[1]), 1);
+        core::ptr::copy_nonoverlapping(original, core::ptr::addr_of_mut!((*tasks)[2]), 1);
     }
     Some(OriginalControl { cr0, cr4 })
 }
@@ -119,7 +123,7 @@ pub unsafe fn enter() -> Option<OriginalControl> {
 /// Safety: only BSP, IF=0 in the interrupt gate, both task IDs in 0..2,
 /// enter() was called, and no other CPU accesses FX images.
 pub unsafe fn switch(current: usize, next: usize) -> Option<u64> {
-    if current >= 2 || next >= 2 || current == next {
+    if current >= FX_TASKS || next >= FX_TASKS || current == next {
         return None;
     }
     unsafe {
@@ -191,11 +195,14 @@ mod tests {
 
     #[test]
     fn distinct_context_images_never_alias() {
-        let task = [FxImage::empty(), FxImage::empty()];
+        let task = [FxImage::empty(), FxImage::empty(), FxImage::empty()];
         let a = core::ptr::addr_of!(task[0]) as usize;
         let b = core::ptr::addr_of!(task[1]) as usize;
+        let c = core::ptr::addr_of!(task[2]) as usize;
         assert_eq!(b - a, FX_BYTES);
+        assert_eq!(c - b, FX_BYTES);
         assert_eq!(a & 15, 0);
         assert_eq!(b & 15, 0);
+        assert_eq!(c & 15, 0);
     }
 }
