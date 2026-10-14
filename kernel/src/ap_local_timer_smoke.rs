@@ -163,7 +163,8 @@ pub fn secondary_run(index: usize) -> bool {
 fn wait_all(cpus: &[&MpInfo], bsp_id: u32) -> bool {
     for _ in 0..BSP_WAIT_SPINS {
         if cpus.iter().enumerate().all(|(index, cpu)| {
-            cpu.lapic_id == bsp_id || DONE[index].load(Ordering::Acquire)
+            cpu.lapic_id == bsp_id || (DONE[index].load(Ordering::Acquire)
+                && ap_ipi_smoke::is_offline(index))
         }) { return true; }
         core::hint::spin_loop();
     }
@@ -191,7 +192,8 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
         let advances = PROGRESS_IRQS[index].load(Ordering::Acquire);
         let steps = WORK[index].load(Ordering::Acquire);
         let armed = READY[index].load(Ordering::Acquire);
-        let finished = DONE[index].load(Ordering::Acquire);
+        let finished = DONE[index].load(Ordering::Acquire)
+            && ap_ipi_smoke::is_offline(index);
         if !armed || !finished || FAILED[index].load(Ordering::Acquire)
             || ACTIVE[index].load(Ordering::Acquire)
             || irq < MIN_TICKS || ack != irq
