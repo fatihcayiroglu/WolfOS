@@ -136,7 +136,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
              exit_task, rejected, stack_kib, bsp, userspace, deferred,
              nested, depth, fairness_max_delta, fourth_irqs,
              live_admitted) = map(int, handoff.groups())
-            if (tasks != 3 or switches < 60
+            if (tasks != 3 or switches < 78
                 or min(a_irq, b_irq, c_irq) < 4
                 or a_irq + b_irq + c_irq + fourth_irqs != switches
                 or fourth_irqs < 4 or live_admitted != 1
@@ -146,6 +146,26 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
                 or deferred < 4 or nested != 1 or depth != 0
                 or fairness_max_delta > 1):
                 print(f"FAIL: invalid three-task IRQ fairness evidence: {handoff.groups()}")
+                return False
+            live_lifecycle = re.search(
+                r"WOLFOS_APIC_LIVE_BLOCK_WAKE_OK task=(\d+) block=(\d+) blocked_irqs=(\d+) frozen=(\d+) skipped=(\d+) woke=(\d+) resumed=(\d+) resume_irqs=(\d+) block_errors=(\d+) frozen_work=(\d+) finished_cannot_wake=(\d+) suspended_stack=(\d+) preserved_sse=(\d+) bsp_only=(\d+)",
+                output,
+            )
+            if live_lifecycle is None:
+                print("FAIL: newly enqueued fourth task has no real IRQ Blocked/Wake/Resume proof")
+                return False
+            (sleep_task, blocks, sleep_irqs, frozen, skips, wakes, resumes,
+             resume_irqs, sleep_errors, frozen_work, denied_terminal_wake,
+             suspended_stack, preserved_sse, bsp_lifecycle) = map(
+                 int, live_lifecycle.groups()
+            )
+            if (sleep_task != 3 or blocks != 1
+                or sleep_irqs < 6 or frozen != sleep_irqs or skips < 2
+                or wakes != 1 or resumes != 1 or resume_irqs < 4
+                or sleep_errors != 0 or frozen_work == 0
+                or denied_terminal_wake != 1 or suspended_stack != 1
+                or preserved_sse != 1 or bsp_lifecycle != 1):
+                print(f"FAIL: live worker was scheduled while Blocked, failed wake or leaked terminal identity: {live_lifecycle.groups()}")
                 return False
             live = re.search(
                 r"WOLFOS_APIC_LIVE_ENQUEUE_OK slot=(\d+) generation=(\d+) admissions=(\d+) executions=(\d+) irq=(\d+) work=(\d+) xmm_initial=0x([0-9a-f]+) xmm_final=0x([0-9a-f]+) corrupt=(\d+) finished=(\d+) parked=(\d+) frozen_irqs=(\d+) survivor_switches=(\d+) gpr_frame=(\d+) fx_private=(\d+) bsp_only=(\d+)",
@@ -207,7 +227,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
              survivor0, survivor1, never_rescheduled, fx_still_owned) = map(
                 int, finished.groups()
             )
-            if (finished_task != 2 or finished_mask != 4 or ready_mask != 3
+            if (finished_task != 2 or finished_mask != 12 or ready_mask != 3
                 or finish_count != 1 or freeze_irqs < 6 or finish_skips < 2
                 or finish_errors != 0 or finished_work == 0
                 or survivor0 < 4 or survivor1 < 4
@@ -306,6 +326,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             "WOLFOS_APIC_IRQ_FRAME_ERROR", "WOLFOS_APIC_GPR_ERROR",
             "WOLFOS_APIC_PREEMPT_ERROR",
             "WOLFOS_APIC_LIVE_ENQUEUE_ERROR",
+            "WOLFOS_APIC_LIVE_BLOCK_WAKE_ERROR",
             "WOLFOS_APIC_BLOCK_WAKE_ERROR",
             "WOLFOS_APIC_FINISHED_ERROR",
             "WOLFOS_APIC_RECYCLE_ERROR",

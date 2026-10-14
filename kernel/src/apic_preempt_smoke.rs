@@ -27,7 +27,7 @@ const LIVE_REQUIRED_IRQS: u64 = 4;
 const LIVE_FROZEN_REQUIRED: u64 = 4;
 const LIVE_XMM0: u64 = 0x53a7_1199_cafe_f00d;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = 60;
+const STOP_AFTER: u64 = 78;
 const FINISH_AFTER_SWITCHES: u64 = 26;
 const FINISH_FREEZE_REQUIRED: u64 = 6;
 const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
@@ -139,6 +139,23 @@ static LIVE_FINISHES: AtomicU64 = AtomicU64::new(0);
 static LIVE_STOP_WORK: AtomicU64 = AtomicU64::new(0);
 static LIVE_FROZEN: AtomicU64 = AtomicU64::new(0);
 static LIVE_SURVIVOR_SWITCHES: AtomicU64 = AtomicU64::new(0);
+// Additional lifecycle for *in-flight admitted* task3: 0 not blocked,
+// 1=task3 removed itself from Ready, 2=timer has woken task3,
+// 3=task3 has actually resumed on the original suspended stack.
+const LIVE_WAKE_AFTER_IRQS: u64 = 6;
+const LIVE_POST_WAKE_MIN_IRQS: u64 = 4;
+static LIVE_BLOCK_PHASE: AtomicUsize = AtomicUsize::new(0);
+static LIVE_BLOCK_CAPTURED: AtomicBool = AtomicBool::new(false);
+static LIVE_BLOCK_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_OTHER_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCKED_IRQS: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_FROZEN: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_SKIPPED: AtomicU64 = AtomicU64::new(0);
+static LIVE_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_RESUME_COUNT: AtomicU64 = AtomicU64::new(0);
+static LIVE_POST_WAKE_IRQS: AtomicU64 = AtomicU64::new(0);
+static LIVE_BLOCK_ERRORS: AtomicU64 = AtomicU64::new(0);
 
 // Second-generation task2 runs as a single IRQ-interruptible kernel worker
 // after the original fixed 3-task scheduler has stopped on the BSP stack.
@@ -413,6 +430,63 @@ fn admit_live_task3() -> bool {
     result
 }
 
+/// Hardware-only wakeup of task3 while the three original kernel workers
+/// remain runnable. The first xAPIC IRQ after the self-block captures the
+/// exact suspended task3 work counter; all later IRQs while it is Blocked
+/// must observe that value frozen, proving no illegal dispatch occurred.
+/// Only when >=6 real IRQs have elapsed does the timer make it Ready.
+fn observe_live_block_and_wake(current: usize) {
+    if LIVE_PHASE.load(Ordering::Acquire) != 1
+        || LIVE_BLOCK_PHASE.load(Ordering::Acquire) != 1
+    {
+        return;
+    }
+    if current == LIVE_TASK {
+        if !LIVE_BLOCK_CAPTURED.swap(true, Ordering::AcqRel) {
+            LIVE_BLOCK_WORK.store(LIVE_TASK_WORK.load(Ordering::Acquire), Ordering::Release);
+            LIVE_BLOCK_OTHER_WORK.store(
+                WORK.iter().map(|w| w.load(Ordering::Acquire)).sum(),
+                Ordering::Release,
+            );
+        }
+        return;
+    }
+    if !LIVE_BLOCK_CAPTURED.load(Ordering::Acquire) {
+        LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if LIVE_TASK_WORK.load(Ordering::Acquire)
+        == LIVE_BLOCK_WORK.load(Ordering::Acquire)
+    {
+        LIVE_BLOCK_FROZEN.fetch_add(1, Ordering::Relaxed);
+    } else {
+        LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
+    if current == 2 {
+        // With bit3 Blocked, the next RR task after slot2 must be slot0.
+        LIVE_BLOCK_SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    let count = LIVE_BLOCKED_IRQS.fetch_add(1, Ordering::AcqRel) + 1;
+    if count >= LIVE_WAKE_AFTER_IRQS {
+        let other_work: u64 = WORK.iter().map(|w| w.load(Ordering::Acquire)).sum();
+        if other_work <= LIVE_BLOCK_OTHER_WORK.load(Ordering::Acquire) {
+            LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+        let wake = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::wake_unfinished(
+                mask, FINISHED.load(Ordering::Acquire), LIVE_TASK, SLOT_COUNT
+            ).ok(),
+        );
+        if wake.is_ok() {
+            LIVE_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+            LIVE_BLOCK_PHASE.store(2, Ordering::Release);
+        } else {
+            LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The fourth worker was Finished on its own stack. A timer IRQ must
 /// involuntarily switch AWAY from it before we can claim it is parked.
 /// All subsequent hardware interrupts verify no further work on task3.
@@ -484,6 +558,7 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     // Nested preempt-disable sections were checked above and never switch.
     timer_block_wake(current);
     timer_finished_task_observation(current);
+    observe_live_block_and_wake(current);
     observe_live_retirement(current);
     let available_count = if LIVE_PHASE.load(Ordering::Acquire) == 0 {
         TASK_COUNT
@@ -555,6 +630,11 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     FRAME_RSP[current].store(old_rsp, Ordering::Relaxed);
     if current == LIVE_TASK {
         LIVE_INTERRUPTED.fetch_add(1, Ordering::Relaxed);
+        if LIVE_BLOCK_PHASE.load(Ordering::Acquire) >= 3
+            && LIVE_PHASE.load(Ordering::Acquire) == 1
+        {
+            LIVE_POST_WAKE_IRQS.fetch_add(1, Ordering::Relaxed);
+        }
     } else {
         INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
     }
@@ -690,6 +770,9 @@ fn busy_task(id: usize) -> ! {
         if id == 2 && !finished_once
             && BLOCK_PHASE.load(Ordering::Acquire) == 3
             && LIVE_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_POST_WAKE_IRQS.load(Ordering::Acquire) >= LIVE_POST_WAKE_MIN_IRQS
+            && LIVE_BLOCK_FROZEN.load(Ordering::Acquire) >= LIVE_WAKE_AFTER_IRQS
             && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
             && SWITCHES.load(Ordering::Relaxed) >= FINISH_AFTER_SWITCHES
             && POST_WAKE_VISITS.iter().all(|visit|
@@ -706,7 +789,7 @@ fn busy_task(id: usize) -> ! {
             let finished = RUNNABLE.fetch_update(
                 Ordering::AcqRel, Ordering::Acquire,
                 |mask| rr_policy::finish_runnable(
-                    mask, FINISHED.load(Ordering::Acquire), 2, TASK_COUNT
+                    mask, FINISHED.load(Ordering::Acquire), 2, SLOT_COUNT
                 ).ok().map(|(ready, _)| ready)
             ).is_ok();
             // SAFETY: the single BSP owns this table. Nestable preemption
@@ -722,7 +805,7 @@ fn busy_task(id: usize) -> ! {
                 }
             } else { false };
             if finished && ownership_finished {
-                FINISHED.store(1u64 << 2, Ordering::Release);
+                FINISHED.fetch_or(1u64 << 2, Ordering::AcqRel);
                 FINISH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                 FINISH_PHASE.store(1, Ordering::Release);
             } else {
@@ -742,6 +825,9 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_POST_WAKE_IRQS.load(Ordering::Acquire) >= LIVE_POST_WAKE_MIN_IRQS
+            && LIVE_BLOCK_FROZEN.load(Ordering::Acquire) >= LIVE_WAKE_AFTER_IRQS
             && LIVE_PHASE.load(Ordering::Acquire) == 3
             && LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
             && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
@@ -796,14 +882,58 @@ extern "C" fn task3() -> ! {
     unsafe { fx_state::set_test_xmm0(LIVE_XMM0); }
     XMM_READY[LIVE_TASK].store(true, Ordering::Release);
     LIVE_ENTRY_SEEN.store(true, Ordering::Release);
+    let mut blocked_once = false;
+    let mut resumed_once = false;
 
     for _ in 0..MAX_TASK_SPINS {
+        if !blocked_once
+            && LIVE_INTERRUPTED.load(Ordering::Acquire) >= 1
+            && LIVE_TASK_WORK.load(Ordering::Acquire) >= 128
+        {
+            // Real, newly admitted task3 blocks ITSELF on its own stack,
+            // with IF still enabled. Preemption is disabled only while
+            // changing Ready. No voluntary task-to-task yield occurs.
+            if PREEMPT_DEPTH.disable() != Ok(1) {
+                LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            let blocked = RUNNABLE.fetch_update(
+                Ordering::AcqRel, Ordering::Acquire,
+                |mask| rr_policy::block_runnable(
+                    mask, LIVE_TASK, SLOT_COUNT
+                ).ok(),
+            ).is_ok();
+            if blocked {
+                LIVE_BLOCK_COUNT.fetch_add(1, Ordering::Relaxed);
+                LIVE_BLOCK_PHASE.store(1, Ordering::Release);
+            } else {
+                LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            if PREEMPT_DEPTH.enable() != Ok(0) {
+                LIVE_BLOCK_ERRORS.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            blocked_once = true;
+        }
+        if blocked_once && !resumed_once
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 2
+        {
+            // Execution resumed from the EXACT suspended RIP/RSP and
+            // private FXSAVE64 image after timer IRQ wake. The SSE
+            // sentinel is independently checked just below.
+            LIVE_RESUME_COUNT.fetch_add(1, Ordering::Relaxed);
+            LIVE_BLOCK_PHASE.store(3, Ordering::Release);
+            resumed_once = true;
+        }
         if unsafe { fx_state::read_test_xmm0() } != LIVE_XMM0 {
             LIVE_BAD.fetch_add(1, Ordering::Relaxed);
             break;
         }
         LIVE_TASK_WORK.fetch_add(1, Ordering::Relaxed);
         if LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
+            && LIVE_POST_WAKE_IRQS.load(Ordering::Acquire) >= LIVE_POST_WAKE_MIN_IRQS
+            && LIVE_BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_BLOCK_FROZEN.load(Ordering::Acquire) >= LIVE_WAKE_AFTER_IRQS
             && LIVE_TASK_WORK.load(Ordering::Relaxed) > 512
         {
             break;
@@ -830,6 +960,10 @@ extern "C" fn task3() -> ! {
             )
         };
         if finished {
+            // Unlike PR #47, terminal state is recorded in FINISHED as
+            // well as the private slot owner. A subsequent wake must
+            // reject this generation; task2's later termination ORs bit2.
+            FINISHED.fetch_or(1u64 << LIVE_TASK, Ordering::AcqRel);
             LIVE_FINISHES.fetch_add(1, Ordering::Relaxed);
             LIVE_PHASE.store(2, Ordering::Release);
         } else {
@@ -891,7 +1025,7 @@ fn recycle_quiescent_task2() -> Option<RecycleProof> {
     // smoke. No cross-CPU reclamation is possible with this prototype.
     if !interrupts_disabled || !scheduler_inactive || !disjoint_bsp
         || !old_task_not_current || ready_mask != 0b011
-        || finished_mask != 0b100
+        || finished_mask != 0b1100
         || FINISH_PHASE.load(Ordering::Acquire) != 2
         || FINISH_ERRORS.load(Ordering::Acquire) != 0
         || frozen < task_slot::MIN_GRACE_IRQS
@@ -1099,7 +1233,7 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
         || RECYCLE_ACTIVE.load(Ordering::Acquire)
         || PREEMPT_DEPTH.depth() != 0
         || proof.old_generation.checked_add(1) != Some(proof.new_generation)
-        || FINISHED.load(Ordering::Acquire) != 0b100
+        || FINISHED.load(Ordering::Acquire) != 0b1100
         || RUNNABLE.load(Ordering::Acquire) != 0b011
     {
         return fail("not_quiescent");
@@ -1173,7 +1307,8 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
     // There is no active generic task scheduler; IRQs simply IRETQ to
     // the new worker, which returns once to its saved BSP caller.
     RUNNABLE.store(1 << 2, Ordering::Release);
-    FINISHED.store(0, Ordering::Release);
+    // The first-generation task3 remains terminal throughout reuse.
+    FINISHED.store(1u64 << LIVE_TASK, Ordering::Release);
     // SAFETY: BSP, IF=0 and valid isolated private x86-64 kernel frame.
     // IRETQ enables IF *on the worker's stack*, not on the BSP. The worker
     // returns via the paired context_switch primitive with IF=0.
@@ -1197,7 +1332,7 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
     // another stack, and the timer ISR will no longer restore this FX state.
     unsafe { fx_state::leave(original_fx); }
     RUNNABLE.store(0, Ordering::Release);
-    FINISHED.store(1 << 2, Ordering::Release);
+    FINISHED.store((1 << LIVE_TASK) | (1 << 2), Ordering::Release);
     // SAFETY: BSP IF=0, the old handle cannot be mistaken for the new one.
     let state_ok = unsafe {
         let table = &mut *SLOT_OWNERS.0.get();
@@ -1218,7 +1353,7 @@ fn prove_recycled_task_runs(proof: &RecycleProof) -> bool {
         && !x86_64::instructions::interrupts::are_enabled()
         && !ACTIVE.load(Ordering::Acquire)
         && RUNNABLE.load(Ordering::Acquire) == 0
-        && FINISHED.load(Ordering::Acquire) == 0b100;
+        && FINISHED.load(Ordering::Acquire) == 0b1100;
     if ok {
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_REUSE_EXEC_OK task=2 old_gen={} new_gen={} via_iretq=1 entry_r12={:#x} entry_r15={:#x} irq={} work={} first_irq_work={} xmm_initial={:#x} xmm_final={:#x} xmm_old={:#x} corrupt={} stale=1 finished_new=1 ready=0 bsp_only=1\n",
@@ -1288,6 +1423,18 @@ pub fn verify() -> bool {
     LIVE_STOP_WORK.store(0, Ordering::Relaxed);
     LIVE_FROZEN.store(0, Ordering::Relaxed);
     LIVE_SURVIVOR_SWITCHES.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_PHASE.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_CAPTURED.store(false, Ordering::Relaxed);
+    LIVE_BLOCK_COUNT.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_WORK.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_OTHER_WORK.store(0, Ordering::Relaxed);
+    LIVE_BLOCKED_IRQS.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_FROZEN.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_SKIPPED.store(0, Ordering::Relaxed);
+    LIVE_WAKE_COUNT.store(0, Ordering::Relaxed);
+    LIVE_RESUME_COUNT.store(0, Ordering::Relaxed);
+    LIVE_POST_WAKE_IRQS.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_ERRORS.store(0, Ordering::Relaxed);
     FRAME_RSP[LIVE_TASK].store(0, Ordering::Relaxed);
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
@@ -1333,6 +1480,21 @@ pub fn verify() -> bool {
     let live_frozen = LIVE_FROZEN.load(Ordering::Acquire);
     let live_survivors = LIVE_SURVIVOR_SWITCHES.load(Ordering::Acquire);
     let live_entry = LIVE_ENTRY_SEEN.load(Ordering::Acquire);
+    let live_block_phase = LIVE_BLOCK_PHASE.load(Ordering::Acquire);
+    let live_blocks = LIVE_BLOCK_COUNT.load(Ordering::Acquire);
+    let live_block_irqs = LIVE_BLOCKED_IRQS.load(Ordering::Acquire);
+    let live_block_frozen = LIVE_BLOCK_FROZEN.load(Ordering::Acquire);
+    let live_block_skips = LIVE_BLOCK_SKIPPED.load(Ordering::Acquire);
+    let live_block_work = LIVE_BLOCK_WORK.load(Ordering::Acquire);
+    let live_wakes = LIVE_WAKE_COUNT.load(Ordering::Acquire);
+    let live_resumes = LIVE_RESUME_COUNT.load(Ordering::Acquire);
+    let live_post_wake_irqs = LIVE_POST_WAKE_IRQS.load(Ordering::Acquire);
+    let live_block_errors = LIVE_BLOCK_ERRORS.load(Ordering::Acquire);
+    let live_wake_finished_rejected = rr_policy::wake_unfinished(
+        RUNNABLE.load(Ordering::Acquire),
+        FINISHED.load(Ordering::Acquire),
+        LIVE_TASK, SLOT_COUNT
+    ) == Err(rr_policy::RunnableError::AlreadyFinished);
     let work0 = WORK[0].load(Ordering::Acquire);
     let work1 = WORK[1].load(Ordering::Acquire);
     let work2 = WORK[2].load(Ordering::Acquire);
@@ -1387,6 +1549,13 @@ pub fn verify() -> bool {
         && live_first_xmm != TASK_XMM0[2]
         && live_frozen >= LIVE_FROZEN_REQUIRED
         && live_survivors >= LIVE_FROZEN_REQUIRED
+        && live_block_phase == 3
+        && live_blocks == 1 && live_wakes == 1 && live_resumes == 1
+        && live_block_irqs >= LIVE_WAKE_AFTER_IRQS
+        && live_block_frozen == live_block_irqs
+        && live_block_skips >= 2 && live_block_work > 0
+        && live_post_wake_irqs >= LIVE_POST_WAKE_MIN_IRQS
+        && live_block_errors == 0 && live_wake_finished_rejected
         && work0 > 0 && work1 > 0 && work2 > 0
         && rejected == 0 && exit_task < TASK_COUNT
         && deferred >= 4 && nested_ok && depth == 0
@@ -1399,7 +1568,7 @@ pub fn verify() -> bool {
         && freeze_checks == block_irqs && block_skips >= 2
         && frozen_work > 0 && block_errors == 0
         && RUNNABLE.load(Ordering::Acquire) == 0b011
-        && finish_phase == 2 && finished_mask == 0b100
+        && finish_phase == 2 && finished_mask == 0b1100
         && finish_attempts == 1 && finish_work > 0
         && finish_freezes >= FINISH_FREEZE_REQUIRED
         && finish_skips >= 2 && finish_errors == 0
@@ -1409,13 +1578,19 @@ pub fn verify() -> bool {
         && (0..SLOT_COUNT).all(canary_ok);
     if ok {
         crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_LIVE_BLOCK_WAKE_OK task=3 block={} blocked_irqs={} frozen={} skipped={} woke={} resumed={} resume_irqs={} block_errors={} frozen_work={} finished_cannot_wake=1 suspended_stack=1 preserved_sse=1 bsp_only=1\n",
+            live_blocks, live_block_irqs, live_block_frozen, live_block_skips,
+            live_wakes, live_resumes, live_post_wake_irqs,
+            live_block_errors, live_block_work
+        ));
+        crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_LIVE_ENQUEUE_OK slot=3 generation={} admissions={} executions=1 irq={} work={} xmm_initial={:#x} xmm_final={:#x} corrupt={} finished={} parked={} frozen_irqs={} survivor_switches={} gpr_frame=1 fx_private=1 bsp_only=1\n",
             live_gen, live_admits, fourth, live_work, live_first_xmm,
             LIVE_XMM0, live_bad, live_finishes, u8::from(live_phase == 3),
             live_frozen, live_survivors
         ));
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_FINISHED_OK task=2 mask=4 ready=3 finish=1 frozen_irqs={} skipped={} errors={} frozen_work={} survivor0={} survivor1={} never_rescheduled=1 fx_still_owned=1\n",
+            "WOLFOS_APIC_FINISHED_OK task=2 mask=12 ready=3 finish=1 frozen_irqs={} skipped={} errors={} frozen_work={} survivor0={} survivor1={} never_rescheduled=1 fx_still_owned=1\n",
             finish_freezes, finish_skips, finish_errors, finish_work,
             survivor0, survivor1
         ));
