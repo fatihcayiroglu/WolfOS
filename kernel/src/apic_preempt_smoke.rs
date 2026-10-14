@@ -337,6 +337,101 @@ fn timer_finished_task_observation(current: usize) {
     }
 }
 
+/// Running task0 creates a NEW task while the other three tasks remain
+/// scheduled by actual timer IRQs. Preemption is disabled around metadata
+/// writes, but interrupts remain enabled and still receive EOI.
+fn admit_live_task3() -> bool {
+    if LIVE_PHASE.load(Ordering::Acquire) != 0
+        || BLOCK_PHASE.load(Ordering::Acquire) != 3
+    {
+        return false;
+    }
+    if PREEMPT_DEPTH.disable() != Ok(1) {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let result = (|| {
+        let bottom = stack_bottom(LIVE_TASK);
+        let top = stack_top(LIVE_TASK);
+        if bottom & 15 != 0 || top & 15 != 0
+            || FRAME_RSP[LIVE_TASK].load(Ordering::Relaxed) != 0
+        {
+            return false;
+        }
+        let cs = CODE_SELECTOR.load(Ordering::Acquire) as u16;
+        let ss = SS::get_reg().0;
+        let frame_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
+        let frame = KernelTrapFrame {
+            registers: SavedGprs::default(),
+            hardware: HardwareReturnFrame {
+                rip: task3 as usize as u64,
+                cs: u64::from(cs),
+                rflags: 0x202,
+                rsp: (top - 8) as u64,
+                ss: u64::from(ss),
+            },
+        };
+        // SAFETY: no task3 exists yet and task0 has an unbroken
+        // preemption-disable guard. Only BSP accesses these private bytes.
+        let frame_ok = unsafe {
+            (bottom as *mut u64).write_volatile(CANARY ^ LIVE_TASK as u64);
+            (frame_rsp as *mut KernelTrapFrame).write(frame);
+            validate_kernel_resume(
+                frame_rsp as u64, bottom as u64, top as u64, cs,
+                &*(frame_rsp as *const KernelTrapFrame)
+            ).is_ok()
+        };
+        if !frame_ok { return false; }
+        // SAFETY: only BSP owns this slot table. IRQ handler never reads it.
+        let Some(handle) = (unsafe {
+            (&mut *SLOT_OWNERS.0.get()).spawn(LIVE_TASK).ok()
+        }) else { return false; };
+        if handle.generation != 1 {
+            return false;
+        }
+        LIVE_HANDLE_GEN.store(handle.generation, Ordering::Release);
+        FRAME_RSP[LIVE_TASK].store(frame_rsp, Ordering::Release);
+        // Publish the admission phase BEFORE the Ready bit. Selection
+        // never sees an uninitialized stack or missing FX image.
+        LIVE_PHASE.store(1, Ordering::Release);
+        let wake = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::wake_runnable(mask, LIVE_TASK, SLOT_COUNT).ok()
+        ).is_ok();
+        if !wake { return false; }
+        LIVE_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
+        true
+    })();
+    if !result {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    if PREEMPT_DEPTH.enable() != Ok(0) {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    result
+}
+
+/// The fourth worker was Finished on its own stack. A timer IRQ must
+/// involuntarily switch AWAY from it before we can claim it is parked.
+/// All subsequent hardware interrupts verify no further work on task3.
+fn observe_live_retirement(current: usize) {
+    if LIVE_PHASE.load(Ordering::Acquire) == 2 && current == LIVE_TASK {
+        LIVE_STOP_WORK.store(LIVE_TASK_WORK.load(Ordering::Acquire), Ordering::Release);
+        LIVE_PHASE.store(3, Ordering::Release);
+    } else if LIVE_PHASE.load(Ordering::Acquire) == 3
+        && current != LIVE_TASK
+    {
+        if LIVE_TASK_WORK.load(Ordering::Acquire)
+            == LIVE_STOP_WORK.load(Ordering::Acquire)
+        {
+            LIVE_FROZEN.fetch_add(1, Ordering::Relaxed);
+        } else {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
 /// No allocations, logging, task changes inside Rust frame borrows, or
 /// scheduler lock acquisition. The returned pointer is a *different live
