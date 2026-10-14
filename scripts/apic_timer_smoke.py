@@ -35,7 +35,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             return False
         if calibrated:
             calibration = re.search(
-                r"WOLFOS_APIC_CALIBRATION_OK effective_hz=(\\d+) initial_count=(\\d+) pit_hz=(\\d+) pit_ticks=(\\d+) divisor=(\\d+) target_hz=(\\d+)",
+                r"WOLFOS_APIC_CALIBRATION_OK effective_hz=(\d+) initial_count=(\d+) pit_hz=(\d+) pit_ticks=(\d+) divisor=(\d+) target_hz=(\d+)",
                 output,
             )
             if calibration is None:
