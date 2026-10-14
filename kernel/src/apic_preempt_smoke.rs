@@ -17,7 +17,8 @@ use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 use crate::{context_switch, kernel_trap_frame::{
     HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume
-}, preempt_depth::PreemptDepth, fx_state, rr_policy};
+}, preempt_depth::PreemptDepth, fx_state, rr_policy,
+    task_slot::{self, SlotTable, SlotState, SlotError, ReclaimGate}};
 
 const TASK_COUNT: usize = 3;
 const STACK_BYTES: usize = 16 * 1024;
@@ -45,6 +46,16 @@ static STACKS: PrivateStacks =
     PrivateStacks(UnsafeCell::new([
         const { Stack([0; STACK_BYTES]) }; TASK_COUNT
     ]));
+
+/// Pure ownership metadata, separate from ready/finished IRQ bitmap state.
+/// Only BSP mutates it when creating the smoke slots, under task2's
+/// preemption-disabled Finished transition, and after BSP quiescence.
+/// The IRQ callback NEVER accesses this UnsafeCell.
+struct OwnedSlots(UnsafeCell<SlotTable<TASK_COUNT>>);
+// SAFETY: only BSP; the ISR never touches OwnedSlots, and APs are parked.
+// Mutations do not overlap with another Rust reference to this allocation.
+unsafe impl Sync for OwnedSlots {}
+static SLOT_OWNERS: OwnedSlots = OwnedSlots(UnsafeCell::new(SlotTable::new()));
 
 struct BspSlot(UnsafeCell<usize>);
 // SAFETY: only BSP accesses these raw RSP slots while IF=0 and with all
@@ -490,7 +501,19 @@ fn busy_task(id: usize) -> ! {
                     mask, FINISHED.load(Ordering::Acquire), 2, TASK_COUNT
                 ).ok().map(|(ready, _)| ready)
             ).is_ok();
-            if finished {
+            // SAFETY: the single BSP owns this table. Nestable preemption
+            // guard prevents the IRQ dispatcher from switching to another
+            // Rust task while this metadata is being updated. The IRQ
+            // callback never reads SLOT_OWNERS.
+            let ownership_finished = if finished {
+                unsafe {
+                    let table = &mut *SLOT_OWNERS.0.get();
+                    table.handle(2)
+                        .ok()
+                        .is_some_and(|handle| table.finish(handle).is_ok())
+                }
+            } else { false };
+            if finished && ownership_finished {
                 FINISHED.store(1u64 << 2, Ordering::Release);
                 FINISH_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                 FINISH_PHASE.store(1, Ordering::Release);
@@ -553,6 +576,13 @@ pub fn verify() -> bool {
     {
         return false;
     }
+    // SAFETY: BSP IF=0 before any private task runs. This table is never
+    // touched by the timer interrupt dispatcher (which uses atomics only).
+    let allocated = unsafe {
+        let table = &mut *SLOT_OWNERS.0.get();
+        (0..TASK_COUNT).all(|id| table.spawn(id).is_ok())
+    };
+    if !allocated { return false; }
     CURRENT.store(0, Ordering::Relaxed);
     for work in &WORK { work.store(0, Ordering::Relaxed); }
     for interrupted in &INTERRUPTED { interrupted.store(0, Ordering::Relaxed); }
