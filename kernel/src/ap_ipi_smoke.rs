@@ -69,19 +69,19 @@ pub(crate) fn ap_slot(id: u32) -> Option<usize> {
 }
 
 /// Read-only BSP observation after an AP publishes its offline state.
-#[cfg(feature = "ap-local-timer-smoke")]
+#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke"))]
 pub(crate) fn is_offline(index: usize) -> bool {
     index < MAX_BOOT_CPUS && OFFLINE[index].load(Ordering::Acquire)
 }
 /// Reject any accidental directed IPI or spurious APIC interrupt during
 /// the standalone AP-local periodic timer test.
-#[cfg(feature = "ap-local-timer-smoke")]
+#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke"))]
 pub(crate) fn ipi_count() -> u64 {
     (0..COUNT.load(Ordering::Acquire))
         .map(|i| SEEN[i].load(Ordering::Acquire))
         .sum()
 }
-#[cfg(feature = "ap-local-timer-smoke")]
+#[cfg(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke"))]
 pub(crate) fn spurious_count() -> u64 {
     SPURIOUS_COUNT.load(Ordering::Acquire)
 }
@@ -177,6 +177,20 @@ pub fn secondary_wait(index: usize, expected_id: u32) -> bool {
         write(TIMER_LVT, old_timer | TIMER_MASK);
         write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, enabled);
     }
+    #[cfg(feature = "ap-smp-preempt-smoke")]
+    {
+        // Timer-driven task switching stays strictly on this AP. The outer
+        // MP worker/coordinator returns only after its two tasks stop with
+        // IF=0 and restore their private FXSAVE64 context.
+        let result = crate::ap_smp_preempt_smoke::secondary_run(index);
+        x86_64::instructions::interrupts::disable();
+        unsafe {
+            write(TIMER_LVT, old_timer | TIMER_MASK);
+            write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr);
+        }
+        OFFLINE[index].store(true, Ordering::Release);
+        return result;
+    }
     #[cfg(feature = "ap-local-timer-smoke")]
     {
         // The AP-only timer proof controls IF, its own SVR/LVT/divide/count,
@@ -191,11 +205,11 @@ pub fn secondary_wait(index: usize, expected_id: u32) -> bool {
         OFFLINE[index].store(true, Ordering::Release);
         return result;
     }
-    #[cfg(not(feature = "ap-local-timer-smoke"))]
+    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke")))]
     x86_64::instructions::interrupts::enable();
-    #[cfg(not(feature = "ap-local-timer-smoke"))]
+    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke")))]
     READY[index].store(true, Ordering::Release);
-    #[cfg(not(feature = "ap-local-timer-smoke"))]
+    #[cfg(not(any(feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke")))]
     {
         // Spin rather than HLT to avoid a lost STOP wake-up race.
         while !STOP.load(Ordering::Acquire) { core::hint::spin_loop(); }
