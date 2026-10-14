@@ -431,6 +431,21 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_LAPIC_MMIO_OK", topology)
         self.assertIn("lapic_mmio_layout_tests", make)
 
+    def test_lapic_timer_layout_contract(self):
+        parser = (ROOT / "kernel/src/lapic_timer_layout.rs").read_text()
+        make = (ROOT / "Makefile").read_text()
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        self.assertIn("mod lapic_timer_layout;", main)
+        for symbol in ("LVT_TIMER_OFFSET", "INITIAL_COUNT_OFFSET",
+                       "CURRENT_COUNT_OFFSET", "DIVIDE_CONFIG_OFFSET",
+                       "fn encode_divisor", "fn decode_divisor",
+                       "fn parse_lvt", "fn make_lvt",
+                       "ReservedBits", "InvalidMode", "ZeroInitialCount"):
+            self.assertIn(symbol, parser)
+        self.assertIn("lapic_timer_layout_tests", make)
+        self.assertNotIn("write_volatile", parser)
+        self.assertNotIn("wrmsr", parser)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

@@ -17,3 +17,5 @@ P1 topology validation: isolated QEMU MADT tests with 1 and 4 virtual CPUs; APs 
 P1 timer milestone: isolated single-BSP PIT/8259 IRQ0 delivery and EOI acceptance in QEMU (merged); tick-gated safe-point context dispatch on two kernel stacks (merged). APIC timer, clocksource calibration, genuine interrupt-driven preemption and IRQ-safe scheduler remain planned.
 
 P1 local APIC: read-only per-CPU IA32_APIC_BASE MSR + CPUID APIC ID validation for BSP and APs (under review). Read-only BSP xAPIC MMIO mapping/identity test (under review); no APIC timer programming, IPIs or preemption yet.
+
+P1 xAPIC local timer: pure register LVT/vector, mode and divide-configuration decoding and validation (under review), no MMIO writes or IRQ activation. Next: separate BSP-only safe MMIO timer experiment, calibration, and full preemption semantics.

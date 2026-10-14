@@ -32,6 +32,7 @@ mod percpu_context;
 mod lapic_layout;
 mod lapic_probe;
 mod lapic_mmio_layout;
+mod lapic_timer_layout;
 mod lapic_mmio;
 #[cfg(feature = "timer-smoke")]
 mod timer;
