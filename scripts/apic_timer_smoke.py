@@ -98,6 +98,18 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
         if vector != 224 or ticks < 4 or eoi != ticks or preemptive != 0:
             print(f"FAIL: invalid delivery/EOI evidence: {match.groups()}")
             return False
+        asm = re.search(
+            r"WOLFOS_APIC_ASM_TRAP_OK frames=(\d+) gprs=(\d+) iretq=(\d+) same_task=(\d+) invalid=(\d+) preemptive=(\d+)",
+            output,
+        )
+        if asm is None:
+            print("FAIL: real all-GPR xAPIC IRQ assembly entry and IRETQ proof missing")
+            return False
+        frames, gprs, iretq, same_task, invalid, asm_preemptive = map(int, asm.groups())
+        if (frames != ticks or frames != eoi or gprs != 15 or iretq != 1
+            or same_task != 1 or invalid != 0 or asm_preemptive != 0):
+            print(f"FAIL: assembly GPR/trap return proof invalid: {asm.groups()}")
+            return False
         if "WOLFOS_BOOT_OK" not in output or run.returncode != 33:
             print(f"FAIL: boot did not finish successfully: exit={run.returncode}")
             return False

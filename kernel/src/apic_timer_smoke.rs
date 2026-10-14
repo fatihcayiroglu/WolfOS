@@ -15,7 +15,7 @@ use x86_64::structures::paging::{
 use x86_64::{PhysAddr, VirtAddr};
 
 use crate::{lapic_irq_layout, lapic_mmio, lapic_mmio_layout, lapic_probe,
-    lapic_timer_layout, lapic_timer_plan, irq_frame_observation, pmm, serial};
+    lapic_timer_layout, lapic_timer_plan, irq_frame_observation, kernel_trap_frame, pmm, serial};
 
 pub const TIMER_VECTOR: u8 = 0xe0;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
@@ -45,8 +45,9 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 static ACKS: AtomicU64 = AtomicU64::new(0);
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 
-// Read-only first-IRQ observations of non-yielding BSP work; NOT a saved task
-// context. GPR/SIMD, CR3, TLS and FPU state are deliberately NOT captured.
+// Read-only first-IRQ observations of non-yielding BSP work. The custom
+// assembly entry temporarily saves all GPRs, but no scheduler consumes the
+// frame. Extended state (SSE/FPU/XSAVE), CR3 and TLS are NOT saved.
 static BUSY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static BUSY_STEPS: AtomicU64 = AtomicU64::new(0);
 static BUSY_STEPS_AT_IRQ: AtomicU64 = AtomicU64::new(0);
@@ -55,6 +56,9 @@ static BUSY_RIP: AtomicU64 = AtomicU64::new(0);
 static BUSY_RSP: AtomicU64 = AtomicU64::new(0);
 static BUSY_CS: AtomicU64 = AtomicU64::new(0);
 static BUSY_RFLAGS: AtomicU64 = AtomicU64::new(0);
+static TRAP_FRAMES: AtomicU64 = AtomicU64::new(0);
+static TRAP_BAD: AtomicU64 = AtomicU64::new(0);
+static TRAP_GPR_CHECKSUM: AtomicU64 = AtomicU64::new(0);
 
 
 /// IRQ-published BSP epoch; read by a worker with IRQs enabled.
@@ -103,24 +107,51 @@ unsafe fn apic_write(offset: usize, value: u32) {
     unsafe { ((VIRTUAL_ADDRESS as usize + offset) as *mut u32).write_volatile(value); }
 }
 
-/// The only non-spurious APIC interrupt accepted by this isolated test.
-/// EOI must be written once per delivered timer interrupt, BEFORE IRETQ.
-pub extern "x86-interrupt" fn irq(frame: InterruptStackFrame) {
-    // Single BSP: capture architectural fields as values, never retain a
-    // reference to the transient interrupt frame or switch stacks here.
+/// Called ONLY by the naked x86-64 assembly IRQ entry with IF cleared.
+/// The assembly owns the current kernel stack and has saved 15 GPRs before
+/// passing its temporary frame pointer to this ordinary SysV Rust function.
+/// No pointer escapes this call and no task switch or allocation can occur.
+#[unsafe(no_mangle)]
+pub extern "C" fn wolfos_apic_timer_irq_dispatch(
+    frame_ptr: *const kernel_trap_frame::KernelTrapFrame,
+) {
+    // SAFETY: BSP-only installed assembly IRQ entry passes RSP after 15
+    // aligned pushes on the active kernel stack. The pointer is valid only
+    // during this dispatch and is never retained after the callback.
+    let frame = unsafe { &*frame_ptr };
+    let regs = &frame.registers;
+    let hw = &frame.hardware;
+
+    // A nonzero ring-0 frame with saved IF=1 proves the full interrupt
+    // reached our assembly entry, not that another task is resumable.
+    let valid = frame_ptr.is_aligned()
+        && irq_frame_observation::validate_kernel_irq_frame(
+            hw.rip, hw.rsp, hw.cs, hw.rflags,
+        ).is_ok();
+    if !valid {
+        TRAP_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    // Read actual saved register words. They are restored by assembly
+    // before IRETQ; the checksum makes use of saved GPR layout observable.
+    let checksum = regs.rax ^ regs.rbx ^ regs.rcx ^ regs.rdx
+        ^ regs.rsi ^ regs.rdi ^ regs.rbp ^ regs.r8 ^ regs.r9
+        ^ regs.r10 ^ regs.r11 ^ regs.r12 ^ regs.r13 ^ regs.r14 ^ regs.r15;
+    TRAP_GPR_CHECKSUM.fetch_xor(checksum, Ordering::Relaxed);
+    TRAP_FRAMES.fetch_add(1, Ordering::Relaxed);
+
     if BUSY_ACTIVE.load(Ordering::Relaxed) {
         if BUSY_IRQS.load(Ordering::Relaxed) == 0 {
-            BUSY_RIP.store(frame.instruction_pointer.as_u64(), Ordering::Relaxed);
-            BUSY_RSP.store(frame.stack_pointer.as_u64(), Ordering::Relaxed);
-            BUSY_CS.store(u64::from(frame.code_segment.0), Ordering::Relaxed);
-            BUSY_RFLAGS.store(frame.cpu_flags.bits(), Ordering::Relaxed);
+            BUSY_RIP.store(hw.rip, Ordering::Relaxed);
+            BUSY_RSP.store(hw.rsp, Ordering::Relaxed);
+            BUSY_CS.store(hw.cs, Ordering::Relaxed);
+            BUSY_RFLAGS.store(hw.rflags, Ordering::Relaxed);
             BUSY_STEPS_AT_IRQ.store(BUSY_STEPS.load(Ordering::Relaxed), Ordering::Relaxed);
         }
         BUSY_IRQS.fetch_add(1, Ordering::Relaxed);
     }
     TICKS.fetch_add(1, Ordering::Relaxed);
-    // SAFETY: the BSP installs the fixed MMIO alias before enabling IF,
-    // and disables IF before tearing it down. Only the BSP enables IRQs.
+    // SAFETY: BSP retains the sole writable MMIO mapping throughout the
+    // IRQ proof. Issue precisely one EOI before returning to assembly IRETQ.
     unsafe { apic_write(lapic_irq_layout::EOI_OFFSET, lapic_irq_layout::EOI_VALUE); }
     ACKS.fetch_add(1, Ordering::Relaxed);
 }
@@ -285,6 +316,9 @@ fn run_mapped_test(expected_id: u32) -> bool {
     BUSY_RSP.store(0, Ordering::Relaxed);
     BUSY_CS.store(0, Ordering::Relaxed);
     BUSY_RFLAGS.store(0, Ordering::Relaxed);
+    TRAP_FRAMES.store(0, Ordering::Relaxed);
+    TRAP_BAD.store(0, Ordering::Relaxed);
+    TRAP_GPR_CHECKSUM.store(0, Ordering::Relaxed);
 
     // First mask the timer, then set divide/initial count. Only after
     // installing the SVR and IDT do we explicitly unmask the LVT.
@@ -321,7 +355,15 @@ fn run_mapped_test(expected_id: u32) -> bool {
     let ticks = TICKS.load(Ordering::Relaxed);
     let acks = ACKS.load(Ordering::Relaxed);
     let spurious = SPURIOUS.load(Ordering::Relaxed);
-    if delivered && frame_ok && ticks >= TICKS_REQUIRED && ticks == acks && tasks_ok {
+    let trap_frames = TRAP_FRAMES.load(Ordering::Relaxed);
+    let trap_bad = TRAP_BAD.load(Ordering::Relaxed);
+    if delivered && frame_ok && ticks >= TICKS_REQUIRED && ticks == acks
+        && trap_frames == ticks && trap_bad == 0 && tasks_ok
+    {
+        serial::write_fmt(format_args!(
+            "WOLFOS_APIC_ASM_TRAP_OK frames={} gprs=15 iretq=1 same_task=1 invalid={} preemptive=0\n",
+            trap_frames, trap_bad
+        ));
         serial::write_fmt(format_args!(
             "WOLFOS_APIC_TIMER_TASKS_OK threads={} dispatches={} switches={} stack_kib={} gated_by_irq=1 preemptive=0\n",
             crate::timer_tasks::THREAD_COUNT, crate::timer_tasks::DISPATCH_COUNT,
@@ -334,8 +376,8 @@ fn run_mapped_test(expected_id: u32) -> bool {
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} frame_ok={} tasks_ok={}\n",
-            ticks, acks, spurious, frame_ok, tasks_ok
+            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} frame_ok={} tasks_ok={} asm_frames={} asm_bad={}\n",
+            ticks, acks, spurious, frame_ok, tasks_ok, trap_frames, trap_bad
         ));
         false
     }

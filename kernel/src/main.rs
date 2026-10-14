@@ -42,6 +42,10 @@ mod lapic_irq_layout;
 mod apic_timer_smoke;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
 mod irq_frame_observation;
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+mod kernel_trap_frame;
+#[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
+mod apic_irq_entry;
 #[cfg(feature = "apic-calibration-smoke")]
 mod lapic_timer_calibration;
 #[cfg(feature = "timer-smoke")]

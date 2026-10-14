@@ -182,8 +182,13 @@ pub fn initialize() {
     #[cfg(feature = "timer-smoke")]
     idt[crate::timer::TIMER_VECTOR].set_handler_fn(crate::timer::irq0);
     #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
-    idt[crate::apic_timer_smoke::TIMER_VECTOR]
-        .set_handler_fn(crate::apic_timer_smoke::irq);
+    // SAFETY: custom x86-64 long-mode interrupt-gate entry saves all GPRs
+    // before calling the BSP-only Rust dispatch, then IRETQs to same task.
+    // This IDT entry is installed before enabling any APIC smoke interrupts.
+    unsafe {
+        idt[crate::apic_timer_smoke::TIMER_VECTOR]
+            .set_handler_addr(crate::apic_irq_entry::address());
+    }
     #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
     idt[crate::apic_timer_smoke::SPURIOUS_VECTOR]
         .set_handler_fn(crate::apic_timer_smoke::spurious);
