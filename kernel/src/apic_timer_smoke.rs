@@ -45,6 +45,10 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 static ACKS: AtomicU64 = AtomicU64::new(0);
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 
+/// IRQ-published BSP epoch; read by a worker with IRQs enabled.
+/// No timer frequency or wall-clock accuracy is implied.
+pub fn ticks() -> u64 { TICKS.load(Ordering::Relaxed) }
+
 struct TableAllocator;
 // SAFETY: BSP allocates unique physical page-table frames from the PMM;
 // frames stay permanently owned by the active page-table tree.
@@ -234,6 +238,11 @@ fn run_mapped_test(expected_id: u32) -> bool {
         core::hint::spin_loop();
     }
     x86_64::instructions::interrupts::disable();
+    // Each separate worker dispatch must be gated by a fresh real local
+    // APIC IRQ epoch. This is voluntarily yielded, never IRQ-frame preemption.
+    // verify() expects IF=0 and enables IF only inside its worker stacks.
+    let tasks_ok = delivered && crate::timer_tasks::verify();
+    x86_64::instructions::interrupts::disable();
     // Every timer handler has returned and EOI'd before this BSP proceeds.
     unsafe {
         apic_write(plan.mask.offset, plan.mask.value);
@@ -246,7 +255,12 @@ fn run_mapped_test(expected_id: u32) -> bool {
     let ticks = TICKS.load(Ordering::Relaxed);
     let acks = ACKS.load(Ordering::Relaxed);
     let spurious = SPURIOUS.load(Ordering::Relaxed);
-    if delivered && ticks >= TICKS_REQUIRED && ticks == acks {
+    if delivered && ticks >= TICKS_REQUIRED && ticks == acks && tasks_ok {
+        serial::write_fmt(format_args!(
+            "WOLFOS_APIC_TIMER_TASKS_OK threads={} dispatches={} switches={} stack_kib={} gated_by_irq=1 preemptive=0\n",
+            crate::timer_tasks::THREAD_COUNT, crate::timer_tasks::DISPATCH_COUNT,
+            crate::timer_tasks::SWITCH_COUNT, crate::timer_tasks::STACK_KIB
+        ));
         serial::write_fmt(format_args!(
             "WOLFOS_APIC_TIMER_IRQ_OK vector={} ticks={} eoi={} spurious={} preemptive=0\n",
             TIMER_VECTOR, ticks, acks, spurious
@@ -254,8 +268,8 @@ fn run_mapped_test(expected_id: u32) -> bool {
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_APIC_TIMER_ERROR no_irq_or_eoi ticks={} eoi={} spurious={}\n",
-            ticks, acks, spurious
+            "WOLFOS_APIC_TIMER_ERROR no_irq_eoi_or_context ticks={} eoi={} spurious={} tasks_ok={}\n",
+            ticks, acks, spurious, tasks_ok
         ));
         false
     }
