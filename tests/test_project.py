@@ -386,6 +386,28 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("WOLFOS_TIMER_TASKS_OK", acceptance)
         self.assertIn("tuple(map(int, tasks.groups())) != (2, 6, 12, 16, 1, 0)", acceptance)
 
+    def test_local_apic_msr_identity_read_only(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        smp = (ROOT / "kernel/src/smp.rs").read_text()
+        probe = (ROOT / "kernel/src/lapic_probe.rs").read_text()
+        layout = (ROOT / "kernel/src/lapic_layout.rs").read_text()
+        single = (ROOT / "scripts/smoke.py").read_text()
+        four = (ROOT / "scripts/topology_smoke.py").read_text()
+        make = (ROOT / "Makefile").read_text()
+        self.assertIn("mod lapic_probe;", main)
+        self.assertIn("mod lapic_layout;", main)
+        self.assertIn("lapic_probe::capture(index, info.lapic_id, false)", smp)
+        self.assertIn("lapic_probe::capture(bsp_index, mp.bsp_lapic_id, true)", smp)
+        self.assertIn("lapic_probe::verify(cpus, bsp_index)", smp)
+        self.assertIn("WOLFOS_LAPIC_ID_OK", smp)
+        self.assertIn("WOLFOS_LAPIC_ID_OK cpus=1 verified=1", single)
+        self.assertIn("WOLFOS_LAPIC_ID_OK", four)
+        self.assertIn('asm!("rdmsr"', probe)
+        self.assertNotIn('asm!("wrmsr"', probe)
+        self.assertIn("IA32_APIC_BASE_MSR", layout)
+        self.assertIn("GlobalApicDisabled", layout)
+        self.assertIn("lapic_layout_tests", make)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")
