@@ -28,6 +28,19 @@ const DIVISOR: u32 = 16;
 const PIC_MASTER_DATA: u16 = 0x21;
 const PIC_SLAVE_DATA: u16 = 0xa1;
 
+#[cfg(feature = "apic-calibration-smoke")]
+const PIT_CLOCK_HZ: u64 = 1_193_182;
+#[cfg(feature = "apic-calibration-smoke")]
+const PIT_CHANNEL2: u16 = 0x42;
+#[cfg(feature = "apic-calibration-smoke")]
+const PIT_COMMAND: u16 = 0x43;
+#[cfg(feature = "apic-calibration-smoke")]
+const SPEAKER_CONTROL: u16 = 0x61;
+#[cfg(feature = "apic-calibration-smoke")]
+const PIT_INTERVAL_TICKS: u16 = 23_864; // approximately 20 ms; not a precision clock
+#[cfg(feature = "apic-calibration-smoke")]
+const CALIBRATION_MAX_SPINS: u64 = 300_000_000;
+
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static ACKS: AtomicU64 = AtomicU64::new(0);
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
@@ -89,15 +102,68 @@ pub extern "x86-interrupt" fn spurious(_frame: InterruptStackFrame) {
     SPURIOUS.fetch_add(1, Ordering::Relaxed);
 }
 
+#[cfg(feature = "apic-calibration-smoke")]
+fn pit2_calibrated_initial_count() -> Option<(u64, u32)> {
+    use crate::lapic_timer_calibration;
+    use lapic_timer_layout::TimerMode;
+
+    // Channel 2 PIT runs independently of IRQ0. The CPU IF flag remains off.
+    // Use a bounded poll of PIT OUT2 to measure one hardware countdown.
+    let masked_oneshot = lapic_timer_layout::make_lvt(
+        TIMER_VECTOR, true, TimerMode::OneShot
+    ).ok()?;
+    let divisor = lapic_timer_layout::encode_divisor(DIVISOR).ok()?;
+    let old_speaker = inb(SPEAKER_CONTROL);
+    // Gate low and disable the speaker before configuring channel 2.
+    outb(SPEAKER_CONTROL, old_speaker & !0x03);
+    // PIT 8254: channel 2, low/high bytes, interrupt-on-terminal-count.
+    outb(PIT_COMMAND, 0xb0);
+    outb(PIT_CHANNEL2, PIT_INTERVAL_TICKS as u8);
+    outb(PIT_CHANNEL2, (PIT_INTERVAL_TICKS >> 8) as u8);
+    // Verify that the OUT2 signal starts low rather than accepting a stale
+    // high bit as a completed reference interval.
+    if inb(SPEAKER_CONTROL) & 0x20 != 0 {
+        outb(SPEAKER_CONTROL, old_speaker);
+        return None;
+    }
+    unsafe {
+        apic_write(lapic_timer_layout::LVT_TIMER_OFFSET, masked_oneshot);
+        apic_write(lapic_timer_layout::DIVIDE_CONFIG_OFFSET, divisor);
+        apic_write(lapic_timer_layout::INITIAL_COUNT_OFFSET, u32::MAX);
+    }
+    let start = unsafe { apic_read(lapic_timer_layout::CURRENT_COUNT_OFFSET) };
+    outb(SPEAKER_CONTROL, (old_speaker & !0x03) | 0x01);
+    let mut terminal_count = false;
+    for _ in 0..CALIBRATION_MAX_SPINS {
+        if inb(SPEAKER_CONTROL) & 0x20 != 0 {
+            terminal_count = true;
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    let end = unsafe { apic_read(lapic_timer_layout::CURRENT_COUNT_OFFSET) };
+    outb(SPEAKER_CONTROL, old_speaker);
+    unsafe { apic_write(lapic_timer_layout::INITIAL_COUNT_OFFSET, 0); }
+    if !terminal_count {
+        return None;
+    }
+    let delta = start.checked_sub(end)?;
+    let effective_hz = lapic_timer_calibration::effective_ticks_per_second(
+        delta, u64::from(PIT_INTERVAL_TICKS), PIT_CLOCK_HZ
+    ).ok()?;
+    let initial_count = lapic_timer_calibration::periodic_initial_count(
+        effective_hz, 100
+    ).ok()?;
+    // Reject obvious broken observations, but do not claim PIT-level
+    // precision, platform stability or a production clocksource.
+    if !(1_000..=1_000_000_000).contains(&effective_hz) {
+        return None;
+    }
+    Some((effective_hz, initial_count))
+}
+
 fn run_mapped_test(expected_id: u32) -> bool {
     // Enter with IF=0, and leave with IF=0 on every path.
-    let plan = match lapic_timer_plan::periodic_timer_plan(
-        TIMER_VECTOR, DIVISOR, INITIAL_COUNT
-    ) {
-        Ok(plan) => plan,
-        Err(_) => return false,
-    };
-
     // SAFETY: called only after the alias exists and is verified to point
     // to the BSP's enabled xAPIC MMIO base.
     let id = unsafe { apic_read(lapic_mmio_layout::XAPIC_ID_OFFSET) };
@@ -107,6 +173,28 @@ fn run_mapped_test(expected_id: u32) -> bool {
     {
         return false;
     }
+
+    #[cfg(feature = "apic-calibration-smoke")]
+    let (effective_hz, initial_count) = match pit2_calibrated_initial_count() {
+        Some(measurement) => measurement,
+        None => {
+            serial::write_line("WOLFOS_APIC_CALIBRATION_ERROR pit2_measurement_failed");
+            return false;
+        }
+    };
+    #[cfg(not(feature = "apic-calibration-smoke"))]
+    let initial_count = INITIAL_COUNT;
+    let plan = match lapic_timer_plan::periodic_timer_plan(
+        TIMER_VECTOR, DIVISOR, initial_count
+    ) {
+        Ok(plan) => plan,
+        Err(_) => return false,
+    };
+    #[cfg(feature = "apic-calibration-smoke")]
+    serial::write_fmt(format_args!(
+        "WOLFOS_APIC_CALIBRATION_OK effective_hz={} initial_count={} pit_hz={} pit_ticks={} divisor={} target_hz=100\n",
+        effective_hz, initial_count, PIT_CLOCK_HZ, PIT_INTERVAL_TICKS, DIVISOR
+    ));
 
     let original_svr = unsafe { apic_read(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET) };
     let Ok(svr) = lapic_irq_layout::enabled_svr(
@@ -134,7 +222,7 @@ fn run_mapped_test(expected_id: u32) -> bool {
     }
     serial::write_fmt(format_args!(
         "WOLFOS_APIC_TIMER_BEGIN vector={} count={} divisor={} required={}\n",
-        TIMER_VECTOR, INITIAL_COUNT, DIVISOR, TICKS_REQUIRED
+        TIMER_VECTOR, initial_count, DIVISOR, TICKS_REQUIRED
     ));
     x86_64::instructions::interrupts::enable();
     let mut delivered = false;

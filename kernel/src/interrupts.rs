@@ -181,10 +181,10 @@ pub fn initialize() {
     idt.page_fault.set_handler_fn(page_fault);
     #[cfg(feature = "timer-smoke")]
     idt[crate::timer::TIMER_VECTOR].set_handler_fn(crate::timer::irq0);
-    #[cfg(feature = "apic-timer-smoke")]
+    #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
     idt[crate::apic_timer_smoke::TIMER_VECTOR]
         .set_handler_fn(crate::apic_timer_smoke::irq);
-    #[cfg(feature = "apic-timer-smoke")]
+    #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke"))]
     idt[crate::apic_timer_smoke::SPURIOUS_VECTOR]
         .set_handler_fn(crate::apic_timer_smoke::spurious);
     // SAFETY: TSS IST 0 has a statically allocated, distinct 20 KiB stack.
