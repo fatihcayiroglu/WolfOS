@@ -408,6 +408,29 @@ class WolfP0ContractTests(unittest.TestCase):
         self.assertIn("GlobalApicDisabled", layout)
         self.assertIn("lapic_layout_tests", make)
 
+    def test_readonly_uncached_xapic_mmio_probe(self):
+        main = (ROOT / "kernel/src/main.rs").read_text()
+        probe = (ROOT / "kernel/src/lapic_probe.rs").read_text()
+        mmio = (ROOT / "kernel/src/lapic_mmio.rs").read_text()
+        layout = (ROOT / "kernel/src/lapic_mmio_layout.rs").read_text()
+        smoke = (ROOT / "scripts/smoke.py").read_text()
+        topology = (ROOT / "scripts/topology_smoke.py").read_text()
+        make = (ROOT / "Makefile").read_text()
+        self.assertIn("mod lapic_mmio;", main)
+        self.assertIn("lapic_mmio::verify_bsp(mp.bsp_lapic_id, hhdm.offset, entries)", main)
+        self.assertLess(main.index("lapic_mmio::verify_bsp"), main.index("smp::boot_aps(mp)"))
+        self.assertIn("pub fn bsp_mmio_base(", probe)
+        for symbol in ("Cr3::read()", "OffsetPageTable::new", "mapper.map_to",
+                       "mapper.unmap", "flush.flush()", "PageTableFlags::NO_CACHE",
+                       "PageTableFlags::WRITE_THROUGH", "read_volatile()",
+                       "safe_mmio_region", "MEMMAP_USABLE", "WOLFOS_LAPIC_MMIO_OK"):
+            self.assertIn(symbol, mmio)
+        self.assertNotIn("write_volatile()", mmio)
+        self.assertIn("pub fn decode_version(", layout)
+        self.assertIn("WOLFOS_LAPIC_MMIO_OK", smoke)
+        self.assertIn("WOLFOS_LAPIC_MMIO_OK", topology)
+        self.assertIn("lapic_mmio_layout_tests", make)
+
     def test_reproducible_manifest(self):
         m = tomllib.loads((ROOT / "Cargo.toml").read_text())
         self.assertEqual(m["package"]["edition"], "2024")

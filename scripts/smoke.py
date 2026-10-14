@@ -28,6 +28,7 @@ MARKERS = (
     "WOLFOS_PAGING_UNMAP_OK",
     "WOLFOS_FRAMEBUFFER_OK",
     "WOLFOS_SMP_APS_OK total=1",
+    "WOLFOS_LAPIC_MMIO_OK",
     "WOLFOS_LAPIC_ID_OK cpus=1 verified=1",
     "WOLFOS_SMP_CTX_OK cpus=1 active=1 threads=2 switches=12 yields=3 blocked=1 woken=1 finished=2 stack_kib=8 bank_kib=4096",
     "WOLFOS_SMP_STACK_OK total=1 switched=0 stack_kib=32",

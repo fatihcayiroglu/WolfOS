@@ -31,6 +31,8 @@ mod context_batch;
 mod percpu_context;
 mod lapic_layout;
 mod lapic_probe;
+mod lapic_mmio_layout;
+mod lapic_mmio;
 #[cfg(feature = "timer-smoke")]
 mod timer;
 #[cfg(feature = "timer-smoke")]
@@ -190,6 +192,10 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_SMP_ERROR no Limine MP response");
         halt_forever();
     };
+    if !lapic_mmio::verify_bsp(mp.bsp_lapic_id, hhdm.offset, entries) {
+        serial::write_line("WOLFOS_LAPIC_MMIO_TEST_FAILED");
+        halt_forever();
+    }
     if !smp::boot_aps(mp) {
         serial::write_line("WOLFOS_SMP_TEST_FAILED");
         halt_forever();
