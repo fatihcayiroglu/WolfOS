@@ -1,14 +1,15 @@
-//! Candidate x86-64 kernel IRQ stack frame layout for a FUTURE hand-written
-//! assembly entry stub. No live IRQ handler uses this type yet.
+//! BSP x86-64 kernel IRQ stack-frame model for the QEMU-only APIC timer
+//! assembly entry. The frame is read by the handler and restored in place;
+//! **no switching to another saved frame or preemptive task exists**.
 //!
 //! The intended push order is rax, rbx, rcx, rdx, rsi, rdi, rbp,
 //! r8, r9, r10, r11, r12, r13, r14, r15. Hardware provides the
 //! architectural return frame below these saves.
 //!
-//! IMPORTANT: This is NOT a proven IRQ entry/exit ABI, not a scheduler, and
-//! not a sufficient context for FPU/SIMD, FS/GS, CR3, debug registers or
-//! userspace transitions. Real assembly entry and IRETQ must be separately
-//! QEMU-verified before using this layout to switch tasks.
+//! IMPORTANT: the active assembly path must pass actual 1/4-vCPU QEMU
+//! interrupt+IRETQ tests. The stack layout is not enough to support task
+//! switches: FPU/SIMD, FS/GS, CR3, debug state, per-task stacks and robust
+//! IRQ-safe scheduler locking need separate design and validation.
 
 use core::mem::{align_of, offset_of, size_of};
 
