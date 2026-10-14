@@ -59,6 +59,17 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             print("FAIL: APIC timer hardware start marker missing")
             print(run.stderr.decode(errors="replace"))
             return False
+        gpr = re.search(
+            r"WOLFOS_APIC_GPR_OK samples=(\d+) matches=(\d+) mismatches=(\d+) restored=(\d+)",
+            output,
+        )
+        if gpr is None:
+            print("FAIL: no live 15-GPR preservation evidence from assembly probe")
+            return False
+        samples, matches, mismatches, restored = map(int, gpr.groups())
+        if samples < 4 or matches != samples or mismatches or restored != 1:
+            print(f"FAIL: IRQ did not preserve all fifteen live GPRs: {gpr.groups()}")
+            return False
         # Four or more hardware timer IRQs must interrupt a non-yielding
         # BSP function; the first architectural frame is captured read-only.
         frame = re.search(
@@ -115,7 +126,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             return False
         if any(s in output for s in (
             "WOLFOS_APIC_TIMER_ERROR", "WOLFOS_APIC_TIMER_TEST_FAILED",
-            "WOLFOS_APIC_IRQ_FRAME_ERROR",
+            "WOLFOS_APIC_IRQ_FRAME_ERROR", "WOLFOS_APIC_GPR_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):
             print("FAIL: fatal APIC-related kernel diagnostic")
