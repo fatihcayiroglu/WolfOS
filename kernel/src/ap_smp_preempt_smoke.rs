@@ -17,7 +17,7 @@ use limine::mp::MpInfo;
 use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 use crate::{
-    ap_ipi_smoke, context_switch, kernel_trap_frame::{
+    ap_ipi_smoke, context_switch, preempt_depth::PreemptDepth, kernel_trap_frame::{
         HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume,
     }, lapic_irq_layout, lapic_timer_layout, lapic_timer_plan, serial,
 };
@@ -28,6 +28,7 @@ const TASKS: usize = 2;
 const STACK_BYTES: usize = 16 * 1024;
 const MIN_SWITCHES: u64 = 10;
 const MIN_INTERRUPTS_PER_TASK: u64 = 5;
+const MIN_DEFERRED_PER_AP: u64 = 4;
 const COUNT: u32 = 262_144;
 const DIVISOR: u32 = 16;
 const MAX_SPINS: u64 = 50_000_000;
@@ -97,6 +98,8 @@ struct CpuProof {
     switches: AtomicU64,
     invalid: AtomicU64,
     xmm_bad: AtomicU64,
+    deferred: AtomicU64,
+    nested_ok: AtomicBool,
     exited_by: AtomicUsize,
 }
 impl CpuProof {
@@ -114,12 +117,18 @@ impl CpuProof {
             switches: AtomicU64::new(0),
             invalid: AtomicU64::new(0),
             xmm_bad: AtomicU64::new(0),
+            deferred: AtomicU64::new(0),
+            nested_ok: AtomicBool::new(false),
             exited_by: AtomicUsize::new(usize::MAX),
         }
     }
 }
 static CORES: [CpuProof; CPU_SLOTS] = [const { CpuProof::new() }; CPU_SLOTS];
 static UNROUTED: AtomicU64 = AtomicU64::new(0);
+// Each AP's depth is owned exclusively by that processor and its timer IRQ.
+// Other APs and the BSP cannot mutate another core's scheduler guard.
+static GATES: [PreemptDepth; CPU_SLOTS] =
+    [const { PreemptDepth::new() }; CPU_SLOTS];
 
 fn bottom(cpu: usize, task: usize) -> usize {
     // SAFETY: caller has checked cpu < 4 and task < 2; raw address only.
@@ -226,6 +235,8 @@ fn prepare(cpu: usize) -> bool {
     proof.switches.store(0, Ordering::Relaxed);
     proof.invalid.store(0, Ordering::Relaxed);
     proof.xmm_bad.store(0, Ordering::Relaxed);
+    proof.deferred.store(0, Ordering::Relaxed);
+    proof.nested_ok.store(false, Ordering::Relaxed);
     proof.exited_by.store(usize::MAX, Ordering::Relaxed);
     proof.current.store(0, Ordering::Relaxed);
     proof.active.store(false, Ordering::Relaxed);
@@ -237,6 +248,13 @@ fn prepare(cpu: usize) -> bool {
 fn select(cpu: usize, frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame {
     let proof = &CORES[cpu];
     if !proof.active.load(Ordering::Relaxed) { return frame_ptr; }
+    // An active critical section blocks ONLY stack handoff. This same local
+    // IRQ still enters the assembly gate, gets EOI and restores the current
+    // frame. Other CPUs' guards do not affect this CPU's preemption.
+    if !GATES[cpu].can_preempt() {
+        proof.deferred.fetch_add(1, Ordering::Relaxed);
+        return frame_ptr;
+    }
     let current = proof.current.load(Ordering::Relaxed);
     if current >= TASKS {
         proof.invalid.fetch_add(1, Ordering::Relaxed);
@@ -339,6 +357,41 @@ fn stop_timer() -> bool {
     }
 }
 
+/// Task0 owns two nested preemption-disabled critical sections. Real
+/// local timer interrupts and local EOIs must keep flowing, but task1 must
+/// not execute until BOTH nested sections have exited. The inner release
+/// must NOT re-enable preemption. No CLI or voluntary task switch here.
+fn prove_nested_irq_deferral(cpu: usize) -> bool {
+    let proof = &CORES[cpu];
+    if GATES[cpu].depth() != 2
+        || proof.switches.load(Ordering::Acquire) != 0
+        || proof.work[1].load(Ordering::Acquire) != 0 { return false; }
+
+    for phase in 0..2 {
+        let target = (phase as u64 + 1) * 2;
+        let mut arrived = false;
+        for _ in 0..MAX_SPINS {
+            proof.work[0].fetch_add(1, Ordering::Relaxed);
+            if proof.deferred.load(Ordering::Acquire) >= target {
+                arrived = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !arrived || proof.switches.load(Ordering::Acquire) != 0
+            || proof.work[1].load(Ordering::Acquire) != 0
+            || GATES[cpu].depth() != (2 - phase)
+        { return false; }
+        if GATES[cpu].enable() != Ok(1 - phase) { return false; }
+        // After the first release, the outermost guard must still prevent
+        // any task switch despite additional hardware IRQs.
+    }
+    GATES[cpu].can_preempt() && GATES[cpu].depth() == 0
+        && proof.deferred.load(Ordering::Acquire) >= MIN_DEFERRED_PER_AP
+        && proof.switches.load(Ordering::Acquire) == 0
+        && proof.work[1].load(Ordering::Acquire) == 0
+}
+
 #[inline(never)]
 fn run_task(task: usize) -> ! {
     let Some(cpu) = ap_ipi_smoke::ap_slot(ap_ipi_smoke::local_id())
@@ -352,7 +405,14 @@ fn run_task(task: usize) -> ! {
     }
     x86_64::instructions::interrupts::enable();
     let proof = &CORES[cpu];
+    // Task1 must not enter until task0 has observed two truly nested
+    // critical sections with four real timer interrupts but zero switches.
+    let nested = task != 0 || prove_nested_irq_deferral(cpu);
+    if task == 0 {
+        proof.nested_ok.store(nested, Ordering::Release);
+    }
     let mut success = false;
+    if nested {
     for _ in 0..MAX_SPINS {
         proof.work[task].fetch_add(1, Ordering::Relaxed);
         if proof.switches.load(Ordering::Relaxed) >= MIN_SWITCHES
@@ -365,6 +425,7 @@ fn run_task(task: usize) -> ! {
             break;
         }
         core::hint::spin_loop();
+    }
     }
     x86_64::instructions::interrupts::disable();
     proof.active.store(false, Ordering::Relaxed);
@@ -396,6 +457,12 @@ pub fn secondary_run(cpu: usize) -> bool {
     let Ok(plan) = lapic_timer_plan::periodic_timer_plan(VECTOR, DIVISOR, COUNT)
     else { return false; };
     if !fx_enter(cpu) { return false; }
+    // Two AP-owned nested guards start before the first worker is entered.
+    // IF remains off here; task0 turns IF on and proves deferred IRQs.
+    if GATES[cpu].disable() != Ok(1) || GATES[cpu].disable() != Ok(2) {
+        fx_leave(cpu);
+        return false;
+    }
     // The caller has masked the original AP local timer and enabled its
     // SVR. Timer programming remains THIS AP's responsibility.
     unsafe {
@@ -438,6 +505,10 @@ pub fn secondary_run(cpu: usize) -> bool {
         && ticks == eois && ticks >= switches
         && proof.invalid.load(Ordering::Acquire) == 0
         && proof.xmm_bad.load(Ordering::Acquire) == 0
+        && proof.nested_ok.load(Ordering::Acquire)
+        && proof.deferred.load(Ordering::Acquire) >= MIN_DEFERRED_PER_AP
+        && GATES[cpu].depth() == 0
+        && ticks >= switches + proof.deferred.load(Ordering::Acquire)
         && (0..TASKS).all(|task| {
             proof.work[task].load(Ordering::Acquire) > 0
                 && unsafe {
@@ -472,8 +543,9 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
         serial::write_line("WOLFOS_AP_SMP_PREEMPT_ERROR ap_not_finished");
         return false;
     }
-    let (mut irq, mut eoi, mut switched, mut a, mut b, mut work, mut offline) =
-        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize);
+    let (mut irq, mut eoi, mut switched, mut a, mut b, mut work, mut offline,
+         mut deferred, mut nested_aps) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0usize, 0u64, 0usize);
     let mut good = true;
     for (cpu, info) in cpus.iter().enumerate() {
         if info.lapic_id == bsp { continue; }
@@ -493,6 +565,10 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
             || xa + xb != sw || et != it
             || p.invalid.load(Ordering::Acquire) != 0
             || p.xmm_bad.load(Ordering::Acquire) != 0
+            || !p.nested_ok.load(Ordering::Acquire)
+            || p.deferred.load(Ordering::Acquire) < MIN_DEFERRED_PER_AP
+            || GATES[cpu].depth() != 0
+            || it < sw + p.deferred.load(Ordering::Acquire)
         { good = false; }
         irq += it;
         eoi += et;
@@ -502,6 +578,8 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
         work += p.work[0].load(Ordering::Acquire)
             + p.work[1].load(Ordering::Acquire);
         offline += usize::from(ap_ipi_smoke::is_offline(cpu));
+        deferred += p.deferred.load(Ordering::Acquire);
+        nested_aps += usize::from(p.nested_ok.load(Ordering::Acquire));
     }
     let spurious = ap_ipi_smoke::spurious_count();
     let wrong_ipi = ap_ipi_smoke::ipi_count();
@@ -509,18 +587,20 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
     if good && switched >= 30 && a >= 15 && b >= 15
         && irq == eoi && irq >= switched
         && work > 0 && offline == 3
+        && deferred >= 12 && nested_aps == 3
+        && irq >= switched + deferred
         && spurious == 0 && wrong_ipi == 0 && misrouted == 0
     {
         serial::write_fmt(format_args!(
-            "WOLFOS_AP_SMP_PREEMPT_OK cpus=4 aps=3 tasks_per_ap=2 switches={} task0_irqs={} task1_irqs={} ticks={} eois={} work={} invalid=0 xmm_bad=0 spurious=0 wrong_ipi=0 offline={} bsp_if=0 migrated=0\n",
-            switched, a, b, irq, eoi, work, offline
+            "WOLFOS_AP_SMP_PREEMPT_OK cpus=4 aps=3 tasks_per_ap=2 switches={} task0_irqs={} task1_irqs={} ticks={} eois={} work={} invalid=0 xmm_bad=0 spurious=0 wrong_ipi=0 offline={} bsp_if=0 migrated=0 deferred={} nested_aps={} guard_depth=0\n",
+            switched, a, b, irq, eoi, work, offline, deferred, nested_aps
         ));
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_AP_SMP_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} ticks={} eois={} work={} offline={} good={} spurious={} wrong_ipi={} unrouted={}\n",
+            "WOLFOS_AP_SMP_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} ticks={} eois={} work={} offline={} good={} spurious={} wrong_ipi={} unrouted={} deferred={} nested_aps={}\n",
             switched, a, b, irq, eoi, work, offline, good,
-            spurious, wrong_ipi, misrouted
+            spurious, wrong_ipi, misrouted, deferred, nested_aps
         ));
         false
     }

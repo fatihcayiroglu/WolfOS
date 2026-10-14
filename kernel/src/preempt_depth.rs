@@ -1,12 +1,12 @@
-//! BSP-only IRQ-aware preemption-disable depth for kernel critical sections.
+//! IRQ-aware preemption-disable depth for fixed CPU-owned kernel critical sections.
 //!
 //! Unlike CLI, disabling *preemption* leaves hardware timer IRQs deliverable.
 //! The IRQ can still EOI and publish ticks, but cannot hand control to a
 //! different kernel stack until every nested critical section is exited.
 //!
 //! This primitive alone is NOT a production scheduler lock. It is currently
-//! only wired to the BSP-only xAPIC QEMU preemption smoke; there is no AP task
-//! preemption, arbitrary task ownership or cross-CPU scheduling yet.
+//! used by isolated BSP and per-AP xAPIC QEMU preemption smoke tests. Each
+//! AP owns its own depth; this is not cross-CPU locking or migration-safe.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
