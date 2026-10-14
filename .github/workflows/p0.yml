@@ -31,6 +31,8 @@ jobs:
         run: make ap-ipi-smoke
       - name: Independent local periodic xAPIC timer IRQs on three APs (4 vCPUs)
         run: make ap-local-timer-smoke
+      - name: Three APs independently preempt two private kernel tasks by local IRQ (4 vCPUs)
+        run: make ap-smp-preempt-smoke
       - name: PIT IRQ0 hardware timer smoke (single BSP only)
         run: make timer-smoke
       - name: xAPIC periodic timer hardware IRQ smoke (single BSP only)
