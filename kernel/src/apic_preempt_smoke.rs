@@ -567,6 +567,14 @@ pub fn verify() -> bool {
     RESUME_COUNT.store(0, Ordering::Relaxed);
     BLOCK_ERRORS.store(0, Ordering::Relaxed);
     for visit in &POST_WAKE_VISITS { visit.store(0, Ordering::Relaxed); }
+    FINISH_PHASE.store(0, Ordering::Relaxed);
+    FINISHED.store(0, Ordering::Relaxed);
+    FINISH_ATTEMPTS.store(0, Ordering::Relaxed);
+    FINISH_WORK_SNAPSHOT.store(0, Ordering::Relaxed);
+    FINISH_FROZEN_SAMPLES.store(0, Ordering::Relaxed);
+    FINISH_SKIPS.store(0, Ordering::Relaxed);
+    FINISH_ERRORS.store(0, Ordering::Relaxed);
+    for visit in &POST_FINISH_VISITS { visit.store(0, Ordering::Relaxed); }
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
@@ -625,6 +633,15 @@ pub fn verify() -> bool {
     let post0 = POST_WAKE_VISITS[0].load(Ordering::Acquire);
     let post1 = POST_WAKE_VISITS[1].load(Ordering::Acquire);
     let post2 = POST_WAKE_VISITS[2].load(Ordering::Acquire);
+    let finish_phase = FINISH_PHASE.load(Ordering::Acquire);
+    let finished_mask = FINISHED.load(Ordering::Acquire);
+    let finish_attempts = FINISH_ATTEMPTS.load(Ordering::Acquire);
+    let finish_work = FINISH_WORK_SNAPSHOT.load(Ordering::Acquire);
+    let finish_freezes = FINISH_FROZEN_SAMPLES.load(Ordering::Acquire);
+    let finish_skips = FINISH_SKIPS.load(Ordering::Acquire);
+    let finish_errors = FINISH_ERRORS.load(Ordering::Acquire);
+    let survivor0 = POST_FINISH_VISITS[0].load(Ordering::Acquire);
+    let survivor1 = POST_FINISH_VISITS[1].load(Ordering::Acquire);
     let post_min = post0.min(post1).min(post2);
     let post_max = post0.max(post1).max(post2);
     // SAFETY: no further private task or APIC handler uses FX state,
@@ -648,9 +665,21 @@ pub fn verify() -> bool {
         && block_irqs >= WAKE_AFTER_BLOCKED_IRQS
         && freeze_checks == block_irqs && block_skips >= 2
         && frozen_work > 0 && block_errors == 0
-        && RUNNABLE.load(Ordering::Acquire) == 0b111
+        && RUNNABLE.load(Ordering::Acquire) == 0b011
+        && finish_phase == 2 && finished_mask == 0b100
+        && finish_attempts == 1 && finish_work > 0
+        && finish_freezes >= FINISH_FREEZE_REQUIRED
+        && finish_skips >= 2 && finish_errors == 0
+        && survivor0 >= MIN_EPOCHS_PER_TASK
+        && survivor1 >= MIN_EPOCHS_PER_TASK
+        && survivor0.abs_diff(survivor1) <= 1
         && (0..TASK_COUNT).all(canary_ok);
     if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_FINISHED_OK task=2 mask=4 ready=3 finish=1 frozen_irqs={} skipped={} errors={} frozen_work={} survivor0={} survivor1={} never_rescheduled=1 fx_still_owned=1\n",
+            finish_freezes, finish_skips, finish_errors, finish_work,
+            survivor0, survivor1
+        ));
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_BLOCK_WAKE_OK task=1 blocked_irqs={} frozen_samples={} skipped={} attempts={} wakes={} resumed={} errors={} frozen_work={} postwake0={} postwake1={} postwake2={} stack_resumed=1\n",
             block_irqs, freeze_checks, block_skips, block_attempts, wakes,
@@ -667,12 +696,13 @@ pub fn verify() -> bool {
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={} phase={} block_irqs={} frozen={} skipped={} wakes={} resumed={} block_errors={} postwake={}/{}/{}\n",
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={} phase={} block_irqs={} frozen={} skipped={} wakes={} resumed={} block_errors={} postwake={}/{}/{} finish_phase={} finish_mask={} finish_freezes={} finish_skips={} finish_errors={} survivors={}/{}\n",
             switches, first, second, third, work0, work1, work2, exit_task, rejected,
             deferred, nested_ok, depth, fx_switches, fx_observations, fx_bad,
             fx_work_checks, xmm_ready, !unexpected_interrupt_state, block_phase,
             block_irqs, freeze_checks, block_skips, wakes, resumed, block_errors,
-            post0, post1, post2
+            post0, post1, post2, finish_phase, finished_mask, finish_freezes,
+            finish_skips, finish_errors, survivor0, survivor1
         ));
     }
     ok
