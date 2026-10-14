@@ -22,6 +22,10 @@ mod acpi_layout;
 mod acpi_tables;
 mod acpi_walk;
 mod smp;
+#[cfg(feature = "ap-ipi-smoke")]
+mod ipi_layout;
+#[cfg(feature = "ap-ipi-smoke")]
+mod ap_ipi_smoke;
 mod ap_stack;
 mod scheduler;
 mod thread_scheduler;
@@ -228,8 +232,20 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_LAPIC_MMIO_TEST_FAILED");
         halt_forever();
     }
+    // Feature-isolated BSP mapping exists BEFORE AP startup: APs inherit
+    // a writable UC local-APIC alias for private IRQ acknowledgement.
+    #[cfg(feature = "ap-ipi-smoke")]
+    if !ap_ipi_smoke::prepare_bsp(mp.bsp_lapic_id, hhdm.offset, entries, mp.cpus()) {
+        serial::write_line("WOLFOS_AP_IPI_ERROR cannot_prepare_xapic");
+        halt_forever();
+    }
     if !smp::boot_aps(mp) {
         serial::write_line("WOLFOS_SMP_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "ap-ipi-smoke")]
+    if !ap_ipi_smoke::verify_bsp(mp.bsp_lapic_id, mp.cpus()) {
+        serial::write_line("WOLFOS_AP_IPI_TEST_FAILED");
         halt_forever();
     }
     if !context_switch::verify_roundtrip() {
