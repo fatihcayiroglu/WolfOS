@@ -68,6 +68,24 @@ pub(crate) fn ap_slot(id: u32) -> Option<usize> {
     (0..count).find(|i| IDS[*i].load(Ordering::Relaxed) == id)
 }
 
+/// Read-only BSP observation after an AP publishes its offline state.
+#[cfg(feature = "ap-local-timer-smoke")]
+pub(crate) fn is_offline(index: usize) -> bool {
+    index < MAX_BOOT_CPUS && OFFLINE[index].load(Ordering::Acquire)
+}
+/// Reject any accidental directed IPI or spurious APIC interrupt during
+/// the standalone AP-local periodic timer test.
+#[cfg(feature = "ap-local-timer-smoke")]
+pub(crate) fn ipi_count() -> u64 {
+    (0..COUNT.load(Ordering::Acquire))
+        .map(|i| SEEN[i].load(Ordering::Acquire))
+        .sum()
+}
+#[cfg(feature = "ap-local-timer-smoke")]
+pub(crate) fn spurious_count() -> u64 {
+    SPURIOUS_COUNT.load(Ordering::Acquire)
+}
+
 /// Called on receiving AP, by its independent IDT and with IF=0. No
 /// serial output, heap allocation or BSP context is touched here.
 pub extern "x86-interrupt" fn irq(_frame: InterruptStackFrame) {
