@@ -19,13 +19,15 @@ else ifeq ($(FLAVOR),apic-timer)
 FEATURES := --features apic-timer-smoke
 else ifeq ($(FLAVOR),apic-calibration)
 FEATURES := --features apic-calibration-smoke
+else ifeq ($(FLAVOR),apic-preempt)
+FEATURES := --features apic-preempt-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -86,6 +88,10 @@ apic-timer-smoke:
 apic-calibration-smoke:
 	$(MAKE) iso FLAVOR=apic-calibration
 	python3 scripts/apic_timer_smoke.py $(OUT)/wolfos-apic-calibration.iso --calibrated
+
+apic-preempt-smoke:
+	$(MAKE) iso FLAVOR=apic-preempt
+	python3 scripts/apic_timer_smoke.py $(OUT)/wolfos-apic-preempt.iso --preemptive
 
 test:
 	python3 -m unittest discover -s tests -v
