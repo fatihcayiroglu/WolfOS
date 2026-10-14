@@ -46,7 +46,7 @@ def main() -> int:
             r"switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) "
             r"ticks=(\d+) eois=(\d+) work=(\d+) invalid=(\d+) "
             r"xmm_bad=(\d+) spurious=(\d+) wrong_ipi=(\d+) offline=(\d+) "
-            r"bsp_if=(\d+) migrated=(\d+)"
+            r"bsp_if=(\d+) migrated=(\d+) deferred=(\d+) nested_aps=(\d+) guard_depth=(\d+)"
         )
         proof = re.search(pattern, output)
         if proof is None:
@@ -54,12 +54,15 @@ def main() -> int:
             return 1
         (cpus, aps, tasks, switches, a, b, ticks, eois,
          work, invalid, xmm_bad, spurious, wrong_ipi,
-         offline, bsp_if, migrated) = map(int, proof.groups())
+         offline, bsp_if, migrated, deferred, nested_aps,
+         guard_depth) = map(int, proof.groups())
         if (cpus != 4 or aps != 3 or tasks != 2 or switches < 30
             or a < 15 or b < 15 or a + b != switches
             or ticks < switches or ticks != eois or work == 0
             or invalid or xmm_bad or spurious or wrong_ipi
-            or offline != 3 or bsp_if != 0 or migrated != 0):
+            or offline != 3 or bsp_if != 0 or migrated != 0
+            or deferred < 12 or nested_aps != 3 or guard_depth != 0
+            or ticks < switches + deferred):
             print(f"FAIL: invalid independent per-AP IRQ/task/x87-SSE evidence: {proof.groups()}")
             return 1
 
@@ -82,7 +85,8 @@ def main() -> int:
         print(
             f"PASS: 3 independent APs with 2 private kernel tasks each; "
             f"{switches} real timer-IRQ involuntary task switches, "
-            f"{ticks} AP-local IRQs/{eois} EOIs, no x87/SSE corruption, "
+            f"{ticks} AP-local IRQs/{eois} EOIs, {deferred} deferrals across "
+            "nested critical sections, no x87/SSE corruption, "
             "all APs parked IF=0, BSP remained unpreempted"
         )
         return 0
