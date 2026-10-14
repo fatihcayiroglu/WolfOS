@@ -126,7 +126,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             return False
         if preemptive:
             handoff = re.search(
-                r"WOLFOS_APIC_PREEMPT_OK tasks=(\d+) involuntary_switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) task2_irqs=(\d+) work0=(\d+) work1=(\d+) work2=(\d+) exit_task=(\d+) rejected=(\d+) stack_kib=(\d+) bsp_only=(\d+) user_mode=(\d+) deferred=(\d+) nested=(\d+) guard_depth=(\d+) fairness_max_delta=(\d+)",
+                r"WOLFOS_APIC_PREEMPT_OK tasks=(\d+) involuntary_switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) task2_irqs=(\d+) work0=(\d+) work1=(\d+) work2=(\d+) exit_task=(\d+) rejected=(\d+) stack_kib=(\d+) bsp_only=(\d+) user_mode=(\d+) deferred=(\d+) nested=(\d+) guard_depth=(\d+) fairness_max_delta=(\d+) task3_irqs=(\d+) live_admitted=(\d+)",
                 output,
             )
             if handoff is None:
@@ -134,16 +134,46 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
                 return False
             (tasks, switches, a_irq, b_irq, c_irq, work0, work1, work2,
              exit_task, rejected, stack_kib, bsp, userspace, deferred,
-             nested, depth, fairness_max_delta) = map(int, handoff.groups())
-            if (tasks != 3 or switches < 36
+             nested, depth, fairness_max_delta, fourth_irqs,
+             live_admitted) = map(int, handoff.groups())
+            if (tasks != 3 or switches < 60
                 or min(a_irq, b_irq, c_irq) < 4
-                or a_irq + b_irq + c_irq != switches
+                or a_irq + b_irq + c_irq + fourth_irqs != switches
+                or fourth_irqs < 4 or live_admitted != 1
                 or not all((work0, work1, work2))
                 or exit_task not in (0, 1, 2) or rejected != 0
                 or stack_kib != 16 or bsp != 1 or userspace != 0
                 or deferred < 4 or nested != 1 or depth != 0
                 or fairness_max_delta > 1):
                 print(f"FAIL: invalid three-task IRQ fairness evidence: {handoff.groups()}")
+                return False
+            live = re.search(
+                r"WOLFOS_APIC_LIVE_ENQUEUE_OK slot=(\d+) generation=(\d+) admissions=(\d+) executions=(\d+) irq=(\d+) work=(\d+) xmm_initial=0x([0-9a-f]+) xmm_final=0x([0-9a-f]+) corrupt=(\d+) finished=(\d+) parked=(\d+) frozen_irqs=(\d+) survivor_switches=(\d+) gpr_frame=(\d+) fx_private=(\d+) bsp_only=(\d+)",
+                output,
+            )
+            if live is None:
+                print("FAIL: fourth task never joined active hardware preemptive scheduler")
+                return False
+            (slot, generation, admissions, executions, live_irqs,
+             live_work, initial_hex, final_hex, corrupt, finished_live,
+             parked, frozen_irqs, survivor_switches, gpr_frame,
+             fx_private, bsp_live) = live.groups()
+            (slot, generation, admissions, executions, live_irqs,
+             live_work, corrupt, finished_live, parked, frozen_irqs,
+             survivor_switches, gpr_frame, fx_private, bsp_live) = map(
+                int, (slot, generation, admissions, executions, live_irqs,
+                      live_work, corrupt, finished_live, parked, frozen_irqs,
+                      survivor_switches, gpr_frame, fx_private, bsp_live)
+            )
+            if (slot != 3 or generation != 1 or admissions != 1
+                or executions != 1 or live_irqs != fourth_irqs
+                or live_irqs < 4 or live_work <= 512
+                or int(initial_hex, 16) == 0x0f0e0d0c0b0a0908
+                or int(final_hex, 16) != 0x53a71199cafef00d
+                or corrupt != 0 or finished_live != 1 or parked != 1
+                or frozen_irqs < 4 or survivor_switches < 4
+                or gpr_frame != 1 or fx_private != 1 or bsp_live != 1):
+                print(f"FAIL: live fourth task did not preempt/finish safely: {live.groups()}")
                 return False
             lifecycle = re.search(
                 r"WOLFOS_APIC_BLOCK_WAKE_OK task=(\d+) blocked_irqs=(\d+) frozen_samples=(\d+) skipped=(\d+) attempts=(\d+) wakes=(\d+) resumed=(\d+) errors=(\d+) frozen_work=(\d+) postwake0=(\d+) postwake1=(\d+) postwake2=(\d+) stack_resumed=(\d+)",
@@ -275,6 +305,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             "WOLFOS_APIC_TIMER_ERROR", "WOLFOS_APIC_TIMER_TEST_FAILED",
             "WOLFOS_APIC_IRQ_FRAME_ERROR", "WOLFOS_APIC_GPR_ERROR",
             "WOLFOS_APIC_PREEMPT_ERROR",
+            "WOLFOS_APIC_LIVE_ENQUEUE_ERROR",
             "WOLFOS_APIC_BLOCK_WAKE_ERROR",
             "WOLFOS_APIC_FINISHED_ERROR",
             "WOLFOS_APIC_RECYCLE_ERROR",

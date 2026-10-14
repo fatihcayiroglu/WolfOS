@@ -21,37 +21,43 @@ use crate::{context_switch, kernel_trap_frame::{
     task_slot::{self, SlotTable, SlotState, SlotError, ReclaimGate}};
 
 const TASK_COUNT: usize = 3;
+const SLOT_COUNT: usize = 4; // fourth slot is NOT runnable at boot
+const LIVE_TASK: usize = 3;
+const LIVE_REQUIRED_IRQS: u64 = 4;
+const LIVE_FROZEN_REQUIRED: u64 = 4;
+const LIVE_XMM0: u64 = 0x53a7_1199_cafe_f00d;
 const STACK_BYTES: usize = 16 * 1024;
-const STOP_AFTER: u64 = 36;
+const STOP_AFTER: u64 = 60;
 const FINISH_AFTER_SWITCHES: u64 = 26;
 const FINISH_FREEZE_REQUIRED: u64 = 6;
 const WAKE_AFTER_BLOCKED_IRQS: u64 = 6;
 const MIN_EPOCHS_PER_TASK: u64 = 4;
 const MAX_TASK_SPINS: u64 = 200_000_000;
 const CANARY: u64 = 0x574f_4c46_5052_454d;
-const TASK_XMM0: [u64; TASK_COUNT] = [
+const TASK_XMM0: [u64; SLOT_COUNT] = [
     0x1122_3344_5566_7788,
     0x8877_6655_4433_2211,
     0x0f0e_0d0c_0b0a_0908,
+    LIVE_XMM0,
 ];
 
 #[repr(align(16))]
 struct Stack([u8; STACK_BYTES]);
-struct PrivateStacks(UnsafeCell<[Stack; TASK_COUNT]>);
+struct PrivateStacks(UnsafeCell<[Stack; SLOT_COUNT]>);
 // SAFETY: only BSP runs; tasks own disjoint stacks. The interrupt handler
 // observes saved frame addresses atomically but does not mutate live Rust
 // data borrowed across an IRQ or context switch.
 unsafe impl Sync for PrivateStacks {}
 static STACKS: PrivateStacks =
     PrivateStacks(UnsafeCell::new([
-        const { Stack([0; STACK_BYTES]) }; TASK_COUNT
+        const { Stack([0; STACK_BYTES]) }; SLOT_COUNT
     ]));
 
 /// Pure ownership metadata, separate from ready/finished IRQ bitmap state.
 /// Only BSP mutates it when creating the smoke slots, under task2's
 /// preemption-disabled Finished transition, and after BSP quiescence.
 /// The IRQ callback NEVER accesses this UnsafeCell.
-struct OwnedSlots(UnsafeCell<SlotTable<TASK_COUNT>>);
+struct OwnedSlots(UnsafeCell<SlotTable<SLOT_COUNT>>);
 // SAFETY: only BSP; the ISR never touches OwnedSlots, and APs are parked.
 // Mutations do not overlap with another Rust reference to this allocation.
 unsafe impl Sync for OwnedSlots {}
@@ -68,8 +74,8 @@ static EXIT_RSP: BspSlot = BspSlot(UnsafeCell::new(0));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
-static FRAME_RSP: [AtomicUsize; TASK_COUNT] =
-    [const { AtomicUsize::new(0) }; TASK_COUNT];
+static FRAME_RSP: [AtomicUsize; SLOT_COUNT] =
+    [const { AtomicUsize::new(0) }; SLOT_COUNT];
 static WORK: [AtomicU64; TASK_COUNT] =
     [const { AtomicU64::new(0) }; TASK_COUNT];
 static INTERRUPTED: [AtomicU64; TASK_COUNT] =
@@ -111,12 +117,28 @@ static POST_FINISH_VISITS: [AtomicU64; 2] =
 static PREEMPT_DEPTH: PreemptDepth = PreemptDepth::new();
 static DEFERRED_IRQS: AtomicU64 = AtomicU64::new(0);
 static NESTED_GUARD_OK: AtomicBool = AtomicBool::new(false);
-static XMM_READY: [AtomicBool; TASK_COUNT] =
-    [const { AtomicBool::new(false) }; TASK_COUNT];
+static XMM_READY: [AtomicBool; SLOT_COUNT] =
+    [const { AtomicBool::new(false) }; SLOT_COUNT];
 static FX_SWITCHES: AtomicU64 = AtomicU64::new(0);
 static FX_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static FX_BAD: AtomicU64 = AtomicU64::new(0);
 static FX_WORK_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+// New slot3 is created and becomes Ready WHILE first-generation tasks0/1/2
+// are executing with real IRQ-driven preemption. Epoch 0: absent, 1:
+// admitted, 2: worker3 requested finish, 3: actual timer IRQ suspended it.
+static LIVE_PHASE: AtomicUsize = AtomicUsize::new(0);
+static LIVE_HANDLE_GEN: AtomicU64 = AtomicU64::new(0);
+static LIVE_ADMISSIONS: AtomicU64 = AtomicU64::new(0);
+static LIVE_TASK_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_INTERRUPTED: AtomicU64 = AtomicU64::new(0);
+static LIVE_BAD: AtomicU64 = AtomicU64::new(0);
+static LIVE_INITIAL_XMM: AtomicU64 = AtomicU64::new(0);
+static LIVE_ENTRY_SEEN: AtomicBool = AtomicBool::new(false);
+static LIVE_FINISHES: AtomicU64 = AtomicU64::new(0);
+static LIVE_STOP_WORK: AtomicU64 = AtomicU64::new(0);
+static LIVE_FROZEN: AtomicU64 = AtomicU64::new(0);
+static LIVE_SURVIVOR_SWITCHES: AtomicU64 = AtomicU64::new(0);
 
 // Second-generation task2 runs as a single IRQ-interruptible kernel worker
 // after the original fixed 3-task scheduler has stopped on the BSP stack.
@@ -316,6 +338,101 @@ fn timer_finished_task_observation(current: usize) {
     }
 }
 
+/// Running task0 creates a NEW task while the other three tasks remain
+/// scheduled by actual timer IRQs. Preemption is disabled around metadata
+/// writes, but interrupts remain enabled and still receive EOI.
+fn admit_live_task3() -> bool {
+    if LIVE_PHASE.load(Ordering::Acquire) != 0
+        || BLOCK_PHASE.load(Ordering::Acquire) != 3
+    {
+        return false;
+    }
+    if PREEMPT_DEPTH.disable() != Ok(1) {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let result = (|| {
+        let bottom = stack_bottom(LIVE_TASK);
+        let top = stack_top(LIVE_TASK);
+        if bottom & 15 != 0 || top & 15 != 0
+            || FRAME_RSP[LIVE_TASK].load(Ordering::Relaxed) != 0
+        {
+            return false;
+        }
+        let cs = CODE_SELECTOR.load(Ordering::Acquire) as u16;
+        let ss = SS::get_reg().0;
+        let frame_rsp = top - 8 - 64 - size_of::<KernelTrapFrame>();
+        let frame = KernelTrapFrame {
+            registers: SavedGprs::default(),
+            hardware: HardwareReturnFrame {
+                rip: task3 as usize as u64,
+                cs: u64::from(cs),
+                rflags: 0x202,
+                rsp: (top - 8) as u64,
+                ss: u64::from(ss),
+            },
+        };
+        // SAFETY: no task3 exists yet and task0 has an unbroken
+        // preemption-disable guard. Only BSP accesses these private bytes.
+        let frame_ok = unsafe {
+            (bottom as *mut u64).write_volatile(CANARY ^ LIVE_TASK as u64);
+            (frame_rsp as *mut KernelTrapFrame).write(frame);
+            validate_kernel_resume(
+                frame_rsp as u64, bottom as u64, top as u64, cs,
+                &*(frame_rsp as *const KernelTrapFrame)
+            ).is_ok()
+        };
+        if !frame_ok { return false; }
+        // SAFETY: only BSP owns this slot table. IRQ handler never reads it.
+        let Some(handle) = (unsafe {
+            (&mut *SLOT_OWNERS.0.get()).spawn(LIVE_TASK).ok()
+        }) else { return false; };
+        if handle.generation != 1 {
+            return false;
+        }
+        LIVE_HANDLE_GEN.store(handle.generation, Ordering::Release);
+        FRAME_RSP[LIVE_TASK].store(frame_rsp, Ordering::Release);
+        // Publish the admission phase BEFORE the Ready bit. Selection
+        // never sees an uninitialized stack or missing FX image.
+        LIVE_PHASE.store(1, Ordering::Release);
+        let wake = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::wake_runnable(mask, LIVE_TASK, SLOT_COUNT).ok()
+        ).is_ok();
+        if !wake { return false; }
+        LIVE_ADMISSIONS.fetch_add(1, Ordering::Relaxed);
+        true
+    })();
+    if !result {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    if PREEMPT_DEPTH.enable() != Ok(0) {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    result
+}
+
+/// The fourth worker was Finished on its own stack. A timer IRQ must
+/// involuntarily switch AWAY from it before we can claim it is parked.
+/// All subsequent hardware interrupts verify no further work on task3.
+fn observe_live_retirement(current: usize) {
+    if LIVE_PHASE.load(Ordering::Acquire) == 2 && current == LIVE_TASK {
+        LIVE_STOP_WORK.store(LIVE_TASK_WORK.load(Ordering::Acquire), Ordering::Release);
+        LIVE_PHASE.store(3, Ordering::Release);
+    } else if LIVE_PHASE.load(Ordering::Acquire) == 3
+        && current != LIVE_TASK
+    {
+        if LIVE_TASK_WORK.load(Ordering::Acquire)
+            == LIVE_STOP_WORK.load(Ordering::Acquire)
+        {
+            LIVE_FROZEN.fetch_add(1, Ordering::Relaxed);
+        } else {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// IRQ-time handoff decision. Only the BSP xAPIC timer handler can call it.
 /// No allocations, logging, task changes inside Rust frame borrows, or
 /// scheduler lock acquisition. The returned pointer is a *different live
@@ -367,12 +484,18 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
     // Nested preempt-disable sections were checked above and never switch.
     timer_block_wake(current);
     timer_finished_task_observation(current);
-    if current >= TASK_COUNT {
+    observe_live_retirement(current);
+    let available_count = if LIVE_PHASE.load(Ordering::Acquire) == 0 {
+        TASK_COUNT
+    } else {
+        SLOT_COUNT
+    };
+    if current >= available_count {
         REJECTED.fetch_add(1, Ordering::Relaxed);
         return frame_ptr;
     }
     let next = match rr_policy::next_runnable(
-        current, TASK_COUNT, RUNNABLE.load(Ordering::Relaxed)
+        current, available_count, RUNNABLE.load(Ordering::Relaxed)
     ) {
         Ok(id) if id != current => id,
         Ok(_) => return frame_ptr, // no alternative ready; keep running
@@ -430,16 +553,25 @@ pub fn select_frame(frame_ptr: *const KernelTrapFrame) -> *const KernelTrapFrame
         }
     }
     FRAME_RSP[current].store(old_rsp, Ordering::Relaxed);
-    INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
+    if current == LIVE_TASK {
+        LIVE_INTERRUPTED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        INTERRUPTED[current].fetch_add(1, Ordering::Relaxed);
+    }
     CURRENT.store(next, Ordering::Relaxed);
     SWITCHES.fetch_add(1, Ordering::Relaxed);
+    if LIVE_PHASE.load(Ordering::Acquire) == 3 && next != LIVE_TASK {
+        LIVE_SURVIVOR_SWITCHES.fetch_add(1, Ordering::Relaxed);
+    }
     if FINISH_PHASE.load(Ordering::Acquire) >= 1 {
         if next < 2 {
             POST_FINISH_VISITS[next].fetch_add(1, Ordering::Relaxed);
         } else {
             FINISH_ERRORS.fetch_add(1, Ordering::Relaxed);
         }
-    } else if BLOCK_PHASE.load(Ordering::Acquire) >= 2 {
+    } else if BLOCK_PHASE.load(Ordering::Acquire) >= 2
+        && next < TASK_COUNT
+    {
         POST_WAKE_VISITS[next].fetch_add(1, Ordering::Relaxed);
     }
     next_rsp as *const KernelTrapFrame
@@ -505,7 +637,22 @@ fn busy_task(id: usize) -> ! {
     let mut blocked_once = false;
     let mut resumed_once = false;
     let mut finished_once = false;
+    let mut live_admission_attempted = false;
     for _ in 0..MAX_TASK_SPINS {
+        if id == 0 && !live_admission_attempted
+            && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && SWITCHES.load(Ordering::Acquire) >= 18
+            && POST_WAKE_VISITS.iter().all(|visit|
+                visit.load(Ordering::Relaxed) >= 2
+            )
+        {
+            // This is a LIVE scheduler admission, not a BSP-only startup:
+            // two other workers stay runnable and the hardware timer is
+            // still active. Preemption is suppressed only while publishing
+            // a complete initial trap frame, FX ownership and Ready bit.
+            let _ = admit_live_task3();
+            live_admission_attempted = true;
+        }
         if id == 1 && !blocked_once && WORK[1].load(Ordering::Acquire) >= 128 {
             // The task itself requests Blocked; nested preempt-disable
             // prevents an IRQ handoff across the bitmap+phase update.
@@ -542,6 +689,8 @@ fn busy_task(id: usize) -> ! {
         }
         if id == 2 && !finished_once
             && BLOCK_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
             && SWITCHES.load(Ordering::Relaxed) >= FINISH_AFTER_SWITCHES
             && POST_WAKE_VISITS.iter().all(|visit|
                 visit.load(Ordering::Relaxed) >= MIN_EPOCHS_PER_TASK
@@ -593,6 +742,9 @@ fn busy_task(id: usize) -> ! {
         }
         WORK[id].fetch_add(1, Ordering::Relaxed);
         if SWITCHES.load(Ordering::Relaxed) >= STOP_AFTER
+            && LIVE_PHASE.load(Ordering::Acquire) == 3
+            && LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
+            && LIVE_FROZEN.load(Ordering::Acquire) >= LIVE_FROZEN_REQUIRED
             && BLOCK_PHASE.load(Ordering::Acquire) == 3
             && FINISH_PHASE.load(Ordering::Acquire) == 2
             && FINISH_FROZEN_SAMPLES.load(Ordering::Relaxed) >= FINISH_FREEZE_REQUIRED
@@ -626,6 +778,71 @@ fn busy_task(id: usize) -> ! {
 extern "C" fn task0() -> ! { busy_task(0) }
 extern "C" fn task1() -> ! { busy_task(1) }
 extern "C" fn task2() -> ! { busy_task(2) }
+
+/// Spawned only by the running task0, *after* hardware IRQ round-robin
+/// scheduling has started. No cooperative yield to any other worker.
+/// It owns the fourth FXSAVE64 image and separate 16 KiB private stack.
+extern "C" fn task3() -> ! {
+    if !x86_64::instructions::interrupts::are_enabled()
+        || LIVE_PHASE.load(Ordering::Acquire) != 1
+    {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    let initial_xmm = unsafe { fx_state::read_test_xmm0() };
+    LIVE_INITIAL_XMM.store(initial_xmm, Ordering::Release);
+    if initial_xmm == TASK_XMM0[2] {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    }
+    unsafe { fx_state::set_test_xmm0(LIVE_XMM0); }
+    XMM_READY[LIVE_TASK].store(true, Ordering::Release);
+    LIVE_ENTRY_SEEN.store(true, Ordering::Release);
+
+    for _ in 0..MAX_TASK_SPINS {
+        if unsafe { fx_state::read_test_xmm0() } != LIVE_XMM0 {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        LIVE_TASK_WORK.fetch_add(1, Ordering::Relaxed);
+        if LIVE_INTERRUPTED.load(Ordering::Acquire) >= LIVE_REQUIRED_IRQS
+            && LIVE_TASK_WORK.load(Ordering::Relaxed) > 512
+        {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    if PREEMPT_DEPTH.disable() != Ok(1) {
+        LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let changed = RUNNABLE.fetch_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |mask| rr_policy::finish_runnable(
+                mask, FINISHED.load(Ordering::Acquire), LIVE_TASK, SLOT_COUNT
+            ).ok().map(|(ready, _)| ready)
+        ).is_ok();
+        // SAFETY: BSP-only task and task-owned table; preemption disabled
+        // for this entire mutation. The IRQ handler never reads SLOT_OWNERS.
+        let finished = changed && unsafe {
+            let table = &mut *SLOT_OWNERS.0.get();
+            table.handle(LIVE_TASK).ok().is_some_and(|handle|
+                handle.generation == LIVE_HANDLE_GEN.load(Ordering::Acquire)
+                    && table.finish(handle).is_ok()
+            )
+        };
+        if finished {
+            LIVE_FINISHES.fetch_add(1, Ordering::Relaxed);
+            LIVE_PHASE.store(2, Ordering::Release);
+        } else {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+        if PREEMPT_DEPTH.enable() != Ok(0) {
+            LIVE_BAD.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // IRQ will save this suspended stack and resume a DIFFERENT runnable
+    // worker. We intentionally never free, zero or resume this live frame.
+    loop { core::hint::spin_loop(); }
+}
 
 /// Proof of safe reuse of an INACTIVE slot: the original task 2 was
 /// interrupted, marked Finished, and left off the runnable list for >=6
@@ -1059,6 +1276,19 @@ pub fn verify() -> bool {
     FINISH_SKIPS.store(0, Ordering::Relaxed);
     FINISH_ERRORS.store(0, Ordering::Relaxed);
     for visit in &POST_FINISH_VISITS { visit.store(0, Ordering::Relaxed); }
+    LIVE_PHASE.store(0, Ordering::Relaxed);
+    LIVE_HANDLE_GEN.store(0, Ordering::Relaxed);
+    LIVE_ADMISSIONS.store(0, Ordering::Relaxed);
+    LIVE_TASK_WORK.store(0, Ordering::Relaxed);
+    LIVE_INTERRUPTED.store(0, Ordering::Relaxed);
+    LIVE_BAD.store(0, Ordering::Relaxed);
+    LIVE_INITIAL_XMM.store(0, Ordering::Relaxed);
+    LIVE_ENTRY_SEEN.store(false, Ordering::Relaxed);
+    LIVE_FINISHES.store(0, Ordering::Relaxed);
+    LIVE_STOP_WORK.store(0, Ordering::Relaxed);
+    LIVE_FROZEN.store(0, Ordering::Relaxed);
+    LIVE_SURVIVOR_SWITCHES.store(0, Ordering::Relaxed);
+    FRAME_RSP[LIVE_TASK].store(0, Ordering::Relaxed);
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
     EXIT_TASK.store(usize::MAX, Ordering::Relaxed);
@@ -1092,6 +1322,17 @@ pub fn verify() -> bool {
     let first = INTERRUPTED[0].load(Ordering::Acquire);
     let second = INTERRUPTED[1].load(Ordering::Acquire);
     let third = INTERRUPTED[2].load(Ordering::Acquire);
+    let fourth = LIVE_INTERRUPTED.load(Ordering::Acquire);
+    let live_phase = LIVE_PHASE.load(Ordering::Acquire);
+    let live_gen = LIVE_HANDLE_GEN.load(Ordering::Acquire);
+    let live_admits = LIVE_ADMISSIONS.load(Ordering::Acquire);
+    let live_finishes = LIVE_FINISHES.load(Ordering::Acquire);
+    let live_work = LIVE_TASK_WORK.load(Ordering::Acquire);
+    let live_bad = LIVE_BAD.load(Ordering::Acquire);
+    let live_first_xmm = LIVE_INITIAL_XMM.load(Ordering::Acquire);
+    let live_frozen = LIVE_FROZEN.load(Ordering::Acquire);
+    let live_survivors = LIVE_SURVIVOR_SWITCHES.load(Ordering::Acquire);
+    let live_entry = LIVE_ENTRY_SEEN.load(Ordering::Acquire);
     let work0 = WORK[0].load(Ordering::Acquire);
     let work1 = WORK[1].load(Ordering::Acquire);
     let work2 = WORK[2].load(Ordering::Acquire);
@@ -1137,7 +1378,15 @@ pub fn verify() -> bool {
     let ok = !unexpected_interrupt_state && switches >= STOP_AFTER
         && min_irqs >= MIN_EPOCHS_PER_TASK
         && post_min >= MIN_EPOCHS_PER_TASK && post_max - post_min <= 1
-        && first + second + third == switches
+        && first + second + third + fourth == switches
+        && fourth >= LIVE_REQUIRED_IRQS
+        && live_phase == 3
+        && live_admits == 1 && live_finishes == 1
+        && live_gen == 1 && live_work > 512
+        && live_bad == 0 && live_entry
+        && live_first_xmm != TASK_XMM0[2]
+        && live_frozen >= LIVE_FROZEN_REQUIRED
+        && live_survivors >= LIVE_FROZEN_REQUIRED
         && work0 > 0 && work1 > 0 && work2 > 0
         && rejected == 0 && exit_task < TASK_COUNT
         && deferred >= 4 && nested_ok && depth == 0
@@ -1157,8 +1406,14 @@ pub fn verify() -> bool {
         && survivor0 >= MIN_EPOCHS_PER_TASK
         && survivor1 >= MIN_EPOCHS_PER_TASK
         && survivor0.abs_diff(survivor1) <= 1
-        && (0..TASK_COUNT).all(canary_ok);
+        && (0..SLOT_COUNT).all(canary_ok);
     if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_LIVE_ENQUEUE_OK slot=3 generation={} admissions={} executions=1 irq={} work={} xmm_initial={:#x} xmm_final={:#x} corrupt={} finished={} parked={} frozen_irqs={} survivor_switches={} gpr_frame=1 fx_private=1 bsp_only=1\n",
+            live_gen, live_admits, fourth, live_work, live_first_xmm,
+            LIVE_XMM0, live_bad, live_finishes, u8::from(live_phase == 3),
+            live_frozen, live_survivors
+        ));
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_FINISHED_OK task=2 mask=4 ready=3 finish=1 frozen_irqs={} skipped={} errors={} frozen_work={} survivor0={} survivor1={} never_rescheduled=1 fx_still_owned=1\n",
             finish_freezes, finish_skips, finish_errors, finish_work,
@@ -1174,19 +1429,20 @@ pub fn verify() -> bool {
             fx_switches, fx_observations, fx_work_checks, fx_bad
         ));
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_OK tasks=3 involuntary_switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={} fairness_max_delta={}\n",
+            "WOLFOS_APIC_PREEMPT_OK tasks=3 involuntary_switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} stack_kib=16 bsp_only=1 user_mode=0 deferred={} nested=1 guard_depth={} fairness_max_delta={} task3_irqs={} live_admitted=1\n",
             switches, first, second, third, work0, work1, work2,
-            exit_task, rejected, deferred, depth, post_max - post_min
+            exit_task, rejected, deferred, depth, post_max - post_min, fourth
         ));
     } else {
         crate::serial::write_fmt(format_args!(
-            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={} phase={} block_irqs={} frozen={} skipped={} wakes={} resumed={} block_errors={} postwake={}/{}/{} finish_phase={} finish_mask={} finish_freezes={} finish_skips={} finish_errors={} survivors={}/{}\n",
+            "WOLFOS_APIC_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} task2_irqs={} work0={} work1={} work2={} exit_task={} rejected={} deferred={} nested_ok={} guard_depth={} fx_switches={} fx_observations={} fx_bad={} fx_work_checks={} xmm_ready={} interrupt_state_ok={} phase={} block_irqs={} frozen={} skipped={} wakes={} resumed={} block_errors={} postwake={}/{}/{} finish_phase={} finish_mask={} finish_freezes={} finish_skips={} finish_errors={} survivors={}/{} live_phase={} live_admits={} live_ends={} live_irq={} live_work={} live_bad={} live_frozen={}\n",
             switches, first, second, third, work0, work1, work2, exit_task, rejected,
             deferred, nested_ok, depth, fx_switches, fx_observations, fx_bad,
             fx_work_checks, xmm_ready, !unexpected_interrupt_state, block_phase,
             block_irqs, freeze_checks, block_skips, wakes, resumed, block_errors,
             post0, post1, post2, finish_phase, finished_mask, finish_freezes,
-            finish_skips, finish_errors, survivor0, survivor1
+            finish_skips, finish_errors, survivor0, survivor1, live_phase,
+            live_admits, live_finishes, fourth, live_work, live_bad, live_frozen
         ));
     }
     // Keep the original finished/IRQ/SSE evidence tied to the *live*
