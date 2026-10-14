@@ -27,6 +27,7 @@ ap-local-timer-smoke = ["smoke-exit"]
 ap-smp-preempt-smoke = ["smoke-exit"]
 ap-remote-work-smoke = ["smoke-exit"]
 ap-handoff-smoke = ["smoke-exit"]
+ap-stack-migrate-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
