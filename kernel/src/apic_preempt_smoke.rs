@@ -1423,6 +1423,18 @@ pub fn verify() -> bool {
     LIVE_STOP_WORK.store(0, Ordering::Relaxed);
     LIVE_FROZEN.store(0, Ordering::Relaxed);
     LIVE_SURVIVOR_SWITCHES.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_PHASE.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_CAPTURED.store(false, Ordering::Relaxed);
+    LIVE_BLOCK_COUNT.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_WORK.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_OTHER_WORK.store(0, Ordering::Relaxed);
+    LIVE_BLOCKED_IRQS.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_FROZEN.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_SKIPPED.store(0, Ordering::Relaxed);
+    LIVE_WAKE_COUNT.store(0, Ordering::Relaxed);
+    LIVE_RESUME_COUNT.store(0, Ordering::Relaxed);
+    LIVE_POST_WAKE_IRQS.store(0, Ordering::Relaxed);
+    LIVE_BLOCK_ERRORS.store(0, Ordering::Relaxed);
     FRAME_RSP[LIVE_TASK].store(0, Ordering::Relaxed);
     SWITCHES.store(0, Ordering::Relaxed);
     REJECTED.store(0, Ordering::Relaxed);
@@ -1468,6 +1480,21 @@ pub fn verify() -> bool {
     let live_frozen = LIVE_FROZEN.load(Ordering::Acquire);
     let live_survivors = LIVE_SURVIVOR_SWITCHES.load(Ordering::Acquire);
     let live_entry = LIVE_ENTRY_SEEN.load(Ordering::Acquire);
+    let live_block_phase = LIVE_BLOCK_PHASE.load(Ordering::Acquire);
+    let live_blocks = LIVE_BLOCK_COUNT.load(Ordering::Acquire);
+    let live_block_irqs = LIVE_BLOCKED_IRQS.load(Ordering::Acquire);
+    let live_block_frozen = LIVE_BLOCK_FROZEN.load(Ordering::Acquire);
+    let live_block_skips = LIVE_BLOCK_SKIPPED.load(Ordering::Acquire);
+    let live_block_work = LIVE_BLOCK_WORK.load(Ordering::Acquire);
+    let live_wakes = LIVE_WAKE_COUNT.load(Ordering::Acquire);
+    let live_resumes = LIVE_RESUME_COUNT.load(Ordering::Acquire);
+    let live_post_wake_irqs = LIVE_POST_WAKE_IRQS.load(Ordering::Acquire);
+    let live_block_errors = LIVE_BLOCK_ERRORS.load(Ordering::Acquire);
+    let live_wake_finished_rejected = rr_policy::wake_unfinished(
+        RUNNABLE.load(Ordering::Acquire),
+        FINISHED.load(Ordering::Acquire),
+        LIVE_TASK, SLOT_COUNT
+    ) == Err(rr_policy::RunnableError::AlreadyFinished);
     let work0 = WORK[0].load(Ordering::Acquire);
     let work1 = WORK[1].load(Ordering::Acquire);
     let work2 = WORK[2].load(Ordering::Acquire);
@@ -1522,6 +1549,13 @@ pub fn verify() -> bool {
         && live_first_xmm != TASK_XMM0[2]
         && live_frozen >= LIVE_FROZEN_REQUIRED
         && live_survivors >= LIVE_FROZEN_REQUIRED
+        && live_block_phase == 3
+        && live_blocks == 1 && live_wakes == 1 && live_resumes == 1
+        && live_block_irqs >= LIVE_WAKE_AFTER_IRQS
+        && live_block_frozen == live_block_irqs
+        && live_block_skips >= 2 && live_block_work > 0
+        && live_post_wake_irqs >= LIVE_POST_WAKE_MIN_IRQS
+        && live_block_errors == 0 && live_wake_finished_rejected
         && work0 > 0 && work1 > 0 && work2 > 0
         && rejected == 0 && exit_task < TASK_COUNT
         && deferred >= 4 && nested_ok && depth == 0
@@ -1543,6 +1577,12 @@ pub fn verify() -> bool {
         && survivor0.abs_diff(survivor1) <= 1
         && (0..SLOT_COUNT).all(canary_ok);
     if ok {
+        crate::serial::write_fmt(format_args!(
+            "WOLFOS_APIC_LIVE_BLOCK_WAKE_OK task=3 block={} blocked_irqs={} frozen={} skipped={} woke={} resumed={} resume_irqs={} block_errors={} frozen_work={} finished_cannot_wake=1 suspended_stack=1 preserved_sse=1 bsp_only=1\n",
+            live_blocks, live_block_irqs, live_block_frozen, live_block_skips,
+            live_wakes, live_resumes, live_post_wake_irqs,
+            live_block_errors, live_block_work
+        ));
         crate::serial::write_fmt(format_args!(
             "WOLFOS_APIC_LIVE_ENQUEUE_OK slot=3 generation={} admissions={} executions=1 irq={} work={} xmm_initial={:#x} xmm_final={:#x} corrupt={} finished={} parked={} frozen_irqs={} survivor_switches={} gpr_frame=1 fx_private=1 bsp_only=1\n",
             live_gen, live_admits, fourth, live_work, live_first_xmm,
