@@ -52,6 +52,8 @@ pub enum RunnableError {
     AlreadyBlocked,
     AlreadyReady,
     WouldBlockLastRunnable,
+    AlreadyFinished,
+    OverlappingLifecycleMask,
 }
 
 fn valid_bit(mask: u64, task: usize, count: usize)
@@ -95,6 +97,49 @@ pub fn wake_runnable(mask: u64, task: usize, count: usize)
         return Err(RunnableError::AlreadyReady);
     }
     Ok(mask | bit)
+}
+
+/// Termination moves a runnable task into the Finished mask, which is
+/// disjoint from the Ready mask. It cannot be scheduled or resurrected by
+/// ordinary wake operations. Both masks are updated as one logical
+/// transaction under the BSP's preemption-disabled critical section.
+///
+/// This pure function does not implement cross-CPU locking, lifetime
+/// reclamation or freeing a kernel stack.
+pub fn finish_runnable(
+    runnable: u64,
+    finished: u64,
+    task: usize,
+    count: usize,
+) -> Result<(u64, u64), RunnableError> {
+    let bit = valid_bit(runnable, task, count)?;
+    valid_bit(finished, task, count)?;
+    if runnable & finished != 0 {
+        return Err(RunnableError::OverlappingLifecycleMask);
+    }
+    if finished & bit != 0 {
+        return Err(RunnableError::AlreadyFinished);
+    }
+    let ready = block_runnable(runnable, task, count)?;
+    Ok((ready, finished | bit))
+}
+
+/// A Finished task must never become Ready via the sleep/wake mechanism.
+pub fn wake_unfinished(
+    runnable: u64,
+    finished: u64,
+    task: usize,
+    count: usize,
+) -> Result<u64, RunnableError> {
+    let bit = valid_bit(runnable, task, count)?;
+    valid_bit(finished, task, count)?;
+    if runnable & finished != 0 {
+        return Err(RunnableError::OverlappingLifecycleMask);
+    }
+    if finished & bit != 0 {
+        return Err(RunnableError::AlreadyFinished);
+    }
+    wake_runnable(runnable, task, count)
 }
 
 #[cfg(test)]
@@ -175,6 +220,50 @@ mod tests {
         assert_eq!(block_runnable(0b1000, 1, 3), Err(RunnableError::InvalidMask));
         assert_eq!(wake_runnable(0b101, 0, 3), Err(RunnableError::AlreadyReady));
         assert_eq!(wake_runnable(0, 63, 64), Ok(1u64 << 63));
+    }
+
+    #[test]
+    fn finished_task_is_excluded_and_cannot_be_woken() {
+        let (ready, finished) = finish_runnable(0b111, 0, 2, 3).unwrap();
+        assert_eq!((ready, finished), (0b011, 0b100));
+        assert_eq!(next_runnable(1, 3, ready), Ok(0));
+        assert_eq!(next_runnable(0, 3, ready), Ok(1));
+        assert_eq!(
+            wake_unfinished(ready, finished, 2, 3),
+            Err(RunnableError::AlreadyFinished)
+        );
+        assert_eq!(
+            finish_runnable(ready, finished, 2, 3),
+            Err(RunnableError::AlreadyFinished)
+        );
+        assert_eq!(wake_unfinished(ready, finished, 1, 3), Err(RunnableError::AlreadyReady));
+    }
+
+    #[test]
+    fn termination_enforces_bounds_no_overlap_and_at_least_one_ready() {
+        assert_eq!(
+            finish_runnable(0b100, 0, 2, 3),
+            Err(RunnableError::WouldBlockLastRunnable)
+        );
+        assert_eq!(
+            finish_runnable(0b111, 0b100, 1, 3),
+            Err(RunnableError::OverlappingLifecycleMask)
+        );
+        assert_eq!(
+            wake_unfinished(0b011, 0b001, 2, 3),
+            Err(RunnableError::OverlappingLifecycleMask)
+        );
+        assert_eq!(
+            finish_runnable(0b111, 0, 3, 3),
+            Err(RunnableError::InvalidTask)
+        );
+        assert_eq!(
+            finish_runnable(0b111, 0b1000, 2, 3),
+            Err(RunnableError::InvalidMask)
+        );
+        assert_eq!(finish_runnable(0b111, 0, 2, 0), Err(RunnableError::InvalidTaskCount));
+        assert_eq!(wake_unfinished(0b011, 0b100, 3, 3), Err(RunnableError::InvalidTask));
+        assert_eq!(wake_unfinished(0b011, 0b100, 2, 3), Err(RunnableError::AlreadyFinished));
     }
 
 }

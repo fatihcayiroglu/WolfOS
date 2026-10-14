@@ -135,7 +135,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             (tasks, switches, a_irq, b_irq, c_irq, work0, work1, work2,
              exit_task, rejected, stack_kib, bsp, userspace, deferred,
              nested, depth, fairness_max_delta) = map(int, handoff.groups())
-            if (tasks != 3 or switches < 26
+            if (tasks != 3 or switches < 36
                 or min(a_irq, b_irq, c_irq) < 4
                 or a_irq + b_irq + c_irq != switches
                 or not all((work0, work1, work2))
@@ -165,6 +165,26 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
                 or fairness_max_delta != max(post0, post1, post2) - min(post0, post1, post2)):
                 print(f"FAIL: blocked task advanced before wake, did not resume, or post-wake RR unfair: {lifecycle.groups()}")
                 return False
+            finished = re.search(
+                r"WOLFOS_APIC_FINISHED_OK task=(\d+) mask=(\d+) ready=(\d+) finish=(\d+) frozen_irqs=(\d+) skipped=(\d+) errors=(\d+) frozen_work=(\d+) survivor0=(\d+) survivor1=(\d+) never_rescheduled=(\d+) fx_still_owned=(\d+)",
+                output,
+            )
+            if finished is None:
+                print("FAIL: no real-IRQ Finished task retirement evidence")
+                return False
+            (finished_task, finished_mask, ready_mask, finish_count,
+             freeze_irqs, finish_skips, finish_errors, finished_work,
+             survivor0, survivor1, never_rescheduled, fx_still_owned) = map(
+                int, finished.groups()
+            )
+            if (finished_task != 2 or finished_mask != 4 or ready_mask != 3
+                or finish_count != 1 or freeze_irqs < 6 or finish_skips < 2
+                or finish_errors != 0 or finished_work == 0
+                or survivor0 < 4 or survivor1 < 4
+                or abs(survivor0 - survivor1) > 1
+                or never_rescheduled != 1 or fx_still_owned != 1):
+                print(f"FAIL: task marked Finished was rescheduled, progressed or revived: {finished.groups()}")
+                return False
             fx = re.search(
                 r"WOLFOS_APIC_FXSTATE_OK format=fxsave64 bytes=(\d+) xmm0=(\d+) fx_switches=(\d+) fx_observations=(\d+) work_checks=(\d+) corrupt=(\d+) original_restored=(\d+) avx=(\d+)",
                 output,
@@ -191,6 +211,7 @@ def exercise(iso: Path, cpus: int, calibrated: bool, preemptive: bool) -> bool:
             "WOLFOS_APIC_IRQ_FRAME_ERROR", "WOLFOS_APIC_GPR_ERROR",
             "WOLFOS_APIC_PREEMPT_ERROR",
             "WOLFOS_APIC_BLOCK_WAKE_ERROR",
+            "WOLFOS_APIC_FINISHED_ERROR",
             "WOLFOS_APIC_FXSTATE_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_PANIC",
         )):
