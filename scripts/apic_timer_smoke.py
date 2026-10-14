@@ -59,6 +59,13 @@ def exercise(iso: Path, cpus: int, calibrated: bool) -> bool:
             print("FAIL: APIC timer hardware start marker missing")
             print(run.stderr.decode(errors="replace"))
             return False
+        task_proof = re.search(
+            r"WOLFOS_APIC_TIMER_TASKS_OK threads=(\\d+) dispatches=(\\d+) switches=(\\d+) stack_kib=(\\d+) gated_by_irq=(\\d+) preemptive=(\\d+)",
+            output,
+        )
+        if task_proof is None or tuple(map(int, task_proof.groups())) != (2, 6, 12, 16, 1, 0):
+            print("FAIL: xAPIC tick-gated cooperative context proof absent/invalid")
+            return False
         match = re.search(
             r"WOLFOS_APIC_TIMER_IRQ_OK vector=(\d+) ticks=(\d+) eoi=(\d+) spurious=(\d+) preemptive=(\d+)",
             output,
