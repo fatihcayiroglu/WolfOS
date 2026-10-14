@@ -681,9 +681,14 @@ fn recycle_quiescent_task2() -> Option<RecycleProof> {
     // APs are parked; task2 is fully retired and cannot resume. The 16 KiB
     // region is private to slot2 and does not overlap other task stacks.
     let scrubbed_stack = unsafe {
-        core::ptr::write_bytes(bottom as *mut u8, 0, STACK_BYTES);
-        core::slice::from_raw_parts(bottom as *const u8, STACK_BYTES)
-            .iter().all(|byte| *byte == 0)
+        // Volatile writes make the clearing operation observable even in
+        // a release/optimized kernel: do not elide dead-stack scrubbing.
+        for offset in (0..STACK_BYTES).step_by(size_of::<u64>()) {
+            core::ptr::write_volatile((bottom + offset) as *mut u64, 0);
+        }
+        (0..STACK_BYTES).step_by(size_of::<u64>()).all(|offset|
+            core::ptr::read_volatile((bottom + offset) as *const u64) == 0
+        )
     };
     if !scrubbed_stack { return None; }
 
