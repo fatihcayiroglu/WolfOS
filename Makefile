@@ -122,6 +122,8 @@ test:
 	$(OUT)/preempt_depth_tests
 	rustc --edition=2024 --test kernel/src/fx_state.rs -o $(OUT)/fx_state_tests
 	$(OUT)/fx_state_tests
+	rustc --edition=2024 --test kernel/src/rr_policy.rs -o $(OUT)/rr_policy_tests
+	$(OUT)/rr_policy_tests
 	rustc --edition=2024 --test kernel/src/scheduler.rs -o $(OUT)/scheduler_tests
 	$(OUT)/scheduler_tests
 	rustc --edition=2024 --test kernel/src/thread_scheduler.rs -o $(OUT)/thread_scheduler_tests
