@@ -44,7 +44,8 @@ mod apic_timer_smoke;
 mod lapic_timer_calibration;
 #[cfg(feature = "timer-smoke")]
 mod timer;
-#[cfg(feature = "timer-smoke")]
+#[cfg(any(feature = "timer-smoke", feature = "apic-timer-smoke",
+          feature = "apic-calibration-smoke"))]
 mod timer_tasks;
 
 #[used]

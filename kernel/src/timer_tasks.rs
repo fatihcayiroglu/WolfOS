@@ -1,6 +1,6 @@
-//! Two real Rust execution contexts dispatched by PIT IRQ0 tick epochs.
+//! Two real Rust execution contexts dispatched by hardware timer IRQ epochs.
 //!
-//! Isolation: timer-smoke only; one BSP, all APs parked, 8259 IRQ0 only.
+//! Isolation: timer-smoke or apic-timer smoke; BSP only, all APs parked.
 //! The interrupt handler NEVER context-switches. Each worker observes a new
 //! hardware tick with IRQs enabled, masks interrupts, then voluntarily yields
 //! at a safe ABI boundary. This is tick-driven cooperative dispatch, NOT
@@ -9,7 +9,17 @@
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
 
-use crate::{context_switch, timer};
+use crate::context_switch;
+
+/// Flavor-selected ISR-owned tick counter. Every flavor runs in a separate
+/// QEMU smoke boot. The IRQ only updates atomics; tasks yield voluntarily.
+#[cfg(feature = "timer-smoke")]
+fn hardware_ticks() -> u64 { crate::timer::ticks() }
+
+#[cfg(all(not(feature = "timer-smoke"),
+          any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke")))]
+fn hardware_ticks() -> u64 { crate::apic_timer_smoke::ticks() }
+
 
 const WORKERS: usize = 2;
 const ROUNDS: usize = 3;
@@ -54,8 +64,8 @@ impl State {
 }
 
 struct StateCell(UnsafeCell<State>);
-// SAFETY: only BSP touches State, and IRQ0 reads/writes a distinct AtomicU64
-// owned by timer.rs. Each closure ends before any context switch; APs park.
+// SAFETY: only BSP touches State, and the active timer ISR reads/writes
+// its own distinct AtomicU64. State borrows end before switches; APs park.
 unsafe impl Sync for StateCell {}
 
 static STATE: StateCell = StateCell(UnsafeCell::new(State::new()));
@@ -151,13 +161,13 @@ extern "C" fn wolfos_tick_worker_rust(id: usize) -> ! {
     if id >= WORKERS { crate::halt_forever(); }
     for round in 0..ROUNDS {
         if !stack_ok(id) { crate::halt_forever(); }
-        // The worker executes on a private real stack while genuine PIT
-        // interrupts fire. Only the atomic tick counter is IRQ-shared.
-        let start_tick = timer::ticks();
+        // The worker executes on a private real stack while genuine hardware
+        // timer interrupts fire. Only the atomic tick counter is IRQ-shared.
+        let start_tick = hardware_ticks();
         x86_64::instructions::interrupts::enable();
         let mut seen = None;
         for _ in 0..MAX_WAIT_SPINS {
-            let tick = timer::ticks();
+            let tick = hardware_ticks();
             if tick > start_tick {
                 seen = Some(tick);
                 break;
@@ -176,7 +186,7 @@ extern "C" fn wolfos_tick_worker_rust(id: usize) -> ! {
 }
 
 /// BSP-only proof: switch on two independent Rust stacks after a new timer
-/// epoch. Called with interrupts masked while PIT IRQ0 is configured.
+/// epoch. Called with interrupts masked while the timer IRQ is configured.
 pub fn verify() -> bool {
     if x86_64::instructions::interrupts::are_enabled() { return false; }
     if !with_state(|s| {
