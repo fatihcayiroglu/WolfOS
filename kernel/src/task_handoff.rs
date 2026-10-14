@@ -281,53 +281,72 @@ mod tests {
 
     #[test]
     fn real_threads_handoff_has_single_running_owner() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering as Ord}};
+        // Real OS threads are intentionally used: the coordinator sends
+        // an exact owner+epoch command, the selected worker performs a
+        // single running->paused quantum, and the coordinator verifies the
+        // Acquire-visible snapshot BEFORE transferring the owner.
+        //
+        // Previous implementation polled all epochs on all workers for a
+        // fixed number of busy-loop iterations; CI scheduler starvation
+        // caused occasional false "AP did not quiesce" despite correct
+        // lease code. Channels remove timing-dependent readiness races
+        // without weakening any ownership, digest or count assertions.
+        use std::sync::{mpsc, Arc};
         use std::thread;
+        use std::time::Duration;
         let lease = Arc::new(TaskLease::new());
-        let stop = Arc::new(AtomicBool::new(false));
         assert_eq!(lease.initialize(1), Ok(()));
-        let mut join = Vec::new();
-        for cpu in 1..=3 {
-            let shared = lease.clone();
-            let halt = stop.clone();
-            join.push(thread::spawn(move || {
-                let mut completed = 0u64;
-                while !halt.load(Ord::Acquire) {
-                    for epoch in 0..12u64 {
-                        if shared.resume(cpu, epoch).is_ok() {
-                            assert!(shared.execute_quantum(cpu, epoch).is_ok());
-                            completed += 1;
-                        }
-                        thread::yield_now();
-                    }
+
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let mut senders = Vec::new();
+        let mut workers = Vec::new();
+        for cpu in 1..=3usize {
+            let shared = Arc::clone(&lease);
+            let (sender, receiver) = mpsc::channel::<u64>();
+            let done = completed_tx.clone();
+            senders.push(sender);
+            workers.push(thread::spawn(move || {
+                let mut count = 0u64;
+                while let Ok(epoch) = receiver.recv() {
+                    assert_eq!(shared.resume(cpu, epoch), Ok(()));
+                    assert_eq!(shared.resume(cpu, epoch), Err(HandoffError::WrongPhase));
+                    let snapshot = shared.execute_quantum(cpu, epoch).unwrap();
+                    assert_eq!(snapshot.owner, cpu);
+                    assert_eq!(snapshot.epoch, epoch);
+                    done.send((cpu, epoch, snapshot)).unwrap();
+                    count += 1;
                 }
-                completed
+                count
             }));
         }
-        let mut prev = INITIAL_DIGEST;
+        drop(completed_tx);
+        let mut previous = INITIAL_DIGEST;
         let mut owner = 1usize;
         let mut epoch = 0;
-        for step in 1..=12 {
-            let mut snapshot = None;
-            for _ in 0..5_000_000 {
-                if let Ok(s) = lease.snapshot() {
-                    if s.steps == step { snapshot = Some(s); break; }
-                }
-                thread::yield_now();
-            }
-            let snap = snapshot.expect("AP did not quiesce");
-            assert_eq!(snap.owner, owner);
-            prev = advance_digest(prev, step);
-            assert_eq!(snap.digest, prev);
+        for step in 1..=12u64 {
+            senders[owner - 1].send(epoch).unwrap();
+            let (actual_owner, actual_epoch, completed) =
+                completed_rx.recv_timeout(Duration::from_secs(15))
+                    .expect("AP worker did not publish completion");
+            assert_eq!(actual_owner, owner);
+            assert_eq!(actual_epoch, epoch);
+            assert_eq!(completed.steps, step);
+            previous = advance_digest(previous, step);
+            assert_eq!(completed.digest, previous);
+            let paused = lease.snapshot().unwrap();
+            assert_eq!(paused, completed);
             if step != 12 {
                 let next = (owner % 3) + 1;
                 epoch = lease.transfer(owner, next, epoch).unwrap();
+                assert_eq!(lease.resume(owner, epoch - 1), Err(HandoffError::WrongOwner));
                 owner = next;
             }
         }
         lease.retire(owner, epoch).unwrap();
-        stop.store(true, Ord::Release);
-        let count: u64 = join.into_iter().map(|h| h.join().unwrap()).sum();
-        assert_eq!(count, 12);
+        assert!(lease.is_retired(owner, epoch));
+        assert_eq!(lease.snapshot(), Err(HandoffError::WrongPhase));
+        drop(senders);
+        let total: u64 = workers.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 12);
     }
 }
