@@ -25,6 +25,7 @@ apic-preempt-smoke = ["smoke-exit"]
 ap-ipi-smoke = ["smoke-exit"]
 ap-local-timer-smoke = ["smoke-exit"]
 ap-smp-preempt-smoke = ["smoke-exit"]
+ap-remote-work-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
