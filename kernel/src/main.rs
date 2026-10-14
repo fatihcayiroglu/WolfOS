@@ -68,7 +68,7 @@ mod kernel_trap_frame;
 mod apic_irq_entry;
 #[cfg(feature = "apic-preempt-smoke")]
 mod apic_preempt_smoke;
-#[cfg(feature = "apic-preempt-smoke")]
+#[cfg(any(feature = "apic-preempt-smoke", feature = "ap-smp-preempt-smoke"))]
 mod preempt_depth;
 #[cfg(feature = "apic-preempt-smoke")]
 mod fx_state;
