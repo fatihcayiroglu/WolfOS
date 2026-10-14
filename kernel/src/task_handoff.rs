@@ -214,7 +214,14 @@ mod tests {
         let mut current = 1usize;
         let mut epoch = 0;
         for step in 1..=12u64 {
-            assert_eq!(lease.snapshot().unwrap().steps, step - 1);
+            if step == 1 {
+                assert_eq!(lease.snapshot().unwrap().steps, 0);
+            } else {
+                // An owner-transfer has already moved the lease into
+                // InTransit: a not-yet-resumed task is NOT quiesced and
+                // must refuse a stale Paused snapshot.
+                assert_eq!(lease.snapshot(), Err(HandoffError::WrongPhase));
+            }
             assert_eq!(lease.resume(current, epoch), Ok(()));
             assert_eq!(lease.snapshot(), Err(HandoffError::WrongPhase));
             let snap = lease.execute_quantum(current, epoch).unwrap();
