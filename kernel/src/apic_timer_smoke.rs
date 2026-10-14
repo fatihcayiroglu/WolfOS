@@ -112,8 +112,8 @@ pub extern "x86-interrupt" fn irq(frame: InterruptStackFrame) {
         if BUSY_IRQS.load(Ordering::Relaxed) == 0 {
             BUSY_RIP.store(frame.instruction_pointer.as_u64(), Ordering::Relaxed);
             BUSY_RSP.store(frame.stack_pointer.as_u64(), Ordering::Relaxed);
-            BUSY_CS.store(frame.code_segment, Ordering::Relaxed);
-            BUSY_RFLAGS.store(frame.cpu_flags, Ordering::Relaxed);
+            BUSY_CS.store(u64::from(frame.code_segment.0), Ordering::Relaxed);
+            BUSY_RFLAGS.store(frame.cpu_flags.bits(), Ordering::Relaxed);
             BUSY_STEPS_AT_IRQ.store(BUSY_STEPS.load(Ordering::Relaxed), Ordering::Relaxed);
         }
         BUSY_IRQS.fetch_add(1, Ordering::Relaxed);
