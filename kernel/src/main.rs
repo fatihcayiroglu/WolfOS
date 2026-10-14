@@ -42,7 +42,7 @@ mod lapic_mmio;
            feature = "apic-preempt-smoke"))]
 mod lapic_timer_plan;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
-           feature = "apic-preempt-smoke"))]
+           feature = "apic-preempt-smoke", feature = "ap-ipi-smoke"))]
 mod lapic_irq_layout;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke"))]
