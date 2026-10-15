@@ -48,6 +48,9 @@ kernel-stack-lease-smoke = ["smoke-exit"]
 kernel-stack-guard-smoke = ["smoke-exit"]
 kernel-stack-guard-fault-smoke = ["smoke-exit"]
 kernel-stack-guard-upper-fault-smoke = ["smoke-exit"]
+high-half-stack-arena-smoke = ["smoke-exit"]
+high-half-stack-arena-lower-fault-smoke = ["smoke-exit"]
+high-half-stack-arena-upper-fault-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
