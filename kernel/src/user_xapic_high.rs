@@ -7,6 +7,9 @@ use core::ptr;
 pub const VA:u64=0xffff_e000_0000_1000;
 pub const ROOT_INDEX:usize=((VA>>39)&0x1ff) as usize;
 const P:u64=1;const W:u64=2;const U:u64=4;
+// x86-64 hardware marks a USED upper-half PML4 entry Accessed (bit 5).
+// Other permission or physical-frame modifications must still be refused.
+const ACCESSED:u64=1<<5;
 const PWT:u64=8;const PCD:u64=16;const NX:u64=1<<63;
 pub const MMIO_FLAGS:u64=P|W|PWT|PCD|NX;
 
@@ -72,6 +75,10 @@ pub unsafe fn read(offset:usize)->u32{
 pub unsafe fn write(offset:usize,value:u32){
     unsafe{((VA as usize+offset) as *mut u32).write_volatile(value);}
 }
+pub fn live_root_matches(actual:u64,owned_pdpt:u64)->bool{
+    actual & !ACCESSED == (owned_pdpt|P|W|NX)
+}
+
 /// Remove high MMIO tree ONLY after local timer masked, BSP IF=0, boot CR3
 /// restored, and all private user roots are quiescent.
 ///
@@ -81,7 +88,7 @@ pub unsafe fn write(offset:usize,value:u32){
 pub unsafe fn unpublish(hhdm:u64,boot_root:u64,frames:[u64;3])
     ->Result<(),Error>{
     let root=unsafe{&mut *((hhdm+boot_root) as *mut [u64;512])};
-    if root[ROOT_INDEX] != (frames[0]|P|W|NX){
+    if !live_root_matches(root[ROOT_INDEX],frames[0]){
         return Err(Error::Missing)
     }
     root[ROOT_INDEX]=0;
@@ -99,6 +106,18 @@ mod tests{
         assert_ne!(MMIO_FLAGS&(PCD|PWT),0);
         assert_ne!(MMIO_FLAGS&NX,0);
     }
+    #[test]
+    fn accessed_bit_set_by_actual_cpu_must_not_reject_valid_live_mapping(){
+        let pdpt=0x1234_5000;
+        let expected=pdpt|P|W|NX;
+        assert!(live_root_matches(expected,pdpt));
+        assert!(live_root_matches(expected|ACCESSED,pdpt));
+        for tamper in [expected|U,expected|PCD,expected|PWT,
+                       expected^(1<<12),expected&!NX]{
+            assert!(!live_root_matches(tamper,pdpt));
+        }
+    }
+
     #[test]
     fn exclude_boot_alias_bad_physical_and_slot_reuse(){
         let f=[0x1000,0x2000,0x3000];
