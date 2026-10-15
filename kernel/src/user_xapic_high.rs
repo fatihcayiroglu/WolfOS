@@ -70,7 +70,7 @@ pub unsafe fn read(offset:usize)->u32{
 /// Same as read(); exclusively owned and genuine xAPIC in MMIO mode.
 #[cfg(not(test))]
 pub unsafe fn write(offset:usize,value:u32){
-    unsafe{((VA as usize+offset) as *mut u32).write_volatile();}
+    unsafe{((VA as usize+offset) as *mut u32).write_volatile(value);}
 }
 /// Remove high MMIO tree ONLY after local timer masked, BSP IF=0, boot CR3
 /// restored, and all private user roots are quiescent.
