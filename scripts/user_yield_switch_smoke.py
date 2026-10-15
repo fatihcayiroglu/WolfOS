@@ -57,6 +57,9 @@ def main():
                 "WOLFOS_RING3_TIMER_HIGH_MMIO_OK uc=1 supervisor_only=1 inherited_cr3=2 eoi_high=1 owned_frames=28")
             checks.insert(3,
                 "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=2")
+            if timer_preempt:
+                checks.insert(2,
+                    "WOLFOS_RING3_NONYIELD_PREFLIGHT_OK independent_elf=2 sys_yield=0 kernel_elf_loader=1 executed=0")
         if irq_ready or timer_observe:
             checks.insert(checks.index(STEPS[3]),
                 "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed="+("1" if timer_observe else "0"))

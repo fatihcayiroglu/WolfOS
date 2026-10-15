@@ -67,6 +67,40 @@ fn main() {
             assert!(fs::metadata(&elf).unwrap().len()<32768,
                 "unexpectedly large second ELF");
         }
+        if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some() {
+            // Build both no-yield native ELFs for *admission only* in the
+            // existing real-QEMU gate. They are never executed by this
+            // two-switch smoke and cannot alter its historical workload.
+            println!("cargo:rerun-if-changed=user/timer_no_yield.S");
+            let mut attest=String::new();
+            for pid in [1usize,2] {
+                let obj=path.join(format!("wolfos-nonyield-{pid}.o"));
+                let elf=path.join(format!("wolfos-nonyield-{pid}.elf"));
+                let def=format!("WOLFOS_PID={pid}");
+                checked("as",&["--64","--defsym",&def,
+                    "-o",obj.to_str().unwrap(),"user/timer_no_yield.S"]);
+                checked("ld",&["-m","elf_x86_64","-nostdlib",
+                    "-static","-T","user/hello.ld","-o",
+                    elf.to_str().unwrap(),obj.to_str().unwrap()]);
+                let output=Command::new("nm").arg("-n").arg(&elf)
+                    .output().expect("nonyield nm missing");
+                assert!(output.status.success(),"nonyield nm failed");
+                let map=String::from_utf8(output.stdout)
+                    .expect("nonyield nm not utf8");
+                for (name,suffix) in [
+                    ("_start","ENTRY"),("_work_begin","WORK_BEGIN"),
+                    ("_work_end","WORK_END"),("_exit_return","AFTER_EXIT"),
+                    ("progress","PROGRESS"),
+                ] {
+                    let address=nm_symbol(&map,name);
+                    attest+=&format!("pub const PID{pid}_{suffix}:u64={address:#x};\n");
+                }
+                assert!(fs::metadata(&elf).unwrap().len()<32768,
+                    "unexpectedly large no-yield ELF");
+            }
+            fs::write(path.join("wolfos_nonyield_symbols.rs"),attest)
+                .expect("write independent no-yield ELF symbols");
+        }
         fs::write(path.join("wolfos_yield_symbols.rs"),symbols)
             .expect("write separately linked ELF symbol table");
         return;

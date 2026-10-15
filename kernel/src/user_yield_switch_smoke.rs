@@ -25,6 +25,13 @@ use crate::{
 use crate::user_irq_preempt_contract::{self,Evidence};
 
 mod sym {include!(concat!(env!("OUT_DIR"),"/wolfos_yield_symbols.rs"));}
+#[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+mod noyield_sym {include!(concat!(env!("OUT_DIR"),"/wolfos_nonyield_symbols.rs"));}
+#[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+const NONYIELD_ELFS:[&[u8];2]=[
+    include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-1.elf")),
+    include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-2.elf")),
+];
 const ELFS:[&[u8];2]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-1.elf")),
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-2.elf")),
@@ -356,6 +363,39 @@ fn prepare_elf(hhdm:u64,frames:[u64;7],source:*const [u64;512],
     }
 }
 
+/// Validate the two newly built no-yield ELF files using the *actual*
+/// allocation-free WolfOS kernel loader preflight, without executing them
+/// or changing any legacy IRQ/user process run. This is admission only.
+#[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+fn validate_nonyield_elf_admission() {
+    let info=[
+        (noyield_sym::PID1_ENTRY,noyield_sym::PID1_WORK_BEGIN,
+         noyield_sym::PID1_WORK_END,noyield_sym::PID1_AFTER_EXIT,
+         noyield_sym::PID1_PROGRESS),
+        (noyield_sym::PID2_ENTRY,noyield_sym::PID2_WORK_BEGIN,
+         noyield_sym::PID2_WORK_END,noyield_sym::PID2_AFTER_EXIT,
+         noyield_sym::PID2_PROGRESS),
+    ];
+    for (i,&(entry,begin,end,after_exit,progress)) in
+        info.iter().enumerate() {
+        let plan=preflight(NONYIELD_ELFS[i])
+            .unwrap_or_else(|_|fail("nonyield_elf_kernel_preflight"));
+        if plan.len!=2 || plan.entry!=CODE || entry!=CODE ||
+           !(CODE..end).contains(&begin) || end>=after_exit ||
+           after_exit>=CODE+PAGE || progress!=DATA {
+            fail("nonyield_elf_kernel_symbol_bounds")
+        }
+        let (Some(text),Some(data))=(plan.segments[0],plan.segments[1])
+            else{fail("nonyield_elf_kernel_missing_segment")};
+        if text.page_start!=CODE || text.page_end!=CODE+PAGE ||
+            !text.executable || text.writable ||
+            data.page_start!=DATA || data.page_end!=DATA+PAGE ||
+            !data.writable || data.executable || data.file_size!=8 {
+            fail("nonyield_elf_kernel_permissions")
+        }
+    }
+}
+
 /// Enter first native ELF through a REAL IRETQ with BSP IF=0.
 /// On successful execution this function never returns.
 pub fn enter(hhdm:u64)->!{
@@ -370,6 +410,13 @@ pub fn enter(hhdm:u64)->!{
     }
     let boot_root=root(hhdm,boot);
     if unsafe{(*boot_root)[ROOT_INDEX]}!=0{fail("guard_high_root_occupied")}
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    {
+        validate_nonyield_elf_admission();
+        serial::write_line(
+            "WOLFOS_RING3_NONYIELD_PREFLIGHT_OK independent_elf=2 sys_yield=0 kernel_elf_loader=1 executed=0"
+        );
+    }
     let before=pmm::statistics().allocated_frames;
     let mut phys=[0u64;PHYSICAL];
     for i in 0..PHYSICAL{
