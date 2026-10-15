@@ -61,7 +61,7 @@ fn main() {
             if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some(){
                 for (name,suffix) in [("_busy_begin","BUSY_BEGIN"),("_busy_end","BUSY_END")] {
                     let addr=nm_symbol(&map,name);
-                    symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\\n");
+                    symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\n");
                 }
             }
             assert!(fs::metadata(&elf).unwrap().len()<32768,
