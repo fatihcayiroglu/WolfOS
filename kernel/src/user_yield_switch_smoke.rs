@@ -214,10 +214,17 @@ pub fn enter(hhdm:u64)->!{
         let s=arena.reserve((i+1) as u64,
             [phys[b],phys[b+1],phys[b+2],phys[b+3]])
             .unwrap_or_else(|_|fail("guarded_pid_stack"));
-        if user_ring_entry::validate(Ring3Entry{
+        let entry_contract=Ring3Entry{
             rip:entry(i),user_rsp:USER_TOP,kernel_rsp0:s.top,
-            user_cs:cs,user_ss:ss,rflags:2,
-        }).is_err(){fail("strict_ring3_entry_metadata")}
+            user_cs:cs,user_ss:ss,
+            rflags:if cfg!(feature="p2-ring3-irq-ready-smoke") {0x202}else{2},
+        };
+        let validated=if cfg!(feature="p2-ring3-irq-ready-smoke") {
+            user_ring_entry::validate_interruptible(entry_contract)
+        } else {
+            user_ring_entry::validate(entry_contract)
+        };
+        if validated.is_err(){fail("strict_ring3_entry_metadata")}
         stacks[i]=Some(s);
         let at=ARENA_FRAMES+i*PER_PID;
         leases[i].copy_from_slice(&phys[at..at+PER_PID]);
