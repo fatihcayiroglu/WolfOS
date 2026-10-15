@@ -47,7 +47,7 @@ class NativeNoYieldFixtures(unittest.TestCase):
                        "-T", str(LINKER), "-o", str(elf), str(obj))
                 raw = elf.read_bytes()
                 binaries.append(raw)
-                self.assertEqual(raw[:4], b"\\x7fELF")
+                self.assertEqual(raw[:4], b"\x7fELF")
                 self.assertEqual(raw[4], 2, "ELF64 required")
                 self.assertEqual(raw[5], 1, "little-endian required")
                 self.assertEqual(struct.unpack_from("<H", raw, 16)[0], 2, "ET_EXEC required")
@@ -61,7 +61,7 @@ class NativeNoYieldFixtures(unittest.TestCase):
                 listing = invoke("objdump", "-d", str(elf))
                 # Exactly one user software interrupt, and it belongs to EXIT.
                 interrupts = re.findall(
-                    r"^\\s*([0-9a-f]+):[^\\n]*\\bint\\s+\\$0x80\\b",
+                    r"^\s*([0-9a-f]+):[^\n]*\bint\s+\$0x80\b",
                     listing, flags=re.MULTILINE)
                 self.assertEqual(len(interrupts), 1)
                 irq_addr = int(interrupts[0], 16)
