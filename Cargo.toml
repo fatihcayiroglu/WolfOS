@@ -33,6 +33,7 @@ ap-runqueue-smoke = ["smoke-exit"]
 elf64-preflight-smoke = ["smoke-exit"]
 user-vm-shadow-smoke = ["smoke-exit"]
 user-ring-prep-smoke = ["smoke-exit"]
+user-ring3-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
