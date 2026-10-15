@@ -60,9 +60,9 @@ _after_putc:
     xor esi, esi
     int 0x80
 _after_exit:
-    ud2                    // EXIT must never return
+    ud2                    # EXIT must never return
 fail:
-    ud2                    // Any wrong syscall / ELF data result must fault
+    ud2                    # Wrong syscall or ELF data result must fault
 hello_text:
     .ascii "Hello from WolfOS!\n"
 hello_end:
