@@ -2,7 +2,7 @@
 
 WolfOS is an original experimental x86-64 OS kernel written in Rust (`no_std`). It is **not Linux**. Limine is currently used as the bootloader, not as the WolfOS kernel.
 
-**Current status (October 2026):** Boot, frame allocation, paging, CPU exceptions, PCI/ACPI discovery and cooperative per-CPU saved-context kernel threads have reproducible QEMU tests. Legacy PIT IRQ0 and genuine BSP-local xAPIC timer IRQ delivery with EOI have both been verified. PIT channel 2 can be used in an *isolated smoke test* to estimate the effective local APIC timer rate. **No kernel task preemption, system clocksource or AP-local timer scheduling yet.** Not ready to install on physical hardware.
+**Current status (October 2026):** WolfOS boots in QEMU and has reproducible tests for frame allocation, paging, CPU exceptions, PCI/ACPI discovery, and kernel saved-context threads. Two independently linked ELF64 programs execute at Ring 3 with distinct CR3 roots, guarded high-half TSS.RSP0 kernel stacks, and per-process FXSAVE64 state. An isolated single-BSP hardware test genuinely preempts each Ring 3 program once using the local xAPIC timer, switches to the other process through a saved GPR/IRET frame, and later completes eight cooperative yields and two exits. The post-merge `main` P0 CI is green for PR #95. **This is a bounded two-task acceptance test, not a production scheduler**: repeated all-timer-driven round-robin, AP-local scheduling, validated clocksource, general ELF/process semantics, and user SMP migration remain future work. Not ready to install on physical hardware.
 
 ## Requirements
 
@@ -28,9 +28,9 @@ All smoke targets build CD ISO files under `out/`. They do not write physical di
 
 ## What is and is not implemented
 
-The currently verified scope is an early kernel: Rust-owned boot execution, frame allocator, CPU tables/exceptions, basic paging, ACPI topology, kernel-only cooperative scheduling/context switches and BSP timer interrupt smoke tests. The reference-clock calibration runs only in a QEMU test variant; measured rate is not a validated clocksource for general scheduling or accurate wall-clock time.
+The verified scope remains an experimental Rust-owned kernel: boot execution, frame allocator, CPU tables/exceptions, paging, ACPI topology, kernel saved-context switches, basic Ring 3 ELF execution, per-process address-space isolation, real user privilege transitions, cooperative cross-process yields and **two genuine timer-driven involuntary inter-process switches** in an isolated BSP QEMU test. Its xAPIC experiment has bounded switching, no production runqueue, and does not prove sustained non-yielding workloads. The reference-clock calibration runs only in a QEMU test variant; the measured rate is not a validated general scheduling clocksource or accurate wall-clock source.
 
-WolfOS does **not** yet have Ring 3 user processes, ELF process loading, a shell, a usable filesystem, production drivers, network, GPU acceleration, a preemptive scheduler, or support for Windows programs, Steam and GTA V. Windows compatibility is a long-term goal, not a present feature. Physical-machine driver safety and cross-platform application compatibility require separate engineering and test gates.
+WolfOS does **not** yet have a shell, a consumer-ready filesystem, production drivers, network, GPU acceleration, a general-purpose preemptive scheduler, or support for Windows programs, Steam and GTA V. Its Ring 3/ELF support and VFS/RamFS experiments are currently bounded development milestones, not mature general-purpose services. Windows compatibility is a long-term goal, not a present feature. Physical-machine driver safety and cross-platform application compatibility require separate engineering and test gates.
 
 See [the roadmap](docs/ROADMAP.md), [security guidance](docs/SECURITY.md) and [Turkish getting-started guide](docs/BASLANGIC_TR.md).
 
