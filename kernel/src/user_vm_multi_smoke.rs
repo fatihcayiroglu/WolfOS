@@ -1,0 +1,168 @@
+//! Additional P2 QEMU acceptance: four heterogeneous user pages in the
+//! SAME disconnected PML4/PDPT/PD/PT hierarchy, backed by eight distinct
+//! PMM frames. Two ELF text/BSS pages, one ELF data page and one stack page.
+//! Real byte copy / BSS zeroing occurs through supervisor HHDM only.
+//! We never write CR3, enter CPL3 or execute any ELF file.
+
+use crate::{
+    elf64_preflight::preflight,
+    elf64_page_image::{materialize, PAGE_SIZE},
+    pmm, serial,
+    user_vm_layout::ENTRY_COUNT,
+    user_vm_multi::{self, UserPage},
+};
+use x86_64::{registers::control::Cr3, VirtAddr};
+
+const FRAME_TOTAL: usize = 8;
+const TABLES: usize = 4;
+const TEXT: u64 = 0x401000;
+const TEXT_BSS: u64 = 0x402000;
+const DATA: u64 = 0x403000;
+const STACK: u64 = 0x404000;
+
+fn put16(b: &mut [u8], pos: usize, val: u16) {
+    b[pos..pos + 2].copy_from_slice(&val.to_le_bytes());
+}
+fn put32(b: &mut [u8], pos: usize, val: u32) {
+    b[pos..pos + 4].copy_from_slice(&val.to_le_bytes());
+}
+fn put64(b: &mut [u8], pos: usize, val: u64) {
+    b[pos..pos + 8].copy_from_slice(&val.to_le_bytes());
+}
+
+fn fixture() -> [u8; 512] {
+    let mut b = [0u8; 512];
+    b[..4].copy_from_slice(b"\x7fELF");
+    b[4..7].copy_from_slice(&[2, 1, 1]);
+    put16(&mut b, 16, 2); // ET_EXEC
+    put16(&mut b, 18, 62); // EM_X86_64
+    put32(&mut b, 20, 1);
+    put64(&mut b, 24, 0x401100); // executable file bytes
+    put64(&mut b, 32, 64); // program header table
+    put16(&mut b, 52, 64);
+    put16(&mut b, 54, 56);
+    put16(&mut b, 56, 2);
+
+    put32(&mut b, 64, 1); // PT_LOAD text
+    put32(&mut b, 68, 5); // R + X
+    put64(&mut b, 72, 0x100);
+    put64(&mut b, 80, 0x401100);
+    put64(&mut b, 96, 8);
+    put64(&mut b, 104, 0x1000); // spans TWO pages, mostly BSS
+    put64(&mut b, 112, 0x1000);
+
+    put32(&mut b, 120, 1); // PT_LOAD data
+    put32(&mut b, 124, 6); // R + W
+    put64(&mut b, 128, 0x180);
+    put64(&mut b, 136, 0x403180);
+    put64(&mut b, 152, 8);
+    put64(&mut b, 160, 0x600);
+    put64(&mut b, 168, 0x1000);
+    b[0x100] = 0xc3;
+    b[0x180..0x188].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    b
+}
+
+fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
+    let file = fixture();
+    let Ok(plan) = preflight(&file) else { return false; };
+    if plan.len != 2 || plan.entry != 0x401100 { return false; }
+    let Some(text) = plan.segments[0] else { return false; };
+    let Some(data) = plan.segments[1] else { return false; };
+    if text.page_start != TEXT || text.page_end != DATA
+        || data.page_start != DATA || data.page_end != STACK
+        || text.writable || !text.executable || !data.writable || data.executable
+    { return false; }
+
+    let mut pointers = [core::ptr::null_mut::<u8>(); FRAME_TOTAL];
+    for (i, physical) in frames.iter().copied().enumerate() {
+        let Some(vaddr) = hhdm.checked_add(physical)
+            .and_then(|value| VirtAddr::try_new(value).ok())
+        else { return false; };
+        pointers[i] = vaddr.as_mut_ptr::<u8>();
+    }
+    let pages = [
+        UserPage { virtual_address: TEXT, physical_frame: frames[4],
+            writable: false, executable: true },
+        UserPage { virtual_address: TEXT_BSS, physical_frame: frames[5],
+            writable: false, executable: true },
+        UserPage { virtual_address: DATA, physical_frame: frames[6],
+            writable: true, executable: false },
+        UserPage { virtual_address: STACK, physical_frame: frames[7],
+            writable: true, executable: false },
+    ];
+    // SAFETY: eight separately owned and HHDM-mapped PMM physical frames.
+    // These pointers are disjoint, never exposed to another CPU and stay
+    // owned until this synchronous proof finishes and PMM frees them.
+    unsafe {
+        for ptr in pointers { core::ptr::write_bytes(ptr, 0xa5, PAGE_SIZE); }
+        // Page-table creation demands four pristine, disjoint tables.
+        for ptr in &pointers[..TABLES] {
+            core::ptr::write_bytes(*ptr, 0, PAGE_SIZE);
+        }
+        let root = &mut *pointers[0].cast::<[u64; ENTRY_COUNT]>();
+        let pdpt = &mut *pointers[1].cast::<[u64; ENTRY_COUNT]>();
+        let pd = &mut *pointers[2].cast::<[u64; ENTRY_COUNT]>();
+        let pt = &mut *pointers[3].cast::<[u64; ENTRY_COUNT]>();
+        if user_vm_multi::populate(root, pdpt, pd, pt,
+            [frames[0], frames[1], frames[2], frames[3]], &pages).is_err()
+        { return false; }
+        if user_vm_multi::audit(root, pdpt, pd, pt,
+            [frames[0], frames[1], frames[2], frames[3]], &pages).is_err()
+            || root[256..].iter().any(|p| *p != 0)
+        { return false; }
+
+        let first = &mut *pointers[4].cast::<[u8; PAGE_SIZE]>();
+        let second = &mut *pointers[5].cast::<[u8; PAGE_SIZE]>();
+        let third = &mut *pointers[6].cast::<[u8; PAGE_SIZE]>();
+        let fourth = &mut *pointers[7].cast::<[u8; PAGE_SIZE]>();
+        if materialize(&file, &text, TEXT, first).is_err()
+            || materialize(&file, &text, TEXT_BSS, second).is_err()
+            || materialize(&file, &data, DATA, third).is_err()
+        { return false; }
+        fourth.fill(0); // new zeroed stack, with no ELF file backing.
+        first[0x100] == 0xc3
+            && first.iter().enumerate().all(|(i, b)| *b == if i == 0x100 { 0xc3 } else { 0 })
+            && second.iter().all(|b| *b == 0)
+            && third[..0x180].iter().all(|b| *b == 0)
+            && third[0x180..0x188] == [1, 2, 3, 4, 5, 6, 7, 8]
+            && third[0x188..].iter().all(|b| *b == 0)
+            && fourth.iter().all(|b| *b == 0)
+    }
+}
+
+pub fn verify(hhdm: u64) -> bool {
+    let before = pmm::statistics().allocated_frames;
+    let (cr3, _) = Cr3::read();
+    let cr3_before = cr3.start_address().as_u64();
+    let mut frames = [0u64; FRAME_TOTAL];
+    let mut acquired = 0usize;
+    for frame in frames.iter_mut() {
+        let Some(value) = pmm::allocate_frame() else { break; };
+        *frame = value;
+        acquired += 1;
+    }
+    let exclusive = acquired == FRAME_TOTAL
+        && frames.iter().enumerate().all(|(i, frame)|
+            *frame != 0 && *frame % 4096 == 0 && !frames[..i].contains(frame)
+        );
+    let verified = exclusive && prove(hhdm, &frames);
+    let mut freed = 0usize;
+    for physical in frames[..acquired].iter().rev().copied() {
+        if pmm::free_frame(physical).is_ok() { freed += 1; }
+    }
+    let (now, _) = Cr3::read();
+    let cr3_unchanged = now.start_address().as_u64() == cr3_before;
+    let no_leak = pmm::statistics().allocated_frames == before;
+    if !verified || freed != FRAME_TOTAL || !cr3_unchanged || !no_leak {
+        serial::write_fmt(format_args!(
+            "WOLFOS_USER_MULTI_ERROR allocated={} verified={} freed={} cr3={} accounting={}\n",
+            acquired, verified, freed, cr3_unchanged, no_leak,
+        ));
+        return false;
+    }
+    serial::write_line(
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 high_half_empty=1 freed=8 cr3_unchanged=1 ring3=0"
+    );
+    true
+}
