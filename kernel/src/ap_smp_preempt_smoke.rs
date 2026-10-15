@@ -168,6 +168,17 @@ fn fx_enter(cpu: usize) -> bool {
         save_fx(bank);
         core::ptr::copy_nonoverlapping(bank, bank.add(1), 1);
         core::ptr::copy_nonoverlapping(bank, bank.add(2), 1);
+        // The synthetic task1 IRETQ frame has IF=1. A local timer can
+        // interrupt it BEFORE run_task(1) executes its first movq xmm0.
+        // Prime both valid task FX images with their expected XMM0
+        // sentinels *before* enabling the AP timer; all non-XMM0 state
+        // remains from a real FXSAVE64 baseline. This is not a waived
+        // first-interrupt assertion: every FXSAVE comparison stays strict.
+        for task in 0..TASKS {
+            crate::fx_bootstrap_image::seed_xmm0(
+                &mut (*bank.add(task + 1)).0, XMM_TAGS[task],
+            );
+        }
         (*CONTROLS.0.get())[cpu].cr0 = cr0;
         (*CONTROLS.0.get())[cpu].cr4 = cr4;
     }
