@@ -17,6 +17,10 @@ mod pmm_layout;
 mod interrupts;
 mod pci;
 mod paging;
+#[cfg(feature = "elf64-preflight-smoke")]
+mod elf64_preflight;
+#[cfg(feature = "elf64-preflight-smoke")]
+mod elf64_preflight_smoke;
 mod acpi;
 mod acpi_layout;
 mod acpi_tables;
@@ -221,6 +225,11 @@ pub extern "C" fn kmain() -> ! {
 
     if !paging::mapping_roundtrip(hhdm.offset) {
         serial::write_line("WOLFOS_PAGING_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "elf64-preflight-smoke")]
+    if !elf64_preflight_smoke::verify() {
+        serial::write_line("WOLFOS_ELF64_PREFLIGHT_TEST_FAILED");
         halt_forever();
     }
     #[cfg(feature = "paging-fault-smoke")]
