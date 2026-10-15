@@ -110,6 +110,8 @@ struct Runtime{
     timer_irqs:[u64;COUNT],
     #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     timer_busy:[u64;COUNT],
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    timer_preempts:[u64;COUNT],
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // SAFETY: only one BSP may access the runtime; IF=0 from admission until
@@ -193,6 +195,72 @@ pub extern "C" fn observe_timer_irq(
     }
     if s.timer_irqs[i]>100_000{
         fail("unexpected_interrupt_storm")
+    }
+    // A REAL hardware timer IRQ may choose an independently mapped
+    // OTHER PID's full hardware IRET frame, without a voluntary INT80.
+    // Limit this isolated proof to one preemption PER PID in its assembly
+    // no-syscall busy window. The remaining genuine IRQs resume the same
+    // PID. This ensures the existing strict eight-yield regression still
+    // checks both ELF data counters after involuntary interruption.
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    let preempt_target={
+        let other=1-i;
+        if in_busy && s.timer_preempts[i]==0
+            && s.timer_preempts[other]==0
+            && s.frames[other]!=0 && !s.exits[other] {
+            Some(other)
+        } else {
+            None
+        }
+    };
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    if let Some(next)=preempt_target{
+        let next_frame=s.frames[next];
+        if next_frame!=s.stacks[next].top
+                -user_syscall_abi::FRAME_BYTES as u64
+            || next_frame&15!=0
+            || s.processes.snapshot((next+1) as u64)
+                .is_none_or(|p| p.state!=ProcessState::Ready
+                    || p.cr3_root!=s.leases[next][0]) {
+            fail("involuntary_next_pid_frame_or_root")
+        }
+        // The IRQ's captured GPR+5-word hardware frame remains pinned
+        // on the departing PID's *own* guarded high-half kernel stack.
+        // It is safe to retain across CR3 switches: this supervisor
+        // high-half subtree is shared by BOTH sanitized process roots.
+        s.frames[i]=raw as u64;
+        if s.processes.park_running(pid,s.leases[i][0]).is_err() {
+            fail("involuntary_park_running_pid")
+        }
+        if unsafe{s.fx.switch_to(s.fx_tokens[next])}.is_err()
+            || s.fx.image_xmm0(s.fx_tokens[i])!=Ok(USER_ID[i]) {
+            fail("involuntary_fx_state_save_restore")
+        }
+        if !unsafe{interrupts::test_handoff_rsp0(s.stacks[next].top)} {
+            fail("involuntary_next_tss_rsp0")
+        }
+        // xAPIC in-service vector MUST be acknowledged exactly once
+        // from the CURRENT validated private-CR3 supervisor UC alias.
+        // No serial I/O, blocking locks, allocations or busy waits on
+        // the successful timer IRQ scheduling path.
+        unsafe{
+            crate::user_xapic_high::write(
+                crate::lapic_irq_layout::EOI_OFFSET,
+                crate::lapic_irq_layout::EOI_VALUE);
+        }
+        unsafe{
+            asm!("mov cr3, {}",in(reg)s.leases[next][0],
+                options(nostack,preserves_flags));
+        }
+        if actual_cr3()!=s.leases[next][0]
+            || s.processes.mark_running((next+1) as u64,
+                         s.leases[next][0]).is_err()
+            || s.processes.running()!=1 {
+            fail("involuntary_private_cr3_or_running_pid")
+        }
+        s.timer_preempts[i]+=1;
+        s.current=next;
+        return next_frame as *const UserSyscallFrame;
     }
     // SAFETY: this high VA is supervisor-only UC in the CURRENT private
     // user CR3 root; this is a genuine local xAPIC in-service vector.
@@ -429,6 +497,8 @@ pub fn enter(hhdm:u64)->!{
         timer_irqs:[0;COUNT],
         #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
         timer_busy:[0;COUNT],
+        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        timer_preempts:[0;COUNT],
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
@@ -599,8 +669,25 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 fail("missing_real_cpl3_busy_loop_timer_irq")
             }
             TIMER_LIVE.store(false,core::sync::atomic::Ordering::Release);
+            #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+            {
+                if s.timer_preempts!=[1,1] {
+                    fail("missing_two_real_involuntary_pid_switches")
+                }
+                serial::write_fmt(format_args!(
+                    "WOLFOS_RING3_TIMER_PREEMPT_OK real_timer_switches=2 pid1_to_pid2={} pid2_to_pid1={} irq_frame_preserved=1 private_cr3=1 tss_rsp0=1 fx_save_restore=1 no_int80=1\n",
+                    s.timer_preempts[0],s.timer_preempts[1]
+                ));
+            }
+            #[cfg(not(feature = "p2-ring3-timer-preempt-smoke"))]
             serial::write_fmt(format_args!(
                 "WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs={} pid1_busy_irqs={} pid2_busy_irqs={} eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1\n",
+                s.timer_irqs[0]+s.timer_irqs[1],
+                s.timer_busy[0],s.timer_busy[1]
+            ));
+            #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+            serial::write_fmt(format_args!(
+                "WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs={} pid1_busy_irqs={} pid2_busy_irqs={} eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=0\n",
                 s.timer_irqs[0]+s.timer_irqs[1],
                 s.timer_busy[0],s.timer_busy[1]
             ));
