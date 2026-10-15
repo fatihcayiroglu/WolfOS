@@ -25,6 +25,7 @@ use crate::{
     elf64_page_image::{materialize, PAGE_SIZE},
     elf64_preflight::preflight,
     interrupts, kernel_half_shadow, pmm, serial,
+    process_lifecycle::{ProcessCell, ProcessState},
     user_ring_entry::{self, Ring3Entry},
     user_syscall_abi::{self, Outcome, UserSyscallFrame},
 };
@@ -53,6 +54,12 @@ static BOOT_CR3: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BEFORE: AtomicUsize = AtomicUsize::new(0);
 static STAGE: AtomicUsize = AtomicUsize::new(0);
 static OWNED: [AtomicU64; FRAMES] = [const { AtomicU64::new(0) }; FRAMES];
+/// Common audited ownership record for the original ELF smoke and the
+/// two-process lifecycle feature, with monotonic process generations.
+static PROCESS: ProcessCell<FRAMES> = ProcessCell::new();
+static RUN_INDEX: AtomicUsize = AtomicUsize::new(0);
+static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
+const MAX_RUNS: usize = if cfg!(feature = "user-process-smoke") { 2 } else { 1 };
 
 fn fail(reason: &str) -> ! {
     serial::write_fmt(format_args!("WOLFOS_ELF_RUN_ERROR {reason}\n"));
@@ -89,7 +96,29 @@ fn allocate_owned() -> Option<[u64; FRAMES]> {
 }
 
 pub fn enter(hhdm: u64) -> ! {
-    if !interrupts::verify_ring3_preconditions() { fail("gdt_tss") }
+    let index = RUN_INDEX.load(Ordering::Acquire);
+    if index >= MAX_RUNS || hhdm == 0 { fail("invalid_process_launch") }
+    let pid = index as u64 + 1;
+    HHDM_OFFSET.store(hhdm, Ordering::Release);
+    if index == 0 {
+        if !interrupts::verify_ring3_preconditions() { fail("gdt_tss") }
+    } else {
+        #[cfg(feature = "user-process-smoke")]
+        {
+            // Only allow the second user admission AFTER the first PID was
+            // fully reaped and no PMM pages remain owned. CPU SS=0 is valid
+            // here because the kernel arrived via a real CPL3 INT80 trap.
+            let safely_reaped = matches!(
+                PROCESS.with(|p| (p.pid, p.state, p.frames)),
+                Ok((1, ProcessState::Reaped, frames)) if frames.iter().all(|f| *f == 0),
+            );
+            if !safely_reaped || OWNED.iter().any(|p| p.load(Ordering::Acquire) != 0)
+                || !interrupts::verify_ring3_reentry_preconditions()
+            { fail("second_user_kernel_reentry_preflight") }
+        }
+        #[cfg(not(feature = "user-process-smoke"))]
+        fail("unreachable_user_reentry");
+    }
     if symbols::ENTRY != 0x401000 || symbols::AFTER_ID <= symbols::ENTRY
         || symbols::AFTER_ADD <= symbols::AFTER_ID
         || symbols::AFTER_PUTC <= symbols::AFTER_ADD
@@ -220,11 +249,22 @@ pub fn enter(hhdm: u64) -> ! {
         for (at, phys) in frames.iter().copied().enumerate() {
             OWNED[at].store(phys, Ordering::Release);
         }
+        if !matches!(PROCESS.with(|p| p.admit(pid, frames[0], frames)), Ok(Ok(()))) {
+            fail("process_admission_or_frame_ownership")
+        }
         compiler_fence(Ordering::SeqCst);
         asm!("mov cr3, {}", in(reg) frames[0],
             options(nostack, preserves_flags));
         let (now, _) = Cr3::read();
         if now.start_address().as_u64() != frames[0] { fail("new_cr3_not_active") }
+        if !matches!(PROCESS.with(|p| p.mark_running(pid, frames[0])), Ok(Ok(()))) {
+            fail("process_running_transition")
+        }
+        #[cfg(feature = "user-process-smoke")]
+        serial::write_fmt(format_args!(
+            "WOLFOS_PROCESS_START pid={} state=running private_cr3=1 owned_frames=7\n",
+            pid,
+        ));
         serial::write_fmt(format_args!(
             "WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 bss_zero=1 cr3_new=1 root_slot={} user_entry={:#x}\n",
             slot, plan.entry,
@@ -329,6 +369,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             raw
         }
         Outcome::ExitZero => {
+            let pid = RUN_INDEX.load(Ordering::Acquire) as u64 + 1;
             if stage != RETURN_COUNT || STAGE.load(Ordering::Acquire) != TOTAL_CALLS
             { fail("unexpected_exit_stage") }
             let data = DATA_HHDM.load(Ordering::Acquire);
@@ -338,6 +379,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             let actual = unsafe { &*(data as *const [u8; 65]) };
             if actual[0] != 0x5a || actual[1..].iter().any(|b| *b != 0)
             { fail("guest_elf_data_or_bss_corrupted") }
+            if !matches!(PROCESS.with(|p| p.exit_zero(pid, active)), Ok(Ok(()))) {
+                fail("process_exit_transition")
+            }
             serial::write_line("WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22");
 
             // Hardware restoration before FREE: the boot CR3 has all needed
@@ -351,16 +395,45 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             }
             let (now, _) = Cr3::read();
             if now.start_address().as_u64() != boot { fail("boot_cr3_not_restored") }
+            // The audited PID ledger authorizes release ONLY after CR3
+            // restoration, only for this exact owning PID, exactly once.
+            let owned_by_pid = match PROCESS.with(|p| p.reap(pid, boot)) {
+                Ok(Ok(frames)) => frames,
+                _ => fail("process_reap_or_active_cr3"),
+            };
             for i in (0..FRAMES).rev() {
                 let owned = OWNED[i].swap(0, Ordering::AcqRel);
-                if owned == 0 || pmm::free_frame(owned).is_err() {
+                if owned == 0 || owned != owned_by_pid[i]
+                    || pmm::free_frame(owned).is_err()
+                {
                     fail("owned_user_frame_free_failed")
                 }
+            }
+            if !matches!(PROCESS.with(|p| p.state), Ok(ProcessState::Reaped)) {
+                fail("process_not_reaped")
             }
             if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
             { fail("pmm_frame_leak") }
             serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
             serial::write_line("WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=0 resources_released=1 real_process_manager=0");
+            #[cfg(feature = "user-process-smoke")]
+            {
+                serial::write_fmt(format_args!(
+                    "WOLFOS_PROCESS_REAP_OK pid={} exited=1 restored_cr3=1 freed_frames=7 no_leak=1\n",
+                    pid,
+                ));
+                if pid == 1 {
+                    RUN_INDEX.store(1, Ordering::Release);
+                    serial::write_line("WOLFOS_PROCESS_RELAUNCH pid=2 generation=2 first_reaped=1");
+                    // No return to user kernel-stack frames from PID 1:
+                    // only start a new independent root after full CR3
+                    // restoration and prior PMM resources were reclaimed.
+                    enter(HHDM_OFFSET.load(Ordering::Acquire));
+                }
+                if pid != 2 { fail("invalid_second_process_pid") }
+                RUN_INDEX.store(2, Ordering::Release);
+                serial::write_line("WOLFOS_PROCESS_LIFECYCLE_OK launched=2 exited=2 reaped=2 total_int80=44 restored_cr3=1 per_pid_owner=1 pmm_no_leak=1 concurrent=0");
+            }
             serial::qemu_exit_success()
         }
     }
