@@ -54,6 +54,13 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
     pub fn running(&self) -> usize {
         self.slots.iter().filter(|p| p.state == ProcessState::Running).count()
     }
+    /// A supplied supervisor CR3 must not alias ANY resident user process,
+    /// including a READY process with no prepared resume context yet.
+    pub fn owns_live_cr3(&self, root: u64) -> bool {
+        root != 0 && self.slots.iter().any(|p|
+            Self::live(p.state) && p.cr3_root == root
+        )
+    }
 
     fn live(state: ProcessState) -> bool {
         matches!(state, ProcessState::Ready | ProcessState::Running | ProcessState::Exited)
