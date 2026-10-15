@@ -37,7 +37,7 @@ mod user_file_io;
 mod user_file_io_smoke;
 #[cfg(any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
 mod process_lifecycle;
-#[cfg(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke"))]
+#[cfg(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke"))]
 mod ramfs;
 #[cfg(any(feature = "user-vfs-smoke", feature = "user-file-io-smoke"))]
 mod vfs;
