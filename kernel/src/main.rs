@@ -15,21 +15,23 @@ mod cpu;
 mod pmm;
 mod pmm_layout;
 mod interrupts;
-#[cfg(any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 mod user_ring_entry;
 #[cfg(feature = "user-ring3-smoke")]
 mod user_ring3_smoke;
 #[cfg(feature = "user-ring3-isolation-smoke")]
 mod user_ring3_isolation_smoke;
-#[cfg(any(feature = "user-syscall-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 mod user_syscall_abi;
-#[cfg(any(feature = "user-syscall-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 mod user_syscall_entry;
 #[cfg(feature = "user-syscall-smoke")]
 mod user_syscall_smoke;
-#[cfg(any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
+#[cfg(any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
 mod user_elf_run_smoke;
-#[cfg(any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
+#[cfg(feature = "user-copy-smoke")]
+mod user_copy;
+#[cfg(any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
 mod process_lifecycle;
 #[cfg(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke"))]
 mod ramfs;
@@ -41,11 +43,11 @@ mod vfs_smoke;
 mod ramfs_smoke;
 mod pci;
 mod paging;
-#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 mod elf64_preflight;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_preflight_smoke;
-#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 mod elf64_page_image;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_layout;
@@ -53,7 +55,7 @@ mod user_vm_layout;
 mod user_vm_shadow_smoke;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi;
-#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 mod kernel_half_shadow;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi_smoke;
@@ -419,7 +421,7 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "user-syscall-smoke")]
     user_syscall_smoke::enter(hhdm.offset);
 
-    #[cfg(any(any(feature = "user-elf-run-smoke", any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
+    #[cfg(any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
     user_elf_run_smoke::enter(hhdm.offset);
 
     #[cfg(feature = "smoke-exit")]
