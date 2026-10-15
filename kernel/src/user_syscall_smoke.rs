@@ -284,6 +284,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             ));
             raw_frame // assembly restores complete register state + IRETQ
         }
+        // This flavor still tests its ORIGINAL five-call contract only.
+        // Console output is a separate, independently linked ELF feature.
+        Outcome::WriteByte(_) => fail("unexpected_console_syscall"),
         Outcome::ExitZero => {
             if STAGE.load(Ordering::Acquire) != 5
                 || data == 0 || unsafe { (data as *const u8).read_volatile() } != 0

@@ -15,25 +15,27 @@ mod cpu;
 mod pmm;
 mod pmm_layout;
 mod interrupts;
-#[cfg(any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke"))]
+#[cfg(any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", feature = "user-elf-run-smoke"))]
 mod user_ring_entry;
 #[cfg(feature = "user-ring3-smoke")]
 mod user_ring3_smoke;
 #[cfg(feature = "user-ring3-isolation-smoke")]
 mod user_ring3_isolation_smoke;
-#[cfg(feature = "user-syscall-smoke")]
+#[cfg(any(feature = "user-syscall-smoke", feature = "user-elf-run-smoke"))]
 mod user_syscall_abi;
-#[cfg(feature = "user-syscall-smoke")]
+#[cfg(any(feature = "user-syscall-smoke", feature = "user-elf-run-smoke"))]
 mod user_syscall_entry;
 #[cfg(feature = "user-syscall-smoke")]
 mod user_syscall_smoke;
+#[cfg(feature = "user-elf-run-smoke")]
+mod user_elf_run_smoke;
 mod pci;
 mod paging;
-#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke"))]
+#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", feature = "user-elf-run-smoke"))]
 mod elf64_preflight;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_preflight_smoke;
-#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke"))]
+#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", feature = "user-elf-run-smoke"))]
 mod elf64_page_image;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_layout;
@@ -41,7 +43,7 @@ mod user_vm_layout;
 mod user_vm_shadow_smoke;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi;
-#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke"))]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", feature = "user-elf-run-smoke"))]
 mod kernel_half_shadow;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi_smoke;
@@ -406,6 +408,9 @@ pub extern "C" fn kmain() -> ! {
 
     #[cfg(feature = "user-syscall-smoke")]
     user_syscall_smoke::enter(hhdm.offset);
+
+    #[cfg(feature = "user-elf-run-smoke")]
+    user_elf_run_smoke::enter(hhdm.offset);
 
     #[cfg(feature = "smoke-exit")]
     serial::qemu_exit_success();
