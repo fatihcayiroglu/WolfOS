@@ -64,7 +64,7 @@ impl GuardPlan {
         pt: &mut [u64; ENTRIES],
     ) -> Result<(), GuardError> {
         if root[ROOT_INDEX] != 0 { return Err(GuardError::TargetAlreadyMapped) }
-        if pdpt.iter().chain(pd).chain(pt).any(|x| *x != 0) {
+        if pdpt.iter().chain(pd.iter()).chain(pt.iter()).any(|x| *x != 0) {
             return Err(GuardError::BadTable)
         }
         // Only the final store to the active PML4 publishes new mappings;
@@ -90,7 +90,7 @@ impl GuardPlan {
             || pd[0] != Self::expected(self.pages[2])
             || root[ROOT_INDEX] & USER != 0
         { return Err(GuardError::BadTable) }
-        if pdpt[1..].iter().chain(pd[1..]).any(|x| *x != 0)
+        if pdpt[1..].iter().chain(pd[1..].iter()).any(|x| *x != 0)
             || pt[6..].iter().any(|x| *x != 0) {
             return Err(GuardError::UnexpectedAlias)
         }
