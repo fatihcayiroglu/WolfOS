@@ -31,6 +31,8 @@ jobs:
         run: make user-vm-shadow-smoke
       - name: P2 user descriptor and TSS.RSP0 / TR preflight (CPL0-only QEMU)
         run: make user-ring-prep-smoke
+      - name: P2 REAL CPL3 / INT80 / IRETQ roundtrip (single-vCPU QEMU)
+        run: make user-ring3-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
