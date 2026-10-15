@@ -17,12 +17,16 @@ mod pmm_layout;
 mod interrupts;
 mod pci;
 mod paging;
-#[cfg(feature = "elf64-preflight-smoke")]
+#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke"))]
 mod elf64_preflight;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_preflight_smoke;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_page_image;
+#[cfg(feature = "user-vm-shadow-smoke")]
+mod user_vm_layout;
+#[cfg(feature = "user-vm-shadow-smoke")]
+mod user_vm_shadow_smoke;
 mod acpi;
 mod acpi_layout;
 mod acpi_tables;
@@ -232,6 +236,11 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "elf64-preflight-smoke")]
     if !elf64_preflight_smoke::verify(hhdm.offset) {
         serial::write_line("WOLFOS_ELF64_PREFLIGHT_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "user-vm-shadow-smoke")]
+    if !user_vm_shadow_smoke::verify(hhdm.offset) {
+        serial::write_line("WOLFOS_USER_ROOT_TEST_FAILED");
         halt_forever();
     }
     #[cfg(feature = "paging-fault-smoke")]
