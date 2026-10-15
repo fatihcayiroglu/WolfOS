@@ -17,6 +17,19 @@ pub const BANK_CAPACITY:usize=2;
 pub struct FxImage{bytes:[u8;IMAGE_BYTES]}
 impl FxImage{
     pub const fn empty()->Self{Self{bytes:[0;IMAGE_BYTES]}}
+    /// Capture the currently valid legacy x87/SSE baseline before any
+    /// per-PID image is seeded. CR0/CR4, FXSR and exclusive BSP CPU state
+    /// must already have been validated by the caller.
+    ///
+    /// # Safety
+    /// IF=0, BSP exclusive, CPUID FXSR/SSE2, CR0.EM=TS=0, CR4.OSFXSR=1.
+    pub unsafe fn capture_baseline()->Self{
+        let mut result=Self::empty();
+        unsafe{
+            asm!("fxsave64 [{}]",in(reg)&mut result,options(nostack));
+        }
+        result
+    }
     pub fn xmm0(&self)->u64{
         let mut data=[0u8;8];
         data.copy_from_slice(&self.bytes[XMM0_OFFSET..XMM0_OFFSET+8]);
