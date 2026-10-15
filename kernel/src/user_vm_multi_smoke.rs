@@ -149,8 +149,10 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
             || kernel_idx < 256 || hhdm_idx < 256
             || active[kernel_idx] & 1 == 0
             || active[hhdm_idx] & 1 == 0
-            || root[kernel_idx] != active[kernel_idx]
-            || root[hhdm_idx] != active[hhdm_idx]
+            || root[kernel_idx] != (active[kernel_idx] & !kernel_half_shadow::PTE_USER)
+            || root[hhdm_idx] != (active[hhdm_idx] & !kernel_half_shadow::PTE_USER)
+            || root[kernel_idx] & kernel_half_shadow::PTE_USER != 0
+            || root[hhdm_idx] & kernel_half_shadow::PTE_USER != 0
         {
             serial::write_fmt(format_args!(
                 "WOLFOS_USER_GRAFT_DIAG copied={copied:?} audit={audited:?} kernel_idx={} kernel_entry={:#x} hhdm_idx={} hhdm_entry={:#x} user_entry={:#x}\n",
