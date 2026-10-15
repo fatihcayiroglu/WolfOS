@@ -5,6 +5,10 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
+#[cfg(feature = "user-ring-prep-smoke")]
+use core::arch::asm;
+#[cfg(feature = "user-ring-prep-smoke")]
+use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
@@ -58,6 +62,27 @@ static TSS_STORAGE: BootCell<TaskStateSegment> = BootCell::new();
 static GDT_STORAGE: BootCell<GlobalDescriptorTable> = BootCell::new();
 static IDT_STORAGE: BootCell<InterruptDescriptorTable> = BootCell::new();
 static IDT_READY: AtomicBool = AtomicBool::new(false);
+
+// P2 one-vCPU isolated QEMU preflight ONLY. No CPL3 switch is performed.
+// The future TSS.RSP0 stack is not the double-fault IST stack.
+#[cfg(feature = "user-ring-prep-smoke")]
+const USER_RSP0_STACK_SIZE: usize = 16 * 1024;
+#[cfg(feature = "user-ring-prep-smoke")]
+const USER_RSP0_CANARY: u64 = 0x574f_4c46_5253_5030; // "WOLFRSP0"
+#[cfg(feature = "user-ring-prep-smoke")]
+#[repr(align(16))]
+struct UserRsp0Stack([u8; USER_RSP0_STACK_SIZE]);
+#[cfg(feature = "user-ring-prep-smoke")]
+static mut BSP_USER_RSP0_STACK: UserRsp0Stack = UserRsp0Stack([0; USER_RSP0_STACK_SIZE]);
+#[cfg(feature = "user-ring-prep-smoke")]
+static USER_RSP0_EXPECTED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "user-ring-prep-smoke")]
+static USER_CS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "user-ring-prep-smoke")]
+static USER_DS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "user-ring-prep-smoke")]
+static USER_TSS_SELECTOR_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+
 
 /// AP stacks must be disjoint. Each processor owns exactly one distinct slot.
 struct ApIstBank(UnsafeCell<[AlignedStack; MAX_BOOT_CPUS]>);
@@ -176,6 +201,22 @@ pub fn initialize() {
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
         VirtAddr::new(stack_top as u64);
+    #[cfg(feature = "user-ring-prep-smoke")]
+    {
+        let rsp0_bottom = (&raw mut BSP_USER_RSP0_STACK).cast::<u8>() as usize;
+        let rsp0_top = rsp0_bottom + USER_RSP0_STACK_SIZE;
+        // This static, 16-byte aligned stack remains mapped supervisor-only
+        // by the live boot tables. Interrupts stay OFF in this QEMU mode.
+        // It is a future CPL3->CPL0 trap landing stack, NOT the IST stack.
+        // SAFETY: serialized BSP boot before any other code touches this
+        // permanently owned static storage.
+        unsafe {
+            rsp0_bottom.cast::<u64>().write(USER_RSP0_CANARY);
+            rsp0_bottom.cast::<u64>().add(1).write(!USER_RSP0_CANARY);
+        }
+        tss.privilege_stack_table[0] = VirtAddr::new(rsp0_top as u64);
+        USER_RSP0_EXPECTED.store(rsp0_top as u64, Ordering::Release);
+    }
 
     // SAFETY: boot path is single-threaded and never calls initialize twice.
     let tss_ref = unsafe { TSS_STORAGE.initialize(tss) };
@@ -184,6 +225,16 @@ pub fn initialize() {
     let kernel_cs = gdt.append(Descriptor::kernel_code_segment());
     let kernel_ds = gdt.append(Descriptor::kernel_data_segment());
     let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));
+    #[cfg(feature = "user-ring-prep-smoke")]
+    {
+        // The kernel stays at CPL0. These are descriptors for a future
+        // isolated IRETQ transition, not a change in current CS/SS.
+        let user_ds = gdt.append(Descriptor::user_data_segment());
+        let user_cs = gdt.append(Descriptor::user_code_segment());
+        USER_CS_EXPECTED.store(usize::from(user_cs.0 | 3), Ordering::Release);
+        USER_DS_EXPECTED.store(usize::from(user_ds.0 | 3), Ordering::Release);
+        USER_TSS_SELECTOR_EXPECTED.store(usize::from(tss_sel.0), Ordering::Release);
+    }
     // SAFETY: object has static backing and is immutable after loading.
     let gdt_ref = unsafe { GDT_STORAGE.initialize(gdt) };
     gdt_ref.load();
@@ -236,6 +287,72 @@ pub fn initialize() {
     // deliver an exception and restore the interrupted execution context.
     x86_64::instructions::interrupts::int3();
     serial::write_line("WOLFOS_BREAKPOINT_RETURN_OK");
+}
+
+#[cfg(feature = "user-ring-prep-smoke")]
+pub fn verify_ring3_preconditions() -> bool {
+    // Only after interrupts::initialize(), before SMP startup. Read actual
+    // hardware task register and actual packed TSS privilege_stack_table.
+    // Unlike a value cached in an atomic, TR and the TSS field attest that
+    // the CPU has a loaded selector pointing to initialized RSP0 storage.
+    let mut tr: u16;
+    // SAFETY: non-mutating x86-64 STR reads the loaded task register.
+    unsafe { asm!("str {0:x}", out(reg) tr, options(nomem, nostack, preserves_flags)); }
+
+    let expected_rsp0 = USER_RSP0_EXPECTED.load(Ordering::Acquire);
+    let user_cs = USER_CS_EXPECTED.load(Ordering::Acquire) as u16;
+    let user_ds = USER_DS_EXPECTED.load(Ordering::Acquire) as u16;
+    let expected_tr = USER_TSS_SELECTOR_EXPECTED.load(Ordering::Acquire) as u16;
+    let base = (&raw const BSP_USER_RSP0_STACK).cast::<u8>() as usize;
+    let top = base + USER_RSP0_STACK_SIZE;
+    // SAFETY: initialized exactly once in initialize() on BSP. No other
+    // thread mutates TSS after its task register is loaded; it is borrowed
+    // read-only for this serialized smoke.
+    let tss = unsafe { (*TSS_STORAGE.0.get()).assume_init_ref() };
+    let actual_rsp0 = unsafe {
+        core::ptr::addr_of!(tss.privilege_stack_table[0]).read_unaligned()
+    }.as_u64();
+    // SAFETY: static storage has never been used as the CPU entry stack
+    // because this smoke does NOT switch to CPL3.
+    let (low, next) = unsafe {
+        (base.cast::<u64>().read(), base.cast::<u64>().add(1).read())
+    };
+
+    let contract = crate::user_ring_entry::validate(crate::user_ring_entry::Ring3Entry {
+        rip: 0x401100,
+        user_rsp: 0x405000,
+        kernel_rsp0: actual_rsp0,
+        user_cs, user_ss: user_ds,
+        rflags: 0x2, // IF=0; no privilege transition is executed here.
+    });
+    let good = expected_rsp0 != 0 && expected_rsp0 == top as u64
+        && expected_rsp0 == actual_rsp0
+        && tr == expected_tr && tr != 0
+        && CS::get_reg().0 == 0x8 && SS::get_reg().0 == 0x10
+        && user_cs & 7 == 3 && user_ds & 7 == 3 && user_cs != user_ds
+        && low == USER_RSP0_CANARY && next == !USER_RSP0_CANARY
+        && contract.is_ok()
+        && stack_top_check(base, top);
+    if !good {
+        serial::write_fmt(format_args!(
+            "WOLFOS_RING_PREP_ERROR tr={:#x}/{:#x} rsp0={:#x}/{:#x} cs={:#x} ds={:#x} canary={} contract={:?}\n",
+            tr, expected_tr, actual_rsp0, expected_rsp0, user_cs, user_ds,
+            low == USER_RSP0_CANARY && next == !USER_RSP0_CANARY, contract,
+        ));
+        return false;
+    }
+    serial::write_fmt(format_args!(
+        "WOLFOS_RING_PREP_OK tr={:#x} user_cs={:#x} user_ds={:#x} rsp0_aligned=1 rsp0_stack_kib=16 ist_disjoint=1 guards=1 cpl=0 ring3=0\n",
+        tr, user_cs, user_ds,
+    ));
+    true
+}
+
+#[cfg(feature = "user-ring-prep-smoke")]
+fn stack_top_check(base: usize, top: usize) -> bool {
+    base != 0 && base % 16 == 0 && top % 16 == 0
+        && top > base && top - base == USER_RSP0_STACK_SIZE
+        && !(base..top).contains(&((&raw const DOUBLE_FAULT_STACK).cast::<u8>() as usize))
 }
 
 extern "x86-interrupt" fn breakpoint(_frame: InterruptStackFrame) {
