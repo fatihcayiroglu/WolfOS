@@ -312,6 +312,20 @@ pub fn initialize() {
 
 #[cfg(any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(feature = "user-elf-run-smoke", feature = "user-process-smoke")))]
 pub fn verify_ring3_preconditions() -> bool {
+    ring3_preflight_inner(false)
+}
+
+/// After a prior real CPL3->CPL0 INT80, x86-64 may leave the kernel's
+/// SS selector NULL even though CPL remains zero and CS is still 0x8.
+/// That is an architecturally valid long-mode interrupt-return state.
+/// NEVER use this admission on the first kernel/user transition. The
+/// caller must have already restored boot CR3 and reaped the previous PID.
+#[cfg(feature = "user-process-smoke")]
+pub fn verify_ring3_reentry_preconditions() -> bool {
+    ring3_preflight_inner(true)
+}
+
+fn ring3_preflight_inner(after_user_trap: bool) -> bool {
     // Only after interrupts::initialize(), before SMP startup. Read actual
     // hardware task register and actual packed TSS privilege_stack_table.
     // Unlike a value cached in an atomic, TR and the TSS field attest that
@@ -349,15 +363,17 @@ pub fn verify_ring3_preconditions() -> bool {
     let good = expected_rsp0 != 0 && expected_rsp0 == top as u64
         && expected_rsp0 == actual_rsp0
         && tr == expected_tr && tr != 0
-        && CS::get_reg().0 == 0x8 && SS::get_reg().0 == 0x10
+        && CS::get_reg().0 == 0x8
+        && (SS::get_reg().0 == 0x10 || (after_user_trap && SS::get_reg().0 == 0))
         && user_cs & 7 == 3 && user_ds & 7 == 3 && user_cs != user_ds
         && low == USER_RSP0_CANARY && next == !USER_RSP0_CANARY
         && contract.is_ok()
         && stack_top_check(base, top);
     if !good {
         serial::write_fmt(format_args!(
-            "WOLFOS_RING_PREP_ERROR tr={:#x}/{:#x} rsp0={:#x}/{:#x} cs={:#x} ds={:#x} canary={} contract={:?}\n",
+            "WOLFOS_RING_PREP_ERROR tr={:#x}/{:#x} rsp0={:#x}/{:#x} cs={:#x} ds={:#x} current_ss={:#x} reentry={} canary={} contract={:?}\n",
             tr, expected_tr, actual_rsp0, expected_rsp0, user_cs, user_ds,
+            SS::get_reg().0, after_user_trap,
             low == USER_RSP0_CANARY && next == !USER_RSP0_CANARY, contract,
         ));
         return false;
