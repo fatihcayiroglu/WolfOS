@@ -5,6 +5,8 @@
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+use core::sync::atomic::AtomicU32;
 use limine::memmap::Entry;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::idt::InterruptStackFrame;
@@ -40,6 +42,40 @@ const SPEAKER_CONTROL: u16 = 0x61;
 const PIT_INTERVAL_TICKS: u16 = 23_864; // approximately 20 ms; not a precision clock
 #[cfg(feature = "apic-calibration-smoke")]
 const CALIBRATION_MAX_SPINS: u64 = 300_000_000;
+
+#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+static USER_SVR:AtomicU32=AtomicU32::new(0);
+#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+static USER_PIC_MASKS:AtomicU32=AtomicU32::new(0);
+#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+static USER_TIMER_CONFIGURED:AtomicBool=AtomicBool::new(false);
+
+/// Runs on the original BSP CR3 and separate boot stack, IF=0, only
+/// after both actual user ELF tasks exited, before any high MMIO unmap.
+/// Restores the exact PIC/SVR state that existed before arming this test.
+#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+pub fn stop_user_timer()->bool{
+    if x86_64::instructions::interrupts::are_enabled()
+        || !USER_TIMER_CONFIGURED.swap(false,Ordering::AcqRel){
+        return false
+    }
+    // SAFETY: permanent low boot-only UC alias still exists, IF=0 and
+    // actual BSP CR3 was restored before this final cleanup.
+    unsafe{
+        let masked=lapic_timer_layout::make_lvt(
+            TIMER_VECTOR,true,lapic_timer_layout::TimerMode::Periodic
+        ).unwrap();
+        apic_write(lapic_timer_layout::LVT_TIMER_OFFSET,masked);
+        apic_write(lapic_timer_layout::INITIAL_COUNT_OFFSET,0);
+        apic_write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET,
+            USER_SVR.load(Ordering::Acquire));
+    }
+    let masks=USER_PIC_MASKS.load(Ordering::Acquire);
+    outb(PIC_MASTER_DATA,masks as u8);
+    outb(PIC_SLAVE_DATA,(masks>>8) as u8);
+    inb(PIC_MASTER_DATA)==masks as u8
+        && inb(PIC_SLAVE_DATA)==(masks>>8) as u8
+}
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static ACKS: AtomicU64 = AtomicU64::new(0);
@@ -128,6 +164,18 @@ unsafe fn apic_write(offset: usize, value: u32) {
 pub extern "C" fn wolfos_apic_timer_irq_dispatch(
     frame_ptr: *const kernel_trap_frame::KernelTrapFrame,
 ) -> *const kernel_trap_frame::KernelTrapFrame {
+    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    if crate::user_yield_switch_smoke::timer_irq_active() {
+        // This is the genuine CPL3 five-word hardware privilege-switch
+        // frame; unlike the legacy CPL0 kernel timer test, the saved RSP
+        // and SS are architecturally present and belong to the user.
+        // Timer callback EOIs through supervisor-only HIGH MMIO in the
+        // currently active private CR3, not the inaccessible low alias.
+        return crate::user_yield_switch_smoke::observe_timer_irq(
+            frame_ptr.cast()
+        ).cast();
+    }
+
     // SAFETY: BSP-only installed assembly IRQ entry passes RSP after 15
     // aligned pushes on the active kernel stack. The pointer is valid only
     // during this dispatch and is never retained after the callback.
@@ -340,7 +388,7 @@ fn prove_read_only_interrupt_frame() -> bool {
     ok
 }
 
-fn run_mapped_test(expected_id: u32) -> bool {
+fn run_mapped_test(expected_id: u32, hhdm:u64) -> bool {
     // Enter with IF=0, and leave with IF=0 on every path.
     // SAFETY: called only after the alias exists and is verified to point
     // to the BSP's enabled xAPIC MMIO base.
@@ -417,6 +465,19 @@ fn run_mapped_test(expected_id: u32) -> bool {
         "WOLFOS_APIC_TIMER_BEGIN vector={} count={} divisor={} required={}\n",
         TIMER_VECTOR, initial_count, DIVISOR, TICKS_REQUIRED
     ));
+    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    {
+        USER_SVR.store(original_svr,Ordering::Release);
+        USER_PIC_MASKS.store(
+            u32::from(original_master)|(u32::from(original_slave)<<8),
+            Ordering::Release);
+        USER_TIMER_CONFIGURED.store(true,Ordering::Release);
+        // Existing hardware verified MMIO UC map, real LVT and IDT are
+        // ready. The user module now creates a SECOND HIGH MMIO alias
+        // visible in both private CR3s. No userspace IRQ is yet enabled.
+        serial::write_line("WOLFOS_BOOT_OK");
+        crate::user_yield_switch_smoke::enter(hhdm);
+    }
     x86_64::instructions::interrupts::enable();
     // Prove *all 15 GPRs* survive involuntary IRQs in a register-only
     // assembly busy loop, then independently observe the Rust worker's frame.
@@ -533,7 +594,7 @@ pub fn verify(expected_id: u32, hhdm: u64, entries: &[&Entry]) -> bool {
     let correct_mapping = mapper.translate_addr(virtual_addr)
         .map(|a| a.as_u64()) == Some(base);
     let result = if correct_mapping {
-        run_mapped_test(expected_id)
+        run_mapped_test(expected_id,hhdm)
     } else {
         serial::write_line("WOLFOS_APIC_TIMER_ERROR map_mismatch");
         false
