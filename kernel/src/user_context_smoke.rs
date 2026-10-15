@@ -92,8 +92,8 @@ pub fn verify() {
         let Ok(plan) = bank.plan_next(&table,current,boot_cr3) else {
             fail("failed_alternating_resume_plan")
         };
-        let wanted = if current == 1 { 2 } else { 1 };
-        if plan.pid != wanted || plan.cr3_root != lease[wanted-1][0]
+        let wanted: usize = if current == 1 { 2 } else { 1 };
+        if plan.pid != wanted as u64 || plan.cr3_root != lease[wanted-1][0]
             || plan.rsp0 != stack(wanted-1).top
             || plan.frame.registers.r12 != signatures[wanted-1]
             || plan.frame.registers.r13 != signatures[wanted-1] ^ u64::MAX
