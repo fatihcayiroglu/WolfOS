@@ -18,7 +18,7 @@ ENTER = re.compile(
 MARKERS = (
     "WOLFOS_ELF_ID_OK cpl3=1 return_rax=0x574f4c46",
     "WOLFOS_ELF_ADD_OK cpl3=1 return_rax=42",
-    "Hello from WolfOS!\r\n",
+    "Hello from WolfOS!\n",
     "WOLFOS_ELF_HELLO_OK bytes=19 syscall_iretq=19",
     "WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22",
     "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1",
@@ -48,7 +48,7 @@ def main() -> int:
         except FileNotFoundError:
             print("FAIL: qemu-system-x86_64 unavailable")
             return 2
-        output = serial.read_text(errors="replace") if serial.exists() else ""
+        # Path.read_text() uses universal newline conversion: COM1 CRLF is\n        # correctly presented as LF. Still insist on ONE complete line.\n        output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
         entry = ENTER.search(output)
         if not entry or not 1 <= int(entry.group(1)) <= 255:
