@@ -45,6 +45,9 @@ user-file-io-smoke = ["smoke-exit"]
 process-table-smoke = ["smoke-exit"]
 user-context-smoke = ["smoke-exit"]
 kernel-stack-lease-smoke = ["smoke-exit"]
+kernel-stack-guard-smoke = ["smoke-exit"]
+kernel-stack-guard-fault-smoke = ["smoke-exit"]
+kernel-stack-guard-upper-fault-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"

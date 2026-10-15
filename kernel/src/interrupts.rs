@@ -436,6 +436,19 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         "WOLFOS_EXCEPTION_PF vector=14 address={:?} flags={:?} rip={:?}\n",
         address, code, frame.instruction_pointer
     ));
+    #[cfg(any(feature = "kernel-stack-guard-fault-smoke",
+              feature = "kernel-stack-guard-upper-fault-smoke"))]
+    if matches!(address, Ok(address) if
+        crate::kernel_stack_guard_smoke::expected_fault(
+            address.as_u64(), code.bits(), frame.instruction_pointer.as_u64())
+    ) {
+        serial::write_fmt(format_args!(
+            "WOLFOS_STACK_GUARD_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\n",
+            if cfg!(feature="kernel-stack-guard-upper-fault-smoke") { "upper" }
+            else { "lower" }
+        ));
+        serial::qemu_exit_success();
+    }
     #[cfg(feature = "paging-fault-smoke")]
     if matches!(address, Ok(fault_address) if fault_address.as_u64() == crate::paging::TEST_VIRTUAL_ADDRESS)
         && !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
