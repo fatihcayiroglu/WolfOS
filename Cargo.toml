@@ -43,6 +43,7 @@ user-vfs-smoke = ["smoke-exit"]
 user-copy-smoke = ["smoke-exit"]
 user-file-io-smoke = ["smoke-exit"]
 process-table-smoke = ["smoke-exit"]
+user-context-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"

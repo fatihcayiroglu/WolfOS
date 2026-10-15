@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 #[path = "process_lifecycle.rs"]
-mod standalone_process;
+pub(crate) mod standalone_process;
 #[cfg(test)]
 use standalone_process::{ProcessError, ProcessRecord, ProcessState};
 #[cfg(not(test))]
@@ -53,6 +53,13 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
 
     pub fn running(&self) -> usize {
         self.slots.iter().filter(|p| p.state == ProcessState::Running).count()
+    }
+    /// A supplied supervisor CR3 must not alias ANY resident user process,
+    /// including a READY process with no prepared resume context yet.
+    pub fn owns_live_cr3(&self, root: u64) -> bool {
+        root != 0 && self.slots.iter().any(|p|
+            Self::live(p.state) && p.cr3_root == root
+        )
     }
 
     fn live(state: ProcessState) -> bool {

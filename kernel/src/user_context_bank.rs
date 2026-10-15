@@ -1,0 +1,352 @@
+//! PID-bound saved CPL3 trap frames, private CR3 ownership and RSP0 stacks.
+//!
+//! This is a *preflight/context storage* facility. It deliberately DOES NOT
+//! write CR3, TSS.RSP0, switch xstate, execute IRETQ, or schedule userspace.
+//! A later hardware gate must pin mappings and perform those operations.
+//! Only a verified kernel trap (or explicit bootstrap) may supply a frame.
+//! The stored whole 15-GPR + 5-word IRETQ frame can be passed to the
+//! existing assembly entry once the independently audited handoff exists.
+#[cfg(test)]
+#[path = "user_syscall_abi.rs"]
+mod standalone_abi;
+#[cfg(test)]
+use standalone_abi::{valid_user_rflags, UserSyscallFrame, FRAME_BYTES};
+#[cfg(not(test))]
+use crate::user_syscall_abi::{valid_user_rflags, UserSyscallFrame, FRAME_BYTES};
+#[cfg(test)]
+#[path = "process_table.rs"]
+mod standalone_table;
+#[cfg(test)]
+use standalone_table::ProcessTable;
+#[cfg(not(test))]
+use crate::process_table::ProcessTable;
+#[cfg(test)]
+use standalone_table::standalone_process::ProcessState;
+#[cfg(not(test))]
+use crate::process_lifecycle::ProcessState;
+
+pub const KSTACK_BYTES: u64 = 16 * 1024;
+const USER_MIN: u64 = 0x10000;
+const USER_END: u64 = 0x0000_8000_0000_0000;
+const KERNEL_START: u64 = 0xffff_8000_0000_0000;
+const PHYS_END: u64 = 1 << 52;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextError {
+    InvalidPid, NotResident, WrongState, BadCr3,
+    BadUserPointer, BadSelectors, BadFlags,
+    BadKernelStack, KernelStackOverlap, FrameOutsideKernelStack,
+    AlreadyPrepared, Full, NotPrepared, OnlyOnePrepared, ActiveUserCr3,
+    StaleProcess, NotRetired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOrigin {
+    /// Kernel-created initial frame, NOT captured from actual user execution.
+    Bootstrap,
+    /// Real, checked TSS.RSP0 interrupt stack copy; PID is RUNNING under CR3.
+    HardwareTrap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KernelStack {
+    pub bottom: u64,
+    pub top: u64,
+}
+
+impl KernelStack {
+    pub fn valid(self) -> bool {
+        self.bottom >= KERNEL_START
+            && self.bottom & 15 == 0 && self.top & 15 == 0
+            && self.bottom.checked_add(KSTACK_BYTES) == Some(self.top)
+    }
+    pub fn overlaps(self, other: Self) -> bool {
+        self.bottom < other.top && other.bottom < self.top
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoredUserFrame {
+    pub pid: u64,
+    pub cr3_root: u64,
+    pub kernel_stack: KernelStack,
+    pub frame: UserSyscallFrame,
+    pub origin: FrameOrigin,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResumePlan {
+    pub pid: u64,
+    pub cr3_root: u64,
+    pub rsp0: u64,
+    pub frame: UserSyscallFrame,
+    pub origin: FrameOrigin,
+}
+
+/// Fixed table stores whole register/IRET frames, never pointers into a
+/// previous trap stack. This prevents a later interrupt stack overwrite
+/// from changing the stored return frame. The caller still must validate
+/// all mapped pages and active hardware state immediately before IRETQ.
+pub struct UserContextBank<const SLOTS: usize> {
+    entries: [Option<StoredUserFrame>; SLOTS],
+}
+
+impl<const SLOTS: usize> UserContextBank<SLOTS> {
+    pub const fn new() -> Self { Self { entries: [None; SLOTS] } }
+
+    pub fn count(&self) -> usize {
+        self.entries.iter().filter(|x| x.is_some()).count()
+    }
+
+    pub fn snapshot(&self, pid: u64) -> Option<StoredUserFrame> {
+        self.entries.iter().flatten().copied().find(|x| x.pid == pid)
+    }
+
+    fn validate_frame(frame: &UserSyscallFrame) -> Result<(), ContextError> {
+        if !(USER_MIN..USER_END).contains(&frame.hardware.rip)
+            || !(USER_MIN..USER_END).contains(&frame.hardware.rsp)
+        { return Err(ContextError::BadUserPointer) }
+        let cs = frame.hardware.cs;
+        let ss = frame.hardware.ss;
+        if cs > u16::MAX as u64 || ss > u16::MAX as u64
+            || cs & 7 != 3 || ss & 7 != 3
+            || cs & !7 == 0 || ss & !7 == 0
+            || cs & 4 != 0 || ss & 4 != 0
+            || cs >> 3 == ss >> 3
+        { return Err(ContextError::BadSelectors) }
+        if !valid_user_rflags(frame.hardware.rflags) {
+            return Err(ContextError::BadFlags)
+        }
+        Ok(())
+    }
+
+    fn insert<const N: usize>(
+        &mut self, table: &ProcessTable<SLOTS, N>,
+        pid: u64, root: u64, stack: KernelStack, frame: UserSyscallFrame,
+        origin: FrameOrigin, trap_at: Option<u64>,
+    ) -> Result<(), ContextError> {
+        if pid == 0 { return Err(ContextError::InvalidPid) }
+        let process = table.snapshot(pid).ok_or(ContextError::NotResident)?;
+        if process.cr3_root != root || root == 0 || root & 4095 != 0
+            || root >= PHYS_END
+        { return Err(ContextError::BadCr3) }
+        if process.state != (match origin {
+            FrameOrigin::Bootstrap => ProcessState::Ready,
+            FrameOrigin::HardwareTrap => ProcessState::Running,
+        }) { return Err(ContextError::WrongState) }
+        if !stack.valid() { return Err(ContextError::BadKernelStack) }
+        Self::validate_frame(&frame)?;
+        if let Some(at) = trap_at {
+            if at & 7 != 0 || at < stack.bottom
+                || at.checked_add(FRAME_BYTES as u64)
+                    .is_none_or(|end| end > stack.top)
+            { return Err(ContextError::FrameOutsideKernelStack) }
+        } else if origin != FrameOrigin::Bootstrap {
+            return Err(ContextError::FrameOutsideKernelStack)
+        }
+        // Duplicate PIDs and overlapping per-process kernel RSP0 stacks
+        // are rejected independently of private userspace PMM ownership.
+        if self.snapshot(pid).is_some() {
+            return Err(ContextError::AlreadyPrepared)
+        }
+        if self.entries.iter().flatten().any(|x| x.kernel_stack.overlaps(stack)) {
+            return Err(ContextError::KernelStackOverlap)
+        }
+        let slot = self.entries.iter().position(Option::is_none)
+            .ok_or(ContextError::Full)?;
+        self.entries[slot] = Some(StoredUserFrame {
+            pid, cr3_root: root, kernel_stack: stack, frame, origin,
+        });
+        Ok(())
+    }
+
+    /// Seed initial IRETQ-like frame from an audited loader plan. The caller
+    /// must ensure lower-half RIP/RSP are backed by this process's own pages;
+    /// this metadata check by itself does NOT prove a page is mapped.
+    pub fn prepare_bootstrap<const N: usize>(
+        &mut self, table: &ProcessTable<SLOTS,N>,
+        pid: u64, root: u64, stack: KernelStack, frame: UserSyscallFrame,
+    ) -> Result<(), ContextError> {
+        self.insert(table, pid, root, stack, frame, FrameOrigin::Bootstrap, None)
+    }
+
+    /// Snapshot the entire hardware trap, but only from a live PID whose
+    /// actual CR3 is independently checked by the caller at the trap site.
+    /// This DOES NOT suspend the process or switch the CPU.
+    pub fn capture_trap<const N: usize>(
+        &mut self, table: &ProcessTable<SLOTS,N>,
+        pid: u64, actual_cr3: u64, stack: KernelStack, trap_at: u64,
+        frame: UserSyscallFrame,
+    ) -> Result<(), ContextError> {
+        self.insert(table, pid, actual_cr3, stack, frame,
+                    FrameOrigin::HardwareTrap, Some(trap_at))
+    }
+
+    /// Return next *metadata* candidate in PID order. The supplied boot CR3
+    /// MUST be read from actual hardware on a disjoint supervisor stack.
+    /// Does not mutate process state or activate any context. It refuses a
+    /// still-live user CR3 to avoid authorizing an unsafe return.
+    pub fn plan_next<const N: usize>(
+        &self, table: &ProcessTable<SLOTS,N>, current_pid: u64,
+        actual_kernel_cr3: u64,
+    ) -> Result<ResumePlan, ContextError> {
+        if actual_kernel_cr3 == 0 || actual_kernel_cr3 & 4095 != 0
+            || actual_kernel_cr3 >= PHYS_END
+        { return Err(ContextError::BadCr3) }
+        // Check every live PID in the ownership registry, not just
+        // prepared frames: an unprepared READY process also owns its CR3.
+        if table.owns_live_cr3(actual_kernel_cr3) {
+            return Err(ContextError::ActiveUserCr3)
+        }
+        if self.snapshot(current_pid).is_none() {
+            return Err(ContextError::NotPrepared)
+        }
+        let mut eligible = 0;
+        let mut best_above: Option<StoredUserFrame> = None;
+        let mut best_any: Option<StoredUserFrame> = None;
+        for ctx in self.entries.iter().flatten().copied() {
+            let process = table.snapshot(ctx.pid).ok_or(ContextError::StaleProcess)?;
+            if process.cr3_root != ctx.cr3_root { return Err(ContextError::StaleProcess) }
+            if process.cr3_root == actual_kernel_cr3 {
+                return Err(ContextError::ActiveUserCr3)
+            }
+            if !matches!(process.state, ProcessState::Ready | ProcessState::Running) {
+                return Err(ContextError::WrongState)
+            }
+            if !ctx.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
+            Self::validate_frame(&ctx.frame)?;
+            if ctx.pid != current_pid {
+                eligible += 1;
+                if best_any.is_none_or(|old| ctx.pid < old.pid) { best_any = Some(ctx); }
+                if ctx.pid > current_pid
+                    && best_above.is_none_or(|old| ctx.pid < old.pid) {
+                    best_above = Some(ctx);
+                }
+            }
+        }
+        if eligible == 0 { return Err(ContextError::OnlyOnePrepared) }
+        let next = best_above.or(best_any).ok_or(ContextError::OnlyOnePrepared)?;
+        Ok(ResumePlan { pid: next.pid, cr3_root: next.cr3_root,
+            rsp0: next.kernel_stack.top, frame: next.frame, origin: next.origin })
+    }
+
+    /// A context can be removed only after ProcessTable has revoked that
+    /// PID via cancellation/reaping; never free a saved live trap frame.
+    pub fn retire<const N: usize>(
+        &mut self, table: &ProcessTable<SLOTS,N>, pid: u64,
+    ) -> Result<(), ContextError> {
+        let index = self.entries.iter().position(|e| e.is_some_and(|x| x.pid == pid))
+            .ok_or(ContextError::NotPrepared)?;
+        if table.snapshot(pid).is_some() { return Err(ContextError::NotRetired) }
+        self.entries[index] = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frames(start: u64) -> [u64;7] {
+        core::array::from_fn(|i| start + (i as u64) * 4096)
+    }
+    fn stack(at: u64) -> KernelStack {
+        KernelStack { bottom: at, top: at + KSTACK_BYTES }
+    }
+    fn frame(rip: u64, marker: u64) -> UserSyscallFrame {
+        let mut x = UserSyscallFrame::default();
+        x.hardware.rip = rip;
+        x.hardware.rsp = 0x405000;
+        x.hardware.cs = 0x2b;
+        x.hardware.ss = 0x23;
+        x.hardware.rflags = 0x2;
+        x.registers.rax = marker;
+        x.registers.r12 = marker.wrapping_mul(3);
+        x
+    }
+    fn two() -> (ProcessTable<2,7>,UserContextBank<2>) {
+        let mut t = ProcessTable::new();
+        t.reserve(0x1000,frames(0x1000)).unwrap();
+        t.reserve(0x10000,frames(0x10000)).unwrap();
+        (t,UserContextBank::new())
+    }
+
+    #[test]
+    fn whole_frames_survive_interleaved_selection_and_pid_revocation() {
+        let (mut t, mut bank) = two();
+        let a = frame(0x401000, 11);
+        let b = frame(0x402000, 22);
+        bank.prepare_bootstrap(&t, 1, 0x1000, stack(0xffff_8000_0010_0000), a).unwrap();
+        bank.prepare_bootstrap(&t, 2, 0x10000, stack(0xffff_8000_0011_0000), b).unwrap();
+        for i in 0..128 {
+            let from = if i % 2 == 0 { 1 } else { 2 };
+            let planned = bank.plan_next(&t, from, 0x90000).unwrap();
+            assert_eq!(planned.pid, if from == 1 { 2 } else { 1 });
+            assert_eq!(planned.frame, if from == 1 { b } else { a });
+            assert_eq!(planned.origin, FrameOrigin::Bootstrap);
+        }
+        assert_eq!(bank.retire(&t,1),Err(ContextError::NotRetired));
+        t.cancel_ready(1,0x90000).unwrap();
+        assert_eq!(bank.plan_next(&t,2,0x90000),Err(ContextError::StaleProcess));
+        bank.retire(&t,1).unwrap();
+        let pid3 = t.reserve(0x20000,frames(0x20000)).unwrap();
+        assert_eq!(pid3,3);
+        let c = frame(0x403000,33);
+        bank.prepare_bootstrap(&t,3,0x20000,stack(0xffff_8000_0010_0000),c).unwrap();
+        assert_eq!(bank.plan_next(&t,2,0x90000).unwrap().pid,3);
+    }
+
+    #[test]
+    fn fails_closed_on_aliasing_kernel_stacks_invalid_frames_and_roots() {
+        let (t, mut bank) = two();
+        let bottom = 0xffff_8000_0010_0000;
+        let clean = frame(0x401000,1);
+        bank.prepare_bootstrap(&t,1,0x1000,stack(bottom),clean).unwrap();
+        assert_eq!(bank.prepare_bootstrap(&t,2,0x10000,stack(bottom + 0x2000),clean),
+            Err(ContextError::KernelStackOverlap));
+        assert_eq!(bank.prepare_bootstrap(&t,2,0x1000,stack(bottom + 0x10000),clean),
+            Err(ContextError::BadCr3));
+        let mut bad = clean;
+        bad.hardware.cs = 8;
+        assert_eq!(bank.prepare_bootstrap(&t,2,0x10000,stack(bottom + 0x10000),bad),
+            Err(ContextError::BadSelectors));
+        bad = clean; bad.hardware.rflags = 0x202;
+        assert_eq!(bank.prepare_bootstrap(&t,2,0x10000,stack(bottom + 0x10000),bad),
+            Err(ContextError::BadFlags));
+        bad = clean; bad.hardware.rip = u64::MAX;
+        assert_eq!(bank.prepare_bootstrap(&t,2,0x10000,stack(bottom + 0x10000),bad),
+            Err(ContextError::BadUserPointer));
+        assert_eq!(bank.plan_next(&t,1,0x10000),Err(ContextError::ActiveUserCr3));
+        assert_eq!(bank.count(),1);
+    }
+
+    #[test]
+    fn hardware_capture_requires_running_pid_and_in_stack_iret_frame() {
+        let (mut t,mut bank) = two();
+        let x = frame(0x401080,73);
+        let k = stack(0xffff_8000_0010_0000);
+        assert_eq!(bank.capture_trap(&t,1,0x1000,k,k.top - 256,x),
+            Err(ContextError::WrongState));
+        t.mark_running(1,0x1000).unwrap();
+        assert_eq!(bank.capture_trap(&t,1,0x10000,k,k.top - 256,x),
+            Err(ContextError::BadCr3));
+        assert_eq!(bank.capture_trap(&t,1,0x1000,k,k.bottom,x),
+            Ok(()));
+        assert_eq!(bank.snapshot(1).unwrap().frame.registers.r12,219);
+        assert_eq!(bank.capture_trap(&t,1,0x1000,k,k.top - 16,x),
+            Err(ContextError::FrameOutsideKernelStack));
+        assert_eq!(bank.count(),1);
+    }
+
+    #[test]
+    fn empty_banks_and_unavailable_next_fail_closed() {
+        let (t,mut bank) = two();
+        assert_eq!(bank.plan_next(&t,1,0x90000),Err(ContextError::NotPrepared));
+        bank.prepare_bootstrap(&t,1,0x1000,stack(0xffff_8000_0010_0000),
+            frame(0x401000,1)).unwrap();
+        assert_eq!(bank.plan_next(&t,1,0x90000),Err(ContextError::OnlyOnePrepared));
+        assert_eq!(bank.prepare_bootstrap(&t,1,0x1000,stack(0xffff_8000_0012_0000),
+            frame(0x401000,1)),Err(ContextError::AlreadyPrepared));
+        assert_eq!(bank.count(),1);
+    }
+}
