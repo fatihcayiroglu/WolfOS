@@ -15,6 +15,8 @@ mod cpu;
 mod pmm;
 mod pmm_layout;
 mod interrupts;
+#[cfg(feature = "user-ring-prep-smoke")]
+mod user_ring_entry;
 mod pci;
 mod paging;
 #[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke"))]
@@ -175,6 +177,11 @@ pub extern "C" fn kmain() -> ! {
     serial::write_line("WOLFOS_LIMINE_OK");
     cpu::log_identity();
     interrupts::initialize();
+    #[cfg(feature = "user-ring-prep-smoke")]
+    if !interrupts::verify_ring3_preconditions() {
+        serial::write_line("WOLFOS_RING_PREP_TEST_FAILED");
+        halt_forever();
+    }
     #[cfg(feature = "exception-smoke")]
     interrupts::trigger_invalid_opcode();
 
