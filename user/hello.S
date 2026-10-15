@@ -55,6 +55,64 @@ _after_putc:
     dec ecx
     jnz print_loop
 
+    .ifdef WOLFOS_FILE_IO
+    // Open a real VFS file by passing a user-mode pointer into RX ELF
+    // text. File handles are opaque PID-owned generation tokens.
+    mov eax, 5
+    lea rdi, [rip + file_path]
+    mov esi, file_path_end - file_path
+    int 0x80
+_after_file_open:
+    test rax, rax
+    js fail
+    test rax, rax
+    jz fail
+    mov r12, rax
+
+    // Read actual file bytes INTO a writable ELF .bss user buffer.
+    mov eax, 6
+    mov rdi, r12
+    lea rsi, [rip + uninitialized]
+    mov edx, 8
+    int 0x80
+_after_file_read:
+    cmp rax, 8
+    jne fail
+    mov r8, 0x0a4b4f5f454c4946     # little endian "FILE_OK\n"
+    mov r9, qword ptr [rip + uninitialized]
+    cmp r8, r9
+    jne fail
+
+    // A malicious READ into executable RX text MUST return -EFAULT and
+    // leave VFS descriptor cursor and protected user code unchanged.
+    mov eax, 6
+    mov rdi, r12
+    lea rsi, [rip + file_path]
+    mov edx, 8
+    int 0x80
+_after_file_bad_read:
+    cmp rax, -14
+    jne fail
+
+    mov eax, 7
+    mov rdi, r12
+    xor esi, esi
+    int 0x80
+_after_file_close:
+    test rax, rax
+    jne fail
+
+    // Kernel virtual pointer is not user accessible, even though it is
+    // canonically addressed and kernel CR3 maps the higher half.
+    mov eax, 5
+    mov rdi, 0xffff800000000000
+    mov esi, file_path_end - file_path
+    int 0x80
+_after_file_bad_open:
+    cmp rax, -14
+    jne fail
+    .endif
+
     mov eax, 3
     xor edi, edi
     xor esi, esi
@@ -66,6 +124,11 @@ fail:
 hello_text:
     .ascii "Hello from WolfOS!\n"
 hello_end:
+    .ifdef WOLFOS_FILE_IO
+file_path:
+    .ascii "/tmp/user.txt"
+file_path_end:
+    .endif
 
 .section .data
 .global fixture_magic
