@@ -568,9 +568,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
         unsafe{fx_state::leave(s.control);}
         let escape=s.boot_rsp;
-        #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+        #[cfg(feature = "p2-ring3-irq-ready-smoke")]
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0"
+        );
+        #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+        serial::write_line(
+            "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=1"
         );
         #[cfg(feature = "p2-ring3-timer-observe-smoke")]
         {
