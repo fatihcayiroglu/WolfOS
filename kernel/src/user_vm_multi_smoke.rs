@@ -151,7 +151,13 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
             || active[hhdm_idx] & 1 == 0
             || root[kernel_idx] != active[kernel_idx]
             || root[hhdm_idx] != active[hhdm_idx]
-        { return false; }
+        {
+            serial::write_fmt(format_args!(
+                "WOLFOS_USER_GRAFT_DIAG copied={copied:?} audit={audited:?} kernel_idx={} kernel_entry={:#x} hhdm_idx={} hhdm_entry={:#x} user_entry={:#x}\n",
+                kernel_idx, active[kernel_idx], hhdm_idx, active[hhdm_idx], old_user_entry,
+            ));
+            return false;
+        }
 
         first[0x100] == 0xc3
             && first.iter().enumerate().all(|(i, b)| *b == if i == 0x100 { 0xc3 } else { 0 })
