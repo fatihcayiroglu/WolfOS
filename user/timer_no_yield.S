@@ -32,7 +32,7 @@ _work_end:
     movq r15, xmm0
     cmp r15, r14
     jne failed
-    mov eax, 3                   // WolfOS experimental EXIT syscall.
+    mov eax, 3                   # WolfOS experimental EXIT syscall.
     xor edi, edi
     xor esi, esi
     int 0x80
