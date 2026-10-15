@@ -18,6 +18,9 @@ use crate::{
     user_fx_bank::{FxImage,FxHandle,UserFxBank},
     fx_state,kernel_half_shadow,interrupts,pmm,serial,
 };
+#[cfg(feature = "p2-ring3-irq-ready-smoke")]
+use crate::user_irq_preempt_contract::{self,Evidence};
+
 mod sym {include!(concat!(env!("OUT_DIR"),"/wolfos_yield_symbols.rs"));}
 const ELFS:[&[u8];2]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-1.elf")),
@@ -30,10 +33,34 @@ const P:u64=1;const W:u64=2;const U:u64=4;const NX:u64=1<<63;
 const CODE:u64=0x401000;const DATA:u64=0x403000;
 const STACK:u64=0x404000;const USER_TOP:u64=STACK+PAGE;
 const TEST_YIELD:u64=9;
+#[cfg(feature = "p2-ring3-irq-ready-smoke")]
+const IRQ_USER_RFLAGS:u64=0x202;
+#[cfg(feature = "p2-ring3-irq-ready-smoke")]
+fn pic_read(port:u16)->u8{
+    let value:u8;
+    // SAFETY: exclusive BSP x86 I/O access, PIC queried only in isolated
+    // QEMU while maskable IRQs are off in privileged code.
+    unsafe{asm!("in al, dx",in("dx")port,lateout("al")value,
+        options(nostack,nomem,preserves_flags));}
+    value
+}
+#[cfg(feature = "p2-ring3-irq-ready-smoke")]
+fn pic_write(port:u16,value:u8){
+    // SAFETY: only BSP owns PIC mask ports while APs are parked.
+    unsafe{asm!("out dx, al",in("dx")port,in("al")value,
+        options(nostack,nomem,preserves_flags));}
+}
+
 const TRAPS:usize=10;
 const ROUNDS:u64=4;
 const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002];
 
+fn valid_test_user_flags(flags:u64)->bool{
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+    {user_irq_preempt_contract::safe_irq_user_flags(flags)}
+    #[cfg(not(feature = "p2-ring3-irq-ready-smoke"))]
+    {user_syscall_abi::valid_user_rflags(flags)}
+}
 fn fail(why:&str)->!{
     serial::write_fmt(format_args!("WOLFOS_RING3_YIELD_ERROR {why}\n"));
     crate::halt_forever()
@@ -68,6 +95,8 @@ struct Runtime{
     yields:[u64;COUNT],
     exits:[bool;COUNT],
     hardware_traps:usize,
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+    pic_before:[u8;2],
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // SAFETY: only one BSP may access the runtime; IF=0 from admission until
@@ -185,10 +214,17 @@ pub fn enter(hhdm:u64)->!{
         let s=arena.reserve((i+1) as u64,
             [phys[b],phys[b+1],phys[b+2],phys[b+3]])
             .unwrap_or_else(|_|fail("guarded_pid_stack"));
-        if user_ring_entry::validate(Ring3Entry{
+        let entry_contract=Ring3Entry{
             rip:entry(i),user_rsp:USER_TOP,kernel_rsp0:s.top,
-            user_cs:cs,user_ss:ss,rflags:2,
-        }).is_err(){fail("strict_ring3_entry_metadata")}
+            user_cs:cs,user_ss:ss,
+            rflags:if cfg!(feature="p2-ring3-irq-ready-smoke") {0x202}else{2},
+        };
+        let validated=if cfg!(feature="p2-ring3-irq-ready-smoke") {
+            user_ring_entry::validate_interruptible(entry_contract)
+        } else {
+            user_ring_entry::validate(entry_contract)
+        };
+        if validated.is_err(){fail("strict_ring3_entry_metadata")}
         stacks[i]=Some(s);
         let at=ARENA_FRAMES+i*PER_PID;
         leases[i].copy_from_slice(&phys[at..at+PER_PID]);
@@ -217,6 +253,18 @@ pub fn enter(hhdm:u64)->!{
     // which the audited arena already tolerates, while still denying U/S.
     let first=stacks[0].unwrap_or_else(||fail("pid1_missing_stack"));
     let second=stacks[1].unwrap_or_else(||fail("pid2_missing_stack"));
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+    let pic_before=[pic_read(0x21),pic_read(0xa1)];
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+    {
+        // Explicitly mask both legacy PICs before enabling CPL3 IF; the
+        // local xAPIC timer is still intentionally NOT armed here.
+        pic_write(0x21,0xff);
+        pic_write(0xa1,0xff);
+        if pic_read(0x21)!=0xff || pic_read(0xa1)!=0xff {
+            fail("pic_mask_before_interruptible_cpl3")
+        }
+    }
     let control=unsafe{fx_state::enter()}
         .unwrap_or_else(||fail("fx_enable"));
     let baseline=unsafe{FxImage::capture_baseline()};
@@ -229,9 +277,13 @@ pub fn enter(hhdm:u64)->!{
     let mut boot_rsp:u64;
     unsafe{asm!("mov {}, rsp",out(reg)boot_rsp,
         options(nomem,nostack,preserves_flags));}
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+    let entry_flags=IRQ_USER_RFLAGS;
+    #[cfg(not(feature = "p2-ring3-irq-ready-smoke"))]
+    let entry_flags=2u64;
     let bootstrap=UserSyscallFrame{
         hardware:user_syscall_abi::InterruptReturn{
-            rip:entry(1),cs:cs as u64,rflags:2,
+            rip:entry(1),cs:cs as u64,rflags:entry_flags,
             rsp:USER_TOP,ss:ss as u64,
         },
         ..UserSyscallFrame::default()
@@ -246,6 +298,8 @@ pub fn enter(hhdm:u64)->!{
         fx_tokens:[tokens[0].unwrap(),tokens[1].unwrap()],
         control,frames:[0,second_frame],current:0,
         yields:[0;COUNT],exits:[false;COUNT],hardware_traps:0,
+        #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+        pic_before,
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
@@ -281,7 +335,7 @@ pub fn enter(hhdm:u64)->!{
             "iretq",
             ss=in(reg)ss as u64,
             rsp=in(reg)USER_TOP,
-            flags=in(reg)2u64,
+            flags=in(reg)entry_flags,
             cs=in(reg)cs as u64,
             rip=in(reg)entry(0),
             options(noreturn),
@@ -316,11 +370,33 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     let (cs,ss,_)=interrupts::ring3_cpu_state();
     if f.hardware.cs!=cs as u64||f.hardware.ss!=ss as u64
         ||f.hardware.rsp!=USER_TOP
-        ||!user_syscall_abi::valid_user_rflags(f.hardware.rflags)
+        ||!valid_test_user_flags(f.hardware.rflags)
         ||f.registers.r12!=pid
         ||f.registers.r14!=USER_ID[i]
         ||f.registers.rdi!=0||f.registers.rsi!=0 {
         fail("real_user_gpr_iret_frame")
+    }
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+    {
+        // These checks run on *real* INT80 hardware capture while CPL3
+        // had IF=1. The trap is still voluntary; timer IRQ is NOT armed.
+        let evidence=Evidence {
+            pid,expected_pid:(i+1) as u64,
+            actual_cr3:active_root,owned_cr3:s.leases[i][0],
+            actual_rsp0:interrupts::test_actual_rsp0(),
+            owned_stack_bottom:st.bottom,owned_stack_top:st.top,
+            actual_frame_address:raw as u64,
+            user_rip:f.hardware.rip,user_rsp:f.hardware.rsp,
+            user_cs:f.hardware.cs,user_ss:f.hardware.ss,
+            user_rflags:f.hardware.rflags,
+            fpu_owner_pid:s.fx.active_pid().unwrap_or(0),
+        };
+        if user_irq_preempt_contract::validate(evidence).is_err() {
+            fail("interruptible_ring3_irq_frame_or_pid_ownership")
+        }
+        if pic_read(0x21)!=0xff || pic_read(0xa1)!=0xff {
+            fail("legacy_pic_unmasked_in_interruptible_guest")
+        }
     }
     let val=unsafe{(ptr(s.hhdm,s.leases[i][5]) as *const u64).read_volatile()};
     let n=f.registers.rax;
@@ -370,6 +446,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
         unsafe{fx_state::leave(s.control);}
         let escape=s.boot_rsp;
+        #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+        serial::write_line(
+            "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0"
+        );
         serial::write_line(
             "WOLFOS_RING3_YIELD_HARDWARE_OK native_elves=2 real_cpl3=1 total_traps=10 yields=8 exits=2 iret_cross_pid=9 separate_cr3=1 distinct_guarded_rsp0=1 xmm0_preserved=1"
         );
@@ -462,6 +542,18 @@ extern "C" fn finalize()->! {
         ||s.arena.occupied()!=0||actual_cr3()!=s.boot
         ||unsafe{(*root(s.hhdm,s.boot))[ROOT_INDEX]}!=0{
         fail("post_yield_resource_leak")
+    }
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
+    {
+        if x86_64::instructions::interrupts::are_enabled() {
+            fail("restore_pic_only_with_kernel_if_off")
+        }
+        pic_write(0x21,s.pic_before[0]);
+        pic_write(0xa1,s.pic_before[1]);
+        if pic_read(0x21)!=s.pic_before[0]||pic_read(0xa1)!=s.pic_before[1] {
+            fail("pic_mask_restore")
+        }
+        serial::write_line("WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1");
     }
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=25 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"

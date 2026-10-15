@@ -23,8 +23,9 @@ ERRORS=[
     "WOLFOS_EXCEPTION_PF","WOLFOS_EXCEPTION_DF",
 ]
 def main():
-    if len(sys.argv)!=2 or not Path(sys.argv[1]).is_file():
-        print("Usage: user_yield_switch_smoke.py kernel.iso")
+    irq_ready = len(sys.argv)==3 and sys.argv[2]=="--irq-ready"
+    if len(sys.argv) not in (2,3) or (len(sys.argv)==3 and not irq_ready) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_yield_switch_smoke.py kernel.iso [--irq-ready]")
         return 2
     with tempfile.TemporaryDirectory(prefix="wolfos-real-ring3-yield-") as temp:
         log=Path(temp)/"serial.log"
@@ -45,11 +46,21 @@ def main():
             return 2
         out=log.read_text(errors="replace") if log.exists() else ""
         print(out)
-        loc=[out.find(p) for p in STEPS]
+        checks=STEPS.copy()
+        if irq_ready:
+            checks.insert(3,
+                "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0")
+            checks.insert(5,
+                "WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1")
+        else:
+            if "WOLFOS_RING3_IRQ_READY_OK" in out or "WOLFOS_RING3_IRQ_READY_RESTORE_OK" in out:
+                print("FAIL: interruptible guest evidence in IF=0 legacy flavor")
+                return 1
+        loc=[out.find(p) for p in checks]
         if any(x<0 for x in loc) or loc!=sorted(loc):
             print("FAIL: incomplete or out-of-order real native two-ELF proof")
             return 1
-        if any(out.count(p)!=1 for p in STEPS):
+        if any(out.count(p)!=1 for p in checks):
             print("FAIL: duplicate evidence markers")
             return 1
         if any(x in out for x in ERRORS):
@@ -84,7 +95,7 @@ def main():
             print("FAIL: expected QEMU debug-exit 33, got",r.returncode)
             print(r.stderr.decode(errors="replace"))
             return 1
-        print("PASS: 2 native ELF Ring3 programs, 8 real INT80 yields, 9 cross-PID IRETQ handoffs, 2 exits, zero leaks")
+        print("PASS: 2 native ELF Ring3 programs, 8 real INT80 yields, 9 cross-PID IRETQ handoffs, 2 exits, zero leaks; "+("all ten CPL3 frames IF=1 and PIC masked" if irq_ready else "IF=0 legacy"))
         return 0
 if __name__=="__main__":
     sys.exit(main())

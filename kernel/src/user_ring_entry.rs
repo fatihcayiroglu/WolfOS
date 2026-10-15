@@ -65,6 +65,17 @@ pub fn validate(frame: Ring3Entry) -> Result<(), EntryError> {
     Ok(())
 }
 
+/// Separately authorized *interruptible* Ring3 bootstrap: same strict
+/// RIP/RSP/selector/supervisor RSP0 contract as the historical IF=0
+/// entry, but allow exactly IF=1 and no other additional flag. The
+/// original validate() contract is unchanged for all existing guests.
+pub fn validate_interruptible(frame: Ring3Entry)->Result<(),EntryError>{
+    if frame.rflags != (RFLAGS_FIXED | (1<<9)){
+        return Err(EntryError::InvalidFlags)
+    }
+    validate(Ring3Entry{rflags:RFLAGS_FIXED,..frame})
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +89,23 @@ mod tests {
             user_ss: 0x23,
             rflags: 0x2,
         }
+    }
+
+    #[test]
+    fn independently_authorized_if_enabled_entry_rejects_all_other_privilege_flags(){
+        let mut f=fixture();
+        assert_eq!(validate_interruptible(f),Err(EntryError::InvalidFlags));
+        f.rflags=0x202;
+        assert_eq!(validate_interruptible(f),Ok(()));
+        assert_eq!(validate(f),Err(EntryError::InvalidFlags));
+        for extra in [0x100,0x400,0x1000,0x2000,0x4000,0x10000,0x20000]{
+            f.rflags=0x202|extra;
+            assert_eq!(validate_interruptible(f),Err(EntryError::InvalidFlags));
+        }
+        f=fixture();f.rflags=0x202;f.user_cs=0x8;
+        assert_eq!(validate_interruptible(f),Err(EntryError::InvalidUserSelectors));
+        f=fixture();f.rflags=0x202;f.kernel_rsp0=0;
+        assert_eq!(validate_interruptible(f),Err(EntryError::InvalidKernelStack));
     }
 
     #[test]

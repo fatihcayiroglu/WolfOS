@@ -25,7 +25,8 @@ fn nm_symbol(output: &str, name: &str) -> u64 {
 
 fn main() {
     println!("cargo:rerun-if-changed=user/yield.S");
-    if env::var_os("CARGO_FEATURE_P2_RING3_YIELD_SMOKE").is_some() {
+    if env::var_os("CARGO_FEATURE_P2_RING3_YIELD_SMOKE").is_some()
+        || env::var_os("CARGO_FEATURE_P2_RING3_IRQ_READY_SMOKE").is_some() {
         println!("cargo:rerun-if-changed=user/hello.ld");
         let path=PathBuf::from(env::var_os("OUT_DIR").unwrap());
         fs::create_dir_all(&path).expect("make yield OUT_DIR");

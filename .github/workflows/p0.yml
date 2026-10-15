@@ -73,6 +73,8 @@ jobs:
         run: make p2-handoff-preflight-smoke
       - name: P2 actual two native ELF Ring3 cooperative INT80 yield with distinct guarded RSP0 CR3 FXSAVE64 and complete PMM cleanup
         run: make p2-ring3-yield-smoke
+      - name: P2 two actual native Ring3 ELF IF-enabled contexts with checked PID CR3 TSS FX and masked PIC (QEMU)
+        run: make p2-ring3-irq-ready-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
