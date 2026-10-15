@@ -17,7 +17,7 @@ use crate::context_switch;
 fn hardware_ticks() -> u64 { crate::timer::ticks() }
 
 #[cfg(all(not(feature = "timer-smoke"),
-          any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
+          any(feature = "apic-timer-smoke", feature = "p2-ring3-timer-observe-smoke", feature = "apic-calibration-smoke",
               feature = "apic-preempt-smoke")))]
 fn hardware_ticks() -> u64 { crate::apic_timer_smoke::ticks() }
 
