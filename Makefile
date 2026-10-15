@@ -305,6 +305,8 @@ p2-ring3-timer-preempt-smoke:
 
 test:
 	python3 -m unittest discover -s tests -v
+	rustc --edition=2024 --test kernel/src/ap_preempt_progress_budget.rs -o $(OUT)/ap_preempt_progress_budget_tests
+	$(OUT)/ap_preempt_progress_budget_tests
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/pmm_layout.rs -o $(OUT)/pmm_layout_tests
 	rustc --edition=2024 --test kernel/src/acpi_layout.rs -o $(OUT)/acpi_layout_tests

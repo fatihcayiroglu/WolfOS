@@ -17,7 +17,8 @@ use limine::mp::MpInfo;
 use x86_64::instructions::segmentation::{CS, SS, Segment};
 
 use crate::{
-    ap_ipi_smoke, context_switch, preempt_depth::PreemptDepth, kernel_trap_frame::{
+    ap_ipi_smoke, ap_preempt_progress_budget::IrqProgressBudget,
+    context_switch, preempt_depth::PreemptDepth, kernel_trap_frame::{
         HardwareReturnFrame, KernelTrapFrame, SavedGprs, validate_kernel_resume,
     }, lapic_irq_layout, lapic_timer_layout, lapic_timer_plan, serial,
 };
@@ -32,6 +33,10 @@ const MIN_DEFERRED_PER_AP: u64 = 4;
 const COUNT: u32 = 262_144;
 const DIVISOR: u32 = 16;
 const MAX_SPINS: u64 = 50_000_000;
+// Fail closed even if an endless stream of IRQs keeps renewing idle windows.
+// IRQ arrival replenishes ONLY no-progress budget; never the hard cap.
+const MAX_WORK_POLLS: u64 = MAX_SPINS * 8;
+const MAX_WORK_TICKS: u64 = 64;
 const BSP_WAIT_SPINS: usize = 200_000_000;
 const CANARY: u64 = 0x4150_5052_454d_5054;
 const FX_BYTES: usize = 512;
@@ -424,7 +429,11 @@ fn run_task(task: usize) -> ! {
     }
     let mut success = false;
     if nested {
-    for _ in 0..MAX_SPINS {
+    let mut budget = IrqProgressBudget::new(proof.ticks.load(Ordering::Acquire));
+    while budget.poll(
+        proof.ticks.load(Ordering::Acquire), MAX_SPINS,
+        MAX_WORK_POLLS, MAX_WORK_TICKS,
+    ) {
         proof.work[task].fetch_add(1, Ordering::Relaxed);
         if proof.switches.load(Ordering::Relaxed) >= MIN_SWITCHES
             && proof.interrupted[0].load(Ordering::Relaxed) >= MIN_INTERRUPTS_PER_TASK
