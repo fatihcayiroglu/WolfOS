@@ -39,6 +39,7 @@ user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
 user-process-smoke = ["smoke-exit"]
 user-ramfs-smoke = ["smoke-exit"]
+user-vfs-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"

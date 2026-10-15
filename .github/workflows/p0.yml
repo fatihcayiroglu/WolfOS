@@ -43,6 +43,8 @@ jobs:
         run: make user-process-smoke
       - name: P2 original RamFS staged ELF64 native Hello executes as real Ring3 process and reaps
         run: make user-ramfs-smoke
+      - name: P2 native VFS root/tmp mounts, PID-owned FDs and real ELF64 CPL3 boot
+        run: make user-vfs-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
