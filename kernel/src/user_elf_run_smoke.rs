@@ -43,7 +43,8 @@ const NX: u64 = 1 << 63;
 const SLOTS: usize = 512;
 const FRAMES: usize = 7; // new PML4, PDPT, PD, PT, RX text, RW data/BSS, RW stack
 const STACK_VA: u64 = 0x404000;
-const RETURN_COUNT: usize = if cfg!(feature = "user-copy-smoke") { 3 } else { HELLO.len() + 2 };
+const RETURN_COUNT: usize = if cfg!(feature = "user-file-io-smoke") { 9 }
+    else if cfg!(feature = "user-copy-smoke") { 3 } else { HELLO.len() + 2 };
 const TOTAL_CALLS: usize = RETURN_COUNT + 1;
 
 static ENTRY: AtomicU64 = AtomicU64::new(0);
@@ -53,6 +54,8 @@ static CR3_PHYS: AtomicU64 = AtomicU64::new(0);
 static BOOT_CR3: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BEFORE: AtomicUsize = AtomicUsize::new(0);
 static STAGE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "user-file-io-smoke")]
+static FILE_FD: AtomicU64 = AtomicU64::new(0);
 static OWNED: [AtomicU64; FRAMES] = [const { AtomicU64::new(0) }; FRAMES];
 /// Common audited ownership record for the original ELF smoke and the
 /// two-process lifecycle feature, with monotonic process generations.
@@ -63,8 +66,8 @@ const MAX_RUNS: usize = if cfg!(feature = "user-process-smoke") { 2 } else { 1 }
 
 /// Read only PTEs inside this task's four exclusively owned paging pages.
 /// No unchecked physical address from user inputs can reach the HHDM.
-#[cfg(feature = "user-copy-smoke")]
-fn private_pte(physical: u64) -> Option<u64> {
+#[cfg(any(feature = "user-copy-smoke", feature = "user-file-io-smoke"))]
+pub(crate) fn private_pte(physical: u64) -> Option<u64> {
     let frame = physical & !4095;
     if physical & 7 != 0
         || !OWNED[..4].iter().any(|f| f.load(Ordering::Acquire) == frame)
@@ -75,8 +78,8 @@ fn private_pte(physical: u64) -> Option<u64> {
     Some(unsafe { core::ptr::read_volatile(ptr.cast::<u64>()) })
 }
 
-#[cfg(feature = "user-copy-smoke")]
-fn private_byte(physical: u64) -> Option<u8> {
+#[cfg(any(feature = "user-copy-smoke", feature = "user-file-io-smoke"))]
+pub(crate) fn private_byte(physical: u64) -> Option<u8> {
     let frame = physical & !4095;
     if !OWNED[4..].iter().any(|f| f.load(Ordering::Acquire) == frame) {
         return None
@@ -86,8 +89,8 @@ fn private_byte(physical: u64) -> Option<u8> {
     Some(unsafe { core::ptr::read_volatile(ptr) })
 }
 
-#[cfg(feature = "user-copy-smoke")]
-fn private_rw_byte(physical: u64, value: Option<u8>) -> Option<u8> {
+#[cfg(any(feature = "user-copy-smoke", feature = "user-file-io-smoke"))]
+pub(crate) fn private_rw_byte(physical: u64, value: Option<u8>) -> Option<u8> {
     let frame = physical & !4095;
     if !OWNED[5..].iter().any(|f| f.load(Ordering::Acquire) == frame) {
         return None
@@ -142,6 +145,8 @@ pub fn enter(hhdm: u64) -> ! {
     HHDM_OFFSET.store(hhdm, Ordering::Release);
     #[cfg(feature = "user-vfs-smoke")]
     crate::vfs_smoke::prepare(ELF);
+    #[cfg(feature = "user-file-io-smoke")]
+    crate::user_file_io_smoke::prepare();
     #[cfg(feature = "user-ramfs-smoke")]
     crate::ramfs_smoke::prepare(ELF);
     #[cfg(feature = "user-vfs-smoke")]
@@ -169,6 +174,19 @@ pub fn enter(hhdm: u64) -> ! {
         #[cfg(not(feature = "user-process-smoke"))]
         fail("unreachable_user_reentry");
     }
+    #[cfg(feature = "user-file-io-smoke")]
+    if !(symbols::AFTER_ADD < symbols::FILE_BAD_OPEN
+        && symbols::FILE_BAD_OPEN < symbols::FILE_OPEN
+        && symbols::FILE_OPEN < symbols::FILE_BAD_READ
+        && symbols::FILE_BAD_READ < symbols::FILE_READ
+        && symbols::FILE_READ < symbols::FILE_EOF
+        && symbols::FILE_EOF < symbols::FILE_CLOSE
+        && symbols::FILE_CLOSE < symbols::FILE_STALE_CLOSE
+        && symbols::FILE_STALE_CLOSE <= symbols::AFTER_PUTC
+        && symbols::FILE_PATH >= symbols::HELLO_END
+        && symbols::FILE_PATH_END - symbols::FILE_PATH == 12
+        && symbols::FILE_PATH_END < 0x402000)
+    { fail("independent_file_io_symbols") }
     #[cfg(feature = "user-copy-smoke")]
     if symbols::AFTER_WRITE <= symbols::AFTER_ADD
         || symbols::AFTER_WRITE >= symbols::AFTER_EXIT {
@@ -210,6 +228,18 @@ pub fn enter(hhdm: u64) -> ! {
         .and_then(|begin| begin.checked_add(hello_offset))
         .and_then(|start| elf.get(start..start + HELLO.len()));
     if hello_in_file != Some(&HELLO[..]) { fail("elf_message_content") }
+    #[cfg(feature = "user-file-io-smoke")]
+    {
+        let file_path_offset = usize::try_from(
+            symbols::FILE_PATH - text.virtual_address
+        ).unwrap_or(usize::MAX);
+        let path_from_file = usize::try_from(text.file_offset).ok()
+            .and_then(|begin| begin.checked_add(file_path_offset))
+            .and_then(|start| elf.get(start..start + 12));
+        if path_from_file != Some(&b"/tmp/msg.txt"[..]) {
+            fail("independently_linked_file_path")
+        }
+    }
 
     let (user_cs, user_ss, rsp0) = interrupts::ring3_cpu_state();
     let (boot_frame, _) = Cr3::read();
@@ -301,6 +331,8 @@ pub fn enter(hhdm: u64) -> ! {
         DATA_HHDM.store(ptrs[5] as u64, Ordering::Release);
         CR3_PHYS.store(frames[0], Ordering::Release);
         STAGE.store(0, Ordering::Release);
+        #[cfg(feature = "user-file-io-smoke")]
+        FILE_FD.store(0, Ordering::Release);
         for (at, phys) in frames.iter().copied().enumerate() {
             OWNED[at].store(phys, Ordering::Release);
         }
@@ -363,6 +395,65 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     // pointer is dereferenced; all virtual user inputs are only numbers.
     let frame = unsafe { &mut *raw };
     let base = user_entry - symbols::ENTRY;
+    #[cfg(feature = "user-file-io-smoke")]
+    if stage >= 2 && stage < RETURN_COUNT {
+        let pid = RUN_INDEX.load(Ordering::Acquire) as u64 + 1;
+        let fd = FILE_FD.load(Ordering::Acquire);
+        let (expected_rip, nr, a0, a1, a2, want) = match stage {
+            2 => (symbols::FILE_BAD_OPEN, 6, 0xffff_8000_0000_0000,
+                  12, 0, crate::user_file_io::EFAULT as u64),
+            3 => (symbols::FILE_OPEN, 6, base + symbols::FILE_PATH,
+                  12, 0, 256),
+            4 => (symbols::FILE_BAD_READ, 7, fd,
+                  base + symbols::HELLO_TEXT, 8, crate::user_file_io::EFAULT as u64),
+            5 => (symbols::FILE_READ, 7, fd, user_top - 32, 8, 8),
+            6 => (symbols::FILE_EOF, 7, fd, user_top - 32, 8, 0),
+            7 => (symbols::FILE_CLOSE, 8, fd, 0, 0, 0),
+            8 => (symbols::FILE_STALE_CLOSE, 8, fd, 0, 0,
+                  crate::user_file_io::EBADF as u64),
+            _ => fail("invalid_file_io_stage"),
+        };
+        if frame.hardware.cs != u64::from(user_cs)
+            || frame.hardware.ss != u64::from(user_ss)
+            || frame.hardware.rip != base + expected_rip
+            || frame.hardware.rsp != user_top
+            || !user_syscall_abi::valid_user_rflags(frame.hardware.rflags)
+            || frame.registers.rax != nr || frame.registers.rdi != a0
+            || frame.registers.rsi != a1 || frame.registers.rdx != a2
+            || (stage >= 4 && frame.registers.r12 != fd)
+        { fail("file_io_guest_trap_frame_or_registers") }
+        let result = crate::user_file_io_smoke::dispatch(pid, active, nr, a0, a1, a2);
+        if result != want { 
+            serial::write_fmt(format_args!(
+                "WOLFOS_FILE_IO_ERROR stage={} result={:#x} expected={:#x}\n",
+                stage, result, want
+            ));
+            fail("file_io_return_value")
+        }
+        match stage {
+            2 => serial::write_line("WOLFOS_FILE_IO_BAD_OPEN_OK supervisor_denied=1"),
+            3 => {
+                FILE_FD.store(result, Ordering::Release);
+                serial::write_line("WOLFOS_FILE_IO_OPEN_OK path_user_rx=1 fd=256");
+            },
+            4 => serial::write_line("WOLFOS_FILE_IO_BAD_READ_OK rx_write_denied=1 cursor_rollback=1"),
+            5 => {
+                let mut proof = [0u8;8];
+                if crate::user_copy::copy_from(
+                    active, user_top - 32, &mut proof, private_pte, private_byte
+                ).is_err() || proof != *b"FILE_OK\n"
+                { fail("user_stack_file_contents") }
+                serial::write_line("WOLFOS_FILE_IO_READ_OK bytes=8 user_stack=1 payload=FILE_OK");
+            },
+            6 => serial::write_line("WOLFOS_FILE_IO_EOF_OK read=0"),
+            7 => serial::write_line("WOLFOS_FILE_IO_CLOSE_OK released=1"),
+            8 => serial::write_line("WOLFOS_FILE_IO_STALE_OK ebadf=1"),
+            _ => fail("invalid_file_io_marker"),
+        }
+        frame.registers.rax = result;
+        STAGE.store(stage + 1, Ordering::Release);
+        return raw;
+    }
     let expected_rip = if stage == 0 { symbols::AFTER_ID }
         else if stage == 1 { symbols::AFTER_ADD }
         else if cfg!(feature = "user-copy-smoke") && stage == 2 {
@@ -487,7 +578,11 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             if !matches!(PROCESS.with(|p| p.exit_zero(pid, active)), Ok(Ok(()))) {
                 fail("process_exit_transition")
             }
-            if cfg!(feature = "user-copy-smoke") {
+            #[cfg(feature = "user-file-io-smoke")]
+            crate::user_file_io_smoke::verify_exit(pid);
+            if cfg!(feature = "user-file-io-smoke") {
+                serial::write_line("WOLFOS_FILE_IO_EXIT_OK code=0 cpl3=1 calls=10");
+            } else if cfg!(feature = "user-copy-smoke") {
                 serial::write_line("WOLFOS_USERCOPY_EXIT_OK code=0 cpl3=1 calls=4");
             } else {
                 serial::write_line("WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22");
@@ -524,7 +619,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
             { fail("pmm_frame_leak") }
             serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
-            if cfg!(feature = "user-copy-smoke") {
+            if cfg!(feature = "user-file-io-smoke") {
+                serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=10 exit=0 resources_released=1 persistent=0 production=0");
+            } else if cfg!(feature = "user-copy-smoke") {
                 serial::write_line("WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 int80_calls=4 exit=0 resources_released=1 production_user_copy=0");
             } else {
                 serial::write_line("WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=0 resources_released=1 real_process_manager=0");
