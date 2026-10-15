@@ -15,7 +15,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use limine::mp::MpInfo;
 use crate::{
-    ap_ipi_smoke, percpu_work_queue::{CpuWorkQueue, QueueError, CAPACITY, digest}, serial,
+    ap_ipi_smoke, ap_work_placement::{choose_destination, PlacementError},
+    percpu_work_queue::{CpuWorkQueue, QueueError, CAPACITY, digest}, serial,
 };
 
 const CPUS: usize = 4;
@@ -163,20 +164,38 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
         return false;
     }
 
-    let (mut submitted, mut sent, mut full, mut wrong, mut checked) =
-        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut submitted, mut sent, mut full, mut wrong, mut checked,
+         mut redirects, mut no_capacity) =
+        (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut valid = true;
     'waves: for wave in 1..=WAVES {
-        // Fill ALL three AP queues before sending ANY IPI.
-        for cpu in 1..CPUS {
-            for slot in 0..CAPACITY {
-                let seq = (wave - 1) * CAPACITY as u64 + slot as u64 + 1;
-                if Q[cpu].enqueue(cpu, seq, token(cpu, seq)).is_err() {
-                    valid = false;
-                    break 'waves;
-                }
-                submitted += 1;
+        // ALL new jobs request AP1. The first 4 stay there. Once AP1
+        // becomes full, 8 overflow jobs are routed to the least-loaded
+        // ready AP2/AP3 before any AP is woken. This is placement of
+        // NEW jobs only; no live task ownership or queued jobs move.
+        let online = [false,
+            READY[1].load(Ordering::Acquire),
+            READY[2].load(Ordering::Acquire),
+            READY[3].load(Ordering::Acquire)];
+        for _ in 0..((CPUS - 1) * CAPACITY) {
+            let queued = [0, Q[1].len(), Q[2].len(), Q[3].len()];
+            let Ok(choice) = choose_destination(1, 0, &online, &queued, CAPACITY)
+            else { valid = false; break 'waves; };
+            let cpu = choice.destination;
+            if choice.redirected { redirects += 1; }
+            let seq = (wave - 1) * CAPACITY as u64 + queued[cpu] as u64 + 1;
+            if Q[cpu].enqueue(cpu, seq, token(cpu, seq)).is_err() {
+                valid = false; break 'waves;
             }
+            submitted += 1;
+        }
+        // Every AP queue is now full. The placement policy must refuse
+        // additional work instead of overwriting anyone's FIFO.
+        let all_full = [0, Q[1].len(), Q[2].len(), Q[3].len()];
+        if choose_destination(1, 0, &online, &all_full, CAPACITY)
+            == Err(PlacementError::NoCapacity)
+        { no_capacity += 1; } else { valid = false; break 'waves; }
+        for cpu in 1..CPUS {
             let overflow_seq = wave * CAPACITY as u64 + 1;
             if Q[cpu].enqueue(cpu, overflow_seq, token(cpu, overflow_seq))
                 == Err(QueueError::Full)
@@ -186,8 +205,7 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
                 == Err(QueueError::WrongCpu)
             { wrong += 1; } else { valid = false; break 'waves; }
             if Q[cpu].len() != CAPACITY {
-                valid = false;
-                break 'waves;
+                valid = false; break 'waves;
             }
         }
         for cpu in 1..CPUS {
@@ -251,15 +269,17 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
     if valid && parked && submitted == 24 && sent == 6
         && checked == submitted && ipis == sent && eois == sent
         && jobs == submitted && full == 6 && wrong == 6
+        && redirects == 16 && no_capacity == 2
         && drained == 3 && peak == 3 && remaining == 0
         && ENTERED[0].load(Ordering::Acquire) == 3
         && ENTERED[1].load(Ordering::Acquire) == 3
         && bad == 0 && spurious == 0
     {
         serial::write_fmt(format_args!(
-            "WOLFOS_AP_RUNQUEUE_OK cpus=4 aps=3 capacity=4 waves=2 submitted={} executed={} full_rejected={} wrong_owner_rejected={} ipis={} eois={} fifo={} wraps=3 peak={} active={} idle={} offline=3 invalid={} spurious={} bsp_if=0 task_migrated=0\n",
+            "WOLFOS_AP_RUNQUEUE_OK cpus=4 aps=3 capacity=4 waves=2 submitted={} executed={} full_rejected={} wrong_owner_rejected={} ipis={} eois={} fifo={} wraps=3 peak={} active={} idle={} offline=3 invalid={} spurious={} bsp_if=0 task_migrated=0 redirected={} no_capacity={}\n",
             submitted, jobs, full, wrong, ipis, eois,
-            checked, peak, remaining, drained, bad, spurious
+            checked, peak, remaining, drained, bad, spurious,
+            redirects, no_capacity
         ));
         true
     } else {
