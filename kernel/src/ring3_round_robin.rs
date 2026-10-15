@@ -47,6 +47,23 @@ impl RoundRobin {
         self.switches = switches;
         Ok(self.slots[self.active.unwrap()].pid)
     }
+    /// Explicit cooperative syscall path, distinct from hardware timer_tick.
+    /// Keeps the policy ledger synchronized with the actual Ring3 IRET handoff.
+    /// No timer accounting is attributed to a voluntary yield.
+    pub fn voluntary_yield(&mut self, interrupted_pid: u64) -> Result<u64, Error> {
+        let i = self.active.ok_or(Error::NoRunnable)?;
+        if self.slots[i].pid != interrupted_pid || self.slots[i].state != State::Running {
+            return Err(Error::WrongState);
+        }
+        let j = 1 - i;
+        if self.slots[j].state != State::Ready { return Err(Error::NoRunnable); }
+        let switches = self.switches.checked_add(1).ok_or(Error::Overflow)?;
+        self.slots[i].state = State::Ready;
+        self.slots[j].state = State::Running;
+        self.active = Some(j);
+        self.switches = switches;
+        Ok(self.slots[j].pid)
+    }
     pub fn exit(&mut self, pid: u64) -> Result<Option<u64>, Error> {
         let i = self.active.ok_or(Error::NoRunnable)?;
         if self.slots[i].pid != pid || self.slots[i].state != State::Running { return Err(Error::WrongState); }
@@ -108,6 +125,37 @@ mod tests {
         let before=q;
         assert_eq!(q.timer_tick(22),Err(Error::NoRunnable));
         assert_eq!(q.admit(33),Err(Error::WrongState));
+        assert_eq!(q,before);
+    }
+    #[test]
+    fn hardware_ticks_and_syscall_yields_remain_separate() {
+        let mut q=RoundRobin::new();
+        q.admit(1).unwrap(); q.admit(2).unwrap(); q.start(1).unwrap();
+        assert_eq!(q.timer_tick(1),Ok(2));
+        assert_eq!(q.timer_tick(2),Ok(1));
+        for k in 0..8 {
+            let from=if k%2==0 {1} else {2};
+            assert_eq!(q.voluntary_yield(from),Ok(if from==1 {2} else {1}));
+        }
+        assert_eq!(q.switches(),10);
+        assert_eq!(q.slots()[0].ticks,1);
+        assert_eq!(q.slots()[1].ticks,1);
+        assert_eq!(q.exit(1),Ok(Some(2)));
+        assert_eq!(q.exit(2),Ok(None));
+        assert_eq!(q.running(),None);
+    }
+    #[test]
+    fn invalid_voluntary_handoffs_leave_every_field_intact() {
+        let mut q=RoundRobin::new();
+        q.admit(1).unwrap(); q.start(1).unwrap();
+        let before=q;
+        assert_eq!(q.voluntary_yield(1),Err(Error::NoRunnable));
+        assert_eq!(q.voluntary_yield(2),Err(Error::WrongState));
+        assert_eq!(q,before);
+        q.admit(2).unwrap();
+        q.switches=u64::MAX;
+        let before=q;
+        assert_eq!(q.voluntary_yield(1),Err(Error::Overflow));
         assert_eq!(q,before);
     }
     #[test]

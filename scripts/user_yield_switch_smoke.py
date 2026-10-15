@@ -64,6 +64,8 @@ def main():
                 if timer_preempt:
                     checks.insert(checks.index(STEPS[3]),
                         "WOLFOS_RING3_TIMER_PREEMPT_OK real_timer_switches=2 pid1_to_pid2=1 pid2_to_pid1=1 irq_frame_preserved=1 private_cr3=1 tss_rsp0=1 fx_save_restore=1 no_int80=1")
+                    checks.insert(checks.index(STEPS[3]),
+                        "WOLFOS_RING3_RR_POLICY_OK hardware_timer_decisions=2 voluntary_yield_decisions=8 exited=2 single_running=1")
                 checks.insert(checks.index(STEPS[3]),
                     "WOLFOS_RING3_TIMER_HARDWARE_OK")
                 checks.insert(len(checks)-1,
