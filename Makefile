@@ -188,6 +188,8 @@ test:
 	$(OUT)/kernel_trap_frame_tests
 	rustc --edition=2024 --test kernel/src/elf64_preflight.rs -o $(OUT)/elf64_preflight_tests
 	$(OUT)/elf64_preflight_tests
+	rustc --edition=2024 --test tests/elf64_page_image.rs -o $(OUT)/elf64_page_image_tests
+	$(OUT)/elf64_page_image_tests
 	rustc --edition=2024 --test kernel/src/preempt_depth.rs -o $(OUT)/preempt_depth_tests
 	$(OUT)/preempt_depth_tests
 	rustc --edition=2024 --test kernel/src/fx_state.rs -o $(OUT)/fx_state_tests
