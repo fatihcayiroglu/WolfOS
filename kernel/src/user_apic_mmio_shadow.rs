@@ -65,11 +65,15 @@ impl ApicMapping {
            ||pd.iter().any(|e|*e!=0)||pt.iter().any(|e|*e!=0){
             return Err(MappingError::Occupied)
         }
-        // Four exact levels. This is NOT a general-purpose page mapper.
-        boot[ROOT_INDEX]=self.tables[0]|PRESENT|RW;
-        pdpt[0]=self.tables[1]|PRESENT|RW;
-        pd[0]=self.tables[2]|PRESENT|RW;
+        // Fully populate private child tables before publishing ANY
+        // reference into the active PML4. Exposing the root first would
+        // permit an interrupt or page walker to observe a partially
+        // constructed device hierarchy. This is NOT a general VMM.
         pt[0]=self.mmio_pa|PRESENT|RW|PWT|PCD|NX;
+        pd[0]=self.tables[2]|PRESENT|RW;
+        pdpt[0]=self.tables[1]|PRESENT|RW;
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        boot[ROOT_INDEX]=self.tables[0]|PRESENT|RW; // publish LAST
         Ok(())
     }
     pub fn audit(&self,boot:&[u64;512],pdpt:&[u64;512],
@@ -129,6 +133,24 @@ mod tests{
         assert_eq!(m.audit(&boot,&a,&b,&c),Ok(()));
         let mut guest=[0;512];guest[ROOT_INDEX]=boot[ROOT_INDEX];
         assert_eq!(m.audit_process_root(&boot,&guest),Ok(()));
+        m.unpublish(&mut boot,&mut a,&mut b,&mut c).unwrap();
+        assert_eq!(boot[ROOT_INDEX],0);
+    }
+    #[test]
+    fn root_is_unpublished_until_children_are_prevalidated(){
+        let m=frames();
+        let(mut boot,mut a,mut b,mut c)=([0;512],[0;512],[0;512],[0;512]);
+        c[44]=1;
+        assert_eq!(m.publish(&mut boot,&mut a,&mut b,&mut c),
+            Err(MappingError::Occupied));
+        assert_eq!(boot[ROOT_INDEX],0);
+        assert_eq!(a[0],0);
+        assert_eq!(b[0],0);
+        assert_eq!(c[0],0);
+        c[44]=0;
+        m.publish(&mut boot,&mut a,&mut b,&mut c).unwrap();
+        assert_eq!(m.audit(&boot,&a,&b,&c),Ok(()));
+        assert_eq!(c[0],0xfee0_0000|PRESENT|RW|PWT|PCD|NX);
         m.unpublish(&mut boot,&mut a,&mut b,&mut c).unwrap();
         assert_eq!(boot[ROOT_INDEX],0);
     }
