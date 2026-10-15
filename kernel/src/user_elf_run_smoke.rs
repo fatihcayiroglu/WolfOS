@@ -102,9 +102,13 @@ pub fn enter(hhdm: u64) -> ! {
     HHDM_OFFSET.store(hhdm, Ordering::Release);
     #[cfg(feature = "user-ramfs-smoke")]
     crate::ramfs_smoke::prepare(ELF);
+    #[cfg(feature = "user-vfs-smoke")]
+    crate::vfs_smoke::prepare(ELF);
     #[cfg(feature = "user-ramfs-smoke")]
     let elf: &[u8] = crate::ramfs_smoke::elf_file();
-    #[cfg(not(feature = "user-ramfs-smoke"))]
+    #[cfg(feature = "user-vfs-smoke")]
+    let elf: &[u8] = crate::vfs_smoke::elf_file();
+    #[cfg(not(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")))]
     let elf: &[u8] = ELF;
     if index == 0 {
         if !interrupts::verify_ring3_preconditions() { fail("gdt_tss") }
@@ -442,6 +446,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             }
             #[cfg(feature = "user-ramfs-smoke")]
             crate::ramfs_smoke::report_elf_exit();
+            #[cfg(feature = "user-vfs-smoke")]
+            crate::vfs_smoke::report_exit();
             serial::qemu_exit_success()
         }
     }
