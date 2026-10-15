@@ -55,6 +55,12 @@ jobs:
         run: make user-context-smoke
       - name: P2 real PMM-backed 16KiB per-PID kernel stacks, canaries and no-leak retirement
         run: make kernel-stack-lease-smoke
+      - name: P2 real discontiguous PMM supervisor stack guarded mapping and zero-leak cleanup
+        run: make kernel-stack-guard-smoke
+      - name: P2 x86-64 actual non-present lower stack guard supervisor page fault
+        run: make kernel-stack-guard-fault-smoke
+      - name: P2 x86-64 actual non-present upper stack guard supervisor page fault
+        run: make kernel-stack-guard-upper-fault-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
