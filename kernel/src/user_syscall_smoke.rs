@@ -253,7 +253,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         || frame.registers.r12 != 0x76543210
     {
         serial::write_fmt(format_args!(
-            "WOLFOS_SYSCALL_ERROR bad_frame stage={} nr={:#x} rdi={:#x} rsi={:#x} rip={:#x} cs={:#x} ss={:#x} flags={:#x}\\n",
+            "WOLFOS_SYSCALL_ERROR bad_frame stage={} nr={:#x} rdi={:#x} rsi={:#x} rip={:#x} cs={:#x} ss={:#x} flags={:#x}\n",
             stage, frame.registers.rax, frame.registers.rdi,
             frame.registers.rsi, frame.hardware.rip, frame.hardware.cs,
             frame.hardware.ss, frame.hardware.rflags,
@@ -279,7 +279,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             // Only RAX is changed. Assembly restores ALL other 14 GPRs.
             frame.registers.rax = result;
             serial::write_fmt(format_args!(
-                "WOLFOS_SYSCALL_RETURN stage={} rax={:#x} saved_gpr=1 cpl3=1 kernel_cpl=0\\n",
+                "WOLFOS_SYSCALL_RETURN stage={} rax={:#x} saved_gpr=1 cpl3=1 kernel_cpl=0\n",
                 stage + 1, result,
             ));
             raw_frame // assembly restores complete register state + IRETQ
