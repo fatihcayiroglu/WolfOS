@@ -490,3 +490,169 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
     }
 }
+
+
+/// Hardware-proven single-page user copy for the feature-isolated file ABI.
+/// Every page-table ancestor MUST resolve to our seven PMM-owned frames.
+/// Never borrow or dereference the untrusted virtual address directly.
+#[cfg(feature = "user-file-io-smoke")]
+fn user_pointer(address: u64, bytes: usize, writable: bool) -> Result<*mut u8, ()> {
+    use crate::user_copy;
+    let base = ENTRY.load(Ordering::Acquire)
+        .checked_sub(symbols::ENTRY).ok_or(())?;
+    let hhdm = HHDM_OFFSET.load(Ordering::Acquire);
+    let frame = |n: usize| OWNED[n].load(Ordering::Acquire);
+    if hhdm == 0 || (0..FRAMES).any(|i| frame(i) == 0) {
+        return Err(())
+    }
+    let (root, _) = Cr3::read();
+    if root.start_address().as_u64() != frame(0) {
+        return Err(())
+    }
+    let slot = ((base >> 39) & 511) as usize;
+    if slot == 0 || slot >= 256 { return Err(()) }
+    let page = address & !(PAGE - 1);
+    let (leaf_idx, page_phys) = if page == base + 0x401000 {
+        (1usize, frame(4))
+    } else if page == base + 0x403000 {
+        (3usize, frame(5))
+    } else if page == base + STACK_VA {
+        (4usize, frame(6))
+    } else { return Err(()) };
+    // SAFETY: Every table frame originated from PMM's independently
+    // validated, live frame ownership ledger. HHDM remains mapped in
+    // BOTH original and sanitized kernel high halves. Only read table
+    // entries after live CR3 and all owner frame identities were checked.
+    let table = |index: usize| unsafe {
+        &*((hhdm + frame(index)) as *const [u64; SLOTS])
+    };
+    if table(0)[slot] != frame(1) | (PRESENT | WRITE | USER)
+        || table(1)[0] != frame(2) | (PRESENT | WRITE | USER)
+        || table(2)[2] != frame(3) | (PRESENT | WRITE | USER)
+    { return Err(()) }
+    let leaf = table(3)[leaf_idx];
+    let offset = user_copy::admit(
+        address, bytes, page, leaf, page_phys, writable
+    ).map_err(|_| ())?;
+    let vaddr = hhdm.checked_add(page_phys)
+        .and_then(|p| p.checked_add(offset as u64)).ok_or(())?;
+    let valid = VirtAddr::try_new(vaddr).map_err(|_| ())?;
+    Ok(valid.as_mut_ptr())
+}
+
+/// Exact independent ELF instruction symbol -> syscall number, register
+/// argument, and user-pointer-admission contract. These five calls are
+/// NOT exposed in the old 22-call ABI smoke; they are a separate feature.
+#[cfg(feature = "user-file-io-smoke")]
+fn handle_file_call(
+    raw: *mut UserSyscallFrame,
+    frame: &mut UserSyscallFrame,
+    base: u64,
+    stage: usize,
+) -> *mut UserSyscallFrame {
+    let offset = stage - RETURN_COUNT;
+    if offset >= 5 { fail("invalid_file_syscall_stage") }
+    let expected_rip = [
+        symbols::AFTER_FILE_OPEN,
+        symbols::AFTER_FILE_READ,
+        symbols::AFTER_FILE_BAD_READ,
+        symbols::AFTER_FILE_CLOSE,
+        symbols::AFTER_FILE_BAD_OPEN,
+    ][offset] + base;
+    let expected_num = [5, 6, 6, 7, 5][offset];
+    let token = FILE_FD.load(Ordering::Acquire);
+    let expected_rdi = match offset {
+        0 => base + symbols::FILE_PATH,
+        1..=3 => token,
+        _ => 0xffff800000000000,
+    };
+    let expected_rsi = match offset {
+        0 | 4 => 13,
+        1 => base + symbols::BSS_START,
+        2 => base + symbols::FILE_PATH,
+        _ => 0,
+    };
+    let (user_cs, user_ss, _) = interrupts::ring3_cpu_state();
+    if frame.hardware.cs != u64::from(user_cs)
+        || frame.hardware.ss != u64::from(user_ss)
+        || frame.hardware.rip != expected_rip
+        || frame.hardware.rsp != STACK_TOP.load(Ordering::Acquire)
+        || !user_syscall_abi::valid_user_rflags(frame.hardware.rflags)
+        || frame.registers.rax != expected_num
+        || frame.registers.rdi != expected_rdi
+        || frame.registers.rsi != expected_rsi
+        || ((offset == 1 || offset == 2) && frame.registers.rdx != 8)
+        || ((offset == 1 || offset == 2 || offset == 3) && token == 0)
+    {
+        serial::write_fmt(format_args!(
+            "WOLFOS_FILE_IO_ERROR trap index={} num={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rip={:#x} exp_rip={:#x}\n",
+            offset, frame.registers.rax, frame.registers.rdi,
+            frame.registers.rsi, frame.registers.rdx,
+            frame.hardware.rip, expected_rip
+        ));
+        crate::halt_forever()
+    }
+    const EFAULT: u64 = (-14i64) as u64;
+    let pid = RUN_INDEX.load(Ordering::Acquire) as u64 + 1;
+    if pid != 1 { fail("file_io_pid_owner") }
+    let result = match offset {
+        0 => {
+            let ptr = user_pointer(expected_rdi, 13, false)
+                .unwrap_or_else(|_| fail("valid_open_path_pointer_rejected"));
+            let mut path = [0u8; 13];
+            // SAFETY: pointer has been checked against current CR3
+            // ancestors, read-only user text PTE, frame identity and
+            // single-page 13-byte extent.
+            unsafe { core::ptr::copy_nonoverlapping(ptr, path.as_mut_ptr(), 13) };
+            if &path != crate::user_file_io_smoke::PATH {
+                fail("untrusted_user_path_not_expected")
+            }
+            let fd = crate::user_file_io_smoke::open_read(pid, &path)
+                .unwrap_or_else(|_| fail("file_open_failed"));
+            FILE_FD.store(fd, Ordering::Release);
+            serial::write_line("WOLFOS_FILE_OPEN_OK cpl3=1 pid=1 path_from_user=1 fd_owned=1");
+            fd
+        }
+        1 => {
+            let dest = user_pointer(expected_rsi, 8, true)
+                .unwrap_or_else(|_| fail("valid_bss_destination_rejected"));
+            let mut bytes = [0u8; 8];
+            let count = crate::user_file_io_smoke::read(pid, token, &mut bytes)
+                .unwrap_or_else(|_| fail("vfs_file_read_failed"));
+            if count != 8 || &bytes != FILE_BYTES { fail("wrong_file_contents") }
+            // SAFETY: independent RW+NX user leaf and PMM ownership
+            // checked before writing to the HHDM alias; no guest threads.
+            unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, 8) };
+            if crate::user_file_io_smoke::tell(pid, token) != Ok(8) {
+                fail("vfs_read_cursor_incorrect")
+            }
+            serial::write_line("WOLFOS_FILE_READ_OK cpl3=1 bytes=8 copied_to_bss=1 cursor=8");
+            count as u64
+        }
+        2 => {
+            if user_pointer(expected_rsi, 8, true).is_ok()
+                || crate::user_file_io_smoke::tell(pid, token) != Ok(8)
+            { fail("writable_executable_text_or_cursor_corruption") }
+            serial::write_line("WOLFOS_FILE_EFAULT_RX_OK denied_write_to_user_code=1 cursor_unchanged=1");
+            EFAULT
+        }
+        3 => {
+            if crate::user_file_io_smoke::close(pid, token).is_err() {
+                fail("vfs_close_failed")
+            }
+            FILE_FD.store(0, Ordering::Release);
+            serial::write_line("WOLFOS_FILE_CLOSE_OK pid=1 descriptor_released=1");
+            0
+        }
+        _ => {
+            if user_pointer(expected_rdi, 13, false).is_ok() {
+                fail("kernel_half_user_pointer_accepted")
+            }
+            serial::write_line("WOLFOS_FILE_EFAULT_KERNEL_OK denied_kernel_pointer=1");
+            EFAULT
+        }
+    };
+    frame.registers.rax = result;
+    STAGE.store(stage + 1, Ordering::Release);
+    raw
+}
