@@ -14,9 +14,6 @@ pub const USER_MIN: u64 = 0x1_0000;
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
 const KERNEL_HALF_START: u64 = 0xffff_8000_0000_0000;
 const RFLAGS_FIXED: u64 = 1 << 1;
-const UNSAFE_USER_FLAGS: u64 = (3 << 12) | (1 << 14) | (1 << 17) // IOPL, NT, VM
-    | (1 << 8) | (1 << 16) | (1 << 18); // TF, RF, AC
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ring3Entry {
     pub rip: u64,
@@ -43,7 +40,7 @@ pub fn validate(frame: Ring3Entry) -> Result<(), EntryError> {
     // The initial stack top may be immediately ABOVE the last mapped page.
     // The stack itself must not be empty, kernel-owned or unaligned.
     if frame.user_rsp <= USER_MIN
-        || frame.user_rsp > USER_END
+        || frame.user_rsp >= USER_END
         || frame.user_rsp % 16 != 0
     {
         return Err(EntryError::InvalidUserStack);
@@ -60,10 +57,9 @@ pub fn validate(frame: Ring3Entry) -> Result<(), EntryError> {
     {
         return Err(EntryError::InvalidUserSelectors);
     }
-    if frame.rflags & RFLAGS_FIXED == 0
-        || frame.rflags & UNSAFE_USER_FLAGS != 0
-        || frame.rflags & 0xffff_ffff_0000_0000 != 0
-    {
+    // First bootstrap entry must start with exactly reserved bit 1 set:
+    // IF=0, IOPL=0, DF=0, TF=0, NT=0, RF=0, VM=0 and no unknown bits.
+    if frame.rflags != RFLAGS_FIXED {
         return Err(EntryError::InvalidFlags);
     }
     Ok(())
@@ -100,7 +96,7 @@ mod tests {
 
     #[test]
     fn prohibits_unaligned_or_supervisor_or_empty_user_stacks() {
-        for rsp in [0, USER_MIN, 0x404001, USER_END + 16, u64::MAX] {
+        for rsp in [0, USER_MIN, 0x404001, USER_END, USER_END + 16, u64::MAX] {
             let mut entry = fixture();
             entry.user_rsp = rsp;
             assert_eq!(validate(entry), Err(EntryError::InvalidUserStack));
@@ -130,7 +126,7 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_iret_flags() {
-        for flags in [0, 0x1002, 0x2002, 0x4002, 0x10002, 0x20002, 0x40002, 0x40000_0002] {
+        for flags in [0, 0x202, 0x402, 0x1002, 0x2002, 0x4002, 0x10002, 0x20002, 0x40002, 0x40000_0002] {
             let mut entry = fixture();
             entry.rflags = flags;
             assert_eq!(validate(entry), Err(EntryError::InvalidFlags));
