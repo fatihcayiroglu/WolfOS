@@ -21,6 +21,8 @@ mod paging;
 mod elf64_preflight;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_preflight_smoke;
+#[cfg(feature = "elf64-preflight-smoke")]
+mod elf64_page_image;
 mod acpi;
 mod acpi_layout;
 mod acpi_tables;
@@ -228,7 +230,7 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     #[cfg(feature = "elf64-preflight-smoke")]
-    if !elf64_preflight_smoke::verify() {
+    if !elf64_preflight_smoke::verify(hhdm.offset) {
         serial::write_line("WOLFOS_ELF64_PREFLIGHT_TEST_FAILED");
         halt_forever();
     }
