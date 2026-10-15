@@ -48,6 +48,20 @@ static USER_SVR:AtomicU32=AtomicU32::new(0);
 #[cfg(feature = "p2-ring3-timer-observe-smoke")]
 static USER_PIC_MASKS:AtomicU32=AtomicU32::new(0);
 #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+static USER_BSP_ID:AtomicU32=AtomicU32::new(0);
+
+/// Read the already verified current-mode BSP MMIO base; this is only
+/// meaningful once the xAPIC single-BSP timer test has validated its ID,
+/// firmware RAM exclusions, MMIO version and LVT readiness.
+#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+pub fn trusted_user_xapic_base()->Option<u64>{
+    if !USER_TIMER_CONFIGURED.load(Ordering::Acquire){return None}
+    crate::lapic_probe::bsp_mmio_base(
+        USER_BSP_ID.load(Ordering::Acquire)
+    )
+}
+
+#[cfg(feature = "p2-ring3-timer-observe-smoke")]
 static USER_TIMER_CONFIGURED:AtomicBool=AtomicBool::new(false);
 
 /// Runs on the original BSP CR3 and separate boot stack, IF=0, only
@@ -467,6 +481,7 @@ fn run_mapped_test(expected_id: u32, hhdm:u64) -> bool {
     ));
     #[cfg(feature = "p2-ring3-timer-observe-smoke")]
     {
+        USER_BSP_ID.store(expected_id,Ordering::Release);
         USER_SVR.store(original_svr,Ordering::Release);
         USER_PIC_MASKS.store(
             u32::from(original_master)|(u32::from(original_slave)<<8),
