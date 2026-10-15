@@ -32,6 +32,7 @@ ap-irq-migrate-smoke = ["smoke-exit"]
 ap-runqueue-smoke = ["smoke-exit"]
 elf64-preflight-smoke = ["smoke-exit"]
 user-vm-shadow-smoke = ["smoke-exit"]
+user-ring-prep-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
