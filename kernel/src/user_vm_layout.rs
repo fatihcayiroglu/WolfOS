@@ -99,8 +99,8 @@ pub fn populate_one(
     if write && exec {
         return Err(RootError::WriteExecute);
     }
-    if [root as &[_; ENTRY_COUNT], pdpt, pd, pt].iter()
-        .any(|table| table.iter().any(|entry| *entry != 0))
+    if root.iter().chain(pdpt.iter()).chain(pd.iter()).chain(pt.iter())
+        .any(|entry| *entry != 0)
     {
         return Err(RootError::DirtyDestination);
     }
