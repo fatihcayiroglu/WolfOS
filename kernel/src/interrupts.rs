@@ -418,7 +418,7 @@ pub fn test_actual_rsp0() -> u64 {
 }
 
 /// Read back selector + stack metadata after verify_ring3_preconditions().
-#[cfg(any(feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "p2-handoff-preflight-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 pub fn ring3_cpu_state() -> (u16, u16, u64) {
     (USER_CS_EXPECTED.load(Ordering::Acquire) as u16,
      USER_DS_EXPECTED.load(Ordering::Acquire) as u16,
