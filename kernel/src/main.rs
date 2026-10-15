@@ -442,8 +442,8 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_TIMER_TEST_FAILED");
         halt_forever();
     }
-    #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
-           feature = "apic-preempt-smoke"))]
+    #[cfg(any(feature = "apic-timer-smoke", feature = "p2-ring3-timer-observe-smoke",
+           feature = "apic-calibration-smoke", feature = "apic-preempt-smoke"))]
     if !apic_timer_smoke::verify(mp.bsp_lapic_id, hhdm.offset, entries) {
         serial::write_line("WOLFOS_APIC_TIMER_TEST_FAILED");
         halt_forever();
