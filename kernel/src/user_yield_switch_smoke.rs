@@ -580,7 +580,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             }
             TIMER_LIVE.store(false,core::sync::atomic::Ordering::Release);
             serial::write_fmt(format_args!(
-                "WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs={} pid1_busy_irqs={} pid2_busy_irqs={} eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1\\n",
+                "WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs={} pid1_busy_irqs={} pid2_busy_irqs={} eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1\n",
                 s.timer_irqs[0]+s.timer_irqs[1],
                 s.timer_busy[0],s.timer_busy[1]
             ));
@@ -694,7 +694,7 @@ extern "C" fn finalize()->! {
         ||unsafe{(*root(s.hhdm,s.boot))[ROOT_INDEX]}!=0{
         fail("post_yield_resource_leak")
     }
-    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(feature = "p2-ring3-irq-ready-smoke")]
     {
         if x86_64::instructions::interrupts::are_enabled() {
             fail("restore_pic_only_with_kernel_if_off")
@@ -705,6 +705,15 @@ extern "C" fn finalize()->! {
             fail("pic_mask_restore")
         }
         serial::write_line("WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1");
+    }
+    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    {
+        if x86_64::instructions::interrupts::are_enabled() {
+            fail("timer_guest_cleanup_IF_unexpectedly_enabled")
+        }
+        serial::write_line(
+            "WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1"
+        );
     }
     #[cfg(not(feature = "p2-ring3-timer-observe-smoke"))]
     serial::write_line(
