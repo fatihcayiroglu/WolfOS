@@ -58,6 +58,8 @@ mod ap_runqueue_smoke;
 mod ap_preempt_irq_entry;
 #[cfg(feature = "ap-smp-preempt-smoke")]
 mod ap_smp_preempt_smoke;
+#[cfg(feature = "ap-smp-preempt-smoke")]
+mod fx_bootstrap_image;
 #[cfg(feature = "ap-local-timer-smoke")]
 mod ap_local_timer_smoke;
 mod ap_stack;
