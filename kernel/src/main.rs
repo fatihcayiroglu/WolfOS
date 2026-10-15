@@ -30,6 +30,8 @@ mod user_vm_shadow_smoke;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi;
 #[cfg(feature = "user-vm-shadow-smoke")]
+mod kernel_half_shadow;
+#[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi_smoke;
 mod acpi;
 mod acpi_layout;
