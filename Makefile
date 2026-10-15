@@ -57,13 +57,15 @@ else ifeq ($(FLAVOR),user-ramfs)
 FEATURES := --features user-ramfs-smoke
 else ifeq ($(FLAVOR),user-vfs)
 FEATURES := --features user-vfs-smoke
+else ifeq ($(FLAVOR),user-copy)
+FEATURES := --features user-copy-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -201,6 +203,10 @@ user-vfs-smoke:
 	$(MAKE) iso FLAVOR=user-vfs
 	python3 scripts/user_vfs_smoke.py $(OUT)/wolfos-user-vfs.iso
 
+user-copy-smoke:
+	$(MAKE) iso FLAVOR=user-copy
+	python3 scripts/user_copy_smoke.py $(OUT)/wolfos-user-copy.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -259,6 +265,8 @@ test:
 	$(OUT)/ramfs_tests
 	rustc --edition=2024 --test kernel/src/process_lifecycle.rs -o $(OUT)/process_lifecycle_tests
 	$(OUT)/process_lifecycle_tests
+	rustc --edition=2024 --test kernel/src/user_copy.rs -o $(OUT)/user_copy_tests
+	$(OUT)/user_copy_tests
 	rustc --edition=2024 --test kernel/src/user_syscall_abi.rs -o $(OUT)/user_syscall_abi_tests
 	$(OUT)/user_syscall_abi_tests
 	rustc --edition=2024 --test tests/elf64_page_image.rs -o $(OUT)/elf64_page_image_tests
