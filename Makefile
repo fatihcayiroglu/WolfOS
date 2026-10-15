@@ -170,6 +170,8 @@ test:
 	$(OUT)/percpu_work_queue_tests
 	rustc --edition=2024 --test kernel/src/ap_work_placement.rs -o $(OUT)/ap_work_placement_tests
 	$(OUT)/ap_work_placement_tests
+	rustc --edition=2024 --test tests/ap_streaming_dispatch.rs -o $(OUT)/ap_streaming_dispatch_tests
+	$(OUT)/ap_streaming_dispatch_tests
 	rustc --edition=2024 --test kernel/src/task_handoff.rs -o $(OUT)/task_handoff_tests
 	$(OUT)/task_handoff_tests
 	rustc --edition=2024 --test kernel/src/migrating_stack_contract.rs -o $(OUT)/migrating_stack_contract_tests

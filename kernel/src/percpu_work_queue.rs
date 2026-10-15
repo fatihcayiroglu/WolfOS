@@ -23,6 +23,7 @@ pub enum QueueError {
     BadSequence,
     BadToken,
     Exhausted,
+    Contended,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,11 +98,37 @@ impl CpuWorkQueue {
         Ok(Some(result))
     }
 
+    /// Checked producer-side occupancy snapshot. With concurrent AP drains,
+    /// a one-pass read of independent head/tail atomics may mix generations:
+    /// seeing an old head and a new tail can falsely suggest over-capacity.
+    /// Recheck the consumer's head before trusting the observation. The BSP
+    /// must remain the single producer while taking this snapshot.
+    ///
+    /// A highly active consumer may cause transient Contended; the caller
+    /// must retry at a safe publication boundary instead of treating the
+    /// queue as empty or silently clipping a damaged counter.
+    pub fn try_len(&self) -> Result<usize, QueueError> {
+        for _ in 0..64 {
+            let first_head = self.head.load(Ordering::Acquire);
+            let tail = self.tail.load(Ordering::Acquire);
+            let second_head = self.head.load(Ordering::Acquire);
+            if first_head != second_head {
+                core::hint::spin_loop();
+                continue;
+            }
+            if tail < first_head || tail - first_head > CAPACITY as u64 {
+                return Err(QueueError::Exhausted);
+            }
+            return Ok((tail - first_head) as usize);
+        }
+        Err(QueueError::Contended)
+    }
+
+    /// Conservative convenience observation. Never report free capacity on
+    /// a malformed or unstable snapshot; admission paths use try_len() and
+    /// handle errors explicitly.
     pub fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        if tail < head { return 0; }
-        (tail - head).min(CAPACITY as u64) as usize
+        self.try_len().unwrap_or(CAPACITY)
     }
 
     pub fn is_drained(&self, count: u64) -> bool {
@@ -163,6 +190,19 @@ mod tests {
         assert_eq!(queue.dequeue(3), Ok(None));
         assert_eq!(queue.enqueue(3, 1, 90), Err(QueueError::BadSequence));
         assert!(queue.is_drained(1));
+    }
+
+    #[test]
+    fn inconsistent_snapshot_fails_closed_instead_of_reporting_empty() {
+        let q = CpuWorkQueue::new(1);
+        q.head.store(5, Ordering::Relaxed);
+        q.tail.store(3, Ordering::Relaxed);
+        assert_eq!(q.try_len(), Err(QueueError::Exhausted));
+        assert_eq!(q.len(), CAPACITY);
+        q.tail.store(10, Ordering::Relaxed);
+        assert_eq!(q.try_len(), Err(QueueError::Exhausted));
+        q.head.store(7, Ordering::Relaxed);
+        assert_eq!(q.try_len(), Ok(3));
     }
 
     #[test]
