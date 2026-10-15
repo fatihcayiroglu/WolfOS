@@ -59,6 +59,7 @@ def main() -> int:
             print(f"FAIL: invalid quiescence/lease/IPI/EOI state {got}; expected {required}")
             return 1
         for error in (
+            "WOLFOS_AP_HANDOFF_DIAG",
             "WOLFOS_AP_HANDOFF_ERROR",
             "WOLFOS_AP_HANDOFF_TEST_FAILED",
             "WOLFOS_AP_IPI_ERROR", "WOLFOS_PANIC",
