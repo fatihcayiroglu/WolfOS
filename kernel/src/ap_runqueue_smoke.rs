@@ -91,7 +91,7 @@ pub fn secondary_run(cpu: usize) -> bool {
         // The BSP has already published the entire wave before the IPI.
         if IN_IRQ[cpu].load(Ordering::Acquire)
             || WAKE[cpu].load(Ordering::Acquire) != wave
-            || Q[cpu].len() != CAPACITY
+            || Q[cpu].try_len() != Ok(CAPACITY)
         { good = false; break; }
         ARMED[cpu].store(wave, Ordering::Release);
         if !wait(|| RELEASE.load(Ordering::Acquire) >= wave
@@ -178,7 +178,10 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
             READY[2].load(Ordering::Acquire),
             READY[3].load(Ordering::Acquire)];
         for _ in 0..((CPUS - 1) * CAPACITY) {
-            let queued = [0, Q[1].len(), Q[2].len(), Q[3].len()];
+            let (Ok(q1), Ok(q2), Ok(q3)) =
+                (Q[1].try_len(), Q[2].try_len(), Q[3].try_len())
+            else { valid = false; break 'waves; };
+            let queued = [0, q1, q2, q3];
             let Ok(choice) = choose_destination(1, 0, &online, &queued, CAPACITY)
             else { valid = false; break 'waves; };
             let cpu = choice.destination;
@@ -191,7 +194,10 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
         }
         // Every AP queue is now full. The placement policy must refuse
         // additional work instead of overwriting anyone's FIFO.
-        let all_full = [0, Q[1].len(), Q[2].len(), Q[3].len()];
+        let (Ok(q1), Ok(q2), Ok(q3)) =
+            (Q[1].try_len(), Q[2].try_len(), Q[3].try_len())
+        else { valid = false; break 'waves; };
+        let all_full = [0, q1, q2, q3];
         if choose_destination(1, 0, &online, &all_full, CAPACITY)
             == Err(PlacementError::NoCapacity)
         { no_capacity += 1; } else { valid = false; break 'waves; }
@@ -204,7 +210,7 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
             if Q[cpu].enqueue(other, overflow_seq, token(other, overflow_seq))
                 == Err(QueueError::WrongCpu)
             { wrong += 1; } else { valid = false; break 'waves; }
-            if Q[cpu].len() != CAPACITY {
+            if Q[cpu].try_len() != Ok(CAPACITY) {
                 valid = false; break 'waves;
             }
         }
