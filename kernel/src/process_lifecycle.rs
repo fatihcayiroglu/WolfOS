@@ -107,6 +107,27 @@ impl<const N: usize> ProcessRecord<N> {
         Ok(())
     }
 
+    /// Roll back a RESERVED/READY process before any user execution.
+    /// A caller must supply the actual hardware CR3, already verified to
+    /// differ from the tentative root. Returned frames remain the caller's
+    /// responsibility and must be released exactly once through PMM.
+    pub fn cancel_ready(&mut self, pid: u64, active_cr3: u64)
+        -> Result<[u64; N], ProcessError>
+    {
+        self.identity(pid)?;
+        if self.state != ProcessState::Ready {
+            return Err(ProcessError::WrongState)
+        }
+        if active_cr3 == 0 || active_cr3 == self.cr3_root {
+            return Err(ProcessError::ActiveCr3)
+        }
+        let owned = self.frames;
+        self.frames = [0; N];
+        self.cr3_root = 0;
+        self.state = ProcessState::Reaped;
+        Ok(owned)
+    }
+
     /// Release authorization requires: correct PID, exited state and
     /// restored CR3 not equal to the private root. A successful reap
     /// marks ownership relinquished exactly once before any caller frees
@@ -229,6 +250,25 @@ mod tests {
         assert_eq!(p.reap(1, 0), Err(ProcessError::ActiveCr3));
         assert_eq!(p.state, ProcessState::Exited);
         assert_eq!(p.reap(1, 0x9000), Ok(owned()));
+    }
+
+    #[test]
+    fn failed_ready_admission_can_cancel_only_when_root_is_inactive() {
+        let mut p = ProcessRecord::<7>::empty();
+        p.admit(11, owned()[0], owned()).unwrap();
+        let snapshot = p;
+        assert_eq!(p.cancel_ready(11, 0), Err(ProcessError::ActiveCr3));
+        assert_eq!(p.cancel_ready(11, owned()[0]), Err(ProcessError::ActiveCr3));
+        assert_eq!(p.cancel_ready(12, 0x9000), Err(ProcessError::StalePid));
+        assert_eq!(p, snapshot);
+        assert_eq!(p.cancel_ready(11, 0x9000), Ok(owned()));
+        assert_eq!(p.state, ProcessState::Reaped);
+        assert_eq!(p.frames, [0; 7]);
+        assert_eq!(p.cancel_ready(11, 0x9000), Err(ProcessError::WrongState));
+        assert_eq!(p.reap(11, 0x9000), Err(ProcessError::WrongState));
+        p.admit(12, owned()[0], owned()).unwrap();
+        p.mark_running(12, owned()[0]).unwrap();
+        assert_eq!(p.cancel_ready(12, 0x9000), Err(ProcessError::WrongState));
     }
 
     #[test]
