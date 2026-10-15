@@ -449,6 +449,20 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
         ));
         serial::qemu_exit_success();
     }
+    #[cfg(any(feature = "high-half-stack-arena-lower-fault-smoke",
+              feature = "high-half-stack-arena-upper-fault-smoke"))]
+    if matches!(address, Ok(v) if
+        crate::high_half_stack_arena_smoke::expected_fault(
+            v.as_u64(), code.bits(), frame.instruction_pointer.as_u64())
+    ) {
+        serial::write_fmt(format_args!(
+            "WOLFOS_HIGH_STACK_ARENA_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\n",
+            if cfg!(feature="high-half-stack-arena-upper-fault-smoke") {
+                "pid2_upper"
+            } else { "pid1_lower" }
+        ));
+        serial::qemu_exit_success();
+    }
     #[cfg(feature = "paging-fault-smoke")]
     if matches!(address, Ok(fault_address) if fault_address.as_u64() == crate::paging::TEST_VIRTUAL_ADDRESS)
         && !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
