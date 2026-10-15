@@ -85,6 +85,32 @@ mod tests {
         assert_eq!(q.exit(2),Ok(Some(1))); assert_eq!(q.exit(1),Ok(None));
     }
     #[test]
+    fn overflow_rejection_preserves_exact_scheduler_state() {
+        let mut q=RoundRobin::new(); q.admit(1).unwrap(); q.admit(2).unwrap(); q.start(1).unwrap();
+        q.slots[0].ticks=u64::MAX;
+        let before=q;
+        assert_eq!(q.timer_tick(1),Err(Error::Overflow));
+        assert_eq!(q,before);
+        q.slots[0].ticks=0;
+        q.switches=u64::MAX;
+        let before=q;
+        assert_eq!(q.timer_tick(1),Err(Error::Overflow));
+        assert_eq!(q,before);
+    }
+    #[test]
+    fn full_ledger_and_finished_tasks_cannot_be_readmitted() {
+        let mut q=RoundRobin::new(); q.admit(11).unwrap(); q.admit(22).unwrap();
+        let before=q;
+        assert_eq!(q.admit(33),Err(Error::WrongState));
+        assert_eq!(q,before);
+        q.start(11).unwrap(); assert_eq!(q.exit(11),Ok(Some(22)));
+        assert_eq!(q.exit(22),Ok(None));
+        let before=q;
+        assert_eq!(q.timer_tick(22),Err(Error::NoRunnable));
+        assert_eq!(q.admit(33),Err(Error::WrongState));
+        assert_eq!(q,before);
+    }
+    #[test]
     fn exited_pid_is_stale() {
         let mut q=RoundRobin::new(); q.admit(1).unwrap(); q.admit(2).unwrap(); q.start(1).unwrap();
         q.exit(1).unwrap(); let before=q; assert_eq!(q.timer_tick(1),Err(Error::WrongState)); assert_eq!(q,before);
