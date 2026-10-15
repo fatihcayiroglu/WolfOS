@@ -211,8 +211,8 @@ pub fn initialize() {
         // SAFETY: serialized BSP boot before any other code touches this
         // permanently owned static storage.
         unsafe {
-            rsp0_bottom.cast::<u64>().write(USER_RSP0_CANARY);
-            rsp0_bottom.cast::<u64>().add(1).write(!USER_RSP0_CANARY);
+            (rsp0_bottom as *mut u64).write(USER_RSP0_CANARY);
+            (rsp0_bottom as *mut u64).add(1).write(!USER_RSP0_CANARY);
         }
         tss.privilege_stack_table[0] = VirtAddr::new(rsp0_top as u64);
         USER_RSP0_EXPECTED.store(rsp0_top as u64, Ordering::Release);
@@ -315,7 +315,7 @@ pub fn verify_ring3_preconditions() -> bool {
     // SAFETY: static storage has never been used as the CPU entry stack
     // because this smoke does NOT switch to CPL3.
     let (low, next) = unsafe {
-        (base.cast::<u64>().read(), base.cast::<u64>().add(1).read())
+        ((base as *const u64).read(), (base as *const u64).add(1).read())
     };
 
     let contract = crate::user_ring_entry::validate(crate::user_ring_entry::Ring3Entry {
@@ -352,7 +352,11 @@ pub fn verify_ring3_preconditions() -> bool {
 fn stack_top_check(base: usize, top: usize) -> bool {
     base != 0 && base % 16 == 0 && top % 16 == 0
         && top > base && top - base == USER_RSP0_STACK_SIZE
-        && !(base..top).contains(&((&raw const DOUBLE_FAULT_STACK).cast::<u8>() as usize))
+        && {
+            let ist = (&raw const DOUBLE_FAULT_STACK).cast::<u8>() as usize;
+            let ist_end = ist + DOUBLE_FAULT_STACK_SIZE;
+            top <= ist || base >= ist_end
+        }
 }
 
 extern "x86-interrupt" fn breakpoint(_frame: InterruptStackFrame) {
