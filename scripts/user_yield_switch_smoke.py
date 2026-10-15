@@ -62,7 +62,7 @@ def main():
             if timer_observe:
                 checks.insert(checks.index(STEPS[3]),
                     "WOLFOS_RING3_TIMER_HARDWARE_OK")
-                checks.insert(checks.index(STEPS[-1]),
+                checks.insert(len(checks)-1,
                     "WOLFOS_RING3_TIMER_CLEANUP_OK actual_irq_eoi=1 lvt_masked=1 pic_restored=1 high_mmio_unmapped=1")
             checks.insert(checks.index(checks[-1]),
                 "WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1")
