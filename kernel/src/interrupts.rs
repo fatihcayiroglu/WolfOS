@@ -325,6 +325,7 @@ pub fn verify_ring3_reentry_preconditions() -> bool {
     ring3_preflight_inner(true)
 }
 
+#[cfg(any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", feature = "user-elf-run-smoke", feature = "user-process-smoke"))]
 fn ring3_preflight_inner(after_user_trap: bool) -> bool {
     // Only after interrupts::initialize(), before SMP startup. Read actual
     // hardware task register and actual packed TSS privilege_stack_table.
