@@ -1,13 +1,13 @@
 //! P2 kernel-half supervisor-only PML4 inheritance for an INACTIVE shadow root.
 //!
-//! The source is the live bootloader PML4. We copy existing upper-half PML4
-//! entries to an independently owned zero-high-half user root AFTER verifying
-//! they are supervisor-only, present/valid and do not point to caller-owned
-//! temporary frames. We NEVER mutate the live source or descendant tables.
+//! The source is the live bootloader PML4, which MAY have U/S=1 even in
+//! its higher-half entries. We *normalize* every inherited high-half entry
+//! by CLEARNING U/S in the fresh shadow root after checked validation.
+//! We NEVER mutate the live source or descendant tables.
 //!
-//! Unlike copying only an arbitrary kernel virtual address, this preserves
-//! the exact pre-existing kernel, HHDM, IDT/stack and framebuffer upper-half
-//! PML4 entries. All kernel upper-half PML4 entries remain U/S=0, which
+//! The graft preserves the boot kernel, HHDM, IDT/stack and framebuffer
+//! upper-half PML4 entries, EXCEPT for clearing U/S. All copied high-half
+//! PML4 entries therefore have U/S=0, which
 //! denies CPL3 access regardless of lower-level flags.
 //!
 //! This is only an admission + metadata-copy proof. It does NOT activate
@@ -67,9 +67,6 @@ fn validate_source(
         if entry & PTE_PRESENT == 0 {
             return Err(GraftError::NonPresentMetadata);
         }
-        if entry & PTE_USER != 0 {
-            return Err(GraftError::UserAccessibleKernel);
-        }
         if entry & PTE_LARGE_PAGE != 0 || entry & PHYS_MASK == 0 {
             return Err(GraftError::InvalidKernelRootEntry);
         }
@@ -85,6 +82,7 @@ fn validate_source(
 }
 
 /// Preflight all source and destination entries BEFORE writing any byte.
+/// The only allowed copy transformation is clearing U/S from high entries.
 /// Caller must hold an exclusive, fresh shadow PML4 frame and a stable
 /// snapshot of the live PML4. Owned frames are the fresh PMM frames,
 /// including the destination PML4 itself and all user page-table frames.
@@ -100,12 +98,18 @@ pub fn graft_kernel_half(
         return Err(GraftError::DirtyKernelHalf);
     }
     let count = validate_source(active, owned)?;
-    shadow[HIGH_HALF_START..].copy_from_slice(&active[HIGH_HALF_START..]);
+    for (dst, source) in shadow[HIGH_HALF_START..].iter_mut()
+        .zip(active[HIGH_HALF_START..].iter().copied())
+    {
+        // Limine may legitimately mark its own high PML4 U/S=1. Never
+        // propagate that privilege: the new root's high half is CPL0 ONLY.
+        *dst = source & !PTE_USER;
+    }
     Ok(count)
 }
 
-/// Independently re-check low-half cardinality, exact high-half equality and
-/// supervisor access on every high PML4 slot after inheritance.
+/// Independently re-check low-half cardinality, exact high-half equivalence
+/// AFTER U/S removal, and supervisor access on EVERY high PML4 slot.
 pub fn audit_kernel_half(
     active: &[u64; PML4_ENTRIES],
     shadow: &[u64; PML4_ENTRIES],
@@ -115,8 +119,15 @@ pub fn audit_kernel_half(
 ) -> Result<usize, GraftError> {
     check_user_lower(shadow, user_pml4_index, expected_user_entry)?;
     let count = validate_source(active, owned)?;
-    if shadow[HIGH_HALF_START..] != active[HIGH_HALF_START..] {
-        return Err(GraftError::AuditMismatch);
+    for (dest, source) in shadow[HIGH_HALF_START..].iter().copied()
+        .zip(active[HIGH_HALF_START..].iter().copied())
+    {
+        if dest & PTE_USER != 0 {
+            return Err(GraftError::UserAccessibleKernel);
+        }
+        if dest != source & !PTE_USER {
+            return Err(GraftError::AuditMismatch);
+        }
     }
     Ok(count)
 }
@@ -155,16 +166,25 @@ mod tests {
     }
 
     #[test]
-    fn fail_without_partial_write_on_user_bit_and_absent_kernel_root() {
+    fn sanitizes_user_bit_from_boot_source_but_denies_target_escalation() {
         let mut src = source();
-        src[511] |= PTE_USER;
+        src[511] |= PTE_USER; // Limine can set this even for high mappings.
+        src[256] |= PTE_USER;
+        let mut dst = target();
+        assert_eq!(graft_kernel_half(&src, &mut dst, 0, USER_ENTRY, &FRAMES), Ok(3));
+        assert_eq!(dst[511], src[511] & !PTE_USER);
+        assert_eq!(dst[256], src[256] & !PTE_USER);
+        assert_eq!(audit_kernel_half(&src, &dst, 0, USER_ENTRY, &FRAMES), Ok(3));
+        dst[511] |= PTE_USER;
+        assert_eq!(audit_kernel_half(&src, &dst, 0, USER_ENTRY, &FRAMES),
+            Err(GraftError::UserAccessibleKernel));
+    }
+
+    #[test]
+    fn rejects_missing_kernel_half_without_partial_write() {
+        let src = [0u64; PML4_ENTRIES];
         let mut dst = target();
         let before = dst;
-        assert_eq!(graft_kernel_half(&src, &mut dst, 0, USER_ENTRY, &FRAMES),
-            Err(GraftError::UserAccessibleKernel));
-        assert_eq!(dst, before);
-
-        let src = [0u64; PML4_ENTRIES];
         assert_eq!(graft_kernel_half(&src, &mut dst, 0, USER_ENTRY, &FRAMES),
             Err(GraftError::NoKernelMappings));
         assert_eq!(dst, before);
