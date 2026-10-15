@@ -59,3 +59,23 @@ currently resume the interrupted same PID. The next PR must save the
 preempted frame/FX image and restore a DIFFERENT runnable PID with an
 actual CR3/TSS handoff, plus correct timer EOI and fully validated
 state; retain all prior CI gates.
+
+
+## Integration acceptance against main after #93 / #94
+
+This ADR and its timer QEMU proof must be revalidated against the
+updated main containing #93's independent supervisor high-half UC
+xAPIC mapping contract and #94's publish-last-PML4 requirement.
+
+The new `user_xapic_high::publish` routine fully initializes its
+PMM-owned PDPT/PD/PT before its *final* PML4 publication store and
+rejects an occupied root slot; it is NOT a substitute for the
+#93/#94 pure contract on other root users. The timer high-half mapping
+and the separately gated contract have distinct ownership/lifetime
+requirements; neither bypasses the other's CI gate.
+
+When the feature branch predates #93 and #94, require a complete
+pull-request CI checkout against the NEW merge base and green tests
+on the exact changed head SHA. A successful earlier branch-only
+run against the older base is insufficient evidence of integration.
+Do not close issue #91; all timer IRQs still resume the same PID.
