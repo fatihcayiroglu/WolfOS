@@ -35,9 +35,9 @@ mod user_copy;
 mod user_file_io;
 #[cfg(feature = "user-file-io-smoke")]
 mod user_file_io_smoke;
-#[cfg(any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "process-table-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))]
+#[cfg(any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "process-table-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))))]
 mod process_lifecycle;
-#[cfg(any(feature = "kernel-stack-lease-smoke", any(feature = "process-table-smoke", feature = "user-context-smoke")))]
+#[cfg(any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "process-table-smoke", feature = "user-context-smoke"))))]
 mod process_table;
 #[cfg(any(feature = "kernel-stack-lease-smoke", feature = "user-context-smoke"))]
 mod user_context_bank;
@@ -168,8 +168,12 @@ mod apic_irq_entry;
 mod apic_preempt_smoke;
 #[cfg(any(feature = "apic-preempt-smoke", feature = "ap-smp-preempt-smoke"))]
 mod preempt_depth;
-#[cfg(feature = "apic-preempt-smoke")]
+#[cfg(any(feature = "apic-preempt-smoke", feature = "user-fx-smoke"))]
 mod fx_state;
+#[cfg(feature = "user-fx-smoke")]
+mod user_fx_bank;
+#[cfg(feature = "user-fx-smoke")]
+mod user_fx_smoke;
 #[cfg(feature = "apic-preempt-smoke")]
 mod rr_policy;
 #[cfg(feature = "apic-preempt-smoke")]
@@ -464,6 +468,9 @@ pub extern "C" fn kmain() -> ! {
 
     #[cfg(any(feature = "high-half-stack-arena-smoke", feature = "high-half-stack-arena-lower-fault-smoke", feature = "high-half-stack-arena-upper-fault-smoke"))]
     high_half_stack_arena_smoke::verify(hhdm.offset);
+
+    #[cfg(feature = "user-fx-smoke")]
+    user_fx_smoke::verify();
 
     #[cfg(feature = "smoke-exit")]
     serial::qemu_exit_success();
