@@ -17,7 +17,7 @@ fn put64(b: &mut [u8], at: usize, n: u64) {
     b[at..at+8].copy_from_slice(&n.to_le_bytes());
 }
 fn fixture() -> Vec<u8> {
-    let mut b = vec![0u8; 0x300];
+    let mut b = vec![0u8; 0x1200];
     b[..4].copy_from_slice(b"\x7fELF");
     b[4..7].copy_from_slice(&[2, 1, 1]);
     put16(&mut b, 16, 2);
@@ -30,12 +30,12 @@ fn fixture() -> Vec<u8> {
     put16(&mut b, 56, 1);
     put32(&mut b, 64, 1);
     put32(&mut b, 68, 5);
-    put64(&mut b, 72, 0x1f0);
+    put64(&mut b, 72, 0xff0);
     put64(&mut b, 80, 0x401ff0);
     put64(&mut b, 96, 20);
     put64(&mut b, 104, 0x1000);
     put64(&mut b, 112, 0x1000);
-    for n in 0..20usize { b[0x1f0+n] = (n + 1) as u8; }
+    for n in 0..20usize { b[0xff0+n] = (n + 1) as u8; }
     b
 }
 
@@ -103,7 +103,7 @@ fn forged_wx_untrusted_file_or_bad_plan_fail_before_zeroing() {
     );
     segment.writable = false;
     assert_eq!(
-        materialize(&bytes[..0x200], &segment, 0x401000, &mut page),
+        materialize(&bytes[..0x1000], &segment, 0x401000, &mut page),
         Err(MaterializeError::InvalidFile)
     );
     segment.page_end += 4096;
