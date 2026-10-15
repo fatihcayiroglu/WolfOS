@@ -225,15 +225,14 @@ mod tests {
         });
         let mut expected_hash = 0u64;
         for round in 0..32u64 {
+            // Next batch may be published only after previous batch has
+            // drained; within the batch producer fills all eight slots.
+            while q.published() != q.consumed() {
+                thread::yield_now();
+            }
             let initial = round * CAPACITY as u64;
             for offset in 1..=CAPACITY as u64 {
                 let id = initial + offset;
-                // Each block is published only after the previous block
-                // has drained. This barrier avoids scheduling-related
-                // false failure; the consumer remains a genuine thread.
-                while q.published() != q.consumed() {
-                    thread::yield_now();
-                }
                 assert_eq!(q.publish(1, job_token(1, id)), Ok(id));
                 expected_hash = rolling_digest(
                     expected_hash, 1, id, job_token(1, id),
