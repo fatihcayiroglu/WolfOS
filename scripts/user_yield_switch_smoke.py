@@ -57,7 +57,7 @@ def main():
             checks.insert(3,
                 "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=2")
         if irq_ready or timer_observe:
-            checks.insert(3,
+            checks.insert(checks.index(STEPS[3]),
                 "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0")
             if timer_observe:
                 checks.insert(checks.index(STEPS[3]),
@@ -78,7 +78,7 @@ def main():
             irq_line=next((line for line in out.splitlines()
                 if line.startswith("WOLFOS_RING3_TIMER_HARDWARE_OK ")),None)
             hit=re.fullmatch(
-                r"WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs=(\\d+) pid1_busy_irqs=(\\d+) pid2_busy_irqs=(\\d+) eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1",
+                r"WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs=(\d+) pid1_busy_irqs=(\d+) pid2_busy_irqs=(\d+) eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1",
                 irq_line or "")
             if hit is None or any(int(n)<1 for n in hit.groups()) or int(hit.group(1))<int(hit.group(2))+int(hit.group(3)):
                 print("FAIL: no real xAPIC timer interrupts during BOTH independent users' syscall-free busy windows")
