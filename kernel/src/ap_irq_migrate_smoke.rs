@@ -312,12 +312,10 @@ pub extern "C" fn wolfos_ap_migrate_timer_irq_dispatch(
         return frame;
     };
     TIMER_IRQS[cpu].fetch_add(1, Ordering::Relaxed);
-    // A periodic local timer can raise a second IRQ while this handler
-    // performs FX state saves, frame validation and lease transitions.
-    // Mask LVT and zero initial count FIRST, while IF is still cleared by
-    // the interrupt gate, before touching potentially lengthy FX/lease
-    // logic or sending EOI. Otherwise a pending second IRQ may be delivered
-    // after the escape IRETQ, when no task owns this AP's timer.
+    // Every quantum arms one local one-shot tick. Mask LVT and zero
+    // initial count FIRST while IF remains cleared by the interrupt gate.
+    // This also defends against stale/pending delivery: a second tick
+    // must NEVER be counted as a valid migration checkpoint.
     let stopped_on_entry = stop_local_timer();
     let original = frame;
     let mut next_frame = frame;
@@ -441,7 +439,11 @@ pub fn secondary_run(cpu: usize) -> bool {
                 // only UNTIL escape() begins. It then stores its own
                 // suspended coordinator-stack RSP in a different slot.
                 unsafe { (*RSP.0.get()).1[cpu] = fake; }
-                let Ok(plan) = lapic_timer_plan::periodic_timer_plan(
+                // Each migration quantum must produce exactly ONE hardware
+                // preemption. Periodic delivery can queue a second tick
+                // before an IRQ handler masks the LVT, corrupting the
+                // exactly-once TaskLease proof under QEMU host contention.
+                let Ok(plan) = lapic_timer_plan::one_shot_timer_plan(
                     TIMER_VECTOR, DIVISOR, COUNT
                 ) else { fx_leave(cpu); good = false; break; };
                 unsafe {
@@ -451,8 +453,13 @@ pub fn secondary_run(cpu: usize) -> bool {
                 for op in plan.preparation {
                     unsafe { ap_ipi_smoke::write(op.offset, op.value); }
                 }
-                unsafe { ap_ipi_smoke::write(plan.activation.offset, plan.activation.value); }
+                // All frame/FX/lease state is ready before the one-shot
+                // starts. IF stays cleared until the task's own saved
+                // kernel frame resumes. The COUNT write is the final commit
+                // AFTER unmask, so no one-shot expiry is lost while masked.
+                unsafe { ap_ipi_smoke::write(plan.arm.offset, plan.arm.value); }
                 ACTIVE[cpu].store(true, Ordering::Release);
+                unsafe { ap_ipi_smoke::write(plan.start.offset, plan.start.value); }
                 if job.token == 1 {
                     // Initial kernel task entry is an ABI switch, but
                     // the worker NEVER voluntarily yields afterwards.
