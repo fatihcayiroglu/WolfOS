@@ -312,9 +312,19 @@ pub extern "C" fn wolfos_ap_migrate_timer_irq_dispatch(
         return frame;
     };
     TIMER_IRQS[cpu].fetch_add(1, Ordering::Relaxed);
+    // A periodic local timer can raise a second IRQ while this handler
+    // performs FX state saves, frame validation and lease transitions.
+    // Mask LVT and zero initial count FIRST, while IF is still cleared by
+    // the interrupt gate, before touching potentially lengthy FX/lease
+    // logic or sending EOI. Otherwise a pending second IRQ may be delivered
+    // after the escape IRETQ, when no task owns this AP's timer.
+    let stopped_on_entry = stop_local_timer();
     let original = frame;
     let mut next_frame = frame;
-    if cpu >= CORES || !ACTIVE[cpu].swap(false, Ordering::AcqRel) {
+    if cpu >= CORES || !ACTIVE[cpu].swap(false, Ordering::AcqRel)
+        || !stopped_on_entry
+    {
+        IRQ_BAD.fetch_or(32, Ordering::Relaxed);
         ERROR.fetch_add(1, Ordering::Relaxed);
     } else {
         let cs = CS::get_reg().0;
@@ -348,7 +358,6 @@ pub extern "C" fn wolfos_ap_migrate_timer_irq_dispatch(
             let epoch = EPOCH[cpu].load(Ordering::Acquire);
             let snap = LEASE.execute_quantum(cpu, epoch);
             if snap.ok().is_none_or(|s| s.steps != epoch + 1)
-                || !stop_local_timer()
             {
                 IRQ_BAD.fetch_or(8, Ordering::Relaxed);
                 ERROR.fetch_add(1, Ordering::Relaxed);

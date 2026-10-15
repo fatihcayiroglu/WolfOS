@@ -35,13 +35,15 @@ else ifeq ($(FLAVOR),ap-stack-migrate)
 FEATURES := --features ap-stack-migrate-smoke
 else ifeq ($(FLAVOR),ap-irq-migrate)
 FEATURES := --features ap-irq-migrate-smoke
+else ifeq ($(FLAVOR),ap-runqueue)
+FEATURES := --features ap-runqueue-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -135,6 +137,10 @@ ap-irq-migrate-smoke:
 	$(MAKE) iso FLAVOR=ap-irq-migrate
 	python3 scripts/ap_irq_migrate_smoke.py $(OUT)/wolfos-ap-irq-migrate.iso
 
+ap-runqueue-smoke:
+	$(MAKE) iso FLAVOR=ap-runqueue
+	python3 scripts/ap_runqueue_smoke.py $(OUT)/wolfos-ap-runqueue.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -160,6 +166,8 @@ test:
 	$(OUT)/ipi_layout_tests
 	rustc --edition=2024 --test kernel/src/remote_runqueue.rs -o $(OUT)/remote_runqueue_tests
 	$(OUT)/remote_runqueue_tests
+	rustc --edition=2024 --test kernel/src/percpu_work_queue.rs -o $(OUT)/percpu_work_queue_tests
+	$(OUT)/percpu_work_queue_tests
 	rustc --edition=2024 --test kernel/src/task_handoff.rs -o $(OUT)/task_handoff_tests
 	$(OUT)/task_handoff_tests
 	rustc --edition=2024 --test kernel/src/migrating_stack_contract.rs -o $(OUT)/migrating_stack_contract_tests
