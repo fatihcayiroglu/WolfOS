@@ -161,18 +161,28 @@ pub extern "C" fn observe_timer_irq(
         user_rflags:f.hardware.rflags,
         fpu_owner_pid:s.fx.active_pid().unwrap_or(0),
     };
-    if user_irq_preempt_contract::validate(check).is_err()||
-        f.hardware.cs!=user_cs as u64||
+    let (busy_start,busy_end)=user_busy(i);
+    let in_busy=(busy_start..busy_end).contains(&f.hardware.rip);
+    let reason=user_irq_preempt_contract::validate(check).err();
+    let extra=f.hardware.cs!=user_cs as u64||
         f.hardware.ss!=user_ss as u64||
         f.hardware.rsp!=USER_TOP||
-        f.registers.r12!=pid||
-        f.registers.r14!=USER_ID[i]||
-        f.hardware.rip<CODE||f.hardware.rip>=CODE+PAGE{
+        f.hardware.rip<CODE||f.hardware.rip>=CODE+PAGE;
+    // A genuine timer can interrupt the very FIRST instruction after
+    // IRETQ, before user code initializes R12/R14. Verify PID sentinels
+    // only INSIDE the precisely linked initialized busy-loop window.
+    let bad_gpr=in_busy&&(f.registers.r12!=pid||f.registers.r14!=USER_ID[i]);
+    if reason.is_some()||extra||bad_gpr{
+        serial::write_fmt(format_args!(
+            "WOLFOS_RING3_TIMER_DIAGNOSTIC pid={} rip={:#x} rsp={:#x} cs={:#x} ss={:#x} flags={:#x} r12={:#x} r14={:#x} frame={:#x} top={:#x} reason={:?} extra={} bad_gpr={} in_busy={}\n",
+            pid,f.hardware.rip,f.hardware.rsp,f.hardware.cs,
+            f.hardware.ss,f.hardware.rflags,f.registers.r12,
+            f.registers.r14,raw as u64,st.top,reason,extra,bad_gpr,in_busy
+        ));
         fail("real_cpl3_timer_iret_gpr_or_frame_validation")
     }
-    let (busy_start,busy_end)=user_busy(i);
     s.timer_irqs[i]+=1;
-    if (busy_start..busy_end).contains(&f.hardware.rip){
+    if in_busy{
         s.timer_busy[i]+=1;
     }
     if s.timer_irqs[i]>100_000{
