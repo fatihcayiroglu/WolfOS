@@ -51,7 +51,8 @@ fn copies_unaligned_cross_page_file_bytes_and_zeroes_every_other_byte() {
     let a = materialize(&bytes, &segment, 0x401000, &mut first).unwrap();
     assert_eq!((a.copied, a.zeroed), (16, PAGE_SIZE - 16));
     assert!(first[..PAGE_SIZE - 16].iter().all(|b| *b == 0));
-    assert_eq!(&first[PAGE_SIZE - 16..], &(1..=16).collect::<Vec<u8>>());
+    let expected: Vec<u8> = (1..=16).collect();
+    assert_eq!(&first[PAGE_SIZE - 16..], &expected[..]);
 
     let mut second = [0xeeu8; PAGE_SIZE];
     let b = materialize(&bytes, &segment, 0x402000, &mut second).unwrap();
