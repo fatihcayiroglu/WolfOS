@@ -3,7 +3,7 @@
 //! NO CPL3 instruction executes; IRET frames are bootstrap metadata, not
 //! runnable until all ELF/PTE and actual trap lifecycle checks are complete.
 use core::arch::asm;
-use x86_64::{VirtAddr, instructions::{interrupts,tlb}, registers::control::Cr3};
+use x86_64::{VirtAddr, instructions::tlb, registers::control::Cr3};
 use crate::{
     high_half_stack_arena::{
         GuardedArena,Handle,PT_ENTRIES,OWNED as ARENA_FRAMES,
