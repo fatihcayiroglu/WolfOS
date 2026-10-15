@@ -71,6 +71,8 @@ jobs:
         run: make user-fx-smoke
       - name: P2 actual CR3 TSS.RSP0 and FXSAVE64 synchronized handoff between two guarded READY PIDs (BSP-only)
         run: make p2-handoff-preflight-smoke
+      - name: P2 actual two native ELF Ring3 cooperative INT80 yield with distinct guarded RSP0 CR3 FXSAVE64 and complete PMM cleanup
+        run: make p2-ring3-yield-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
