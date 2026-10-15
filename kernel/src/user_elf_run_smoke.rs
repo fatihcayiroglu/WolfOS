@@ -110,7 +110,7 @@ pub fn enter(hhdm: u64) -> ! {
             // here because the kernel arrived via a real CPL3 INT80 trap.
             let safely_reaped = matches!(
                 PROCESS.with(|p| (p.pid, p.state, p.frames)),
-                Ok((1, ProcessState::Reaped, [0; FRAMES])),
+                Ok((1, ProcessState::Reaped, frames)) if frames.iter().all(|f| *f == 0),
             );
             if !safely_reaped || OWNED.iter().any(|p| p.load(Ordering::Acquire) != 0)
                 || !interrupts::verify_ring3_reentry_preconditions()
