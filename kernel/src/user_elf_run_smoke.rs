@@ -44,7 +44,13 @@ const SLOTS: usize = 512;
 const FRAMES: usize = 7; // new PML4, PDPT, PD, PT, RX text, RW data/BSS, RW stack
 const STACK_VA: u64 = 0x404000;
 const RETURN_COUNT: usize = HELLO.len() + 2;
-const TOTAL_CALLS: usize = RETURN_COUNT + 1;
+const EXTRA_FILE_CALLS: usize = if cfg!(feature = "user-file-io-smoke") { 5 } else { 0 };
+const EXIT_STAGE: usize = RETURN_COUNT + EXTRA_FILE_CALLS;
+const TOTAL_CALLS: usize = EXIT_STAGE + 1;
+#[cfg(feature = "user-file-io-smoke")]
+const FILE_BYTES: &[u8; 8] = b"FILE_OK\n";
+#[cfg(feature = "user-file-io-smoke")]
+static FILE_FD: AtomicU64 = AtomicU64::new(0);
 
 static ENTRY: AtomicU64 = AtomicU64::new(0);
 static STACK_TOP: AtomicU64 = AtomicU64::new(0);
@@ -102,6 +108,8 @@ pub fn enter(hhdm: u64) -> ! {
     HHDM_OFFSET.store(hhdm, Ordering::Release);
     #[cfg(feature = "user-vfs-smoke")]
     crate::vfs_smoke::prepare(ELF);
+    #[cfg(feature = "user-file-io-smoke")]
+    crate::user_file_io_smoke::prepare();
     #[cfg(feature = "user-ramfs-smoke")]
     crate::ramfs_smoke::prepare(ELF);
     #[cfg(feature = "user-vfs-smoke")]
@@ -129,6 +137,17 @@ pub fn enter(hhdm: u64) -> ! {
         #[cfg(not(feature = "user-process-smoke"))]
         fail("unreachable_user_reentry");
     }
+    #[cfg(feature = "user-file-io-smoke")]
+    if symbols::FILE_PATH_END != symbols::FILE_PATH + 13
+        || symbols::AFTER_FILE_OPEN <= symbols::AFTER_PUTC
+        || symbols::AFTER_FILE_READ <= symbols::AFTER_FILE_OPEN
+        || symbols::AFTER_FILE_BAD_READ <= symbols::AFTER_FILE_READ
+        || symbols::AFTER_FILE_CLOSE <= symbols::AFTER_FILE_BAD_READ
+        || symbols::AFTER_FILE_BAD_OPEN <= symbols::AFTER_FILE_CLOSE
+        || symbols::AFTER_EXIT <= symbols::AFTER_FILE_BAD_OPEN
+        || symbols::FILE_PATH <= symbols::HELLO_END
+    { fail("file_elf_linker_contract") }
+
     if symbols::ENTRY != 0x401000 || symbols::AFTER_ID <= symbols::ENTRY
         || symbols::AFTER_ADD <= symbols::AFTER_ID
         || symbols::AFTER_PUTC <= symbols::AFTER_ADD
@@ -318,6 +337,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     // pointer is dereferenced; all virtual user inputs are only numbers.
     let frame = unsafe { &mut *raw };
     let base = user_entry - symbols::ENTRY;
+    #[cfg(feature = "user-file-io-smoke")]
+    if stage >= RETURN_COUNT && stage < EXIT_STAGE {
+        return handle_file_call(raw, frame, base, stage);
+    }
     let expected_rip = if stage == 0 { symbols::AFTER_ID }
         else if stage == 1 { symbols::AFTER_ADD }
         else if stage < RETURN_COUNT { symbols::AFTER_PUTC }
@@ -380,19 +403,31 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
         Outcome::ExitZero => {
             let pid = RUN_INDEX.load(Ordering::Acquire) as u64 + 1;
-            if stage != RETURN_COUNT || STAGE.load(Ordering::Acquire) != TOTAL_CALLS
+            if stage != EXIT_STAGE || STAGE.load(Ordering::Acquire) != TOTAL_CALLS
             { fail("unexpected_exit_stage") }
             let data = DATA_HHDM.load(Ordering::Acquire);
             if data == 0 { fail("missing_owned_elf_data") }
             // Validate the segment STILL matches genuine ELF file bytes and
             // all BSS bytes remain zero after user execution.
             let actual = unsafe { &*(data as *const [u8; 65]) };
-            if actual[0] != 0x5a || actual[1..].iter().any(|b| *b != 0)
-            { fail("guest_elf_data_or_bss_corrupted") }
+            if actual[0] != 0x5a { fail("guest_elf_data_or_bss_corrupted") }
+            #[cfg(not(feature = "user-file-io-smoke"))]
+            if actual[1..].iter().any(|b| *b != 0)
+            { fail("guest_elf_bss_corrupted") }
+            #[cfg(feature = "user-file-io-smoke")]
+            {
+                if &actual[1..9] != FILE_BYTES || actual[9..].iter().any(|b| *b != 0) {
+                    fail("guest_file_read_did_not_write_bss_exactly")
+                }
+                crate::user_file_io_smoke::finish(pid);
+            }
             if !matches!(PROCESS.with(|p| p.exit_zero(pid, active)), Ok(Ok(()))) {
                 fail("process_exit_transition")
             }
+            #[cfg(not(feature = "user-file-io-smoke"))]
             serial::write_line("WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22");
+            #[cfg(feature = "user-file-io-smoke")]
+            serial::write_line("WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=27");
 
             // Hardware restoration before FREE: the boot CR3 has all needed
             // kernel, HHDM, TSS and serial mappings. Never release an ACTIVE
@@ -425,7 +460,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
             { fail("pmm_frame_leak") }
             serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
+            #[cfg(not(feature = "user-file-io-smoke"))]
             serial::write_line("WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=0 resources_released=1 real_process_manager=0");
+            #[cfg(feature = "user-file-io-smoke")]
+            serial::write_line("WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=27 exit=0 resources_released=1 real_process_manager=0");
             #[cfg(feature = "user-process-smoke")]
             {
                 serial::write_fmt(format_args!(
