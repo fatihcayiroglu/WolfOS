@@ -45,6 +45,8 @@ jobs:
         run: make user-ramfs-smoke
       - name: P2 native VFS root/tmp mounts, PID-owned FDs and real ELF64 CPL3 boot
         run: make user-vfs-smoke
+      - name: P2 real Ring3 user OPEN READ CLOSE and denied kernel/RX user pointers
+        run: make user-file-io-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
