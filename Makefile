@@ -302,6 +302,8 @@ test:
 	$(OUT)/pmm_layout_tests
 	rustc --edition=2024 --test kernel/src/lapic_layout.rs -o $(OUT)/lapic_layout_tests
 	$(OUT)/lapic_layout_tests
+	rustc --edition=2024 --test kernel/src/user_apic_mmio_shadow.rs -o $(OUT)/user_apic_mmio_shadow_tests
+	$(OUT)/user_apic_mmio_shadow_tests
 	rustc --edition=2024 --test kernel/src/lapic_mmio_layout.rs -o $(OUT)/lapic_mmio_layout_tests
 	$(OUT)/lapic_mmio_layout_tests
 	rustc --edition=2024 --test kernel/src/lapic_timer_layout.rs -o $(OUT)/lapic_timer_layout_tests
