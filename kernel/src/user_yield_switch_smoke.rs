@@ -206,7 +206,6 @@ pub extern "C" fn observe_timer_irq(
     let preempt_target={
         let other=1-i;
         if in_busy && s.timer_preempts[i]==0
-            && s.timer_preempts[other]==0
             && s.frames[other]!=0 && !s.exits[other] {
             Some(other)
         } else {
