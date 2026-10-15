@@ -7,7 +7,7 @@
 use crate::{
     elf64_preflight::preflight,
     elf64_page_image::{materialize, PAGE_SIZE},
-    pmm, serial,
+    kernel_half_shadow, pmm, serial,
     user_vm_layout::ENTRY_COUNT,
     user_vm_multi::{self, UserPage},
 };
@@ -121,6 +121,38 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
             || materialize(&file, &data, DATA, third).is_err()
         { return false; }
         fourth.fill(0); // new zeroed stack, with no ELF file backing.
+
+        // Snapshot the actual live Limine PML4 via HHDM WITHOUT modifying it.
+        // The new root's four page tables are private PMM frames, while the
+        // kernel upper half intentionally shares the live boot paging trees.
+        // No CR3 switch, so boot code continues using the original mappings.
+        let active_pml4_phys = Cr3::read().0.start_address().as_u64();
+        let Some(active_pml4_ptr) = hhdm.checked_add(active_pml4_phys)
+            .and_then(|value| VirtAddr::try_new(value).ok())
+        else { return false; };
+        // SAFETY: the Limine HHDM maps active CR3's PML4. Only BSP executes
+        // this test with maskable IRQs off and before any AP starts; the
+        // source is read-only, private target PML4 is a distinct PMM frame.
+        let active = &*active_pml4_ptr.as_ptr::<[u64; ENTRY_COUNT]>();
+        let old_user_entry = root[0];
+        let copied = kernel_half_shadow::graft_kernel_half(
+            active, root, 0, old_user_entry, frames,
+        );
+        let audited = kernel_half_shadow::audit_kernel_half(
+            active, root, 0, old_user_entry, frames,
+        );
+        let kernel_va = crate::kmain as usize as u64;
+        let kernel_idx = ((kernel_va >> 39) & 511) as usize;
+        let hhdm_idx = ((hhdm >> 39) & 511) as usize;
+        if !matches!(copied, Ok(n) if n >= 1)
+            || copied != audited
+            || kernel_idx < 256 || hhdm_idx < 256
+            || active[kernel_idx] & 1 == 0
+            || active[hhdm_idx] & 1 == 0
+            || root[kernel_idx] != active[kernel_idx]
+            || root[hhdm_idx] != active[hhdm_idx]
+        { return false; }
+
         first[0x100] == 0xc3
             && first.iter().enumerate().all(|(i, b)| *b == if i == 0x100 { 0xc3 } else { 0 })
             && second.iter().all(|b| *b == 0)
@@ -162,7 +194,7 @@ pub fn verify(hhdm: u64) -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 high_half_empty=1 freed=8 cr3_unchanged=1 ring3=0"
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
     true
 }
