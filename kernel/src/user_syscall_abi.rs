@@ -18,6 +18,9 @@ use core::mem::{align_of, offset_of, size_of};
 pub const SYS_WOLFOS_ID: u64 = 1;
 pub const SYS_U32_ADD: u64 = 2;
 pub const SYS_EXIT_ZERO: u64 = 3;
+/// Minimal single-byte ASCII console output; RDI=byte, RSI=0.
+/// This is intentionally not a user-pointer or POSIX write syscall.
+pub const SYS_PUTC: u64 = 4;
 pub const WOLFOS_ID: u64 = 0x574f_4c46;
 pub const ENOSYS: u64 = (-38i64) as u64;
 pub const EINVAL: u64 = (-22i64) as u64;
@@ -78,6 +81,7 @@ pub struct UserSyscallFrame {
 pub enum Outcome {
     Return(u64),
     ExitZero,
+    WriteByte(u8),
 }
 
 /// Pure, deterministic, nonallocating and strict. Never follows a user ptr.
@@ -98,6 +102,13 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64) -> Outcome {
                 }
             } else {
                 Outcome::Return(EINVAL)
+            }
+        },
+        SYS_PUTC => {
+            if arg1 != 0 || arg0 > 127 || (arg0 != 10 && !(32..=126).contains(&arg0)) {
+                Outcome::Return(EINVAL)
+            } else {
+                Outcome::WriteByte(arg0 as u8)
             }
         },
         SYS_EXIT_ZERO => {
@@ -177,6 +188,17 @@ mod tests {
             0x1_0000_0002, u64::MAX
         ] {
             assert!(!valid_user_rflags(flags), "unsafe trap flags {flags:#x}");
+        }
+    }
+
+    #[test]
+    fn ascii_console_only_accepts_single_valid_byte_and_zeroed_reserved_arg() {
+        assert_eq!(dispatch(4, b'H' as u64, 0), Outcome::WriteByte(b'H'));
+        assert_eq!(dispatch(4, b'\n' as u64, 0), Outcome::WriteByte(b'\n'));
+        for (byte, reserved) in [(0, 0), (9, 0), (31, 0), (127, 0),
+            (128, 0), (u64::MAX, 0), (b'A' as u64, 1)]
+        {
+            assert_eq!(dispatch(4, byte, reserved), Outcome::Return(EINVAL));
         }
     }
 
