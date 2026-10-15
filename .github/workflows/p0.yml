@@ -67,6 +67,8 @@ jobs:
         run: make high-half-stack-arena-lower-fault-smoke
       - name: P2 real high-half PID2 upper guard supervisor #PF
         run: make high-half-stack-arena-upper-fault-smoke
+      - name: P2 real BSP per-PID legacy FXSAVE64 FXRSTOR64 across 64 changes and exact PMM cleanup
+        run: make user-fx-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
