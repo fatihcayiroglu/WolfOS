@@ -90,11 +90,6 @@ impl GuardPlan {
             || pd[0] != Self::expected(self.pages[2])
             || root[ROOT_INDEX] & USER != 0
         { return Err(GuardError::BadTable) }
-        if root[..ROOT_INDEX].iter().any(|x| *x != 0)
-            || root[ROOT_INDEX+1..256].iter().any(|x| *x != 0) {
-            // Other LOW root entries may legitimately exist (P1 mapping);
-            // do NOT forbid them and do NOT mutate them.
-        }
         if pdpt[1..].iter().chain(pd[1..]).any(|x| *x != 0)
             || pt[6..].iter().any(|x| *x != 0) {
             return Err(GuardError::UnexpectedAlias)
