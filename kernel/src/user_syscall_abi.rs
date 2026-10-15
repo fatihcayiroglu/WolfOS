@@ -25,6 +25,18 @@ pub const EINVAL: u64 = (-22i64) as u64;
 pub const GPR_BYTES: usize = 15 * 8;
 pub const FRAME_BYTES: usize = GPR_BYTES + 5 * 8;
 
+/// In a running user task, ordinary arithmetic (XOR, CMP) changes CF, PF,
+/// AF, ZF, SF and OF. The kernel must allow these bits to vary, but a
+/// bootstrap QEMU syscall must keep IF, IOPL, DF, TF, NT, RF, VM, AC and all
+/// undefined/reserved flags clear. Bit 1 must always be set.
+const ALLOWED_USER_RFLAGS: u64 = 0x2 | (1 << 0) | (1 << 2)
+    | (1 << 4) | (1 << 6) | (1 << 7) | (1 << 11);
+
+pub fn valid_user_rflags(flags: u64) -> bool {
+    flags & 0x2 != 0 && flags & !ALLOWED_USER_RFLAGS == 0
+}
+
+
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct SavedGprs {
@@ -153,6 +165,19 @@ mod tests {
         assert_eq!(dispatch(3, 0, 0), Outcome::ExitZero);
         assert_eq!(dispatch(3, 1, 0), Outcome::Return(EINVAL));
         assert_eq!(dispatch(3, 0, 1), Outcome::Return(EINVAL));
+    }
+
+    #[test]
+    fn arithmetic_flags_change_but_cpl_and_interrupt_state_do_not() {
+        for flags in [0x2, 0x46, 0x92, 0x8d7] {
+            assert!(valid_user_rflags(flags), "ordinary ALU flags {flags:#x}");
+        }
+        for flags in [0, 0x200, 0x202, 0x402, 0x102, 0x1002,
+            0x2002, 0x4002, 0x10002, 0x20002, 0x40002, 0x20_0002,
+            0x1_0000_0002, u64::MAX
+        ] {
+            assert!(!valid_user_rflags(flags), "unsafe trap flags {flags:#x}");
+        }
     }
 
     #[test]
