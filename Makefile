@@ -43,13 +43,15 @@ else ifeq ($(FLAVOR),user-vm-shadow)
 FEATURES := --features user-vm-shadow-smoke
 else ifeq ($(FLAVOR),user-ring-prep)
 FEATURES := --features user-ring-prep-smoke
+else ifeq ($(FLAVOR),user-ring3)
+FEATURES := --features user-ring3-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -158,6 +160,10 @@ user-vm-shadow-smoke:
 user-ring-prep-smoke:
 	$(MAKE) iso FLAVOR=user-ring-prep
 	python3 scripts/user_ring_prep_smoke.py $(OUT)/wolfos-user-ring-prep.iso
+
+user-ring3-smoke:
+	$(MAKE) iso FLAVOR=user-ring3
+	python3 scripts/user_ring3_smoke.py $(OUT)/wolfos-user-ring3.iso
 
 test:
 	python3 -m unittest discover -s tests -v

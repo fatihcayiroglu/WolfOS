@@ -15,8 +15,10 @@ mod cpu;
 mod pmm;
 mod pmm_layout;
 mod interrupts;
-#[cfg(feature = "user-ring-prep-smoke")]
+#[cfg(any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke"))]
 mod user_ring_entry;
+#[cfg(feature = "user-ring3-smoke")]
+mod user_ring3_smoke;
 mod pci;
 mod paging;
 #[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke"))]
@@ -387,6 +389,9 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_line("WOLFOS_BOOT_OK");
+
+    #[cfg(feature = "user-ring3-smoke")]
+    user_ring3_smoke::enter(hhdm.offset);
 
     #[cfg(feature = "smoke-exit")]
     serial::qemu_exit_success();
