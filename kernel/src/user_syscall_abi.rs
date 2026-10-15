@@ -204,7 +204,7 @@ mod tests {
 
     #[test]
     fn unknown_numbers_are_deterministic_errors() {
-        for number in [0, 4, 255, 0x7fff, u64::MAX] {
+        for number in [0, 5, 255, 0x7fff, u64::MAX] {
             assert_eq!(dispatch(number, u64::MAX, u64::MAX), Outcome::Return(ENOSYS));
         }
         assert_eq!(ENOSYS as i64, -38);
