@@ -66,6 +66,12 @@ fn valid_test_user_flags(flags:u64)->bool{
 }
 fn fail(why:&str)->!{
     serial::write_fmt(format_args!("WOLFOS_RING3_YIELD_ERROR {why}\n"));
+    // Dedicated QEMU-only hardware feature: fail with isa-debug-exit
+    // status 35 (distinct from successful 33), rather than spend the
+    // smoke timeout halted after a real invalid CPL3 interrupt.
+    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    unsafe{asm!("out dx, al",in("dx")0xf4u16,in("al")0x11u8,
+        options(nostack,nomem,preserves_flags));}
     crate::halt_forever()
 }
 fn ptr(hhdm:u64,physical:u64)->*mut u8{
