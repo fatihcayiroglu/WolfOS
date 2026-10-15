@@ -61,6 +61,12 @@ jobs:
         run: make kernel-stack-guard-fault-smoke
       - name: P2 x86-64 actual non-present upper stack guard supervisor page fault
         run: make kernel-stack-guard-upper-fault-smoke
+      - name: P2 high-half supervisor arena two PID stacks and guarded PMM cleanup
+        run: make high-half-stack-arena-smoke
+      - name: P2 real high-half PID1 lower guard supervisor #PF
+        run: make high-half-stack-arena-lower-fault-smoke
+      - name: P2 real high-half PID2 upper guard supervisor #PF
+        run: make high-half-stack-arena-upper-fault-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
