@@ -48,7 +48,9 @@ def main() -> int:
         except FileNotFoundError:
             print("FAIL: qemu-system-x86_64 unavailable")
             return 2
-        # Path.read_text() uses universal newline conversion: COM1 CRLF is\n        # correctly presented as LF. Still insist on ONE complete line.\n        output = serial.read_text(errors="replace") if serial.exists() else ""
+        # Path.read_text() uses universal newline conversion: COM1 CRLF is
+        # correctly presented as LF. Still insist on ONE complete line.
+        output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
         entry = ENTER.search(output)
         if not entry or not 1 <= int(entry.group(1)) <= 255:
