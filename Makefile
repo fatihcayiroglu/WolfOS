@@ -49,13 +49,15 @@ else ifeq ($(FLAVOR),user-ring3-isolation)
 FEATURES := --features user-ring3-isolation-smoke
 else ifeq ($(FLAVOR),user-syscall)
 FEATURES := --features user-syscall-smoke
+else ifeq ($(FLAVOR),user-elf-run)
+FEATURES := --features user-elf-run-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -177,6 +179,10 @@ user-syscall-smoke:
 	$(MAKE) iso FLAVOR=user-syscall
 	python3 scripts/user_syscall_smoke.py $(OUT)/wolfos-user-syscall.iso
 
+user-elf-run-smoke:
+	$(MAKE) iso FLAVOR=user-elf-run
+	python3 scripts/user_elf_run_smoke.py $(OUT)/wolfos-user-elf-run.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -216,6 +222,11 @@ test:
 	$(OUT)/irq_frame_observation_tests
 	rustc --edition=2024 --test kernel/src/kernel_trap_frame.rs -o $(OUT)/kernel_trap_frame_tests
 	$(OUT)/kernel_trap_frame_tests
+	# Host Rust tests use a REAL standalone independently linked ELF64 file.
+	as --64 -o $(OUT)/wolfos-user-hello.o user/hello.S
+	ld -m elf_x86_64 -nostdlib -static -T user/hello.ld -o $(OUT)/wolfos-user-hello.elf $(OUT)/wolfos-user-hello.o
+	rustc --edition=2024 --test tests/elf_user_app.rs -o $(OUT)/elf_user_app_tests
+	$(OUT)/elf_user_app_tests
 	rustc --edition=2024 --test kernel/src/elf64_preflight.rs -o $(OUT)/elf64_preflight_tests
 	$(OUT)/elf64_preflight_tests
 	rustc --edition=2024 --test tests/user_vm_layout.rs -o $(OUT)/user_vm_layout_tests
