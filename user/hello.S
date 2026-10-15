@@ -39,6 +39,84 @@ _after_add:
     cmp byte ptr [rip + uninitialized], 0
     jne fail
 
+    // Isolated genuine CPL3 file I/O guest, deliberately NOT a POSIX API.
+    // Every path and destination pointer is read from real user registers.
+.ifdef WOLFOS_FILE_IO_SMOKE
+    // Negative: a supervisor pointer may NEVER be followed.
+    movabs rdi, 0xffff800000000000
+    mov esi, file_path_end - file_path
+    xor edx, edx
+    mov eax, 6
+    int 0x80
+_after_file_bad_open:
+    cmp rax, -14
+    jne fail
+
+    // Positive: OPEN_RO a user RX-text path (the 4-level walker may read RX).
+    lea rdi, [rip + file_path]
+    mov esi, file_path_end - file_path
+    xor edx, edx
+    mov eax, 6
+    int 0x80
+_after_file_open:
+    cmp rax, 256            // first VFS slot, generation one
+    jne fail
+    mov r12, rax            // keep opaque handle across subsequent INT80
+
+    // Negative: READ must not write into the RX executable code page.
+    mov rdi, r12
+    lea rsi, [rip + hello_text]
+    mov edx, 8
+    mov eax, 7
+    int 0x80
+_after_file_bad_read:
+    cmp rax, -14
+    jne fail
+
+    // Positive: READ into a real RW+NX user stack (not a kernel address).
+    mov rdi, r12
+    lea rsi, [rsp - 32]
+    mov edx, 8
+    mov eax, 7
+    int 0x80
+_after_file_read:
+    cmp rax, 8
+    jne fail
+    cmp dword ptr [rsp - 32], 0x454c4946 // FILE
+    jne fail
+    cmp dword ptr [rsp - 28], 0x0a4b4f5f // _OK newline
+    jne fail
+
+    // EOF and clean release, then reject stale handle.
+    mov rdi, r12
+    lea rsi, [rsp - 32]
+    mov edx, 8
+    mov eax, 7
+    int 0x80
+_after_file_eof:
+    test rax, rax
+    jne fail
+
+    mov rdi, r12
+    xor esi, esi
+    xor edx, edx
+    mov eax, 8
+    int 0x80
+_after_file_close:
+    test rax, rax
+    jne fail
+
+    mov rdi, r12
+    xor esi, esi
+    xor edx, edx
+    mov eax, 8
+    int 0x80
+_after_file_stale_close:
+    cmp rax, -9
+    jne fail
+_after_write:
+_after_putc:
+.else
     // New opt-in real user-POINTER syscall. The kernel cannot trust RDI;
     // it must WALK the live independent user CR3 and copy via HHDM.
 .ifdef WOLFOS_USERCOPY_SMOKE
@@ -68,6 +146,7 @@ _after_putc:
     jnz print_loop
 _after_write:
 .endif
+.endif
 
     mov eax, 3
     xor edi, edi
@@ -80,6 +159,9 @@ fail:
 hello_text:
     .ascii "Hello from WolfOS!\n"
 hello_end:
+file_path:
+    .ascii "/tmp/msg.txt"
+file_path_end:
 
 .section .data
 .global fixture_magic
