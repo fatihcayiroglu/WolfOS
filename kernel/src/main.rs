@@ -21,7 +21,7 @@ mod user_ring_entry;
 mod user_ring3_smoke;
 #[cfg(feature = "user-ring3-isolation-smoke")]
 mod user_ring3_isolation_smoke;
-#[cfg(any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "user-context-smoke", any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod user_syscall_abi;
 #[cfg(any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 mod user_syscall_entry;
@@ -35,10 +35,14 @@ mod user_copy;
 mod user_file_io;
 #[cfg(feature = "user-file-io-smoke")]
 mod user_file_io_smoke;
-#[cfg(any(feature = "process-table-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(feature = "user-context-smoke", any(feature = "process-table-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod process_lifecycle;
-#[cfg(feature = "process-table-smoke")]
+#[cfg(any(feature = "process-table-smoke", feature = "user-context-smoke"))]
 mod process_table;
+#[cfg(feature = "user-context-smoke")]
+mod user_context_bank;
+#[cfg(feature = "user-context-smoke")]
+mod user_context_smoke;
 #[cfg(feature = "process-table-smoke")]
 mod process_table_smoke;
 #[cfg(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke"))]
@@ -434,6 +438,9 @@ pub extern "C" fn kmain() -> ! {
 
     #[cfg(feature = "process-table-smoke")]
     process_table_smoke::verify();
+
+    #[cfg(feature = "user-context-smoke")]
+    user_context_smoke::verify();
 
     #[cfg(feature = "smoke-exit")]
     serial::qemu_exit_success();
