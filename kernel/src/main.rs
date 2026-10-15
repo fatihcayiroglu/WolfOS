@@ -15,15 +15,15 @@ mod cpu;
 mod pmm;
 mod pmm_layout;
 mod interrupts;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke")), feature = "user-process-smoke")))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke")), feature = "user-process-smoke")))))]
 mod user_ring_entry;
 #[cfg(feature = "user-ring3-smoke")]
 mod user_ring3_smoke;
 #[cfg(feature = "user-ring3-isolation-smoke")]
 mod user_ring3_isolation_smoke;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))))]
 mod user_syscall_abi;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod user_syscall_entry;
 #[cfg(feature = "user-syscall-smoke")]
 mod user_syscall_smoke;
@@ -35,9 +35,9 @@ mod user_copy;
 mod user_file_io;
 #[cfg(feature = "user-file-io-smoke")]
 mod user_file_io_smoke;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "process-table-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "process-table-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))))))]
 mod process_lifecycle;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "process-table-smoke", feature = "user-context-smoke"))))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "process-table-smoke", feature = "user-context-smoke"))))))]
 mod process_table;
 #[cfg(any(feature = "p2-handoff-preflight-smoke", any(feature = "kernel-stack-lease-smoke", feature = "user-context-smoke")))]
 mod user_context_bank;
@@ -51,7 +51,7 @@ mod kernel_stack_lease_smoke;
 mod kernel_stack_guard;
 #[cfg(any(feature = "kernel-stack-guard-smoke", feature = "kernel-stack-guard-fault-smoke", feature = "kernel-stack-guard-upper-fault-smoke"))]
 mod kernel_stack_guard_smoke;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "high-half-stack-arena-smoke", feature = "high-half-stack-arena-lower-fault-smoke", feature = "high-half-stack-arena-upper-fault-smoke"))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", any(feature = "high-half-stack-arena-smoke", feature = "high-half-stack-arena-lower-fault-smoke", feature = "high-half-stack-arena-upper-fault-smoke"))))]
 mod high_half_stack_arena;
 #[cfg(any(feature = "high-half-stack-arena-smoke", feature = "high-half-stack-arena-lower-fault-smoke", feature = "high-half-stack-arena-upper-fault-smoke"))]
 mod high_half_stack_arena_smoke;
@@ -67,11 +67,11 @@ mod vfs_smoke;
 mod ramfs_smoke;
 mod pci;
 mod paging;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_preflight;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_preflight_smoke;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_page_image;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_layout;
@@ -79,7 +79,7 @@ mod user_vm_layout;
 mod user_vm_shadow_smoke;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "user-vm-shadow-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-vm-shadow-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))]
 mod kernel_half_shadow;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi_smoke;
@@ -168,16 +168,18 @@ mod apic_irq_entry;
 mod apic_preempt_smoke;
 #[cfg(any(feature = "apic-preempt-smoke", feature = "ap-smp-preempt-smoke"))]
 mod preempt_depth;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "apic-preempt-smoke", feature = "user-fx-smoke"))))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", any(feature = "apic-preempt-smoke", feature = "user-fx-smoke"))))]
 mod fx_state;
-#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-handoff-preflight-smoke", feature = "user-fx-smoke")))]
+#[cfg(any(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"), any(feature = "p2-handoff-preflight-smoke", feature = "user-fx-smoke")))]
 mod user_fx_bank;
 #[cfg(feature = "user-fx-smoke")]
 mod user_fx_smoke;
 #[cfg(feature = "p2-handoff-preflight-smoke")]
 mod handoff_preflight_smoke;
-#[cfg(feature = "p2-ring3-yield-smoke")]
+#[cfg(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"))]
 mod user_yield_switch_smoke;
+#[cfg(feature = "p2-ring3-irq-ready-smoke")]
+mod user_irq_preempt_contract;
 #[cfg(feature = "apic-preempt-smoke")]
 mod rr_policy;
 #[cfg(feature = "apic-preempt-smoke")]
