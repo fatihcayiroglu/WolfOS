@@ -29,8 +29,10 @@ mod user_syscall_entry;
 mod user_syscall_smoke;
 #[cfg(any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
 mod user_elf_run_smoke;
-#[cfg(feature = "user-copy-smoke")]
+#[cfg(any(feature = "user-copy-smoke", feature = "user-vfs-smoke"))]
 mod user_copy;
+#[cfg(feature = "user-vfs-smoke")]
+mod user_file_io;
 #[cfg(any(any(any(feature = "user-elf-run-smoke", feature = "user-copy-smoke"), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
 mod process_lifecycle;
 #[cfg(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke"))]
