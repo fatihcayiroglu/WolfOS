@@ -448,7 +448,7 @@ pub extern "C" fn kmain() -> ! {
     }
     serial::write_line("WOLFOS_BOOT_OK");
 
-    #[cfg(feature = "p2-ring3-yield-smoke")]
+    #[cfg(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"))]
     user_yield_switch_smoke::enter(hhdm.offset);
 
     #[cfg(feature = "user-ring3-smoke")]
