@@ -93,7 +93,7 @@ fn main() {
                     ("progress","PROGRESS"),
                 ] {
                     let address=nm_symbol(&map,name);
-                    attest+=&format!("pub const PID{pid}_{suffix}:u64={address:#x};\\n");
+                    attest+=&format!("pub const PID{pid}_{suffix}:u64={address:#x};\n");
                 }
                 assert!(fs::metadata(&elf).unwrap().len()<32768,
                     "unexpectedly large no-yield ELF");
