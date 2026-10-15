@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(test)]
 #[path = "process_lifecycle.rs"]
-mod standalone_process;
+pub(crate) mod standalone_process;
 #[cfg(test)]
 use standalone_process::{ProcessError, ProcessRecord, ProcessState};
 #[cfg(not(test))]
