@@ -48,7 +48,7 @@ fn main() {
                 ("_exit_return","AFTER_EXIT"),("progress","PROGRESS"),
             ] {
                 let addr=nm_symbol(&map,name);
-                symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\\n");
+                symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\n");
             }
             assert!(fs::metadata(&elf).unwrap().len()<32768,
                 "unexpectedly large second ELF");
