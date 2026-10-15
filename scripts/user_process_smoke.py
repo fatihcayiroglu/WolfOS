@@ -72,12 +72,12 @@ def main() -> int:
             return 1
         try:
             first = [
-                entries[0].start(),
                 one(output, START[0]),
+                entries[0].start(),
             ]
             second = [
-                entries[1].start(),
                 one(output, START[1]),
+                entries[1].start(),
             ]
             # Common proof markers MUST appear TWICE; split after first
             # complete REAP, preventing late writes from a reaped process.
