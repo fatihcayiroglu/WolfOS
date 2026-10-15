@@ -184,6 +184,8 @@ test:
 	$(OUT)/preempt_depth_tests
 	rustc --edition=2024 --test kernel/src/fx_state.rs -o $(OUT)/fx_state_tests
 	$(OUT)/fx_state_tests
+	rustc --edition=2024 --test kernel/src/fx_bootstrap_image.rs -o $(OUT)/fx_bootstrap_image_tests
+	$(OUT)/fx_bootstrap_image_tests
 	rustc --edition=2024 --test kernel/src/rr_policy.rs -o $(OUT)/rr_policy_tests
 	$(OUT)/rr_policy_tests
 	rustc --edition=2024 --test kernel/src/task_slot.rs -o $(OUT)/task_slot_tests
