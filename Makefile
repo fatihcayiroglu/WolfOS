@@ -57,6 +57,8 @@ else ifeq ($(FLAVOR),user-ramfs)
 FEATURES := --features user-ramfs-smoke
 else ifeq ($(FLAVOR),user-vfs)
 FEATURES := --features user-vfs-smoke
+else ifeq ($(FLAVOR),p2-handoff-preflight)
+FEATURES := --features p2-handoff-preflight-smoke
 else ifeq ($(FLAVOR),user-fx)
 FEATURES := --features user-fx-smoke
 else ifeq ($(FLAVOR),high-half-stack-arena)
@@ -87,7 +89,7 @@ else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -272,6 +274,10 @@ high-half-stack-arena-upper-fault-smoke:
 user-fx-smoke:
 	$(MAKE) iso FLAVOR=user-fx
 	python3 scripts/user_fx_smoke.py $(OUT)/wolfos-user-fx.iso
+
+p2-handoff-preflight-smoke:
+	$(MAKE) iso FLAVOR=p2-handoff-preflight
+	python3 scripts/handoff_preflight_smoke.py $(OUT)/wolfos-p2-handoff-preflight.iso
 
 test:
 	python3 -m unittest discover -s tests -v
