@@ -21,7 +21,7 @@ mod paging;
 mod elf64_preflight;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_preflight_smoke;
-#[cfg(feature = "elf64-preflight-smoke")]
+#[cfg(any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke"))]
 mod elf64_page_image;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_layout;
