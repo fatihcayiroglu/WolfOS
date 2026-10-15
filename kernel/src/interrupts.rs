@@ -443,7 +443,7 @@ extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFault
             address.as_u64(), code.bits(), frame.instruction_pointer.as_u64())
     ) {
         serial::write_fmt(format_args!(
-            "WOLFOS_STACK_GUARD_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\\n",
+            "WOLFOS_STACK_GUARD_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\n",
             if cfg!(feature="kernel-stack-guard-upper-fault-smoke") { "upper" }
             else { "lower" }
         ));
