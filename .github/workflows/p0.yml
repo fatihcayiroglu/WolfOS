@@ -53,6 +53,8 @@ jobs:
         run: make process-table-smoke
       - name: P2 saved per-PID user IRET frame and separate RSP0 preflight (no hardware handoff)
         run: make user-context-smoke
+      - name: P2 real PMM-backed 16KiB per-PID kernel stacks, canaries and no-leak retirement
+        run: make kernel-stack-lease-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
