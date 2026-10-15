@@ -129,7 +129,7 @@ pub fn initialize_secondary(index: usize) -> bool {
     // only on secondary CPUs. Its handler EOIs the *receiving* local APIC.
     #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
-               feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
+               feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
     {
         idt[crate::ap_ipi_smoke::VECTOR].set_handler_fn(crate::ap_ipi_smoke::irq);
         idt[crate::ap_ipi_smoke::SPURIOUS]
