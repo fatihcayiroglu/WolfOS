@@ -29,14 +29,20 @@ fn main() {
     if env::var_os("CARGO_FEATURE_USER_ELF_RUN_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_RAMFS_SMOKE").is_none()
-        && env::var_os("CARGO_FEATURE_USER_VFS_SMOKE").is_none() {
+        && env::var_os("CARGO_FEATURE_USER_VFS_SMOKE").is_none()
+        && env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_none() {
         return;
     }
     let path = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     fs::create_dir_all(&path).expect("make OUT_DIR");
     let obj = path.join("wolfos-user-hello.o");
     let elf = path.join("wolfos-user-hello.elf");
-    checked("as", &["--64", "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
+        checked("as", &["--64", "--defsym", "WOLFOS_FILE_IO=1",
+            "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    } else {
+        checked("as", &["--64", "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    }
     checked("ld", &["-m", "elf_x86_64", "-nostdlib", "-static",
         "-T", "user/hello.ld", "-o", elf.to_str().unwrap(),
         obj.to_str().unwrap()]);
@@ -55,7 +61,19 @@ fn main() {
         ("uninitialized", "BSS_START"),
     ];
     let mut generated = String::new();
-    for (symbol, var) in symbols {
+    let file_symbols = [
+        ("_after_file_open", "AFTER_FILE_OPEN"),
+        ("_after_file_read", "AFTER_FILE_READ"),
+        ("_after_file_bad_read", "AFTER_FILE_BAD_READ"),
+        ("_after_file_close", "AFTER_FILE_CLOSE"),
+        ("_after_file_bad_open", "AFTER_FILE_BAD_OPEN"),
+        ("file_path", "FILE_PATH"),
+        ("file_path_end", "FILE_PATH_END"),
+    ];
+    for (symbol, var) in symbols.iter().copied().chain(
+        file_symbols.iter().copied()
+            .filter(|_| env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some())
+    ) {
         let value = nm_symbol(&output, symbol);
         generated += &format!("pub const {var}: u64 = {value:#x};\n");
     }
