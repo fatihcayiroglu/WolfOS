@@ -33,6 +33,8 @@ jobs:
         run: make user-ring-prep-smoke
       - name: P2 REAL CPL3 / INT80 / IRETQ roundtrip (single-vCPU QEMU)
         run: make user-ring3-smoke
+      - name: P2 independent sanitized CR3 and REAL denied CPL3 kernel read (#PF)
+        run: make user-ring3-isolation-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
