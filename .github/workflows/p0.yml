@@ -47,6 +47,8 @@ jobs:
         run: make user-vfs-smoke
       - name: P2 real user-pointer WRITE syscall via private user CR3 and denied kernel/RX writes
         run: make user-copy-smoke
+      - name: P2 genuine CPL3 OPEN READ CLOSE, bad pointers, stale fd, exact 7-frame cleanup
+        run: make user-file-io-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
