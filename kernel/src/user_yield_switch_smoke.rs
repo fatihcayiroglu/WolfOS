@@ -1,12 +1,15 @@
 //! Actual CPL3-to-CPL3 cooperative task switches between TWO separately
 //! linked native ET_EXEC ELF64 applications, each on its own CR3, its own
 //! real guarded high-half TSS.RSP0 stack, its own FXSAVE64 image, its own
-//! private user text/data/stack. Zero APs run user tasks. No timer preemption.
+//! private user text/data/stack. Zero APs run user tasks. The optional
+//! xAPIC smoke has TWO bounded hardware preemptions, not a general scheduler.
 //!
 //! Test-only SYS_YIELD=9; never part of the stable WolfOS syscall ABI.
 //! The existing 15-GPR INT80 entry restores the POINTER we return, then
 //! IRETQ resumes the other PID. Faults and unexpected syscalls fail closed.
 use core::{arch::asm,cell::UnsafeCell};
+#[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+use crate::ring3_round_robin::{RoundRobin,State as RrState};
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
              instructions::segmentation::{CS,Segment},registers::control::Cr3};
 use crate::{
@@ -112,6 +115,8 @@ struct Runtime{
     timer_busy:[u64;COUNT],
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     timer_preempts:[u64;COUNT],
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    rr:RoundRobin,
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // SAFETY: only one BSP may access the runtime; IF=0 from admission until
@@ -200,7 +205,9 @@ pub extern "C" fn observe_timer_irq(
     // OTHER PID's full hardware IRET frame, without a voluntary INT80.
     // Limit this isolated proof to one preemption PER PID in its assembly
     // no-syscall busy window. The remaining genuine IRQs resume the same
-    // PID. This ensures the existing strict eight-yield regression still
+    // PID. The round-robin policy is called only for eligible hardware
+    // switch events, never on INT80 or same-PID IRQ returns. This preserves
+    // the existing strict eight-yield regression, which still
     // checks both ELF data counters after involuntary interruption.
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     let preempt_target={
@@ -227,6 +234,9 @@ pub extern "C" fn observe_timer_irq(
         // on the departing PID's *own* guarded high-half kernel stack.
         // It is safe to retain across CR3 switches: this supervisor
         // high-half subtree is shared by BOTH sanitized process roots.
+        if s.rr.timer_tick(pid)!=Ok((next+1) as u64) {
+            fail("timer_policy_rejected_verified_irq_handoff")
+        }
         s.frames[i]=raw as u64;
         if s.processes.park_running(pid,s.leases[i][0]).is_err() {
             fail("involuntary_park_running_pid")
@@ -498,6 +508,14 @@ pub fn enter(hhdm:u64)->!{
         timer_busy:[0;COUNT],
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         timer_preempts:[0;COUNT],
+        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        rr:{
+            let mut q=RoundRobin::new();
+            q.admit(1).unwrap_or_else(|_|fail("rr_pid1_admission"));
+            q.admit(2).unwrap_or_else(|_|fail("rr_pid2_admission"));
+            q.start(1).unwrap_or_else(|_|fail("rr_initial_pid"));
+            q
+        },
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
@@ -617,12 +635,20 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             s.processes.park_running(pid,active_root).is_err(){
             fail("nonsequential_yield_or_park")
         }
+        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        if s.rr.voluntary_yield(pid)!=Ok((2-i) as u64) {
+            fail("rr_voluntary_handoff_out_of_sync")
+        }
         s.yields[i]=val;
         f.registers.rax=0;
     }else{
         if val!=ROUNDS||s.yields[i]!=ROUNDS
             ||s.processes.exit_zero(pid,active_root).is_err(){
             fail("early_or_bad_exit")
+        }
+        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        if s.rr.exit(pid)!=Ok(if s.exits[1-i]{None}else{Some((2-i) as u64)}) {
+            fail("rr_exit_handoff_out_of_sync")
         }
         s.exits[i]=true;
     }
@@ -673,10 +699,19 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 if s.timer_preempts!=[1,1] {
                     fail("missing_two_real_involuntary_pid_switches")
                 }
+                let slots=s.rr.slots();
+                if s.rr.switches()!=10 || s.rr.running().is_some()
+                   || slots[0].pid!=1 || slots[1].pid!=2
+                   || slots[0].state!=RrState::Exited
+                   || slots[1].state!=RrState::Exited
+                   || slots[0].ticks!=1 || slots[1].ticks!=1 {
+                    fail("rr_hardware_policy_ledger_mismatch")
+                }
                 serial::write_fmt(format_args!(
                     "WOLFOS_RING3_TIMER_PREEMPT_OK real_timer_switches=2 pid1_to_pid2={} pid2_to_pid1={} irq_frame_preserved=1 private_cr3=1 tss_rsp0=1 fx_save_restore=1 no_int80=1\n",
                     s.timer_preempts[0],s.timer_preempts[1]
                 ));
+                serial::write_line("WOLFOS_RING3_RR_POLICY_OK hardware_timer_decisions=2 voluntary_yield_decisions=8 exited=2 single_running=1");
             }
             #[cfg(not(feature = "p2-ring3-timer-preempt-smoke"))]
             serial::write_fmt(format_args!(
@@ -706,6 +741,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 options(noreturn),
             );
         }
+    }
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    if s.rr.running()!=Some((next+1) as u64) {
+        fail("rr_selected_pid_differs_from_hardware_target")
     }
     if s.frames[next]==0||s.frames[next]!=
         s.stacks[next].top-user_syscall_abi::FRAME_BYTES as u64
