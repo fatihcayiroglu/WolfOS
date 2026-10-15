@@ -27,7 +27,7 @@ fn device_ok(e:u64,pa:u64)->bool{
     (e&!(A|D))==pa|PRESENT|RW|PWT|PCD|NX
         &&e&USER==0&&e&LARGE==0
 }
-#[derive(Clone,Copy,Debug)]
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub struct ApicMapping {
     /// Exclusively owned PMM table frames: PDPT, PD and PT.
     pub tables:[u64;3],
