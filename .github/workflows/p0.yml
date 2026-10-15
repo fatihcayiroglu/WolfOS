@@ -35,6 +35,8 @@ jobs:
         run: make user-ring3-smoke
       - name: P2 independent sanitized CR3 and REAL denied CPL3 kernel read (#PF)
         run: make user-ring3-isolation-smoke
+      - name: P2 actual RAX/RDI/RSI syscall ABI with GPR-preserving INT80 and IRETQ (QEMU)
+        run: make user-syscall-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
