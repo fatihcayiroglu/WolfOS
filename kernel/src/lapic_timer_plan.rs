@@ -44,9 +44,68 @@ pub fn periodic_timer_plan(
     })
 }
 
+/// Arm exactly one local timer IRQ without accidentally consuming the
+/// count while the LVT is still masked. Unlike the periodic plan, a one-shot
+/// commit must be the FINAL initial-count write, AFTER the LVT is unmasked.
+/// The caller must hold IF=0, finish task/IDT/FX setup, then execute start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OneShotTimerPlan {
+    pub preparation: [RegisterWrite; 3],
+    pub arm: RegisterWrite,
+    pub start: RegisterWrite,
+    pub mask: RegisterWrite,
+}
+
+pub fn one_shot_timer_plan(
+    vector: u8,
+    divisor: u32,
+    initial_count: u32,
+) -> Result<OneShotTimerPlan, TimerError> {
+    let masked = layout::make_lvt(vector, true, TimerMode::OneShot)?;
+    let armed = layout::make_lvt(vector, false, TimerMode::OneShot)?;
+    let divide = layout::encode_divisor(divisor)?;
+    let count = layout::validate_initial_count(initial_count)?;
+    Ok(OneShotTimerPlan {
+        preparation: [
+            RegisterWrite { offset: layout::LVT_TIMER_OFFSET, value: masked },
+            RegisterWrite { offset: layout::INITIAL_COUNT_OFFSET, value: 0 },
+            RegisterWrite { offset: layout::DIVIDE_CONFIG_OFFSET, value: divide },
+        ],
+        arm: RegisterWrite { offset: layout::LVT_TIMER_OFFSET, value: armed },
+        start: RegisterWrite { offset: layout::INITIAL_COUNT_OFFSET, value: count },
+        mask: RegisterWrite { offset: layout::LVT_TIMER_OFFSET, value: masked },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_shot_count_is_last_commit_after_unmask() {
+        let plan = one_shot_timer_plan(0xe4, 16, 262_144).unwrap();
+        assert_eq!(plan.preparation[0].offset, layout::LVT_TIMER_OFFSET);
+        assert_ne!(plan.preparation[0].value & layout::LVT_MASKED, 0);
+        assert_eq!(plan.preparation[1],
+            RegisterWrite { offset: layout::INITIAL_COUNT_OFFSET, value: 0 });
+        assert_eq!(plan.preparation[2],
+            RegisterWrite { offset: layout::DIVIDE_CONFIG_OFFSET, value: 0b0011 });
+        assert_eq!(plan.arm.offset, layout::LVT_TIMER_OFFSET);
+        assert_eq!(plan.arm.value & layout::LVT_MASKED, 0);
+        assert_eq!(layout::parse_lvt(plan.arm.value).unwrap().mode,
+            TimerMode::OneShot);
+        assert_eq!(plan.start,
+            RegisterWrite { offset: layout::INITIAL_COUNT_OFFSET, value: 262_144 });
+        assert_eq!(plan.mask, plan.preparation[0]);
+    }
+
+    #[test]
+    fn one_shot_rejects_invalid_inputs_before_hardware_writes() {
+        assert_eq!(one_shot_timer_plan(0x1f, 16, 1), Err(TimerError::InvalidVector));
+        assert_eq!(one_shot_timer_plan(0xff, 16, 1), Err(TimerError::InvalidVector));
+        assert_eq!(one_shot_timer_plan(0xe4, 3, 1), Err(TimerError::InvalidDivisor));
+        assert_eq!(one_shot_timer_plan(0xe4, 16, 0), Err(TimerError::ZeroInitialCount));
+    }
 
     #[test]
     fn staged_plan_starts_and_ends_masked() {
