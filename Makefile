@@ -37,13 +37,15 @@ else ifeq ($(FLAVOR),ap-irq-migrate)
 FEATURES := --features ap-irq-migrate-smoke
 else ifeq ($(FLAVOR),ap-runqueue)
 FEATURES := --features ap-runqueue-smoke
+else ifeq ($(FLAVOR),elf64-preflight)
+FEATURES := --features elf64-preflight-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -141,6 +143,10 @@ ap-runqueue-smoke:
 	$(MAKE) iso FLAVOR=ap-runqueue
 	python3 scripts/ap_runqueue_smoke.py $(OUT)/wolfos-ap-runqueue.iso
 
+elf64-preflight-smoke:
+	$(MAKE) iso FLAVOR=elf64-preflight
+	python3 scripts/elf64_preflight_smoke.py $(OUT)/wolfos-elf64-preflight.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -180,6 +186,8 @@ test:
 	$(OUT)/irq_frame_observation_tests
 	rustc --edition=2024 --test kernel/src/kernel_trap_frame.rs -o $(OUT)/kernel_trap_frame_tests
 	$(OUT)/kernel_trap_frame_tests
+	rustc --edition=2024 --test kernel/src/elf64_preflight.rs -o $(OUT)/elf64_preflight_tests
+	$(OUT)/elf64_preflight_tests
 	rustc --edition=2024 --test kernel/src/preempt_depth.rs -o $(OUT)/preempt_depth_tests
 	$(OUT)/preempt_depth_tests
 	rustc --edition=2024 --test kernel/src/fx_state.rs -o $(OUT)/fx_state_tests
