@@ -59,9 +59,9 @@ _after_file_bad_open:
     mov eax, 6
     int 0x80
 _after_file_open:
-    cmp rax, 256            // first VFS slot, generation one
+    cmp rax, 256            # first VFS slot, generation one
     jne fail
-    mov r12, rax            // keep opaque handle across subsequent INT80
+    mov r12, rax            # keep opaque handle across subsequent INT80
 
     // Negative: READ must not write into the RX executable code page.
     mov rdi, r12
@@ -82,9 +82,9 @@ _after_file_bad_read:
 _after_file_read:
     cmp rax, 8
     jne fail
-    cmp dword ptr [rsp - 32], 0x454c4946 // FILE
+    cmp dword ptr [rsp - 32], 0x454c4946 # FILE
     jne fail
-    cmp dword ptr [rsp - 28], 0x0a4b4f5f // _OK newline
+    cmp dword ptr [rsp - 28], 0x0a4b4f5f # _OK newline
     jne fail
 
     // EOF and clean release, then reject stale handle.
