@@ -25,6 +25,8 @@ jobs:
         run: make exception-smoke
       - name: Paging map/unmap and page-fault smoke test
         run: make paging-fault-smoke
+      - name: P2 ELF64 strict ET_EXEC preflight (QEMU, no user execution)
+        run: make elf64-preflight-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
