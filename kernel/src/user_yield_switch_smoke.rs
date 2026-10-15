@@ -18,7 +18,7 @@ use crate::{
     user_fx_bank::{FxImage,FxHandle,UserFxBank},
     fx_state,kernel_half_shadow,interrupts,pmm,serial,
 };
-#[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+#[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 use crate::user_irq_preempt_contract::{self,Evidence};
 
 mod sym {include!(concat!(env!("OUT_DIR"),"/wolfos_yield_symbols.rs"));}
@@ -28,17 +28,17 @@ const ELFS:[&[u8];2]=[
 ];
 const COUNT:usize=2;
 const PER_PID:usize=7;
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 const PHYSICAL:usize=ARENA_FRAMES+COUNT*PER_PID+3; // 25 frames + 3 xAPIC high MMIO page tables
-#[cfg(not(feature = "p2-ring3-timer-observe-smoke"))]
+#[cfg(not(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 const PHYSICAL:usize=ARENA_FRAMES+COUNT*PER_PID; // 11+14=25
 const P:u64=1;const W:u64=2;const U:u64=4;const NX:u64=1<<63;
 const CODE:u64=0x401000;const DATA:u64=0x403000;
 const STACK:u64=0x404000;const USER_TOP:u64=STACK+PAGE;
 const TEST_YIELD:u64=9;
-#[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+#[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 const IRQ_USER_RFLAGS:u64=0x202;
-#[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+#[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 fn pic_read(port:u16)->u8{
     let value:u8;
     // SAFETY: exclusive BSP x86 I/O access, PIC queried only in isolated
@@ -47,7 +47,7 @@ fn pic_read(port:u16)->u8{
         options(nostack,nomem,preserves_flags));}
     value
 }
-#[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+#[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 fn pic_write(port:u16,value:u8){
     // SAFETY: only BSP owns PIC mask ports while APs are parked.
     unsafe{asm!("out dx, al",in("dx")port,in("al")value,
@@ -59,9 +59,9 @@ const ROUNDS:u64=4;
 const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002];
 
 fn valid_test_user_flags(flags:u64)->bool{
-    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     {user_irq_preempt_contract::safe_irq_user_flags(flags)}
-    #[cfg(not(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))]
+    #[cfg(not(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
     {user_syscall_abi::valid_user_rflags(flags)}
 }
 fn fail(why:&str)->!{
@@ -69,7 +69,7 @@ fn fail(why:&str)->!{
     // Dedicated QEMU-only hardware feature: fail with isa-debug-exit
     // status 35 (distinct from successful 33), rather than spend the
     // smoke timeout halted after a real invalid CPL3 interrupt.
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     unsafe{asm!("out dx, al",in("dx")0xf4u16,in("al")0x11u8,
         options(nostack,nomem,preserves_flags));}
     crate::halt_forever()
@@ -104,11 +104,11 @@ struct Runtime{
     yields:[u64;COUNT],
     exits:[bool;COUNT],
     hardware_traps:usize,
-    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     pic_before:[u8;2],
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     timer_irqs:[u64;COUNT],
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     timer_busy:[u64;COUNT],
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
@@ -116,17 +116,17 @@ struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // exit, no preemptible AP/async scheduler and no parallel user task exists.
 unsafe impl Sync for BspRuntime {}
 static RUNTIME:BspRuntime=BspRuntime(UnsafeCell::new(None));
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 static TIMER_LIVE:core::sync::atomic::AtomicBool=
     core::sync::atomic::AtomicBool::new(false);
 
 /// True only after the two private user processes and high xAPIC MMIO
 /// alias exist. No serial, allocation, locks or FX manipulation in IRQ.
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 pub fn timer_irq_active()->bool{
     TIMER_LIVE.load(core::sync::atomic::Ordering::Acquire)
 }
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 fn user_busy(pid:usize)->(u64,u64){
     if pid==0{(sym::PID1_BUSY_BEGIN,sym::PID1_BUSY_END)}
     else{(sym::PID2_BUSY_BEGIN,sym::PID2_BUSY_END)}
@@ -136,7 +136,7 @@ fn user_busy(pid:usize)->(u64,u64){
 /// Interrupt gate already cleared IF; caller retained all 15 GPRs.
 /// Returns the SAME user frame, so this milestone proves genuine
 /// involuntary interruption but NOT yet timer-driven task handoff.
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 pub extern "C" fn observe_timer_irq(
     raw:*const UserSyscallFrame,
 )->*const UserSyscallFrame{
@@ -305,7 +305,7 @@ pub fn enter(hhdm:u64)->!{
     if pmm::statistics().allocated_frames!=before+PHYSICAL{
         fail("pmm_baseline")
     }
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     {
         let phys_apic=crate::apic_timer_smoke::trusted_user_xapic_base()
             .unwrap_or_else(||fail("no_verified_bsp_xapic_physical_base"));
@@ -378,9 +378,9 @@ pub fn enter(hhdm:u64)->!{
     // which the audited arena already tolerates, while still denying U/S.
     let first=stacks[0].unwrap_or_else(||fail("pid1_missing_stack"));
     let second=stacks[1].unwrap_or_else(||fail("pid2_missing_stack"));
-    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     let pic_before=[pic_read(0x21),pic_read(0xa1)];
-    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     {
         // Explicitly mask both legacy PICs before enabling CPL3 IF; the
         // local xAPIC timer is still intentionally NOT armed here.
@@ -402,9 +402,9 @@ pub fn enter(hhdm:u64)->!{
     let mut boot_rsp:u64;
     unsafe{asm!("mov {}, rsp",out(reg)boot_rsp,
         options(nomem,nostack,preserves_flags));}
-    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     let entry_flags=IRQ_USER_RFLAGS;
-    #[cfg(not(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))]
+    #[cfg(not(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
     let entry_flags=2u64;
     let bootstrap=UserSyscallFrame{
         hardware:user_syscall_abi::InterruptReturn{
@@ -423,11 +423,11 @@ pub fn enter(hhdm:u64)->!{
         fx_tokens:[tokens[0].unwrap(),tokens[1].unwrap()],
         control,frames:[0,second_frame],current:0,
         yields:[0;COUNT],exits:[false;COUNT],hardware_traps:0,
-        #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+        #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
         pic_before,
-        #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+        #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
         timer_irqs:[0;COUNT],
-        #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+        #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
         timer_busy:[0;COUNT],
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
@@ -438,13 +438,13 @@ pub fn enter(hhdm:u64)->!{
     if !unsafe{interrupts::test_handoff_rsp0(first.top)}{
         fail("activate_initial_tss_rsp0")
     }
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     serial::write_line("WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=2");
-    #[cfg(not(feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(not(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_YIELD_START_OK separate_native_elf=2 live_user_roots=2 guarded_kernel_rsp0=2 fx_images=2 owned_frames=25"
     );
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     serial::write_line(
         "WOLFOS_RING3_YIELD_START_OK separate_native_elf=2 live_user_roots=2 guarded_kernel_rsp0=2 fx_images=2 owned_frames=28"
     );
@@ -458,7 +458,7 @@ pub fn enter(hhdm:u64)->!{
         s.processes.mark_running(1,s.leases[0][0]).is_err(){
         fail("boot_first_pid")
     }
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     TIMER_LIVE.store(true,core::sync::atomic::Ordering::Release);
     // SAFETY: GDT/TR/actual TSS.RSP0 verified, private page roots
     // checked, CPL3 RX and RW/NX pages physically separate, IF=0.
@@ -514,7 +514,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         ||f.registers.rdi!=0||f.registers.rsi!=0 {
         fail("real_user_gpr_iret_frame")
     }
-    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     {
         // These checks run on *real* INT80 hardware capture while CPL3
         // had IF=1. The trap is still voluntary; timer IRQ is NOT armed.
@@ -588,11 +588,11 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0"
         );
-        #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+        #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=1"
         );
-        #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+        #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
         {
             if s.timer_busy.iter().any(|&v|v==0)||
                 s.timer_irqs.iter().any(|&v|v==0){
@@ -689,7 +689,7 @@ extern "C" fn finalize()->! {
             fail("guarded_stack_retirement")
         }
     }
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     {
         if !crate::apic_timer_smoke::stop_user_timer(){
             fail("failed_lvt_svr_pic_restore_after_user_timer")
@@ -726,7 +726,7 @@ extern "C" fn finalize()->! {
         }
         serial::write_line("WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1");
     }
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     {
         if x86_64::instructions::interrupts::are_enabled() {
             fail("timer_guest_cleanup_IF_unexpectedly_enabled")
@@ -735,11 +735,11 @@ extern "C" fn finalize()->! {
             "WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1"
         );
     }
-    #[cfg(not(feature = "p2-ring3-timer-observe-smoke"))]
+    #[cfg(not(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=25 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=28 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
