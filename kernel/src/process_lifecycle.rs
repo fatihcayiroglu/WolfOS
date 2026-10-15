@@ -91,6 +91,24 @@ impl<const N: usize> ProcessRecord<N> {
         Ok(())
     }
 
+    /// Suspend a currently RUNNING user process only after a verified
+    /// CPL3-to-CPL0 trap, while its real CR3 remains active. The saved
+    /// full GPR/IRET and FPU context must already be retained by caller.
+    /// No resource is released, and the monotonic PID identity is intact.
+    pub fn park_running(&mut self, pid: u64, active_cr3: u64)
+        -> Result<(), ProcessError>
+    {
+        self.identity(pid)?;
+        if self.state != ProcessState::Running {
+            return Err(ProcessError::WrongState)
+        }
+        if active_cr3 != self.cr3_root {
+            return Err(ProcessError::WrongAddressSpace)
+        }
+        self.state = ProcessState::Ready;
+        Ok(())
+    }
+
     /// Called in kernel mode on a REAL user EXIT(0) trap.
     pub fn exit_zero(&mut self, pid: u64, active_cr3: u64)
         -> Result<(), ProcessError>
@@ -197,6 +215,22 @@ mod tests {
         [0x1000, 0x2000, 0x3000, 0x4000, 0x5000, 0x6000, 0x7000]
     }
 
+    #[test]
+    fn actual_active_cr3_required_for_running_to_ready_and_resume() {
+        let mut p=ProcessRecord::<7>::empty();
+        p.admit(1,owned()[0],owned()).unwrap();
+        assert_eq!(p.park_running(1,owned()[0]),Err(ProcessError::WrongState));
+        p.mark_running(1,owned()[0]).unwrap();
+        assert_eq!(p.park_running(2,owned()[0]),Err(ProcessError::StalePid));
+        assert_eq!(p.park_running(1,0x9000),Err(ProcessError::WrongAddressSpace));
+        assert_eq!(p.state,ProcessState::Running);
+        p.park_running(1,owned()[0]).unwrap();
+        assert_eq!(p.state,ProcessState::Ready);
+        assert_eq!(p.reap(1,0x9000),Err(ProcessError::WrongState));
+        p.mark_running(1,owned()[0]).unwrap();
+        p.exit_zero(1,owned()[0]).unwrap();
+        assert_eq!(p.park_running(1,owned()[0]),Err(ProcessError::WrongState));
+    }
     #[test]
     fn complete_two_sequential_processes_and_no_duplicate_reap() {
         let mut p = ProcessRecord::<7>::empty();

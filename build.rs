@@ -24,6 +24,39 @@ fn nm_symbol(output: &str, name: &str) -> u64 {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=user/yield.S");
+    if env::var_os("CARGO_FEATURE_P2_RING3_YIELD_SMOKE").is_some() {
+        println!("cargo:rerun-if-changed=user/hello.ld");
+        let path=PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        fs::create_dir_all(&path).expect("make yield OUT_DIR");
+        let mut symbols=String::new();
+        for pid in [1usize,2] {
+            let obj=path.join(format!("wolfos-yield-{pid}.o"));
+            let elf=path.join(format!("wolfos-yield-{pid}.elf"));
+            let def=format!("WOLFOS_PID={pid}");
+            checked("as",&["--64","--defsym",&def,"-o",
+                obj.to_str().unwrap(),"user/yield.S"]);
+            checked("ld",&["-m","elf_x86_64","-nostdlib","-static",
+                "-T","user/hello.ld","-o",elf.to_str().unwrap(),
+                obj.to_str().unwrap()]);
+            let out=Command::new("nm").arg("-n").arg(&elf)
+                .output().expect("missing nm for yield ELF");
+            assert!(out.status.success(),"yield nm failed");
+            let map=String::from_utf8(out.stdout).expect("yield nm not utf8");
+            for (name,suffix) in [
+                ("_start","ENTRY"),("_yield_return","AFTER_YIELD"),
+                ("_exit_return","AFTER_EXIT"),("progress","PROGRESS"),
+            ] {
+                let addr=nm_symbol(&map,name);
+                symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\n");
+            }
+            assert!(fs::metadata(&elf).unwrap().len()<32768,
+                "unexpectedly large second ELF");
+        }
+        fs::write(path.join("wolfos_yield_symbols.rs"),symbols)
+            .expect("write separately linked ELF symbol table");
+        return;
+    }
     println!("cargo:rerun-if-changed=user/hello.S");
     println!("cargo:rerun-if-changed=user/hello.ld");
     if env::var_os("CARGO_FEATURE_USER_ELF_RUN_SMOKE").is_none()

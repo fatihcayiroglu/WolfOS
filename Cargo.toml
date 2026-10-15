@@ -53,6 +53,7 @@ high-half-stack-arena-lower-fault-smoke = ["smoke-exit"]
 high-half-stack-arena-upper-fault-smoke = ["smoke-exit"]
 user-fx-smoke = ["smoke-exit"]
 p2-handoff-preflight-smoke = ["smoke-exit"]
+p2-ring3-yield-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"

@@ -122,6 +122,16 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
             .map_err(TableError::from)
     }
 
+    /// Stop the sole RUNNING PID after a real hardware user trap and
+    /// before activating a different private address space. The handler
+    /// must already have saved all GPR, IRET and FPU state.
+    pub fn park_running(&mut self, pid: u64, actual_cr3: u64)
+        -> Result<(), TableError>
+    {
+        self.record_mut(pid)?.park_running(pid, actual_cr3)
+            .map_err(TableError::from)
+    }
+
     pub fn exit_zero(&mut self, pid: u64, actual_cr3: u64)
         -> Result<(), TableError>
     {
@@ -182,6 +192,28 @@ mod tests {
         core::array::from_fn(|i| start + i as u64 * 4096)
     }
 
+    #[test]
+    fn bounded_round_robin_resumes_only_one_running_pid() {
+        let mut t=ProcessTable::<2,7>::new();
+        let a=frames(0x1000);let b=frames(0x10000);
+        let x=t.reserve(a[0],a).unwrap();
+        let y=t.reserve(b[0],b).unwrap();
+        for _ in 0..32 {
+            t.mark_running(x,a[0]).unwrap();
+            assert_eq!(t.running(),1);
+            assert_eq!(t.mark_running(y,b[0]),Err(TableError::AnotherRunning));
+            assert_eq!(t.park_running(x,b[0]),
+                Err(TableError::Process(ProcessError::WrongAddressSpace)));
+            t.park_running(x,a[0]).unwrap();
+            t.mark_running(y,b[0]).unwrap();
+            assert_eq!(t.running(),1);
+            t.park_running(y,b[0]).unwrap();
+            assert_eq!(t.running(),0);
+        }
+        assert_eq!(t.cancel_ready(x,0x9000),Ok(a));
+        assert_eq!(t.cancel_ready(y,0x9000),Ok(b));
+        assert_eq!(t.occupied(),0);
+    }
     #[test]
     fn three_resident_pids_reuse_slot_without_reusing_pid() {
         let mut t = ProcessTable::<3, 7>::new();
