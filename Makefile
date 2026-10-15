@@ -41,13 +41,15 @@ else ifeq ($(FLAVOR),elf64-preflight)
 FEATURES := --features elf64-preflight-smoke
 else ifeq ($(FLAVOR),user-vm-shadow)
 FEATURES := --features user-vm-shadow-smoke
+else ifeq ($(FLAVOR),user-ring-prep)
+FEATURES := --features user-ring-prep-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -153,6 +155,10 @@ user-vm-shadow-smoke:
 	$(MAKE) iso FLAVOR=user-vm-shadow
 	python3 scripts/user_vm_shadow_smoke.py $(OUT)/wolfos-user-vm-shadow.iso
 
+user-ring-prep-smoke:
+	$(MAKE) iso FLAVOR=user-ring-prep
+	python3 scripts/user_ring_prep_smoke.py $(OUT)/wolfos-user-ring-prep.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -198,6 +204,8 @@ test:
 	$(OUT)/user_vm_layout_tests
 	rustc --edition=2024 --test kernel/src/kernel_half_shadow.rs -o $(OUT)/kernel_half_shadow_tests
 	$(OUT)/kernel_half_shadow_tests
+	rustc --edition=2024 --test kernel/src/user_ring_entry.rs -o $(OUT)/user_ring_entry_tests
+	$(OUT)/user_ring_entry_tests
 	rustc --edition=2024 --test tests/elf64_page_image.rs -o $(OUT)/elf64_page_image_tests
 	$(OUT)/elf64_page_image_tests
 	rustc --edition=2024 --test kernel/src/preempt_depth.rs -o $(OUT)/preempt_depth_tests
