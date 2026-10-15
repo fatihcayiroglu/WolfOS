@@ -5,7 +5,7 @@
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 use core::sync::atomic::AtomicU32;
 use limine::memmap::Entry;
 use x86_64::registers::control::Cr3;
@@ -43,17 +43,17 @@ const PIT_INTERVAL_TICKS: u16 = 23_864; // approximately 20 ms; not a precision 
 #[cfg(feature = "apic-calibration-smoke")]
 const CALIBRATION_MAX_SPINS: u64 = 300_000_000;
 
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 static USER_SVR:AtomicU32=AtomicU32::new(0);
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 static USER_PIC_MASKS:AtomicU32=AtomicU32::new(0);
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 static USER_BSP_ID:AtomicU32=AtomicU32::new(0);
 
 /// Read the already verified current-mode BSP MMIO base; this is only
 /// meaningful once the xAPIC single-BSP timer test has validated its ID,
 /// firmware RAM exclusions, MMIO version and LVT readiness.
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 pub fn trusted_user_xapic_base()->Option<u64>{
     if !USER_TIMER_CONFIGURED.load(Ordering::Acquire){return None}
     crate::lapic_probe::bsp_mmio_base(
@@ -61,13 +61,13 @@ pub fn trusted_user_xapic_base()->Option<u64>{
     )
 }
 
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 static USER_TIMER_CONFIGURED:AtomicBool=AtomicBool::new(false);
 
 /// Runs on the original BSP CR3 and separate boot stack, IF=0, only
 /// after both actual user ELF tasks exited, before any high MMIO unmap.
 /// Restores the exact PIC/SVR state that existed before arming this test.
-#[cfg(feature = "p2-ring3-timer-observe-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 pub fn stop_user_timer()->bool{
     if x86_64::instructions::interrupts::are_enabled()
         || !USER_TIMER_CONFIGURED.swap(false,Ordering::AcqRel){
@@ -178,7 +178,7 @@ unsafe fn apic_write(offset: usize, value: u32) {
 pub extern "C" fn wolfos_apic_timer_irq_dispatch(
     frame_ptr: *const kernel_trap_frame::KernelTrapFrame,
 ) -> *const kernel_trap_frame::KernelTrapFrame {
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     if crate::user_yield_switch_smoke::timer_irq_active() {
         // This is the genuine CPL3 five-word hardware privilege-switch
         // frame; unlike the legacy CPL0 kernel timer test, the saved RSP
@@ -479,7 +479,7 @@ fn run_mapped_test(expected_id: u32, hhdm:u64) -> bool {
         "WOLFOS_APIC_TIMER_BEGIN vector={} count={} divisor={} required={}\n",
         TIMER_VECTOR, initial_count, DIVISOR, TICKS_REQUIRED
     ));
-    #[cfg(feature = "p2-ring3-timer-observe-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
     {
         USER_BSP_ID.store(expected_id,Ordering::Release);
         USER_SVR.store(original_svr,Ordering::Release);

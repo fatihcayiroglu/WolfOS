@@ -79,6 +79,8 @@ jobs:
         run: make p2-ring3-timer-observe-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
+      - name: P2 real involuntary xAPIC IRQ switches to OTHER native Ring3 ELF in private CR3 with TSS FX and full cleanup
+        run: make p2-ring3-timer-preempt-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
         run: make ap-ipi-smoke
       - name: Directed IPIs wake three AP-owned remote work mailboxes (4 vCPUs)

@@ -24,10 +24,11 @@ ERRORS=[
     "WOLFOS_EXCEPTION_PF","WOLFOS_EXCEPTION_DF",
 ]
 def main():
-    timer_observe = len(sys.argv)==3 and sys.argv[2]=="--timer-observe"
+    timer_preempt = len(sys.argv)==3 and sys.argv[2]=="--timer-preempt"
+    timer_observe = (len(sys.argv)==3 and sys.argv[2]=="--timer-observe") or timer_preempt
     irq_ready = len(sys.argv)==3 and sys.argv[2]=="--irq-ready"
     if len(sys.argv) not in (2,3) or (len(sys.argv)==3 and not (irq_ready or timer_observe)) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_yield_switch_smoke.py kernel.iso [--irq-ready|--timer-observe]")
+        print("Usage: user_yield_switch_smoke.py kernel.iso [--irq-ready|--timer-observe|--timer-preempt]")
         return 2
     with tempfile.TemporaryDirectory(prefix="wolfos-real-ring3-yield-") as temp:
         log=Path(temp)/"serial.log"
@@ -60,6 +61,9 @@ def main():
             checks.insert(checks.index(STEPS[3]),
                 "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed="+("1" if timer_observe else "0"))
             if timer_observe:
+                if timer_preempt:
+                    checks.insert(checks.index(STEPS[3]),
+                        "WOLFOS_RING3_TIMER_PREEMPT_OK real_timer_switches=2 pid1_to_pid2=1 pid2_to_pid1=1 irq_frame_preserved=1 private_cr3=1 tss_rsp0=1 fx_save_restore=1 no_int80=1")
                 checks.insert(checks.index(STEPS[3]),
                     "WOLFOS_RING3_TIMER_HARDWARE_OK")
                 checks.insert(len(checks)-1,
@@ -78,7 +82,7 @@ def main():
             irq_line=next((line for line in out.splitlines()
                 if line.startswith("WOLFOS_RING3_TIMER_HARDWARE_OK ")),None)
             hit=re.fullmatch(
-                r"WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs=(\d+) pid1_busy_irqs=(\d+) pid2_busy_irqs=(\d+) eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1",
+                r"WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs=(\d+) pid1_busy_irqs=(\d+) pid2_busy_irqs=(\d+) eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret="+("0" if timer_preempt else "1"),
                 irq_line or "")
             if hit is None or any(int(n)<1 for n in hit.groups()) or int(hit.group(1))<int(hit.group(2))+int(hit.group(3)):
                 print("FAIL: no real xAPIC timer interrupts during BOTH independent users' syscall-free busy windows")
@@ -118,7 +122,7 @@ def main():
             print("FAIL: expected QEMU debug-exit 33, got",r.returncode)
             print(r.stderr.decode(errors="replace"))
             return 1
-        print("PASS: 2 native ELF Ring3 programs, 8 real INT80 yields, 9 cross-PID IRETQ handoffs, 2 exits, zero leaks; "+("genuine xAPIC timer IRQs in BOTH separate Ring3 busy windows" if timer_observe else "all ten CPL3 frames IF=1 and PIC masked" if irq_ready else "IF=0 legacy"))
+        print("PASS: 2 native ELF Ring3 programs, 8 real INT80 yields, 9 cross-PID IRETQ handoffs, 2 exits, zero leaks; "+("2 involuntary real xAPIC IRQ switches between independent Ring3 CR3 + 8 genuine user yields" if timer_preempt else "genuine xAPIC timer IRQs in BOTH separate Ring3 busy windows" if timer_observe else "all ten CPL3 frames IF=1 and PIC masked" if irq_ready else "IF=0 legacy"))
         return 0
 if __name__=="__main__":
     sys.exit(main())

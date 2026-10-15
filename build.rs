@@ -27,7 +27,7 @@ fn main() {
     println!("cargo:rerun-if-changed=user/yield.S");
     if env::var_os("CARGO_FEATURE_P2_RING3_YIELD_SMOKE").is_some()
         || env::var_os("CARGO_FEATURE_P2_RING3_IRQ_READY_SMOKE").is_some()
-        || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() {
+        || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some() {
         println!("cargo:rerun-if-changed=user/hello.ld");
         let path=PathBuf::from(env::var_os("OUT_DIR").unwrap());
         fs::create_dir_all(&path).expect("make yield OUT_DIR");
@@ -36,7 +36,7 @@ fn main() {
             let obj=path.join(format!("wolfos-yield-{pid}.o"));
             let elf=path.join(format!("wolfos-yield-{pid}.elf"));
             let def=format!("WOLFOS_PID={pid}");
-            if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() {
+            if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some() {
                 checked("as",&["--64","--defsym",&def,
                     "--defsym","WOLFOS_TIMER_IRQ_PROBE=1","-o",
                     obj.to_str().unwrap(),"user/yield.S"]);
@@ -58,7 +58,7 @@ fn main() {
                 let addr=nm_symbol(&map,name);
                 symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\n");
             }
-            if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some(){
+            if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some(){
                 for (name,suffix) in [("_busy_begin","BUSY_BEGIN"),("_busy_end","BUSY_END")] {
                     let addr=nm_symbol(&map,name);
                     symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\n");
