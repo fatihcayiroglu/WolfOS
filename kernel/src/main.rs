@@ -178,6 +178,8 @@ mod user_fx_smoke;
 mod handoff_preflight_smoke;
 #[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
 mod user_yield_switch_smoke;
+#[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+mod ring3_round_robin;
 #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 mod user_irq_preempt_contract;
 #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
