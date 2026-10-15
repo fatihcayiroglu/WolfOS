@@ -5,7 +5,8 @@ use x86_64::registers::control::Cr3;
 use x86_64::instructions::interrupts;
 use crate::{
     fx_state, pmm, serial,
-    process_table::{ProcessTable,ProcessState},
+    process_table::ProcessTable,
+    process_lifecycle::ProcessState,
     user_fx_bank::{FxImage,UserFxBank,IMAGE_BYTES},
 };
 
