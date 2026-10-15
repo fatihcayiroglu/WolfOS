@@ -44,6 +44,7 @@ user-copy-smoke = ["smoke-exit"]
 user-file-io-smoke = ["smoke-exit"]
 process-table-smoke = ["smoke-exit"]
 user-context-smoke = ["smoke-exit"]
+kernel-stack-lease-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"

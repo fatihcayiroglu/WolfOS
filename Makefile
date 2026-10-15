@@ -57,6 +57,8 @@ else ifeq ($(FLAVOR),user-ramfs)
 FEATURES := --features user-ramfs-smoke
 else ifeq ($(FLAVOR),user-vfs)
 FEATURES := --features user-vfs-smoke
+else ifeq ($(FLAVOR),kernel-stack-lease)
+FEATURES := --features kernel-stack-lease-smoke
 else ifeq ($(FLAVOR),user-context)
 FEATURES := --features user-context-smoke
 else ifeq ($(FLAVOR),process-table)
@@ -71,7 +73,7 @@ else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -225,6 +227,10 @@ user-context-smoke:
 	$(MAKE) iso FLAVOR=user-context
 	python3 scripts/user_context_smoke.py $(OUT)/wolfos-user-context.iso
 
+kernel-stack-lease-smoke:
+	$(MAKE) iso FLAVOR=kernel-stack-lease
+	python3 scripts/kernel_stack_lease_smoke.py $(OUT)/wolfos-kernel-stack-lease.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -281,6 +287,8 @@ test:
 	$(OUT)/vfs_tests
 	rustc --edition=2024 --test kernel/src/ramfs.rs -o $(OUT)/ramfs_tests
 	$(OUT)/ramfs_tests
+	rustc --edition=2024 --test kernel/src/kernel_stack_lease.rs -o $(OUT)/kernel_stack_lease_tests
+	$(OUT)/kernel_stack_lease_tests
 	rustc --edition=2024 --test kernel/src/user_context_bank.rs -o $(OUT)/user_context_bank_tests
 	$(OUT)/user_context_bank_tests
 	rustc --edition=2024 --test kernel/src/process_table.rs -o $(OUT)/process_table_tests
