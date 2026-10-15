@@ -145,7 +145,7 @@ pub fn enter(hhdm: u64) -> ! {
         || symbols::AFTER_FILE_CLOSE <= symbols::AFTER_FILE_BAD_READ
         || symbols::AFTER_FILE_BAD_OPEN <= symbols::AFTER_FILE_CLOSE
         || symbols::AFTER_EXIT <= symbols::AFTER_FILE_BAD_OPEN
-        || symbols::FILE_PATH <= symbols::HELLO_END
+        || symbols::FILE_PATH < symbols::HELLO_END
     { fail("file_elf_linker_contract") }
 
     if symbols::ENTRY != 0x401000 || symbols::AFTER_ID <= symbols::ENTRY
