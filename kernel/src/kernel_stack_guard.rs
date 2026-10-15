@@ -19,6 +19,8 @@ pub const ROOT_INDEX: usize = ((BASE >> 39) & 511) as usize;
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
+const ACCESSED: u64 = 1 << 5;
+const DIRTY: u64 = 1 << 6;
 const PHYS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const MAX_PHYS: u64 = 1 << 52;
 
@@ -54,6 +56,14 @@ impl GuardPlan {
         physical | PRESENT | WRITABLE // deliberately NO U/S permission
     }
 
+    /// CPU x86-64 page walks may set A on *every* traversed level, and
+    /// D on a written leaf. Ignore ONLY those architecturally owned bits,
+    /// while rejecting User, NX, Global, execute-disable and wrong frames.
+    fn matches_hw(actual: u64, physical: u64, leaf: bool) -> bool {
+        let hardware_bits = ACCESSED | if leaf { DIRTY } else { 0 };
+        actual & !hardware_bits == Self::expected(physical)
+    }
+
     /// All checks before writing the live root. Caller must ensure
     /// exclusive ownership, interrupts masked, no AP/scheduler users and
     /// HHDM access to the private PMM frames.
@@ -85,9 +95,9 @@ impl GuardPlan {
         pd: &[u64; ENTRIES],
         pt: &[u64; ENTRIES],
     ) -> Result<(), GuardError> {
-        if root[ROOT_INDEX] != Self::expected(self.pages[0])
-            || pdpt[0] != Self::expected(self.pages[1])
-            || pd[0] != Self::expected(self.pages[2])
+        if !Self::matches_hw(root[ROOT_INDEX], self.pages[0], false)
+            || !Self::matches_hw(pdpt[0], self.pages[1], false)
+            || !Self::matches_hw(pd[0], self.pages[2], false)
             || root[ROOT_INDEX] & USER != 0
         { return Err(GuardError::BadTable) }
         if pdpt[1..].iter().chain(pd[1..].iter()).any(|x| *x != 0)
@@ -96,7 +106,7 @@ impl GuardPlan {
         }
         if pt[0] != 0 || pt[5] != 0 { return Err(GuardError::BadGuard) }
         for i in 0..STACK_PAGES {
-            if pt[i+1] != Self::expected(self.pages[i+3])
+            if !Self::matches_hw(pt[i+1], self.pages[i+3], true)
                 || pt[i+1] & USER != 0 || pt[i+1] & PHYS_MASK != self.pages[i+3] {
                 return Err(GuardError::WrongLeaf)
             }
@@ -141,6 +151,27 @@ mod tests {
         assert_eq!(root[ROOT_INDEX],0);
         assert_eq!(pt[1..5],[0u64;4]);
     }
+    #[test]
+    fn hardware_accessed_dirty_only_are_allowed_after_real_stack_io() {
+        let p=GuardPlan::new(pages(),0x9000).unwrap();
+        let [mut root,mut pdpt,mut pd,mut pt]=arrays();
+        p.populate(&mut root,&mut pdpt,&mut pd,&mut pt).unwrap();
+        root[ROOT_INDEX]|=ACCESSED;
+        pdpt[0]|=ACCESSED;
+        pd[0]|=ACCESSED;
+        for entry in &mut pt[1..5] { *entry |= ACCESSED | DIRTY }
+        assert_eq!(p.audit(&root,&pdpt,&pd,&pt),Ok(()));
+        // Modifying a USER permission is still a security violation.
+        pt[1]|=USER;
+        assert_eq!(p.audit(&root,&pdpt,&pd,&pt),Err(GuardError::WrongLeaf));
+        pt[1]&=!USER;
+        // Parent must never silently accept a dirty (not leaf) bit.
+        pdpt[0]|=DIRTY;
+        assert_eq!(p.audit(&root,&pdpt,&pd,&pt),Err(GuardError::BadTable));
+        pdpt[0]&=!DIRTY;
+        assert_eq!(p.unpublish(&mut root,&mut pdpt,&mut pd,&mut pt),Ok(()));
+    }
+
     #[test]
     fn alias_frame_or_dirty_target_denied_without_publishing() {
         let mut fr=pages(); fr[6]=fr[3];
