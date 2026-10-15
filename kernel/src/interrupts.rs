@@ -5,9 +5,9 @@
 
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 use core::arch::asm;
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 use core::sync::atomic::AtomicU64;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -65,22 +65,22 @@ static IDT_READY: AtomicBool = AtomicBool::new(false);
 
 // P2 one-vCPU isolated QEMU preflight ONLY. No CPL3 switch is performed.
 // The future TSS.RSP0 stack is not the double-fault IST stack.
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 const USER_RSP0_STACK_SIZE: usize = 16 * 1024;
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 const USER_RSP0_CANARY: u64 = 0x574f_4c46_5253_5030; // "WOLFRSP0"
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 #[repr(align(16))]
 struct UserRsp0Stack([u8; USER_RSP0_STACK_SIZE]);
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 static mut BSP_USER_RSP0_STACK: UserRsp0Stack = UserRsp0Stack([0; USER_RSP0_STACK_SIZE]);
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 static USER_RSP0_EXPECTED: AtomicU64 = AtomicU64::new(0);
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 static USER_CS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 static USER_DS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 static USER_TSS_SELECTOR_EXPECTED: AtomicUsize = AtomicUsize::new(0);
 
 
@@ -201,7 +201,7 @@ pub fn initialize() {
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
         VirtAddr::new(stack_top as u64);
-    #[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+    #[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
     {
         let rsp0_bottom = (&raw mut BSP_USER_RSP0_STACK).cast::<u8>() as usize;
         let rsp0_top = rsp0_bottom + USER_RSP0_STACK_SIZE;
@@ -225,7 +225,7 @@ pub fn initialize() {
     let kernel_cs = gdt.append(Descriptor::kernel_code_segment());
     let kernel_ds = gdt.append(Descriptor::kernel_data_segment());
     let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));
-    #[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+    #[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
     {
         // The kernel stays at CPL0. These are descriptors for a future
         // isolated IRETQ transition, not a change in current CS/SS.
@@ -270,7 +270,7 @@ pub fn initialize() {
         // user code cannot request this vector as an arbitrary INT.
         idt.page_fault.set_handler_fn(crate::user_ring3_isolation_smoke::user_page_fault);
     }
-    #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")), feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+    #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
     unsafe {
         // This custom gate saves ALL 15 GPRs so the kernel can dispatch
         // RAX/RDI/RSI arguments and change saved RAX before real IRETQ.
@@ -280,7 +280,7 @@ pub fn initialize() {
     }
     #[cfg(feature = "timer-smoke")]
     idt[crate::timer::TIMER_VECTOR].set_handler_fn(crate::timer::irq0);
-    #[cfg(any(any(feature = "apic-timer-smoke", feature = "p2-ring3-timer-observe-smoke"), feature = "apic-calibration-smoke",
+    #[cfg(any(any(feature = "apic-timer-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")), feature = "apic-calibration-smoke",
                feature = "apic-preempt-smoke"))]
     // SAFETY: custom x86-64 long-mode interrupt-gate entry saves all GPRs
     // before calling the BSP-only Rust dispatch, then IRETQs to same task.
@@ -289,7 +289,7 @@ pub fn initialize() {
         idt[crate::apic_timer_smoke::TIMER_VECTOR]
             .set_handler_addr(crate::apic_irq_entry::address());
     }
-    #[cfg(any(any(feature = "apic-timer-smoke", feature = "p2-ring3-timer-observe-smoke"), feature = "apic-calibration-smoke",
+    #[cfg(any(any(feature = "apic-timer-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")), feature = "apic-calibration-smoke",
                feature = "apic-preempt-smoke"))]
     idt[crate::apic_timer_smoke::SPURIOUS_VECTOR]
         .set_handler_fn(crate::apic_timer_smoke::spurious);
@@ -310,7 +310,7 @@ pub fn initialize() {
     serial::write_line("WOLFOS_BREAKPOINT_RETURN_OK");
 }
 
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 pub fn verify_ring3_preconditions() -> bool {
     ring3_preflight_inner(false)
 }
@@ -325,7 +325,7 @@ pub fn verify_ring3_reentry_preconditions() -> bool {
     ring3_preflight_inner(true)
 }
 
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))]
 fn ring3_preflight_inner(after_user_trap: bool) -> bool {
     // Only after interrupts::initialize(), before SMP startup. Read actual
     // hardware task register and actual packed TSS privilege_stack_table.
@@ -395,7 +395,7 @@ fn ring3_preflight_inner(after_user_trap: bool) -> bool {
 /// # Safety
 /// Single BSP, IF=0, initialized TSS, no concurrent CPU/interrupt reader,
 /// next RSP0 is a live 16-KiB supervisor stack top mapped in active CR3.
-#[cfg(any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))))]
+#[cfg(any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))))]
 pub unsafe fn test_handoff_rsp0(next: u64) -> bool {
     if next < 0xffff_8000_0000_0000 || next & 15 != 0
         || x86_64::instructions::interrupts::are_enabled() {
@@ -410,7 +410,7 @@ pub unsafe fn test_handoff_rsp0(next: u64) -> bool {
 }
 
 /// Read the actual loaded supervisor RSP0, not a cached metadata value.
-#[cfg(any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))))]
+#[cfg(any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))))]
 pub fn test_actual_rsp0() -> u64 {
     let ptr=unsafe{(*TSS_STORAGE.0.get()).as_ptr()};
     let field=unsafe{core::ptr::addr_of!((*ptr).privilege_stack_table[0])};
@@ -418,14 +418,14 @@ pub fn test_actual_rsp0() -> u64 {
 }
 
 /// Read back selector + stack metadata after verify_ring3_preconditions().
-#[cfg(any(any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke"))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 pub fn ring3_cpu_state() -> (u16, u16, u64) {
     (USER_CS_EXPECTED.load(Ordering::Acquire) as u16,
      USER_DS_EXPECTED.load(Ordering::Acquire) as u16,
      USER_RSP0_EXPECTED.load(Ordering::Acquire))
 }
 
-#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", feature = "p2-ring3-timer-observe-smoke")))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
+#[cfg(any(any(feature = "user-ring-prep-smoke", any(feature = "p2-handoff-preflight-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))), feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))]
 fn stack_top_check(base: usize, top: usize) -> bool {
     base != 0 && base % 16 == 0 && top % 16 == 0
         && top > base && top - base == USER_RSP0_STACK_SIZE
