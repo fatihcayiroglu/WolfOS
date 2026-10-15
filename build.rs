@@ -30,14 +30,18 @@ fn main() {
         && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_RAMFS_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_VFS_SMOKE").is_none()
-        && env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_none() {
+        && env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_none()
+        && env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_none() {
         return;
     }
     let path = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     fs::create_dir_all(&path).expect("make OUT_DIR");
     let obj = path.join("wolfos-user-hello.o");
     let elf = path.join("wolfos-user-hello.elf");
-    if env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_some() {
+    if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
+        checked("as", &["--64", "--defsym", "WOLFOS_FILE_IO_SMOKE=1",
+            "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    } else if env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_some() {
         checked("as", &["--64", "--defsym", "WOLFOS_USERCOPY_SMOKE=1",
             "-o", obj.to_str().unwrap(), "user/hello.S"]);
     } else {
@@ -50,7 +54,7 @@ fn main() {
         .output().expect("nm missing");
     assert!(out.status.success(), "nm ELF symbol scan failed");
     let output = String::from_utf8(out.stdout).expect("bad nm output");
-    let symbols = [
+    let mut symbols = vec![
         ("_start", "ENTRY"), ("_after_id", "AFTER_ID"),
         ("_after_add", "AFTER_ADD"),
         ("_after_write", "AFTER_WRITE"),
@@ -61,6 +65,19 @@ fn main() {
         ("fixture_magic", "FIXTURE_MAGIC"),
         ("uninitialized", "BSS_START"),
     ];
+    if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
+        symbols.extend_from_slice(&[
+            ("_after_file_bad_open", "FILE_BAD_OPEN"),
+            ("_after_file_open", "FILE_OPEN"),
+            ("_after_file_bad_read", "FILE_BAD_READ"),
+            ("_after_file_read", "FILE_READ"),
+            ("_after_file_eof", "FILE_EOF"),
+            ("_after_file_close", "FILE_CLOSE"),
+            ("_after_file_stale_close", "FILE_STALE_CLOSE"),
+            ("file_path", "FILE_PATH"),
+            ("file_path_end", "FILE_PATH_END"),
+        ]);
+    }
     let mut generated = String::new();
     for (symbol, var) in symbols {
         let value = nm_symbol(&output, symbol);
