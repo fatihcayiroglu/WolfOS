@@ -529,11 +529,23 @@ fn user_pointer(address: u64, bytes: usize, writable: bool) -> Result<*mut u8, (
     if table(0)[slot] != frame(1) | (PRESENT | WRITE | USER)
         || table(1)[0] != frame(2) | (PRESENT | WRITE | USER)
         || table(2)[2] != frame(3) | (PRESENT | WRITE | USER)
-    { return Err(()) }
+    {
+        serial::write_fmt(format_args!(
+            "WOLFOS_FILE_COPY_DIAG ancestor root={:#x}/{:#x} pdpt={:#x}/{:#x} pd={:#x}/{:#x}\n",
+            table(0)[slot], frame(1) | 7, table(1)[0], frame(2) | 7,
+            table(2)[2], frame(3) | 7
+        ));
+        return Err(())
+    }
     let leaf = table(3)[leaf_idx];
     let offset = user_copy::admit(
         address, bytes, page, leaf, page_phys, writable
-    ).map_err(|_| ())?;
+    ).map_err(|err| {
+        serial::write_fmt(format_args!(
+            "WOLFOS_FILE_COPY_DIAG admit={:?} va={:#x} page={:#x} len={} leaf={:#x} phys={:#x} write={}\n",
+            err, address, page, bytes, leaf, page_phys, writable,
+        ));
+    })?;
     let vaddr = hhdm.checked_add(page_phys)
         .and_then(|p| p.checked_add(offset as u64)).ok_or(())?;
     let valid = VirtAddr::try_new(vaddr).map_err(|_| ())?;
