@@ -597,6 +597,30 @@ pub fn verify_bsp(bsp: u32, cpus: &[&MpInfo]) -> bool {
         ));
         true
     } else {
+        // Fail-closed hardware diagnostics: no conditions are relaxed.
+        // Every AP is parked before BSP reads these counters.
+        for (cpu, info) in cpus.iter().enumerate() {
+            if info.lapic_id == bsp { continue; }
+            let p = &CORES[cpu];
+            serial::write_fmt(format_args!(
+                "WOLFOS_AP_SMP_PREEMPT_DIAG cpu={} failed={} active={} done={} offline={} current={} exit={} switches={} task0_irqs={} task1_irqs={} ticks={} eois={} deferred={} nested={} guard_depth={} invalid={} xmm_bad={} work0={} work1={} canary0={} canary1={}\n",
+                cpu, p.failed.load(Ordering::Acquire),
+                p.active.load(Ordering::Acquire), p.done.load(Ordering::Acquire),
+                ap_ipi_smoke::is_offline(cpu), p.current.load(Ordering::Acquire),
+                p.exited_by.load(Ordering::Acquire),
+                p.switches.load(Ordering::Acquire),
+                p.interrupted[0].load(Ordering::Acquire),
+                p.interrupted[1].load(Ordering::Acquire),
+                p.ticks.load(Ordering::Acquire),
+                p.eois.load(Ordering::Acquire),
+                p.deferred.load(Ordering::Acquire),
+                p.nested_ok.load(Ordering::Acquire), GATES[cpu].depth(),
+                p.invalid.load(Ordering::Acquire), p.xmm_bad.load(Ordering::Acquire),
+                p.work[0].load(Ordering::Acquire), p.work[1].load(Ordering::Acquire),
+                unsafe { (bottom(cpu, 0) as *const u64).read_volatile() == CANARY ^ cpu as u64 },
+                unsafe { (bottom(cpu, 1) as *const u64).read_volatile() == CANARY ^ cpu as u64 ^ 1 },
+            ));
+        }
         serial::write_fmt(format_args!(
             "WOLFOS_AP_SMP_PREEMPT_ERROR switches={} task0_irqs={} task1_irqs={} ticks={} eois={} work={} offline={} good={} spurious={} wrong_ipi={} unrouted={} deferred={} nested_aps={}\n",
             switched, a, b, irq, eoi, work, offline, good,

@@ -168,6 +168,8 @@ test:
 	$(OUT)/remote_runqueue_tests
 	rustc --edition=2024 --test kernel/src/percpu_work_queue.rs -o $(OUT)/percpu_work_queue_tests
 	$(OUT)/percpu_work_queue_tests
+	rustc --edition=2024 --test kernel/src/ap_work_placement.rs -o $(OUT)/ap_work_placement_tests
+	$(OUT)/ap_work_placement_tests
 	rustc --edition=2024 --test kernel/src/task_handoff.rs -o $(OUT)/task_handoff_tests
 	$(OUT)/task_handoff_tests
 	rustc --edition=2024 --test kernel/src/migrating_stack_contract.rs -o $(OUT)/migrating_stack_contract_tests
