@@ -36,6 +36,7 @@ user-ring-prep-smoke = ["smoke-exit"]
 user-ring3-smoke = ["smoke-exit"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
+user-elf-run-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
