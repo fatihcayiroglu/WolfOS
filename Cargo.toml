@@ -56,6 +56,7 @@ p2-handoff-preflight-smoke = ["smoke-exit"]
 p2-ring3-yield-smoke = ["smoke-exit"]
 p2-ring3-irq-ready-smoke = ["smoke-exit"]
 p2-ring3-timer-observe-smoke = ["smoke-exit"]
+p2-ring3-timer-preempt-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
