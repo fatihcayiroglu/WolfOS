@@ -47,6 +47,10 @@ mod user_context_smoke;
 mod kernel_stack_lease;
 #[cfg(feature = "kernel-stack-lease-smoke")]
 mod kernel_stack_lease_smoke;
+#[cfg(any(feature = "kernel-stack-guard-smoke", feature = "kernel-stack-guard-fault-smoke", feature = "kernel-stack-guard-upper-fault-smoke"))]
+mod kernel_stack_guard;
+#[cfg(any(feature = "kernel-stack-guard-smoke", feature = "kernel-stack-guard-fault-smoke", feature = "kernel-stack-guard-upper-fault-smoke"))]
+mod kernel_stack_guard_smoke;
 #[cfg(feature = "process-table-smoke")]
 mod process_table_smoke;
 #[cfg(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke"))]
@@ -450,6 +454,9 @@ pub extern "C" fn kmain() -> ! {
 
     #[cfg(feature = "kernel-stack-lease-smoke")]
     kernel_stack_lease_smoke::verify(hhdm.offset);
+
+    #[cfg(any(feature = "kernel-stack-guard-smoke", feature = "kernel-stack-guard-fault-smoke", feature = "kernel-stack-guard-upper-fault-smoke"))]
+    kernel_stack_guard_smoke::verify(hhdm.offset);
 
     #[cfg(feature = "smoke-exit")]
     serial::qemu_exit_success();
