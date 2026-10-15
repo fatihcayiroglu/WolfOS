@@ -100,7 +100,25 @@ pub fn enter(hhdm: u64) -> ! {
     if index >= MAX_RUNS || hhdm == 0 { fail("invalid_process_launch") }
     let pid = index as u64 + 1;
     HHDM_OFFSET.store(hhdm, Ordering::Release);
-    if !interrupts::verify_ring3_preconditions() { fail("gdt_tss") }
+    if index == 0 {
+        if !interrupts::verify_ring3_preconditions() { fail("gdt_tss") }
+    } else {
+        #[cfg(feature = "user-process-smoke")]
+        {
+            // Only allow the second user admission AFTER the first PID was
+            // fully reaped and no PMM pages remain owned. CPU SS=0 is valid
+            // here because the kernel arrived via a real CPL3 INT80 trap.
+            let safely_reaped = matches!(
+                PROCESS.with(|p| (p.pid, p.state, p.frames)),
+                Ok((1, ProcessState::Reaped, [0; FRAMES])),
+            );
+            if !safely_reaped || OWNED.iter().any(|p| p.load(Ordering::Acquire) != 0)
+                || !interrupts::verify_ring3_reentry_preconditions()
+            { fail("second_user_kernel_reentry_preflight") }
+        }
+        #[cfg(not(feature = "user-process-smoke"))]
+        fail("unreachable_user_reentry");
+    }
     if symbols::ENTRY != 0x401000 || symbols::AFTER_ID <= symbols::ENTRY
         || symbols::AFTER_ADD <= symbols::AFTER_ID
         || symbols::AFTER_PUTC <= symbols::AFTER_ADD
