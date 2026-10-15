@@ -44,7 +44,7 @@ def main() -> int:
             r"ipis=(\d+) eois=(\d+) fifo=(\d+) wraps=(\d+) "
             r"peak=(\d+) active=(\d+) idle=(\d+) offline=(\d+) "
             r"invalid=(\d+) spurious=(\d+) bsp_if=(\d+) "
-            r"task_migrated=(\d+)",
+            r"task_migrated=(\d+) redirected=(\d+) no_capacity=(\d+)",
             output,
         )
         if proof is None:
@@ -53,7 +53,7 @@ def main() -> int:
         got = tuple(map(int, proof.groups()))
         expected = (
             4, 3, 4, 2, 24, 24, 6, 6,
-            6, 6, 24, 3, 3, 0, 3, 3, 0, 0, 0, 0,
+            6, 6, 24, 3, 3, 0, 3, 3, 0, 0, 0, 0, 16, 2,
         )
         if got != expected:
             print(f"FAIL: invalid per-CPU FIFO/backpressure/overlap/IPI evidence: {got}")
@@ -75,7 +75,8 @@ def main() -> int:
             "PASS: 3 AP-owned four-slot FIFOs, 24 correct jobs across "
             "two real-IPI-triggered waves, 6 actual directed IPIs/EOIs, "
             "6 full-queue rejections, 6 wrong-owner rejections, "
-            "3 overlapping AP CPU work contexts and 0 invalid executions"
+            "3 overlapping AP CPU work contexts, 16 overload redirects, "
+            "2 complete-capacity refusals and 0 invalid executions"
         )
         return 0
 
