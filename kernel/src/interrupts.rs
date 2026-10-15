@@ -370,7 +370,7 @@ pub fn verify_ring3_preconditions() -> bool {
 }
 
 /// Read back selector + stack metadata after verify_ring3_preconditions().
-#[cfg(any(feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke"))]
+#[cfg(any(feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke"))]
 pub fn ring3_cpu_state() -> (u16, u16, u64) {
     (USER_CS_EXPECTED.load(Ordering::Acquire) as u16,
      USER_DS_EXPECTED.load(Ordering::Acquire) as u16,
