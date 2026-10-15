@@ -51,6 +51,8 @@ mod ap_remote_work_smoke;
 #[cfg(feature = "ap-runqueue-smoke")]
 mod percpu_work_queue;
 #[cfg(feature = "ap-runqueue-smoke")]
+mod ap_work_placement;
+#[cfg(feature = "ap-runqueue-smoke")]
 mod ap_runqueue_smoke;
 #[cfg(feature = "ap-smp-preempt-smoke")]
 mod ap_preempt_irq_entry;
