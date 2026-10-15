@@ -35,6 +35,7 @@ user-vm-shadow-smoke = ["smoke-exit"]
 user-ring-prep-smoke = ["smoke-exit"]
 user-ring3-smoke = ["smoke-exit"]
 user-ring3-isolation-smoke = ["smoke-exit"]
+user-syscall-smoke = ["smoke-exit"]
 
 [profile.dev]
 panic = "abort"
