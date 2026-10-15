@@ -43,7 +43,7 @@ const FAULT_RIP_OFFSET: u64 = 28;
 // movabs rax, <EXACT KERNEL CODE VA>; mov rax, [rax]; ud2.
 // Fault RIP is 28 bytes after user entry. The address immediate is patched
 // ONLY while the RX frame is unexposed and accessed through supervisor HHDM.
-const USER_PROGRAM: [u8; 35] = [
+const USER_PROGRAM: [u8; 33] = [
     0xc6, 0x05, 0xf9, 0x0f, 0, 0, 0x11, 0xcd, 0x80,
     0xc6, 0x05, 0xf0, 0x0f, 0, 0, 0x22, 0xcd, 0x80,
     0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0,
