@@ -75,6 +75,8 @@ jobs:
         run: make p2-ring3-yield-smoke
       - name: P2 two actual native Ring3 ELF IF-enabled contexts with checked PID CR3 TSS FX and masked PIC (QEMU)
         run: make p2-ring3-irq-ready-smoke
+      - name: P2 real xAPIC timer IRQ observed in two separate CPL3 ELF busy loops, guarded TSS.RSP0 and private CR3
+        run: make p2-ring3-timer-observe-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)

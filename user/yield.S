@@ -17,6 +17,17 @@ loop:
     // switching to the other private CR3 and back.
     add qword ptr [rip + progress], 1
     inc r13
+.ifdef WOLFOS_TIMER_IRQ_PROBE
+    // User-mode CPU-bound work: no yield, no INT80 in this window.
+    // Only the real xAPIC hardware timer can interrupt these instructions.
+    mov ecx, 6000000
+.global _busy_begin
+.global _busy_end
+_busy_begin:
+    dec ecx
+    jnz _busy_begin
+_busy_end:
+.endif
     mov eax, 9
     xor edi, edi
     xor esi, esi

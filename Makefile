@@ -57,6 +57,8 @@ else ifeq ($(FLAVOR),user-ramfs)
 FEATURES := --features user-ramfs-smoke
 else ifeq ($(FLAVOR),user-vfs)
 FEATURES := --features user-vfs-smoke
+else ifeq ($(FLAVOR),p2-ring3-timer-observe)
+FEATURES := --features p2-ring3-timer-observe-smoke
 else ifeq ($(FLAVOR),p2-ring3-irq-ready)
 FEATURES := --features p2-ring3-irq-ready-smoke
 else ifeq ($(FLAVOR),p2-ring3-yield)
@@ -93,7 +95,7 @@ else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke p2-ring3-timer-observe-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -291,6 +293,10 @@ p2-ring3-irq-ready-smoke:
 	$(MAKE) iso FLAVOR=p2-ring3-irq-ready
 	python3 scripts/user_yield_switch_smoke.py $(OUT)/wolfos-p2-ring3-irq-ready.iso --irq-ready
 
+p2-ring3-timer-observe-smoke:
+	$(MAKE) iso FLAVOR=p2-ring3-timer-observe
+	python3 scripts/user_yield_switch_smoke.py $(OUT)/wolfos-p2-ring3-timer-observe.iso --timer-observe
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -351,6 +357,8 @@ test:
 	$(OUT)/vfs_tests
 	rustc --edition=2024 --test kernel/src/ramfs.rs -o $(OUT)/ramfs_tests
 	$(OUT)/ramfs_tests
+	rustc --edition=2024 --test kernel/src/user_xapic_high.rs -o $(OUT)/user_xapic_high_tests
+	$(OUT)/user_xapic_high_tests
 	rustc --edition=2024 --test kernel/src/user_irq_preempt_contract.rs -o $(OUT)/user_irq_preempt_contract_tests
 	$(OUT)/user_irq_preempt_contract_tests
 	rustc --edition=2024 --test kernel/src/user_fx_bank.rs -o $(OUT)/user_fx_bank_tests
