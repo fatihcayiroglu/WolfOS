@@ -245,7 +245,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         || frame.hardware.ss != u64::from(user_ss)
         || frame.hardware.rip != code + RETURN_OFFSETS[stage]
         || frame.hardware.rsp != top
-        || frame.hardware.rflags != 0x2
+        || !user_syscall_abi::valid_user_rflags(frame.hardware.rflags)
         || frame.registers.rax != expected.0
         || frame.registers.rdi != expected.1
         || frame.registers.rsi != expected.2
