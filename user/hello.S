@@ -44,6 +44,7 @@ _after_add:
 .ifdef WOLFOS_USERCOPY_SMOKE
     lea rdi, [rip + hello_text]
     mov esi, hello_end - hello_text
+    xor edx, edx      # RDX reserved: caller must initialize to zero
     mov eax, 5
     int 0x80
 _after_write:
