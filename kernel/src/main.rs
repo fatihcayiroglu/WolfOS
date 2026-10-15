@@ -24,16 +24,16 @@ mod acpi_walk;
 mod smp;
 #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
            feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
-           feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
+           feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod ipi_layout;
 #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
            feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
-           feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
+           feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod ap_ipi_smoke;
 #[cfg(any(feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke",
-           feature = "ap-irq-migrate-smoke"))]
+           feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod task_handoff;
-#[cfg(any(feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
+#[cfg(any(feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod migrating_stack_contract;
 #[cfg(feature = "ap-stack-migrate-smoke")]
 mod ap_stack_migrate_smoke;
@@ -44,10 +44,14 @@ mod ap_irq_migrate_smoke;
 #[cfg(feature = "ap-handoff-smoke")]
 mod ap_handoff_smoke;
 #[cfg(any(feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke",
-           feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
+           feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod remote_runqueue;
 #[cfg(feature = "ap-remote-work-smoke")]
 mod ap_remote_work_smoke;
+#[cfg(feature = "ap-runqueue-smoke")]
+mod percpu_work_queue;
+#[cfg(feature = "ap-runqueue-smoke")]
+mod ap_runqueue_smoke;
 #[cfg(feature = "ap-smp-preempt-smoke")]
 mod ap_preempt_irq_entry;
 #[cfg(feature = "ap-smp-preempt-smoke")]
@@ -68,12 +72,12 @@ mod lapic_timer_layout;
 mod lapic_mmio;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke", feature = "ap-local-timer-smoke",
-           feature = "ap-smp-preempt-smoke", feature = "ap-irq-migrate-smoke"))]
+           feature = "ap-smp-preempt-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod lapic_timer_plan;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke", feature = "ap-ipi-smoke",
            feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
-           feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
+           feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod lapic_irq_layout;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke"))]
@@ -83,7 +87,7 @@ mod apic_timer_smoke;
 mod irq_frame_observation;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke", feature = "ap-smp-preempt-smoke",
-           feature = "ap-irq-migrate-smoke"))]
+           feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod kernel_trap_frame;
 #[cfg(any(feature = "apic-timer-smoke", feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke"))]
@@ -268,7 +272,7 @@ pub extern "C" fn kmain() -> ! {
     // a writable UC local-APIC alias for private IRQ acknowledgement.
     #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
-               feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke"))]
+               feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
     if !ap_ipi_smoke::prepare_bsp(mp.bsp_lapic_id, hhdm.offset, entries, mp.cpus()) {
         serial::write_line("WOLFOS_AP_IPI_ERROR cannot_prepare_xapic");
         halt_forever();
@@ -290,6 +294,11 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "ap-handoff-smoke")]
     if !ap_handoff_smoke::verify_bsp(mp.bsp_lapic_id, mp.cpus()) {
         serial::write_line("WOLFOS_AP_HANDOFF_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "ap-runqueue-smoke")]
+    if !ap_runqueue_smoke::verify_bsp(mp.bsp_lapic_id, mp.cpus()) {
+        serial::write_line("WOLFOS_AP_RUNQUEUE_TEST_FAILED");
         halt_forever();
     }
     #[cfg(feature = "ap-remote-work-smoke")]
