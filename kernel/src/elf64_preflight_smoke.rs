@@ -2,7 +2,12 @@
 //! preflight on an embedded inert fixture. No user program is executed,
 //! no CR3 change or user page installed, no Ring 3 transition occurs.
 
-use crate::{elf64_preflight::{preflight, ElfError, PAGE_BYTES}, serial};
+use crate::{
+    elf64_preflight::{preflight, ElfError, PAGE_BYTES},
+    elf64_page_image::{materialize, PageContents, PAGE_SIZE},
+    pmm, serial,
+};
+use x86_64::VirtAddr;
 
 fn put16(b: &mut [u8], at: usize, value: u16) {
     b[at..at + 2].copy_from_slice(&value.to_le_bytes());
@@ -14,7 +19,7 @@ fn put64(b: &mut [u8], at: usize, value: u64) {
     b[at..at + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-pub fn verify() -> bool {
+pub fn verify(hhdm_offset: u64) -> bool {
     let mut image = [0u8; 512];
     image[..4].copy_from_slice(b"\x7fELF");
     image[4..7].copy_from_slice(&[2, 1, 1]);
@@ -66,6 +71,41 @@ pub fn verify() -> bool {
         serial::write_line("WOLFOS_ELF64_PREFLIGHT_ERROR fail_open");
         return false;
     }
+    // The kernel itself exercises one real WolfOS-PMM-owned physical frame.
+    // HHDM maps it in supervisor space ONLY; it is never installed as a
+    // user PTE. This proves exact file bytes + BSS zero-fill and ownership
+    // release, not Ring 3 or address-space isolation.
+    let before = pmm::statistics().allocated_frames;
+    let Some(frame) = pmm::allocate_frame() else {
+        serial::write_line("WOLFOS_ELF64_PAGE_ERROR no_free_frame");
+        return false;
+    };
+    let Some(address) = hhdm_offset.checked_add(frame)
+        .and_then(|addr| VirtAddr::try_new(addr).ok())
+    else {
+        let _ = pmm::free_frame(frame);
+        serial::write_line("WOLFOS_ELF64_PAGE_ERROR invalid_hhdm");
+        return false;
+    };
+    // SAFETY: frame is exclusively allocated by WolfOS PMM, 4-KiB aligned,
+    // fully mapped by Limine's HHDM. BSP owns it until free_frame() below.
+    let page = unsafe { &mut *address.as_mut_ptr::<[u8; PAGE_SIZE]>() };
+    let populated = materialize(&image, &load, load.page_start, page);
+    let correct = populated == Ok(PageContents {
+        copied: 8, zeroed: PAGE_SIZE - 8,
+        writable: false, executable: true,
+    }) && page[..0x100].iter().all(|b| *b == 0)
+        && page[0x100] == 0xc3
+        && page[0x101..].iter().all(|b| *b == 0);
+    let released = pmm::free_frame(frame).is_ok();
+    let after = pmm::statistics().allocated_frames;
+    if !correct || !released || after != before {
+        serial::write_line("WOLFOS_ELF64_PAGE_ERROR copy_or_release");
+        return false;
+    }
+    serial::write_line(
+        "WOLFOS_ELF64_PAGE_OK copied=8 zeroed=4088 frame_owned=1 released=1 ring3=0"
+    );
     serial::write_line(
         "WOLFOS_ELF64_PREFLIGHT_OK entry=0x401100 loads=1 pages=1 wx_rejected=1 truncated_rejected=1 kernel_entry_rejected=1 executed=0 ring3=0"
     );
