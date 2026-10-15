@@ -6,8 +6,8 @@ use core::arch::asm;
 use x86_64::{VirtAddr, instructions::tlb, registers::control::Cr3};
 use crate::{
     high_half_stack_arena::{
-        GuardedArena,Handle,PT_ENTRIES,OWNED as ARENA_FRAMES,
-        PAGE,BASE,ROOT_INDEX,SLOTS as ARENA_SLOTS,
+        GuardedArena,PT_ENTRIES,OWNED as ARENA_FRAMES,
+        PAGE,BASE,ROOT_INDEX,
     },
     process_table::ProcessTable,process_lifecycle::ProcessState,
     user_context_bank::{UserContextBank,KernelStack},
@@ -39,7 +39,7 @@ fn frame(entry:u64,rsp:u64,cs:u16,ss:u16,tag:u64)->UserSyscallFrame{
     f
 }
 pub fn verify(hhdm:u64){
-    interrupts::disable();
+    x86_64::instructions::interrupts::disable();
     if !interrupts::verify_ring3_preconditions() {
         fail("boot_tss_or_selectors")
     }
