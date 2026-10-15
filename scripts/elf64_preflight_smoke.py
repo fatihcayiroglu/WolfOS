@@ -35,11 +35,12 @@ def main() -> int:
             return 1
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
-        if MARKER not in output or "WOLFOS_BOOT_OK" not in output:
+        page_marker = "WOLFOS_ELF64_PAGE_OK copied=8 zeroed=4088 frame_owned=1 released=1 ring3=0"
+        if MARKER not in output or page_marker not in output or "WOLFOS_BOOT_OK" not in output:
             print("FAIL: incomplete P2 preflight proof or previous kernel boot")
             return 1
         for bad in (
-            "WOLFOS_ELF64_PREFLIGHT_ERROR", "WOLFOS_ELF64_PREFLIGHT_TEST_FAILED",
+            "WOLFOS_ELF64_PREFLIGHT_ERROR", "WOLFOS_ELF64_PAGE_ERROR", "WOLFOS_ELF64_PREFLIGHT_TEST_FAILED",
             "WOLFOS_PANIC", "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF",
             "WOLFOS_EXCEPTION_DF",
         ):
