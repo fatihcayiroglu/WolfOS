@@ -6,6 +6,7 @@ four guarded TSS.RSP0 pages per PID, 512B FXSAVE64 per process, zero PMM
 leaks. Intentionally single BSP IF=0 and volunteer syscall (no timer preemption).
 """
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -23,9 +24,10 @@ ERRORS=[
     "WOLFOS_EXCEPTION_PF","WOLFOS_EXCEPTION_DF",
 ]
 def main():
+    timer_observe = len(sys.argv)==3 and sys.argv[2]=="--timer-observe"
     irq_ready = len(sys.argv)==3 and sys.argv[2]=="--irq-ready"
-    if len(sys.argv) not in (2,3) or (len(sys.argv)==3 and not irq_ready) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_yield_switch_smoke.py kernel.iso [--irq-ready]")
+    if len(sys.argv) not in (2,3) or (len(sys.argv)==3 and not (irq_ready or timer_observe)) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_yield_switch_smoke.py kernel.iso [--irq-ready|--timer-observe]")
         return 2
     with tempfile.TemporaryDirectory(prefix="wolfos-real-ring3-yield-") as temp:
         log=Path(temp)/"serial.log"
@@ -47,10 +49,22 @@ def main():
         out=log.read_text(errors="replace") if log.exists() else ""
         print(out)
         checks=STEPS.copy()
-        if irq_ready:
+        if timer_observe:
+            checks[2]=checks[2].replace("owned_frames=25","owned_frames=28")
+            checks[-1]=checks[-1].replace("frames_freed=25","frames_freed=28")
+            checks.insert(2,
+                "WOLFOS_RING3_TIMER_HIGH_MMIO_OK uc=1 supervisor_only=1 inherited_cr3=2 eoi_high=1 owned_frames=28")
+            checks.insert(3,
+                "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=2")
+        if irq_ready or timer_observe:
             checks.insert(3,
                 "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0")
-            checks.insert(5,
+            if timer_observe:
+                checks.insert(checks.index(STEPS[3]),
+                    "WOLFOS_RING3_TIMER_HARDWARE_OK")
+                checks.insert(checks.index(STEPS[-1]),
+                    "WOLFOS_RING3_TIMER_CLEANUP_OK actual_irq_eoi=1 lvt_masked=1 pic_restored=1 high_mmio_unmapped=1")
+            checks.insert(checks.index(checks[-1]),
                 "WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1")
         else:
             if "WOLFOS_RING3_IRQ_READY_OK" in out or "WOLFOS_RING3_IRQ_READY_RESTORE_OK" in out:
@@ -60,6 +74,15 @@ def main():
         if any(x<0 for x in loc) or loc!=sorted(loc):
             print("FAIL: incomplete or out-of-order real native two-ELF proof")
             return 1
+        if timer_observe:
+            irq_line=next((line for line in out.splitlines()
+                if line.startswith("WOLFOS_RING3_TIMER_HARDWARE_OK ")),None)
+            hit=re.fullmatch(
+                r"WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs=(\\d+) pid1_busy_irqs=(\\d+) pid2_busy_irqs=(\\d+) eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1",
+                irq_line or "")
+            if hit is None or any(int(n)<1 for n in hit.groups()) or int(hit.group(1))<int(hit.group(2))+int(hit.group(3)):
+                print("FAIL: no real xAPIC timer interrupts during BOTH independent users' syscall-free busy windows")
+                return 1
         if any(out.count(p)!=1 for p in checks):
             print("FAIL: duplicate evidence markers")
             return 1
@@ -95,7 +118,7 @@ def main():
             print("FAIL: expected QEMU debug-exit 33, got",r.returncode)
             print(r.stderr.decode(errors="replace"))
             return 1
-        print("PASS: 2 native ELF Ring3 programs, 8 real INT80 yields, 9 cross-PID IRETQ handoffs, 2 exits, zero leaks; "+("all ten CPL3 frames IF=1 and PIC masked" if irq_ready else "IF=0 legacy"))
+        print("PASS: 2 native ELF Ring3 programs, 8 real INT80 yields, 9 cross-PID IRETQ handoffs, 2 exits, zero leaks; "+("genuine xAPIC timer IRQs in BOTH separate Ring3 busy windows" if timer_observe else "all ten CPL3 frames IF=1 and PIC masked" if irq_ready else "IF=0 legacy"))
         return 0
 if __name__=="__main__":
     sys.exit(main())
