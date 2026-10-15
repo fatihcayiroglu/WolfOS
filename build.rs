@@ -29,14 +29,20 @@ fn main() {
     if env::var_os("CARGO_FEATURE_USER_ELF_RUN_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_RAMFS_SMOKE").is_none()
-        && env::var_os("CARGO_FEATURE_USER_VFS_SMOKE").is_none() {
+        && env::var_os("CARGO_FEATURE_USER_VFS_SMOKE").is_none()
+        && env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_none() {
         return;
     }
     let path = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     fs::create_dir_all(&path).expect("make OUT_DIR");
     let obj = path.join("wolfos-user-hello.o");
     let elf = path.join("wolfos-user-hello.elf");
-    checked("as", &["--64", "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    if env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_some() {
+        checked("as", &["--64", "--defsym", "WOLFOS_USERCOPY_SMOKE=1",
+            "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    } else {
+        checked("as", &["--64", "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    }
     checked("ld", &["-m", "elf_x86_64", "-nostdlib", "-static",
         "-T", "user/hello.ld", "-o", elf.to_str().unwrap(),
         obj.to_str().unwrap()]);
@@ -47,6 +53,7 @@ fn main() {
     let symbols = [
         ("_start", "ENTRY"), ("_after_id", "AFTER_ID"),
         ("_after_add", "AFTER_ADD"),
+        ("_after_write", "AFTER_WRITE"),
         ("_after_putc", "AFTER_PUTC"),
         ("_after_exit", "AFTER_EXIT"),
         ("hello_text", "HELLO_TEXT"),

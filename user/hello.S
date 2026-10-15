@@ -39,8 +39,20 @@ _after_add:
     cmp byte ptr [rip + uninitialized], 0
     jne fail
 
-    // Print the first genuine user-visible message, byte by byte,
-    // through original WolfOS PUTC syscall with no unchecked pointers.
+    // New opt-in real user-POINTER syscall. The kernel cannot trust RDI;
+    // it must WALK the live independent user CR3 and copy via HHDM.
+.ifdef WOLFOS_USERCOPY_SMOKE
+    lea rdi, [rip + hello_text]
+    mov esi, hello_end - hello_text
+    xor edx, edx      # RDX reserved: caller must initialize to zero
+    mov eax, 5
+    int 0x80
+_after_write:
+    cmp rax, hello_end - hello_text
+    jne fail
+_after_putc:
+.else
+    // Original historical single-byte PUTC regression is unchanged.
     lea rbx, [rip + hello_text]
     mov ecx, hello_end - hello_text
 print_loop:
@@ -54,6 +66,8 @@ _after_putc:
     inc rbx
     dec ecx
     jnz print_loop
+_after_write:
+.endif
 
     mov eax, 3
     xor edi, edi
