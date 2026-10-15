@@ -2,6 +2,7 @@
 //! Unlike the old low-half smoke alias, this supervisor-only PML4 entry
 //! is inherited into BOTH private Ring3 CR3 roots, so real IRQ EOI can
 //! execute after the processor changed CR3 without mapping MMIO to user.
+#[cfg(not(test))]
 use core::ptr;
 pub const VA:u64=0xffff_e000_0000_1000;
 pub const ROOT_INDEX:usize=((VA>>39)&0x1ff) as usize;
@@ -32,6 +33,7 @@ pub fn validate(boot_entry:u64,mmio_phys:u64,frames:[u64;3])
 /// # Safety
 /// Exclusive BSP; IF=0, no live private roots yet, PMM owns all 3 frames,
 /// HHDM maps all frames as writable supervisor, and root slot is unused.
+#[cfg(not(test))]
 pub unsafe fn publish(hhdm:u64,boot_root:u64,mmio_phys:u64,
     frames:[u64;3])->Result<(),Error>{
     let root=unsafe{&mut *((hhdm+boot_root) as *mut [u64;512])};
@@ -60,11 +62,13 @@ pub unsafe fn publish(hhdm:u64,boot_root:u64,mmio_phys:u64,
 ///
 /// # Safety
 /// BSP xAPIC, high mapping verified, 16-byte aligned register index.
+#[cfg(not(test))]
 pub unsafe fn read(offset:usize)->u32{
     unsafe{((VA as usize+offset) as *const u32).read_volatile()}
 }
 /// # Safety
 /// Same as read(); exclusively owned and genuine xAPIC in MMIO mode.
+#[cfg(not(test))]
 pub unsafe fn write(offset:usize,value:u32){
     unsafe{((VA as usize+offset) as *mut u32).write_volatile();}
 }
@@ -73,10 +77,11 @@ pub unsafe fn write(offset:usize,value:u32){
 ///
 /// # Safety
 /// Caller ensures no IRQ/CPU can reference high MMIO and frames pinned.
+#[cfg(not(test))]
 pub unsafe fn unpublish(hhdm:u64,boot_root:u64,frames:[u64;3])
     ->Result<(),Error>{
     let root=unsafe{&mut *((hhdm+boot_root) as *mut [u64;512])};
-    if root[ROOT_INDEX] != frames[0]|P|W|NX{
+    if root[ROOT_INDEX] != (frames[0]|P|W|NX){
         return Err(Error::Missing)
     }
     root[ROOT_INDEX]=0;
