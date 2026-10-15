@@ -18,6 +18,7 @@ use limine::mp::MpInfo;
 
 use crate::{
     ap_ipi_smoke,
+    ap_handoff_validation::{validate, StepEvidence, StepFailure},
     remote_runqueue::RemoteMailbox,
     serial,
     task_handoff::{advance_digest, HandoffError, TaskLease, INITIAL_DIGEST},
@@ -154,13 +155,21 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
     let mut paused = 0u64;
     let mut denied = 0u64;
     let mut valid = true;
+    // Diagnoses the FIRST refused BSP transition only; never relax a gate.
+    let mut failure_phase = "none";
+    let mut failure_step = 0u64;
+    let mut failure_cpu = 0usize;
+    let mut failure_evidence: Option<(StepFailure, StepEvidence)> = None;
     let mut local_generations = [0u64; CPU_COUNT];
 
     'steps: for step in 1..=TOTAL_STEPS {
         let cpu = aps[((step - 1) % 3) as usize];
+        failure_step = step;
+        failure_cpu = cpu;
         if step > 1 {
             let old_epoch = epoch;
             let Ok(next_epoch) = TASK.transfer(last, cpu, old_epoch) else {
+                failure_phase = "transfer";
                 valid = false;
                 break 'steps;
             };
@@ -173,15 +182,20 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
                 == Err(HandoffError::WrongOwner) {
                 denied += 1;
             } else {
+                failure_phase = "stale_owner_rejection";
                 valid = false;
                 break 'steps;
             }
         }
         local_generations[cpu] += 1;
         let generation = local_generations[cpu];
-        if QUEUES[cpu].publish(cpu, generation, epoch + 1).is_err()
-            || !ap_ipi_smoke::send(bsp_id, cpus[cpu].lapic_id)
-        {
+        if QUEUES[cpu].publish(cpu, generation, epoch + 1).is_err() {
+            failure_phase = "mailbox_publish";
+            valid = false;
+            break 'steps;
+        }
+        if !ap_ipi_smoke::send(bsp_id, cpus[cpu].lapic_id) {
+            failure_phase = "ipi_send";
             valid = false;
             break 'steps;
         }
@@ -191,29 +205,40 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
         if !wait(|| QUEUES[cpu].completed(cpu, generation)
             .ok().flatten().is_some())
         {
+            failure_phase = "completion_wait";
             valid = false;
             break 'steps;
         }
         expected_digest = advance_digest(expected_digest, step);
-        let snap = TASK.snapshot();
-        let complete = QUEUES[cpu].completed(cpu, generation).ok().flatten();
-        if snap.ok().is_none_or(|s| s.epoch != epoch
-            || s.owner != cpu || s.steps != step
-            || s.digest != expected_digest)
-            || complete != Some(expected_digest)
-            || ap_ipi_smoke::ipi_received(cpu) != generation
-            || ap_ipi_smoke::ipi_eois(cpu) != generation
-            || CLAIMS[cpu].load(Ordering::Acquire) != generation
-            || EXECUTED[cpu].load(Ordering::Acquire) != generation
-            || QUEUES[cpu].retire(cpu, generation).is_err()
-        {
+        let evidence = StepEvidence {
+            snapshot: TASK.snapshot().ok()
+                .map(|s| (s.epoch, s.owner, s.steps, s.digest)),
+            completion: QUEUES[cpu].completed(cpu, generation).ok().flatten(),
+            received: ap_ipi_smoke::ipi_received(cpu),
+            eois: ap_ipi_smoke::ipi_eois(cpu),
+            claimed: CLAIMS[cpu].load(Ordering::Acquire),
+            executed: EXECUTED[cpu].load(Ordering::Acquire),
+        };
+        if let Err(why) = validate(
+            evidence, epoch, cpu, step, expected_digest, generation
+        ) {
+            failure_phase = "proof_validation";
+            failure_evidence = Some((why, evidence));
+            valid = false;
+            break 'steps;
+        }
+        if QUEUES[cpu].retire(cpu, generation).is_err() {
+            failure_phase = "mailbox_retire";
             valid = false;
             break 'steps;
         }
         paused += 1;
         last = cpu;
     }
-    if valid && TASK.retire(last, epoch).is_err() { valid = false; }
+    if valid && TASK.retire(last, epoch).is_err() {
+        failure_phase = "final_retire";
+        valid = false;
+    }
     // STOP only after last completion and owner retirement, never while
     // any AP is still writing a quiesced snapshot or handling its IRQ.
     STOP.store(true, Ordering::Release);
@@ -234,6 +259,15 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
             || EXECUTED[cpu].load(Ordering::Acquire) != PER_AP
             || !ap_ipi_smoke::is_offline(cpu)
         { valid = false; }
+    }
+    // Only error-path instrumentation; no timing-sensitive serial writes
+    // between IPI delivery and worker completion, no retry and no skip.
+    if !valid || !all_offline {
+        serial::write_fmt(format_args!(
+            "WOLFOS_AP_HANDOFF_DIAG first_step={} cpu={} phase={} epoch={} source_owner={} expected_digest={:#x} proof={:?} offline={}\n",
+            failure_step, failure_cpu, failure_phase, epoch, last,
+            expected_digest, failure_evidence, all_offline
+        ));
     }
     let bad = BAD.load(Ordering::Acquire) + ap_ipi_smoke::bad_count();
     let spurious = ap_ipi_smoke::spurious_count();

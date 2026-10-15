@@ -101,6 +101,8 @@ mod ap_irq_migrate_entry;
 mod ap_irq_migrate_smoke;
 #[cfg(feature = "ap-handoff-smoke")]
 mod ap_handoff_smoke;
+#[cfg(feature = "ap-handoff-smoke")]
+mod ap_handoff_validation;
 #[cfg(any(feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke",
            feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod remote_runqueue;
