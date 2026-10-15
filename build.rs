@@ -27,7 +27,8 @@ fn main() {
     println!("cargo:rerun-if-changed=user/hello.S");
     println!("cargo:rerun-if-changed=user/hello.ld");
     if env::var_os("CARGO_FEATURE_USER_ELF_RUN_SMOKE").is_none()
-        && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none() {
+        && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none()
+        && env::var_os("CARGO_FEATURE_USER_RAMFS_SMOKE").is_none() {
         return;
     }
     let path = PathBuf::from(env::var_os("OUT_DIR").unwrap());

@@ -100,6 +100,12 @@ pub fn enter(hhdm: u64) -> ! {
     if index >= MAX_RUNS || hhdm == 0 { fail("invalid_process_launch") }
     let pid = index as u64 + 1;
     HHDM_OFFSET.store(hhdm, Ordering::Release);
+    #[cfg(feature = "user-ramfs-smoke")]
+    crate::ramfs_smoke::prepare(ELF);
+    #[cfg(feature = "user-ramfs-smoke")]
+    let elf: &[u8] = crate::ramfs_smoke::elf_file();
+    #[cfg(not(feature = "user-ramfs-smoke"))]
+    let elf: &[u8] = ELF;
     if index == 0 {
         if !interrupts::verify_ring3_preconditions() { fail("gdt_tss") }
     } else {
@@ -127,14 +133,14 @@ pub fn enter(hhdm: u64) -> ! {
         || symbols::HELLO_END != symbols::HELLO_TEXT + HELLO.len() as u64
         || symbols::FIXTURE_MAGIC != 0x403000
         || symbols::BSS_START != 0x403001
-        || ELF.len() >= 32768
+        || elf.len() >= 32768
     { fail("unexpected_independent_elf_symbols") }
 
     // Unlike the old syscall proof, executable bytes are NEVER hardcoded in
     // the kernel's source or directly copied from a handbuilt instruction
     // array. They must pass the strict ELF64 ET_EXEC parser and PT_LOAD
     // data/BSS materialization path developed in PRs #62-#65.
-    let Ok(plan) = preflight(ELF) else { fail("elf_preflight") };
+    let Ok(plan) = preflight(elf) else { fail("elf_preflight") };
     if plan.len != 2 || plan.entry != symbols::ENTRY { fail("elf_entry_or_segments") }
     let (Some(text), Some(data)) = (plan.segments[0], plan.segments[1])
     else { fail("elf_missing_load") };
@@ -153,7 +159,7 @@ pub fn enter(hhdm: u64) -> ! {
         .unwrap_or(usize::MAX);
     let hello_in_file = usize::try_from(text.file_offset).ok()
         .and_then(|begin| begin.checked_add(hello_offset))
-        .and_then(|start| ELF.get(start..start + HELLO.len()));
+        .and_then(|start| elf.get(start..start + HELLO.len()));
     if hello_in_file != Some(&HELLO[..]) { fail("elf_message_content") }
 
     let (user_cs, user_ss, rsp0) = interrupts::ring3_cpu_state();
@@ -202,9 +208,9 @@ pub fn enter(hhdm: u64) -> ! {
         for ptr in ptrs { core::ptr::write_bytes(ptr, 0, PAGE as usize); }
         let text_page = &mut *ptrs[4].cast::<[u8; PAGE_SIZE]>();
         let data_page = &mut *ptrs[5].cast::<[u8; PAGE_SIZE]>();
-        let Ok(t) = materialize(ELF, &text, text.page_start, text_page)
+        let Ok(t) = materialize(elf, &text, text.page_start, text_page)
         else { fail("text_materialize") };
-        let Ok(d) = materialize(ELF, &data, data.page_start, data_page)
+        let Ok(d) = materialize(elf, &data, data.page_start, data_page)
         else { fail("data_materialize") };
         if !t.executable || t.writable || t.copied != text.file_size as usize
             || d.executable || !d.writable || d.copied != 1
@@ -434,6 +440,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 RUN_INDEX.store(2, Ordering::Release);
                 serial::write_line("WOLFOS_PROCESS_LIFECYCLE_OK launched=2 exited=2 reaped=2 total_int80=44 restored_cr3=1 per_pid_owner=1 pmm_no_leak=1 concurrent=0");
             }
+            #[cfg(feature = "user-ramfs-smoke")]
+            crate::ramfs_smoke::report_elf_exit();
             serial::qemu_exit_success()
         }
     }

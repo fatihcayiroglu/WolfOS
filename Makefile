@@ -53,13 +53,15 @@ else ifeq ($(FLAVOR),user-elf-run)
 FEATURES := --features user-elf-run-smoke
 else ifeq ($(FLAVOR),user-process)
 FEATURES := --features user-process-smoke
+else ifeq ($(FLAVOR),user-ramfs)
+FEATURES := --features user-ramfs-smoke
 else ifeq ($(FLAVOR),normal)
 FEATURES :=
 else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -189,6 +191,10 @@ user-process-smoke:
 	$(MAKE) iso FLAVOR=user-process
 	python3 scripts/user_process_smoke.py $(OUT)/wolfos-user-process.iso
 
+user-ramfs-smoke:
+	$(MAKE) iso FLAVOR=user-ramfs
+	python3 scripts/user_ramfs_smoke.py $(OUT)/wolfos-user-ramfs.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	mkdir -p $(OUT)
@@ -241,6 +247,8 @@ test:
 	$(OUT)/kernel_half_shadow_tests
 	rustc --edition=2024 --test kernel/src/user_ring_entry.rs -o $(OUT)/user_ring_entry_tests
 	$(OUT)/user_ring_entry_tests
+	rustc --edition=2024 --test kernel/src/ramfs.rs -o $(OUT)/ramfs_tests
+	$(OUT)/ramfs_tests
 	rustc --edition=2024 --test kernel/src/process_lifecycle.rs -o $(OUT)/process_lifecycle_tests
 	$(OUT)/process_lifecycle_tests
 	rustc --edition=2024 --test kernel/src/user_syscall_abi.rs -o $(OUT)/user_syscall_abi_tests
