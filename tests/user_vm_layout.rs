@@ -4,6 +4,8 @@
 mod elf64_preflight;
 #[path = "../kernel/src/user_vm_layout.rs"]
 mod user_vm_layout;
+#[path = "../kernel/src/user_vm_multi.rs"]
+mod user_vm_multi;
 
 #[test]
 fn p2_page_geometry_and_address_policy_agree() {
@@ -14,4 +16,11 @@ fn p2_page_geometry_and_address_policy_agree() {
     assert_eq!(user_vm_layout::FRAME_COUNT, 5);
     assert!(user_vm_layout::indices(0x401000).is_ok());
     assert!(user_vm_layout::indices(elf64_preflight::USER_END).is_err());
+}
+
+#[test]
+fn user_multi_shares_same_elf_lower_half_policy() {
+    assert_eq!(user_vm_multi::MAX_PAGES, 4);
+    assert_eq!(user_vm_multi::TABLE_FRAMES, 4);
+    assert!(user_vm_layout::indices(0x404000).is_ok());
 }
