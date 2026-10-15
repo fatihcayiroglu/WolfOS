@@ -193,6 +193,11 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
         if actual_kernel_cr3 == 0 || actual_kernel_cr3 & 4095 != 0
             || actual_kernel_cr3 >= PHYS_END
         { return Err(ContextError::BadCr3) }
+        // Check every live PID in the ownership registry, not just
+        // prepared frames: an unprepared READY process also owns its CR3.
+        if table.owns_live_cr3(actual_kernel_cr3) {
+            return Err(ContextError::ActiveUserCr3)
+        }
         if self.snapshot(current_pid).is_none() {
             return Err(ContextError::NotPrepared)
         }
