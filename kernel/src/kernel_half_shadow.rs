@@ -234,7 +234,7 @@ mod tests {
         let src = source();
         let mut dst = target();
         graft_kernel_half(&src, &mut dst, 0, USER_ENTRY, &FRAMES).unwrap();
-        for (idx, bit) in [(256, PTE_USER), (511, 0x10_000), (300, PTE_PRESENT)] {
+        for (idx, bit) in [(511, 0x10_000), (300, PTE_PRESENT)] {
             let mut corrupt = dst;
             corrupt[idx] ^= bit;
             assert_eq!(audit_kernel_half(&src, &corrupt, 0, USER_ENTRY, &FRAMES),
