@@ -34,11 +34,11 @@ def main() -> int:
             return 2
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
-        if MARKER not in output or "WOLFOS_BOOT_OK" not in output:
+        multi_marker = (\n            "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 "\n            "elf_segments=2 bss_zero=1 high_half_empty=1 freed=8 "\n            "cr3_unchanged=1 ring3=0"\n        )\n        if MARKER not in output or multi_marker not in output or "WOLFOS_BOOT_OK" not in output:
             print("FAIL: missing independently verified user page-table root or normal boot")
             return 1
         for bad in (
-            "WOLFOS_USER_ROOT_ERROR", "WOLFOS_USER_ROOT_TEST_FAILED",
+            "WOLFOS_USER_ROOT_ERROR", "WOLFOS_USER_ROOT_TEST_FAILED",\n            "WOLFOS_USER_MULTI_ERROR", "WOLFOS_USER_MULTI_TEST_FAILED",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF",
             "WOLFOS_EXCEPTION_DF", "WOLFOS_PANIC",
         ):
@@ -49,7 +49,7 @@ def main() -> int:
             print(f"FAIL: expected clean debug-exit 33, got {run.returncode}")
             print(run.stderr.decode(errors="replace"))
             return 1
-        print("PASS: two independent PMM-backed shadow roots, U/S + W^X/NX, no CR3 load")
+        print("PASS: two independent roots plus one mixed four-leaf ELF/stack root, no CR3 load")
         return 0
 
 if __name__ == "__main__":
