@@ -49,6 +49,8 @@ jobs:
         run: make user-copy-smoke
       - name: P2 genuine CPL3 OPEN READ CLOSE, bad pointers, stale fd, exact 7-frame cleanup
         run: make user-file-io-smoke
+      - name: P2 three simultaneous reserved PIDs with disjoint real PMM frames and safe cancellation
+        run: make process-table-smoke
       - name: Four-vCPU ACPI MADT topology smoke test
         run: make topology-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
