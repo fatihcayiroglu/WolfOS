@@ -1,4 +1,5 @@
-//! Independent, PID-owned legacy x87/SSE FXSAVE64 images for two users.
+//! Independent, PID-owned legacy x87/SSE FXSAVE64 images for a bounded set
+//! of users. Production two-slot semantics remain backward compatible.
 //!
 //! This is a BSP-only *preflight*, NOT a Ring3 context scheduler. Hardware
 //! save/restore is only allowed after CPUID FXSR/SSE2 verification, while
@@ -11,6 +12,7 @@ use core::mem::{align_of, size_of};
 pub const IMAGE_BYTES:usize=512;
 pub const XMM0_OFFSET:usize=160;
 pub const BANK_CAPACITY:usize=2;
+pub const FOUR_PID_BANK_CAPACITY:usize=4;
 
 #[repr(C,align(16))]
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
@@ -60,13 +62,17 @@ struct Slot{
 impl Slot{const fn new()->Self{
     Self{pid:0,generation:0,live:false,image:FxImage::empty()}
 }}
-pub struct UserFxBank{
-    slots:[Slot;BANK_CAPACITY],
+pub struct FxBank<const CAPACITY:usize>{
+    slots:[Slot;CAPACITY],
     active:Option<usize>,
 }
-impl UserFxBank{
+/// Retain the existing, QEMU-verified two-PID hardware path without a change.
+pub type UserFxBank=FxBank<BANK_CAPACITY>;
+/// Four-PID candidate bank for the next isolated Ring3 hardware milestone.
+pub type FourPidFxBank=FxBank<FOUR_PID_BANK_CAPACITY>;
+impl<const CAPACITY:usize> FxBank<CAPACITY>{
     pub const fn new()->Self{
-        Self{slots:[const{Slot::new()};BANK_CAPACITY],active:None}
+        Self{slots:[const{Slot::new()};CAPACITY],active:None}
     }
     pub fn occupied(&self)->usize{self.slots.iter().filter(|s|s.live).count()}
     pub fn active_pid(&self)->Option<u64>{
@@ -214,6 +220,53 @@ mod tests{
         assert_eq!(b.seed_xmm0(a,7),Err(FxError::StaleHandle));
         assert_eq!(b.retire_quiescent(a),Err(FxError::StaleHandle));
         assert_eq!(b.image_xmm0(newer),Ok(0));
+    }
+    #[test]
+    fn four_pids_have_independent_legacy_xmm0_images_and_exact_capacity() {
+        let mut bank=FourPidFxBank::new();
+        let image=baseline();
+        let ids=[1u64,2,3,4];
+        let handles=ids.map(|pid|bank.prepare(pid,&image).unwrap());
+        assert_eq!(bank.occupied(),4);
+        assert_eq!(bank.prepare(5,&image),Err(FxError::Capacity));
+        for (i,h) in handles.iter().enumerate() {
+            bank.seed_xmm0(*h,0xfeed_0000+i as u64).unwrap();
+        }
+        for (i,h) in handles.iter().enumerate() {
+            assert_eq!(bank.image_xmm0(*h),Ok(0xfeed_0000+i as u64));
+        }
+        assert_eq!(bank.image_xmm0(FxHandle{pid:4,..handles[0]}),
+                   Err(FxError::StaleHandle));
+        for h in handles {
+            assert_eq!(bank.retire_quiescent(h),Ok(true));
+        }
+        assert_eq!(bank.occupied(),0);
+    }
+    #[test]
+    fn four_pid_reuse_requires_fresh_generation_and_zeroed_fx_image() {
+        let mut bank=FourPidFxBank::new();
+        let image=baseline();
+        let handles=[1u64,2,3,4].map(|pid|bank.prepare(pid,&image).unwrap());
+        bank.seed_xmm0(handles[2],0xbeef_cafe).unwrap();
+        assert_eq!(bank.retire_quiescent(handles[2]),Ok(true));
+        let newer=bank.prepare(9,&image).unwrap();
+        assert_eq!(newer.slot,handles[2].slot);
+        assert_eq!(newer.generation,handles[2].generation+1);
+        assert_eq!(bank.image_xmm0(newer),Ok(0),
+                   "retired PID's private SSE state must never leak into replacement");
+        assert_eq!(bank.seed_xmm0(handles[2],5),Err(FxError::StaleHandle));
+        assert_eq!(bank.retire_quiescent(handles[2]),Err(FxError::StaleHandle));
+        for h in [handles[0],handles[1],handles[3],newer] {
+            assert_eq!(bank.retire_quiescent(h),Ok(true));
+        }
+        assert_eq!(bank.occupied(),0);
+    }
+    #[test]
+    fn zero_capacity_four_bank_api_cannot_admit() {
+        let mut bank=FxBank::<0>::new();
+        assert_eq!(bank.prepare(1,&baseline()),Err(FxError::Capacity));
+        assert_eq!(bank.occupied(),0);
+        assert_eq!(bank.active_pid(),None);
     }
     #[test]
     fn invalid_tokens_never_mutate_another_pids_image(){
