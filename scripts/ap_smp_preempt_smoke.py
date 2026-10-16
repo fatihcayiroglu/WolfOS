@@ -22,8 +22,16 @@ AGGREGATE_PATTERN = (
 
 def unique_aggregate_proof(output: str):
     """Return one complete AP aggregate record, never a substring or duplicate."""
-    matches = [match for line in output.splitlines()
-               if (match := re.fullmatch(AGGREGATE_PATTERN, line)) is not None]
+    matches = []
+    for line in output.splitlines():
+        # Any appearance of the success token must be a complete, valid record.
+        # Reject malformed duplicates even when another record is genuine.
+        if "WOLFOS_AP_SMP_PREEMPT_OK" not in line:
+            continue
+        match = re.fullmatch(AGGREGATE_PATTERN, line)
+        if match is None:
+            return None
+        matches.append(match)
     return matches[0] if len(matches) == 1 else None
 
 
