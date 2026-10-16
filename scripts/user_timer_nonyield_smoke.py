@@ -142,8 +142,11 @@ def main():
                 "WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2")
             ordered.insert(4,
                 "WOLFOS_RING3_FOUR_RESIDENT_OK native_elf=4 private_cr3=4 guarded_rsp0=4 owned_frames=47 frame_gprs=4 executed=0 pmm_no_leak=1")
+            ordered.insert(5,
+                "WOLFOS_RING3_FOUR_POLICY_FX_OK processes=4 queue_handles=4 fx_images=4 simulated_timer_decisions=32 hardware_irqs=0 fx_wiped=4 executed=0")
         elif ("WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK" in output or
-              "WOLFOS_RING3_FOUR_RESIDENT_OK" in output):
+              "WOLFOS_RING3_FOUR_RESIDENT_OK" in output or
+              "WOLFOS_RING3_FOUR_POLICY_FX_OK" in output):
             return fail("four-ELF evidence unexpectedly appears in legacy two-ELF flavor")
         if not ordered_evidence_lines(output, ordered):
             return fail("required QEMU hardware evidence missing, malformed, duplicated or out of order")

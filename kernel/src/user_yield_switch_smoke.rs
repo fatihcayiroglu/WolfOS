@@ -16,6 +16,7 @@ use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
 use crate::{
     high_half_stack_arena::{FourPidGuardedArena,FOUR_PID_OWNED,FOUR_PID_STACKS},
     user_context_bank::{KernelStack,UserContextBank},
+    user_fx_bank::FourPidFxBank,
 };
 use crate::{
     elf64_preflight::preflight,elf64_page_image::{materialize,PAGE_SIZE},
@@ -599,6 +600,71 @@ fn prove_four_resident_preflight(
             fail("four_resident_cross_pid_frame_alias")
         }
     }
+    // Bind the four resident process records, scheduler generations, saved
+    // 15-GPR IRET frames, guarded RSP0 and private FXSAVE64 ownership.
+    // These 32 timer decisions are POLICY SIMULATIONS only. No user-mode
+    // IRET, xAPIC EOI, CR3 write or hardware preemption happens here.
+    // The real two-user xAPIC proof below remains mandatory and unchanged.
+    let original_fx=unsafe{fx_state::enter()}
+        .unwrap_or_else(||fail("four_resident_fx_cpu_contract"));
+    let baseline_fx=unsafe{FxImage::capture_baseline()};
+    let mut fx_bank=FourPidFxBank::new();
+    let mut runqueue=Ring3RunQueue::<FOUR>::new();
+    let mut fx_handles=[None;FOUR];
+    let mut scheduler_handles=[None;FOUR];
+    for i in 0..FOUR {
+        let pid=(i+1) as u64;
+        let fx_token=fx_bank.prepare(pid,&baseline_fx)
+            .unwrap_or_else(|_|fail("four_resident_fx_prepare"));
+        fx_bank.seed_xmm0(fx_token,0xf00d_0000+pid)
+            .unwrap_or_else(|_|fail("four_resident_fx_private_seed"));
+        fx_handles[i]=Some(fx_token);
+        scheduler_handles[i]=Some(runqueue.admit(pid)
+            .unwrap_or_else(|_|fail("four_resident_schedule_admission")));
+    }
+    if runqueue.start_next()!=Ok(scheduler_handles[0].unwrap())
+        || fx_bank.occupied()!=FOUR {
+        fail("four_resident_scheduler_start_or_fx_count")
+    }
+    for turn in 0..32 {
+        let i=turn%FOUR;
+        let j=(i+1)%FOUR;
+        let current=scheduler_handles[i].unwrap();
+        let chosen=runqueue.timer_tick(current)
+            .unwrap_or_else(|_|fail("four_resident_simulated_policy_timer"));
+        if chosen!=scheduler_handles[j].unwrap()
+            || runqueue.running()!=Some(chosen) {
+            fail("four_resident_scheduler_order")
+        }
+        let plan=contexts.plan_queue_handoff(
+            &processes,&runqueue,current,chosen,boot,
+        ).unwrap_or_else(|_|fail("four_resident_owned_policy_handoff"));
+        if plan.pid!=(j+1) as u64
+            || plan.cr3_root!=leases[j][0]
+            || plan.rsp0!=stacks[j].unwrap().top
+            || plan.frame.registers.r12!=0x5700_0000+j as u64
+            || plan.frame.registers.r14!=0x6400_0000+j as u64
+            || fx_bank.image_xmm0(fx_handles[j].unwrap())
+                !=Ok(0xf00d_0000+(j+1) as u64) {
+            fail("four_resident_fx_cr3_rsp0_gpr_mismatch")
+        }
+    }
+    if runqueue.timer_switches()!=32
+        || runqueue.slots().iter().any(|s|s.ticks!=8)
+        || processes.running()!=0 {
+        fail("four_resident_simulated_fairness_or_false_hardware")
+    }
+    for i in 0..FOUR {
+        let expected=if i+1<FOUR {
+            Some(scheduler_handles[i+1].unwrap())
+        } else { None };
+        if runqueue.exit_current(scheduler_handles[i].unwrap())!=Ok(expected){
+            fail("four_resident_simulated_exit_order")
+        }
+    }
+    if runqueue.running().is_some() {
+        fail("four_resident_simulated_queue_still_running")
+    }
     // Revoke READY ownership and invalidate every saved context before
     // unmapping the shared supervisor arena. None ever reached CPL3.
     for i in 0..FOUR {
@@ -612,6 +678,25 @@ fn prove_four_resident_preflight(
             fail("four_resident_revoke_ownership")
         }
     }
+    // Both registries were revoked first. Scrub every retired PID's full
+    // inactive 512-byte FX image and invalidate its scheduler generation;
+    // neither old handle may ever select a replacement task.
+    for i in 0..FOUR {
+        let fx_token=fx_handles[i].unwrap();
+        let q_handle=scheduler_handles[i].unwrap();
+        if fx_bank.retire_quiescent(fx_token)!=Ok(true)
+            || fx_bank.image_xmm0(fx_token).is_ok()
+            || runqueue.reap(q_handle).is_err() {
+            fail("four_resident_fx_wipe_or_scheduler_reap")
+        }
+    }
+    if fx_bank.occupied()!=0 || runqueue.occupied()!=0
+        || runqueue.timer_switches()!=32 {
+        fail("four_resident_fx_scheduler_retirement")
+    }
+    // SAFETY: BSP retains original supervisor CR3 and stack, IF=0, and
+    // no user task accessed FX state. Restore CR0/CR4 and BSP legacy xstate.
+    unsafe { fx_state::leave(original_fx); }
     // SAFETY: no hardware user context was entered; boot CR3, BSP IF=0,
     // no RSP/TSS use of these mappings. Complete unpublication precedes
     // TLB invalidation, stack lease retirement and physical frame release.
@@ -639,6 +724,9 @@ fn prove_four_resident_preflight(
     }
     serial::write_line(
         "WOLFOS_RING3_FOUR_RESIDENT_OK native_elf=4 private_cr3=4 guarded_rsp0=4 owned_frames=47 frame_gprs=4 executed=0 pmm_no_leak=1"
+    );
+    serial::write_line(
+        "WOLFOS_RING3_FOUR_POLICY_FX_OK processes=4 queue_handles=4 fx_images=4 simulated_timer_decisions=32 hardware_irqs=0 fx_wiped=4 executed=0"
     );
 }
 
