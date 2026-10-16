@@ -348,6 +348,129 @@ mod tests {
     }
 
     #[test]
+    fn four_policy_handoffs_bind_generation_cr3_rsp0_and_full_gprs() {
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut contexts = UserContextBank::<4>::new();
+        let mut queue = Ring3RunQueue::<4>::new();
+        let mut handles = [RunHandle { pid: 0, generation: 0 }; 4];
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let bottom = 0xffff_8000_0300_0000;
+        for i in 0..4 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            handles[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 200 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(handles[0]));
+        for turn in 0..32 {
+            let from = handles[turn % 4];
+            let to = if turn % 2 == 0 {
+                queue.timer_tick(from).unwrap()
+            } else {
+                queue.voluntary_yield(from).unwrap()
+            };
+            assert_eq!(to, handles[(turn + 1) % 4]);
+            let planned = contexts.plan_queue_handoff(
+                &table, &queue, from, to, 0x90000,
+            ).unwrap();
+            assert_eq!(planned.pid, to.pid);
+            assert_eq!(planned.cr3_root, roots[(to.pid - 1) as usize]);
+            assert_eq!(planned.rsp0,
+                bottom + (to.pid - 1) * 0x10000 + KSTACK_BYTES);
+            assert_eq!(planned.frame.registers.rax, 200 + to.pid);
+            assert_eq!(planned.frame.registers.r12, (200 + to.pid) * 3);
+            assert_eq!(planned.origin, FrameOrigin::Bootstrap);
+        }
+        assert_eq!(queue.timer_switches(), 16,
+                   "voluntary syscall yields cannot forge timer switches");
+        assert_eq!(table.running(), 0,
+                   "policy-only planning cannot start actual user processes");
+        assert_eq!(contexts.count(), 4);
+    }
+
+    #[test]
+    fn wrong_generation_target_or_blocked_source_never_gets_a_resume_plan() {
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut contexts = UserContextBank::<4>::new();
+        let mut queue = Ring3RunQueue::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 4];
+        for i in 0..4 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(0xffff_8000_0400_0000 + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, pid),
+            ).unwrap();
+        }
+        queue.start_next().unwrap();
+        assert_eq!(queue.timer_tick(h[0]), Ok(h[1]));
+        let good = contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000);
+        assert_eq!(good.unwrap().pid, 2);
+        let forged_from = RunHandle { generation: h[0].generation + 1, ..h[0] };
+        let forged_to = RunHandle { generation: h[1].generation + 1, ..h[1] };
+        for (from, to) in [(forged_from, h[1]), (h[0], forged_to),
+                           (h[0], h[2]), (h[1], h[1])] {
+            assert_eq!(
+                contexts.plan_queue_handoff(&table, &queue, from, to, 0x90000),
+                Err(ContextError::SchedulerMismatch)
+            );
+        }
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], roots[2]),
+            Err(ContextError::ActiveUserCr3));
+        table.mark_running(h[2].pid, roots[2]).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::WrongState));
+        table.park_running(h[2].pid, roots[2]).unwrap();
+        table.cancel_ready(h[2].pid, 0x90000).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::StaleProcess));
+        assert_eq!(queue.running(), Some(h[1]));
+        assert_eq!(queue.timer_switches(), 1);
+    }
+
+    #[test]
+    fn absent_unrelated_context_and_blocked_source_fail_closed() {
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut contexts = UserContextBank::<4>::new();
+        let mut queue = Ring3RunQueue::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 4];
+        for i in 0..4 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            if i != 3 {
+                contexts.prepare_bootstrap(
+                    &table, pid, roots[i],
+                    stack(0xffff_8000_0500_0000 + (i as u64) * 0x10000),
+                    frame(0x401000 + (i as u64) * 0x1000, pid),
+                ).unwrap();
+            }
+        }
+        queue.start_next().unwrap();
+        assert_eq!(queue.timer_tick(h[0]), Ok(h[1]));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::NotPrepared),
+            "a missing fourth READY context invalidates the full ledger");
+        contexts.prepare_bootstrap(
+            &table, h[3].pid, roots[3],
+            stack(0xffff_8000_0503_0000),
+            frame(0x404000, 4),
+        ).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000)
+            .unwrap().pid, h[1].pid);
+        // h1 becomes BLOCKED and h2 becomes RUNNING. A blocked source is
+        // not an authorized timer/yield handoff even if a target is runnable.
+        assert_eq!(queue.block_current(h[1]), Ok(Some(h[2])));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+    }
+
+    #[test]
     fn four_private_contexts_follow_explicit_non_pid_order_selection() {
         let mut t = ProcessTable::<4, 7>::new();
         let mut bank = UserContextBank::<4>::new();
