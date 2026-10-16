@@ -32,9 +32,15 @@ def fail(why, output=""):
 def exit_markers_well_formed(output):
     """Reject duplicate, truncated, or forged extra EXIT/EXIT_SWITCH evidence."""
     lines = output.splitlines()
-    exits = [line for line in lines if line.startswith("WOLFOS_RING3_NONYIELD_EXIT ")]
-    handoffs = [line for line in lines
-                if line.startswith("WOLFOS_RING3_NONYIELD_EXIT_SWITCH ")]
+    # Classify by the entire marker stem, not just the valid space delimiter.
+    # Otherwise malformed records with a missing delimiter, tab or suffix
+    # would be invisible to the count checks and could coexist with genuine
+    # evidence without failing the smoke test.
+    exit_stem = "WOLFOS_RING3_NONYIELD_EXIT"
+    handoff_stem = "WOLFOS_RING3_NONYIELD_EXIT_SWITCH"
+    handoffs = [line for line in lines if line.startswith(handoff_stem)]
+    exits = [line for line in lines
+             if line.startswith(exit_stem) and not line.startswith(handoff_stem)]
     exit_pattern = (r"WOLFOS_RING3_NONYIELD_EXIT pid=[12] progress=\d+ "
                     r"private_cr3=1 rsp0_guarded=1")
     handoff_pattern = (r"WOLFOS_RING3_NONYIELD_EXIT_SWITCH from=[12] to=[12] "

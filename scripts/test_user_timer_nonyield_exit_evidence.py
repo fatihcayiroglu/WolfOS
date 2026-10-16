@@ -52,5 +52,31 @@ class ExitEvidenceTests(unittest.TestCase):
         self.assertFalse(exit_markers_well_formed('\n'.join((EXIT1, SWITCH, 'WOLFOS_RING3_NONYIELD_EXIT pid=2'))))
 
 
+    def test_exit_marker_without_delimiter_is_rejected(self):
+        malformed = "WOLFOS_RING3_NONYIELD_EXIT"
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, SWITCH, EXIT2, malformed))))
+
+    def test_exit_marker_tab_delimiter_is_rejected(self):
+        malformed = EXIT1.replace("EXIT pid=", "EXIT" + chr(9) + "pid=")
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, SWITCH, EXIT2, malformed))))
+
+    def test_exit_marker_unknown_suffix_is_rejected(self):
+        malformed = "WOLFOS_RING3_NONYIELD_EXIT_FORGED pid=1"
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, SWITCH, EXIT2, malformed))))
+
+    def test_handoff_marker_without_delimiter_is_rejected(self):
+        malformed = "WOLFOS_RING3_NONYIELD_EXIT_SWITCH"
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, SWITCH, EXIT2, malformed))))
+
+    def test_handoff_marker_tab_delimiter_is_rejected(self):
+        malformed = SWITCH.replace("SWITCH from=", "SWITCH" + chr(9) + "from=")
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, SWITCH, EXIT2, malformed))))
+
+
 if __name__ == '__main__':
     unittest.main()
