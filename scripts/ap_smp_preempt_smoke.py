@@ -62,7 +62,7 @@ def main() -> int:
 
         output = logfile.read_text(errors="replace") if logfile.exists() else ""
         print(output)
-        if "WOLFOS_SMP_APS_OK total=4 " not in output:
+        if sum(line.startswith("WOLFOS_SMP_APS_OK total=4 ") for line in output.splitlines()) != 1:
             print("FAIL: prerequisite 4-vCPU SMP/CPU context tests not complete")
             return 1
         proof = unique_aggregate_proof(output)
