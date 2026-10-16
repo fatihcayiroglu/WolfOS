@@ -270,10 +270,24 @@ pub extern "C" fn observe_timer_irq(
     // checks both ELF data counters after involuntary interruption.
     #[cfg(feature="p3-ring3-four-elf-live-smoke")]
     let preempt_target=if in_busy {
-        // BSP-only real xAPIC IRQ: rotate among the remaining READY native
-        // users. Already EXITED PIDs are NEVER reactivated or considered.
-        (1..COUNT).map(|step|(i+step)%COUNT)
-            .find(|&j|!s.exits[j] && s.frames[j]!=0)
+        // This IRQ has passed the real hardware-frame / CR3 / TSS / FX
+        // provenance checks above. Charge it to the interrupted PID,
+        // including those which resume without switching. A second
+        // eligible IRQ must expire this bounded time slice. This policy
+        // never produces an EOI or assumes INT80 was a hardware IRQ.
+        let chosen=s.rr.timer_quantum_tick(s.rr_handles[i],2)
+            .unwrap_or_else(|_|fail("four_live_invalid_timer_quantum"));
+        if chosen==s.rr_handles[i] {
+            None
+        } else {
+            let target=usize::try_from(chosen.pid-1)
+                .unwrap_or_else(|_|fail("four_live_quantum_target_overflow"));
+            if target>=COUNT || chosen!=s.rr_handles[target]
+                || s.exits[target] || s.frames[target]==0 {
+                fail("four_live_stale_quantum_target")
+            }
+            Some(target)
+        }
     } else {None};
     #[cfg(all(feature="p2-ring3-timer-preempt-smoke",
               not(feature="p3-ring3-four-elf-live-smoke")))]
@@ -302,8 +316,13 @@ pub extern "C" fn observe_timer_irq(
         // on the departing PID's *own* guarded high-half kernel stack.
         // It is safe to retain across CR3 switches: this supervisor
         // high-half subtree is shared by BOTH sanitized process roots.
+        #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
         if s.rr.timer_tick(s.rr_handles[i])!=Ok(s.rr_handles[next]) {
             fail("timer_policy_rejected_verified_irq_handoff")
+        }
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        if s.rr.running()!=Some(s.rr_handles[next]) {
+            fail("four_live_quantum_selected_wrong_user")
         }
         s.frames[i]=raw as u64;
         if s.processes.park_running(pid,s.leases[i][0]).is_err() {
@@ -1228,6 +1247,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             #[cfg(feature="p3-ring3-four-elf-live-smoke")]
             {
                 let switches=s.timer_preempts.iter().sum::<u64>();
+                let eligible=s.timer_busy.iter().sum::<u64>();
                 let first=s.first_exit_timer_counts
                     .unwrap_or_else(||fail("four_live_missing_first_exit_evidence"));
                 let first_min=*first.iter().min().unwrap();
@@ -1237,7 +1257,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 let bad_slot=slots.iter().enumerate().any(|(i,slot)|
                     slot.state!=RrState::Exited
                     || slot.handle!=s.rr_handles[i]
-                    || slot.ticks!=s.timer_preempts[i]);
+                    // Every authenticated eligible IRQ is charged to its
+                    // source, not only the ones that trigger a context switch.
+                    || slot.ticks!=s.timer_busy[i]);
                 // Strict FIFO round-robin fairness must hold WHILE all four
                 // PIDs are READY/RUNNING. After a PID legitimately EXITs,
                 // it cannot collect more IRQ counts; surviving users may
@@ -1245,6 +1267,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 // equal *lifetime* counts would be mathematically wrong.
                 if switches<16 || last_min<4 || first_min<4
                     || first_max-first_min>1
+                    || eligible<2*switches
+                    || s.rr.current_slice_ticks()!=0
                     || s.rr.timer_switches()!=switches
                     || s.rr.running().is_some() || bad_slot {
                     serial::write_fmt(format_args!(
@@ -1256,10 +1280,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     fail("four_live_real_irq_fairness_or_ledger")
                 }
                 serial::write_fmt(format_args!(
-                    "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} fair_four_min={} fair_four_spread={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
+                    "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} fair_four_min={} fair_four_spread={} quantum_ticks=2 eligible_irqs={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
                     switches,s.timer_preempts[0],s.timer_preempts[1],
                     s.timer_preempts[2],s.timer_preempts[3],
-                    first_min,first_max-first_min
+                    first_min,first_max-first_min,eligible
                 ));
             }
             #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
