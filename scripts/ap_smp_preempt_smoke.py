@@ -11,6 +11,22 @@ import sys
 import tempfile
 
 
+AGGREGATE_PATTERN = (
+            r"WOLFOS_AP_SMP_PREEMPT_OK cpus=(\d+) aps=(\d+) tasks_per_ap=(\d+) "
+            r"switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) "
+            r"ticks=(\d+) eois=(\d+) work=(\d+) invalid=(\d+) "
+            r"xmm_bad=(\d+) spurious=(\d+) wrong_ipi=(\d+) offline=(\d+) "
+            r"bsp_if=(\d+) migrated=(\d+) deferred=(\d+) nested_aps=(\d+) guard_depth=(\d+)"
+        )
+
+
+def unique_aggregate_proof(output: str):
+    """Return one complete AP aggregate record, never a substring or duplicate."""
+    matches = [match for line in output.splitlines()
+               if (match := re.fullmatch(AGGREGATE_PATTERN, line)) is not None]
+    return matches[0] if len(matches) == 1 else None
+
+
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: ap_smp_preempt_smoke.py ISO")
@@ -41,19 +57,10 @@ def main() -> int:
         if "WOLFOS_SMP_APS_OK total=4 " not in output:
             print("FAIL: prerequisite 4-vCPU SMP/CPU context tests not complete")
             return 1
-        pattern = (
-            r"WOLFOS_AP_SMP_PREEMPT_OK cpus=(\d+) aps=(\d+) tasks_per_ap=(\d+) "
-            r"switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) "
-            r"ticks=(\d+) eois=(\d+) work=(\d+) invalid=(\d+) "
-            r"xmm_bad=(\d+) spurious=(\d+) wrong_ipi=(\d+) offline=(\d+) "
-            r"bsp_if=(\d+) migrated=(\d+) deferred=(\d+) nested_aps=(\d+) guard_depth=(\d+)"
-        )
-        matches = [match for line in output.splitlines()
-                   if (match := re.fullmatch(pattern, line)) is not None]
-        if len(matches) != 1:
-            print(f"FAIL: expected exactly one full-line AP SMP proof; found {len(matches)}")
+        proof = unique_aggregate_proof(output)
+        if proof is None:
+            print("FAIL: expected exactly one full-line AP SMP proof")
             return 1
-        proof = matches[0]
         (cpus, aps, tasks, switches, a, b, ticks, eois,
          work, invalid, xmm_bad, spurious, wrong_ipi,
          offline, bsp_if, migrated, deferred, nested_aps,
