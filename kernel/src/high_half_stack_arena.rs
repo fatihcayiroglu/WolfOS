@@ -1,4 +1,5 @@
-//! Fixed two-PID supervisor stack virtual arena, not a general VMM.
+//! Bounded supervisor stack virtual arena. The old two-PID API remains intact.
+//! Four-PID candidate is host-tested before any new real QEMU scheduler.
 //!
 //! Three PMM page-table frames establish an independently reserved HIGH
 //! canonical PML4 slot. Two separately owned stacks each have [nonpresent
@@ -15,6 +16,8 @@ pub const SLOTS: usize = 2;
 pub const PT_ENTRIES: usize = 512;
 pub const TABLE_PAGES: usize = 3;
 pub const OWNED: usize = TABLE_PAGES + SLOTS * STACK_PAGES;
+pub const FOUR_PID_STACKS: usize = 4;
+pub const FOUR_PID_OWNED: usize = TABLE_PAGES + FOUR_PID_STACKS * STACK_PAGES;
 pub const BASE: u64 = 0xffff_d000_0000_0000;
 pub const ROOT_INDEX: usize = ((BASE >> 39) & 511) as usize;
 pub const SLOT_STRIDE: u64 = (STACK_PAGES as u64 + 2) * PAGE;
@@ -52,14 +55,19 @@ struct Entry { generation: u64, stack: Option<Stack> }
 impl Entry {
     const fn new() -> Self { Self { generation: 0, stack: None } }
 }
-pub struct GuardedArena {
+pub struct GuardedArenaN<const N:usize> {
     tables: [u64; TABLE_PAGES],
     root: u64,
-    entries: [Entry; SLOTS],
+    entries: [Entry; N],
     published: bool,
 }
-impl GuardedArena {
+/// Existing two-PID QEMU stack arena ABI is preserved exactly.
+pub type GuardedArena=GuardedArenaN<SLOTS>;
+/// Future four real Ring3 user RSP0 contexts use this candidate type.
+pub type FourPidGuardedArena=GuardedArenaN<FOUR_PID_STACKS>;
+impl<const N:usize> GuardedArenaN<N> {
     pub fn new(tables: [u64; TABLE_PAGES], root: u64) -> Result<Self,ArenaError> {
+        if N==0 || N>PT_ENTRIES/(STACK_PAGES+2) { return Err(ArenaError::Capacity) }
         if root == 0 || root & (PAGE-1) != 0 || root >= MAX_PHYS
             || ROOT_INDEX < 256 || ROOT_INDEX >= 511 {
             return Err(ArenaError::BadRoot)
@@ -72,7 +80,7 @@ impl GuardedArena {
                 return Err(ArenaError::DuplicateFrame)
             }
         }
-        Ok(Self { tables,root,entries: [const { Entry::new() }; SLOTS],published:false })
+        Ok(Self { tables,root,entries: [const { Entry::new() }; N],published:false })
     }
     pub fn occupied(&self) -> usize {
         self.entries.iter().filter(|e| e.stack.is_some()).count()
@@ -126,7 +134,7 @@ impl GuardedArena {
         e & !(A | if leaf{D}else{0}) == Self::expected(p)
     }
     fn all_ready(&self)->Result<(),ArenaError> {
-        if self.occupied()!=SLOTS { return Err(ArenaError::MissingPid) }
+        if self.occupied()!=N { return Err(ArenaError::MissingPid) }
         Ok(())
     }
 
@@ -142,7 +150,7 @@ impl GuardedArena {
         if pdpt.iter().chain(pd.iter()).chain(pt.iter()).any(|x|*x!=0){
             return Err(ArenaError::DirtyTables)
         }
-        for slot in 0..SLOTS {
+        for slot in 0..N {
             let stack=self.entries[slot].stack.ok_or(ArenaError::MissingPid)?;
             for leaf in 0..STACK_PAGES {
                 pt[at(slot)+1+leaf]=Self::expected(stack.frames[leaf]);
@@ -168,10 +176,10 @@ impl GuardedArena {
             return Err(ArenaError::BadTable)
         }
         if pdpt[1..].iter().chain(pd[1..].iter()).any(|x|*x!=0)
-            || pt[SLOTS*(STACK_PAGES+2)..].iter().any(|x|*x!=0) {
+            || pt[N*(STACK_PAGES+2)..].iter().any(|x|*x!=0) {
             return Err(ArenaError::BadTable)
         }
-        for slot in 0..SLOTS {
+        for slot in 0..N {
             let s=self.entries[slot].stack.ok_or(ArenaError::MissingPid)?;
             let index=at(slot);
             if pt[index]!=0 || pt[index+STACK_PAGES+1]!=0 {
@@ -195,7 +203,7 @@ impl GuardedArena {
         root[ROOT_INDEX]=0;
         pdpt[0]=0;
         pd[0]=0;
-        for p in &mut pt[..SLOTS*(STACK_PAGES+2)] {*p=0}
+        for p in &mut pt[..N*(STACK_PAGES+2)] {*p=0}
         self.published=false;
         Ok(())
     }
@@ -220,6 +228,73 @@ mod tests {
     }
     fn frames(a:u64)->[u64;4]{
         [a,a+0x5000,a+0x2000,a+0xa000] // intentionally noncontiguous
+    }
+
+    #[test]
+    fn four_unique_supervisor_stacks_and_eight_guards_are_protected() {
+        let mut a=FourPidGuardedArena::new([0x1000,0x2000,0x3000],0x9000).unwrap();
+        let stacks=[
+            a.reserve(1,frames(0x10000)).unwrap(),
+            a.reserve(2,frames(0x30000)).unwrap(),
+            a.reserve(3,frames(0x50000)).unwrap(),
+            a.reserve(4,frames(0x70000)).unwrap(),
+        ];
+        assert_eq!(a.reserve(5,frames(0x90000)),Err(ArenaError::Capacity));
+        let [mut root,mut pdpt,mut pd,mut pt]=[[0u64;PT_ENTRIES];4];
+        a.publish(&mut root,&mut pdpt,&mut pd,&mut pt).unwrap();
+        assert_eq!(a.audit(&root,&pdpt,&pd,&pt),Ok(()));
+        for slot in 0..FOUR_PID_STACKS {
+            let first=slot*(STACK_PAGES+2);
+            assert_eq!(pt[first],0);
+            assert_eq!(pt[first+STACK_PAGES+1],0);
+            assert_eq!(stacks[slot].bottom,bottom(slot));
+            for leaf in 1..=STACK_PAGES {
+                assert_ne!(pt[first+leaf]&P,0);
+                assert_eq!(pt[first+leaf]&USER,0);
+            }
+        }
+        assert!(pt[24..].iter().all(|&x|x==0));
+        assert_eq!(unsafe{a.retire_after_quiescence(stacks[0].handle)},Err(ArenaError::Busy));
+        a.unpublish(&mut root,&mut pdpt,&mut pd,&mut pt).unwrap();
+        assert!(pt.iter().all(|&x|x==0));
+        for s in stacks { assert_eq!(unsafe{a.retire_after_quiescence(s.handle)},Ok(s.frames)); }
+        assert_eq!(a.occupied(),0);
+    }
+    #[test]
+    fn four_stack_alias_dirty_guard_and_stale_generation_fail_closed() {
+        let mut a=FourPidGuardedArena::new([0x1000,0x2000,0x3000],0x9000).unwrap();
+        let x=a.reserve(1,frames(0x10000)).unwrap();
+        let y=a.reserve(2,frames(0x30000)).unwrap();
+        let z=a.reserve(3,frames(0x50000)).unwrap();
+        let mut overlap=frames(0x70000);
+        overlap[2]=z.frames[0];
+        assert_eq!(a.reserve(4,overlap),Err(ArenaError::DuplicateFrame));
+        assert_eq!(a.occupied(),3);
+        let [mut root,mut pdpt,mut pd,mut pt]=[[0u64;PT_ENTRIES];4];
+        assert_eq!(a.publish(&mut root,&mut pdpt,&mut pd,&mut pt),Err(ArenaError::MissingPid));
+        assert_eq!(root[ROOT_INDEX],0);
+        assert!(pt.iter().all(|&n|n==0));
+        let w=a.reserve(4,frames(0x70000)).unwrap();
+        a.publish(&mut root,&mut pdpt,&mut pd,&mut pt).unwrap();
+        pt[12]=P|RW;
+        assert_eq!(a.audit(&root,&pdpt,&pd,&pt),Err(ArenaError::BadGuard));
+        pt[12]=0;
+        pt[19]|=USER;
+        assert_eq!(a.audit(&root,&pdpt,&pd,&pt),Err(ArenaError::WrongLeaf));
+        pt[19]&=!USER;
+        a.unpublish(&mut root,&mut pdpt,&mut pd,&mut pt).unwrap();
+        for s in [x,y,z,w] { unsafe{a.retire_after_quiescence(s.handle)}.unwrap(); }
+        let newer=a.reserve(5,frames(0x10000)).unwrap();
+        assert_eq!(newer.handle.slot,x.handle.slot);
+        assert_eq!(newer.handle.generation,x.handle.generation+1);
+        assert_eq!(a.inspect(x.handle),Err(ArenaError::StaleHandle));
+    }
+    #[test]
+    fn malformed_stack_counts_are_rejected_before_publication() {
+        assert!(matches!(GuardedArenaN::<0>::new([0x1000,0x2000,0x3000],0x9000),
+                         Err(ArenaError::Capacity)));
+        assert!(matches!(GuardedArenaN::<86>::new([0x1000,0x2000,0x3000],0x9000),
+                         Err(ArenaError::Capacity)));
     }
     #[test]
     fn two_pids_have_distinct_high_half_guarded_stacks(){
