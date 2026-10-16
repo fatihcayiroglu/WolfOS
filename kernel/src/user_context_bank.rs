@@ -289,6 +289,12 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             || !slots.iter().any(|s| s.handle == from && s.state == RunState::Ready)
             || !slots.iter().any(|s| s.handle == to && s.state == RunState::Running)
         { return Err(ContextError::SchedulerMismatch) }
+        // All user contexts must be parked before privileged-state
+        // restoration. A RUNNING registry owner hidden behind an EXITED
+        // policy tombstone must not authorize a second CPU owner.
+        if table.running() != 0 {
+            return Err(ContextError::WrongState)
+        }
 
         for slot in slots {
             if !matches!(slot.state, RunState::Ready | RunState::Running) {
@@ -461,6 +467,15 @@ mod tests {
             stack(0xffff_8000_0503_0000),
             frame(0x404000, 4),
         ).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000)
+            .unwrap().pid, h[1].pid);
+        // A RUNNING table process hidden behind a non-runnable queue slot
+        // must not coexist with any planned new hardware activation.
+        queue.cancel(h[3]).unwrap();
+        table.mark_running(h[3].pid, roots[3]).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::WrongState));
+        table.park_running(h[3].pid, roots[3]).unwrap();
         assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000)
             .unwrap().pid, h[1].pid);
         // h1 becomes BLOCKED and h2 becomes RUNNING. A blocked source is
