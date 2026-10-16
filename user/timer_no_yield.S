@@ -1,6 +1,7 @@
-// Two independent 64-bit ET_EXEC images assembled with WOLFOS_PID=1/2.
+// Four independent 64-bit ET_EXEC images assembled with WOLFOS_PID=1..4.
 // CPU-bound sections never request a voluntary yield. The ONLY INT80 is EXIT(0).
-// This is a host-verified fixture, NOT yet a real timer-driven QEMU smoke.
+// PID1 and PID2 execute in the existing two-task hardware QEMU gate;
+// PID3 and PID4 are independently host-audited and kernel-admitted only.
 .intel_syntax noprefix
 .section .text
 .global _start

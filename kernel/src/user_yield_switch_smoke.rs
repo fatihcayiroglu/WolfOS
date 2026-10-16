@@ -32,6 +32,12 @@ const NONYIELD_ELFS:[&[u8];2]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-1.elf")),
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-2.elf")),
 ];
+#[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+const FOUR_NOYIELD_ELFS:[&[u8];4]=[
+    NONYIELD_ELFS[0], NONYIELD_ELFS[1],
+    include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-3.elf")),
+    include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-4.elf")),
+];
 const ELFS:[&[u8];2]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-1.elf")),
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-2.elf")),
@@ -423,6 +429,46 @@ fn validate_nonyield_elf_admission() {
     }
 }
 
+/// Kernel admission of four independently assembled native no-yield ELF64
+/// binaries. This does NOT allocate, launch or schedule PID3 and PID4.
+#[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+fn validate_four_nonyield_elf_admission() {
+    let info=[
+        (noyield_sym::PID1_ENTRY,noyield_sym::PID1_WORK_BEGIN,
+         noyield_sym::PID1_WORK_END,noyield_sym::PID1_AFTER_EXIT,
+         noyield_sym::PID1_PROGRESS),
+        (noyield_sym::PID2_ENTRY,noyield_sym::PID2_WORK_BEGIN,
+         noyield_sym::PID2_WORK_END,noyield_sym::PID2_AFTER_EXIT,
+         noyield_sym::PID2_PROGRESS),
+        (noyield_sym::PID3_ENTRY,noyield_sym::PID3_WORK_BEGIN,
+         noyield_sym::PID3_WORK_END,noyield_sym::PID3_AFTER_EXIT,
+         noyield_sym::PID3_PROGRESS),
+        (noyield_sym::PID4_ENTRY,noyield_sym::PID4_WORK_BEGIN,
+         noyield_sym::PID4_WORK_END,noyield_sym::PID4_AFTER_EXIT,
+         noyield_sym::PID4_PROGRESS),
+    ];
+    for (i,&(entry,begin,end,after_exit,progress)) in info.iter().enumerate() {
+        let elf=FOUR_NOYIELD_ELFS[i];
+        if elf.len()>=32768 || FOUR_NOYIELD_ELFS[..i].contains(&elf) {
+            fail("four_elf_duplicated_or_oversized")
+        }
+        let plan=preflight(elf).unwrap_or_else(|_|fail("four_elf_strict_preflight"));
+        if plan.len!=2 || plan.entry!=CODE || entry!=CODE ||
+            begin<=entry || end<=begin || end>=after_exit ||
+            after_exit>=DATA || progress!=DATA {
+            fail("four_elf_symbols_or_layout")
+        }
+        let (Some(text),Some(data))=(plan.segments[0],plan.segments[1])
+            else{fail("four_elf_missing_segment")};
+        if text.page_start!=CODE || text.page_end!=CODE+PAGE ||
+            !text.executable || text.writable ||
+            data.page_start!=DATA || data.page_end!=DATA+PAGE ||
+            !data.writable || data.executable || data.file_size!=8 {
+            fail("four_elf_memory_permissions")
+        }
+    }
+}
+
 /// Enter first native ELF through a REAL IRETQ with BSP IF=0.
 /// On successful execution this function never returns.
 pub fn enter(hhdm:u64)->!{
@@ -448,6 +494,11 @@ pub fn enter(hhdm:u64)->!{
         serial::write_line(
             "WOLFOS_RING3_NONYIELD_PREFLIGHT_OK independent_elf=2 kernel_elf_loader=1 ready_for_execution=1"
         );
+        #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+        {
+            validate_four_nonyield_elf_admission();
+            serial::write_line("WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2");
+        }
     }
     let before=pmm::statistics().allocated_frames;
     let mut phys=[0u64;PHYSICAL];

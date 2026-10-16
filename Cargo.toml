@@ -59,6 +59,8 @@ p2-ring3-timer-observe-smoke = ["smoke-exit"]
 p2-ring3-timer-preempt-smoke = ["smoke-exit"]
 # Separate regression flavor; inherits legacy IRQ plumbing but runs native no-yield ELFs.
 p2-ring3-timer-nonyield-smoke = ["p2-ring3-timer-preempt-smoke"]
+# Isolated four-native-ELF kernel admission only; two legacy users still execute.
+p3-ring3-four-elf-preflight-smoke = ["p2-ring3-timer-nonyield-smoke"]
 
 [profile.dev]
 panic = "abort"

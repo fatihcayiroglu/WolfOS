@@ -44,8 +44,9 @@ def exit_markers_well_formed(output):
             and re.fullmatch(handoff_pattern, handoffs[0]) is not None)
 
 def main():
-    if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
-        print("Usage: user_timer_nonyield_smoke.py KERNEL_ISO")
+    four_elf_preflight = len(sys.argv)==3 and sys.argv[2]=="--four-elf-preflight"
+    if len(sys.argv) not in (2,3) or (len(sys.argv)==3 and not four_elf_preflight) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_timer_nonyield_smoke.py KERNEL_ISO [--four-elf-preflight]")
         return 2
     with tempfile.TemporaryDirectory(prefix="wolfos-ring3-nonyield-") as temp:
         log = Path(temp) / "serial.log"
@@ -83,6 +84,11 @@ def main():
             "WOLFOS_RING3_IRQ_READY_RESTORE_OK original_pic_masks=1 kernel_if_off=1",
             "WOLFOS_RING3_NONYIELD_CLEANUP_OK frames_freed=28 exited=2 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1",
         ]
+        if four_elf_preflight:
+            ordered.insert(3,
+                "WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2")
+        elif "WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK" in output:
+            return fail("four-ELF evidence unexpectedly appears in legacy two-ELF flavor")
         locations = [output.find(x) for x in ordered]
         if any(i < 0 for i in locations) or locations != sorted(locations):
             return fail("required QEMU hardware evidence missing or out of order")
@@ -100,7 +106,8 @@ def main():
             output.find("WOLFOS_RING3_NONYIELD_EXIT pid=1"),
             output.find("WOLFOS_RING3_NONYIELD_EXIT pid=2"),
         ]
-        if max(exit_locations) > locations[6]:
+        irq_ready_at=output.find("WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=2")
+        if irq_ready_at<0 or max(exit_locations)>irq_ready_at:
             return fail("exit marker must precede final IRQ readiness evidence")
         exit_switches = re.findall(
             r"^WOLFOS_RING3_NONYIELD_EXIT_SWITCH from=([12]) to=([12]) "

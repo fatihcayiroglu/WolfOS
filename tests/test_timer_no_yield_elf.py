@@ -35,10 +35,10 @@ def symbols(binary):
 
 
 class NativeNoYieldFixtures(unittest.TestCase):
-    def test_two_real_independent_no_yield_elf64_images(self):
+    def test_four_real_independent_no_yield_elf64_images(self):
         binaries = []
         with tempfile.TemporaryDirectory(prefix="wolfos-nonyield-") as tmp:
-            for pid in (1, 2):
+            for pid in (1, 2, 3, 4):
                 obj = Path(tmp) / f"pid{pid}.o"
                 elf = Path(tmp) / f"pid{pid}.elf"
                 invoke("as", "--64", "--defsym", f"WOLFOS_PID={pid}",
@@ -68,8 +68,8 @@ class NativeNoYieldFixtures(unittest.TestCase):
                 self.assertTrue(sym["_work_end"] < irq_addr < sym["_exit_return"])
                 self.assertNotIn("syscall", listing.lower())
                 self.assertLess(len(raw), 32768)
-            self.assertNotEqual(binaries[0], binaries[1],
-                                "the two PID-specific executables must differ")
+            self.assertEqual(len(set(binaries)),4,
+                                 "all four PID-specialized native ELFs must differ")
 
 
 if __name__ == "__main__":
