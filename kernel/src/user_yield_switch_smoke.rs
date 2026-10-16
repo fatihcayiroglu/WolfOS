@@ -20,7 +20,7 @@ use crate::{
 };
 use crate::{
     elf64_preflight::preflight,elf64_page_image::{materialize,PAGE_SIZE},
-    high_half_stack_arena::{GuardedArena,Stack,ROOT_INDEX,BASE,PAGE,OWNED as ARENA_FRAMES},
+    high_half_stack_arena::{GuardedArena,Stack,ROOT_INDEX,BASE,PAGE},
     process_table::ProcessTable,process_lifecycle::ProcessState,
     user_syscall_abi::{self,UserSyscallFrame},
     user_ring_entry::{self,Ring3Entry},
@@ -48,7 +48,22 @@ const ELFS:[&[u8];2]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-1.elf")),
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-2.elf")),
 ];
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+const COUNT:usize=4;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
 const COUNT:usize=2;
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+const ARENA_FRAMES:usize=FOUR_PID_OWNED;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+const ARENA_FRAMES:usize=crate::high_half_stack_arena::OWNED;
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+type RuntimeArena=FourPidGuardedArena;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+type RuntimeArena=GuardedArena;
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+type RuntimeFxBank=FourPidFxBank;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+type RuntimeFxBank=UserFxBank;
 const PER_PID:usize=7;
 #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 const PHYSICAL:usize=ARENA_FRAMES+COUNT*PER_PID+3; // 25 frames + 3 xAPIC high MMIO page tables
@@ -78,6 +93,10 @@ fn pic_write(port:u16,value:u8){
 
 const TRAPS:usize=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {2}else{10};
 const ROUNDS:u64=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {16}else{4};
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002,
+    0x5a5a_0001_0000_0003,0x5a5a_0001_0000_0004];
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
 const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002];
 
 fn valid_test_user_flags(flags:u64)->bool{
@@ -116,9 +135,9 @@ struct Runtime{
     owned:[u64;PHYSICAL],
     leases:[[u64;PER_PID];COUNT],
     stacks:[Stack;COUNT],
-    arena:GuardedArena,
+    arena:RuntimeArena,
     processes:ProcessTable<COUNT,PER_PID>,
-    fx:UserFxBank,
+    fx:RuntimeFxBank,
     fx_tokens:[FxHandle;COUNT],
     control:fx_state::OriginalControl,
     frames:[u64;COUNT],
@@ -798,7 +817,7 @@ pub fn enter(hhdm:u64)->!{
             "WOLFOS_RING3_TIMER_HIGH_MMIO_OK uc=1 supervisor_only=1 inherited_cr3=2 eoi_high=1 owned_frames=28"
         );
     }
-    let mut arena=GuardedArena::new([phys[0],phys[1],phys[2]],boot)
+    let mut arena=RuntimeArena::new([phys[0],phys[1],phys[2]],boot)
         .unwrap_or_else(|_|fail("guarded_arena_root"));
     let mut stacks=[None;COUNT];
     let mut leases=[[0u64;PER_PID];COUNT];
@@ -862,7 +881,7 @@ pub fn enter(hhdm:u64)->!{
     let control=unsafe{fx_state::enter()}
         .unwrap_or_else(||fail("fx_enable"));
     let baseline=unsafe{FxImage::capture_baseline()};
-    let mut fx=UserFxBank::new();
+    let mut fx=RuntimeFxBank::new();
     let mut tokens=[None;COUNT];
     for i in 0..COUNT {
         tokens[i]=Some(fx.prepare((i+1) as u64,&baseline)
