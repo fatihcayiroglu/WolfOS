@@ -19,6 +19,12 @@ class ExitEvidenceTests(unittest.TestCase):
     def test_duplicate_exit(self):
         self.assertFalse(exit_markers_well_formed('\n'.join((EXIT1, EXIT1, SWITCH, EXIT2))))
 
+    def test_two_exits_with_same_pid(self):
+        self.assertFalse(exit_markers_well_formed('\n'.join((EXIT1, SWITCH, EXIT1))))
+
+    def test_self_handoff(self):
+        self.assertFalse(exit_markers_well_formed('\n'.join((EXIT1, SWITCH.replace('to=2', 'to=1'), EXIT2))))
+
     def test_missing_handoff(self):
         self.assertFalse(exit_markers_well_formed('\n'.join((EXIT1, EXIT2))))
 
