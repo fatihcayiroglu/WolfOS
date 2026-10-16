@@ -25,7 +25,7 @@ def switch_row(src, dst):
 
 
 def complete():
-    return [
+    rows = [
         *ORDERED[:9],
         exit_row(1), switch_row(1, 2),
         exit_row(2), switch_row(2, 3),
@@ -33,6 +33,10 @@ def complete():
         exit_row(4),
         ORDERED[9], HARDWARE, *ORDERED[10:],
     ]
+    # The real descriptor proof carries validated GDT/TR metadata. The
+    # fail-closed parser intentionally rejects a bare unadorned stem.
+    rows[1] = "WOLFOS_RING_PREP_OK tr=0x18 user_cs=0x33"
+    return rows
 
 
 class FourLiveHardwareEvidenceTests(unittest.TestCase):
