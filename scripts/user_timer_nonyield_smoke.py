@@ -39,9 +39,15 @@ def exit_markers_well_formed(output):
                     r"private_cr3=1 rsp0_guarded=1")
     handoff_pattern = (r"WOLFOS_RING3_NONYIELD_EXIT_SWITCH from=[12] to=[12] "
                        r"private_cr3=1 tss_rsp0=1 fx_saved=1")
-    return (len(exits) == 2 and len(handoffs) == 1
-            and all(re.fullmatch(exit_pattern, line) for line in exits)
-            and re.fullmatch(handoff_pattern, handoffs[0]) is not None)
+    if len(exits) != 2 or len(handoffs) != 1:
+        return False
+    if not all(re.fullmatch(exit_pattern, line) for line in exits):
+        return False
+    if not re.fullmatch(handoff_pattern, handoffs[0]):
+        return False
+    exit_pids = {re.search(r"pid=([12])", line).group(1) for line in exits}
+    handoff = re.search(r"from=([12]) to=([12])", handoffs[0])
+    return exit_pids == {"1", "2"} and handoff.group(1) != handoff.group(2)
 
 def main():
     four_elf_preflight = len(sys.argv)==3 and sys.argv[2]=="--four-elf-preflight"
