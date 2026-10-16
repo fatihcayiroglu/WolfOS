@@ -10,7 +10,7 @@ from user_timer_four_live_smoke import (
 HARDWARE = (
     "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches=40 "
     "pid1=10 pid2=10 pid3=10 pid4=10 fair_four_min=8 fair_four_spread=1 "
-    "voluntary_yields=0 exits=4 "
+    "quantum_ticks=2 eligible_irqs=88 voluntary_yields=0 exits=4 "
     "progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4"
 )
 
@@ -55,7 +55,8 @@ class FourLiveHardwareEvidenceTests(unittest.TestCase):
         unequal = (HARDWARE.replace("timer_switches=40", "timer_switches=3680")
                    .replace("pid1=10 pid2=10 pid3=10 pid4=10",
                             "pid1=894 pid2=926 pid3=930 pid4=930")
-                   .replace("fair_four_min=8", "fair_four_min=880"))
+                   .replace("fair_four_min=8", "fair_four_min=880")
+                   .replace("eligible_irqs=88", "eligible_irqs=7500"))
         rows[rows.index(HARDWARE)] = unequal
         self.assertTrue(self.check(rows),
                         "an EXITED PID cannot keep accruing IRQ decisions")
@@ -87,6 +88,9 @@ class FourLiveHardwareEvidenceTests(unittest.TestCase):
             ("fair_four_min=8", "fair_four_min=3"),
             ("fair_four_min=8", "fair_four_min=11"),
             ("fair_four_spread=1", "fair_four_spread=2"),
+            ("quantum_ticks=2", "quantum_ticks=1"),
+            ("eligible_irqs=88", "eligible_irqs=79"),
+            ("eligible_irqs=88", "eligible_irqs=0"),
             ("voluntary_yields=0", "voluntary_yields=1"),
             ("exits=4", "exits=2"),
             ("executed=4", "executed=2"),
