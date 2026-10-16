@@ -10,6 +10,8 @@
 use core::{arch::asm,cell::UnsafeCell};
 #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
 use crate::ring3_runqueue::{Handle as RunHandle,Ring3RunQueue,State as RrState};
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+use crate::ring3_irq_eoi_ledger::Ring3IrqEoiLedger;
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
              instructions::segmentation::{CS,Segment},registers::control::Cr3};
 #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
@@ -155,6 +157,8 @@ struct Runtime{
     timer_preempts:[u64;COUNT],
     #[cfg(feature="p3-ring3-four-elf-live-smoke")]
     first_exit_timer_counts:Option<[u64;COUNT]>,
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    irq_eoi:Ring3IrqEoiLedger<COUNT>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     rr:Ring3RunQueue<COUNT>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
@@ -253,6 +257,10 @@ pub extern "C" fn observe_timer_irq(
         ));
         fail("real_cpl3_timer_iret_gpr_or_frame_validation")
     }
+    // Frame, user selectors, private CR3, TSS.RSP0 and FX owner have
+    // passed real hardware IRQ authentication before opening this EOI.
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    if s.irq_eoi.begin(i).is_err() { fail("four_live_eoi_duplicate_irq") }
     s.timer_irqs[i]+=1;
     if in_busy{
         s.timer_busy[i]+=1;
@@ -985,6 +993,8 @@ pub fn enter(hhdm:u64)->!{
         timer_preempts:[0;COUNT],
         #[cfg(feature="p3-ring3-four-elf-live-smoke")]
         first_exit_timer_counts:None,
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        irq_eoi:Ring3IrqEoiLedger::new(),
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         rr,
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
