@@ -20,7 +20,7 @@ use crate::{
 };
 use crate::{
     elf64_preflight::preflight,elf64_page_image::{materialize,PAGE_SIZE},
-    high_half_stack_arena::{GuardedArena,Stack,ROOT_INDEX,BASE,PAGE,OWNED as ARENA_FRAMES},
+    high_half_stack_arena::{GuardedArena,Stack,ROOT_INDEX,BASE,PAGE},
     process_table::ProcessTable,process_lifecycle::ProcessState,
     user_syscall_abi::{self,UserSyscallFrame},
     user_ring_entry::{self,Ring3Entry},
@@ -48,7 +48,22 @@ const ELFS:[&[u8];2]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-1.elf")),
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-2.elf")),
 ];
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+const COUNT:usize=4;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
 const COUNT:usize=2;
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+const ARENA_FRAMES:usize=FOUR_PID_OWNED;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+const ARENA_FRAMES:usize=crate::high_half_stack_arena::OWNED;
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+type RuntimeArena=FourPidGuardedArena;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+type RuntimeArena=GuardedArena;
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+type RuntimeFxBank=FourPidFxBank;
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+type RuntimeFxBank=UserFxBank;
 const PER_PID:usize=7;
 #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
 const PHYSICAL:usize=ARENA_FRAMES+COUNT*PER_PID+3; // 25 frames + 3 xAPIC high MMIO page tables
@@ -76,8 +91,12 @@ fn pic_write(port:u16,value:u8){
         options(nostack,nomem,preserves_flags));}
 }
 
-const TRAPS:usize=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {2}else{10};
+const TRAPS:usize=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {COUNT}else{10};
 const ROUNDS:u64=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {16}else{4};
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002,
+    0x5a5a_0001_0000_0003,0x5a5a_0001_0000_0004];
+#[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
 const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002];
 
 fn valid_test_user_flags(flags:u64)->bool{
@@ -116,9 +135,9 @@ struct Runtime{
     owned:[u64;PHYSICAL],
     leases:[[u64;PER_PID];COUNT],
     stacks:[Stack;COUNT],
-    arena:GuardedArena,
+    arena:RuntimeArena,
     processes:ProcessTable<COUNT,PER_PID>,
-    fx:UserFxBank,
+    fx:RuntimeFxBank,
     fx_tokens:[FxHandle;COUNT],
     control:fx_state::OriginalControl,
     frames:[u64;COUNT],
@@ -134,6 +153,8 @@ struct Runtime{
     timer_busy:[u64;COUNT],
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     timer_preempts:[u64;COUNT],
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    first_exit_timer_counts:Option<[u64;COUNT]>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     rr:Ring3RunQueue<COUNT>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
@@ -158,8 +179,17 @@ pub fn timer_irq_active()->bool{
 fn user_busy(pid:usize)->(u64,u64){
     #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
     {
-        if pid==0{(noyield_sym::PID1_WORK_BEGIN,noyield_sym::PID1_WORK_END)}
-        else{(noyield_sym::PID2_WORK_BEGIN,noyield_sym::PID2_WORK_END)}
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        {match pid {
+            0=>(noyield_sym::PID1_WORK_BEGIN,noyield_sym::PID1_WORK_END),
+            1=>(noyield_sym::PID2_WORK_BEGIN,noyield_sym::PID2_WORK_END),
+            2=>(noyield_sym::PID3_WORK_BEGIN,noyield_sym::PID3_WORK_END),
+            3=>(noyield_sym::PID4_WORK_BEGIN,noyield_sym::PID4_WORK_END),
+            _=>fail("four_live_invalid_busy_pid"),
+        }}
+        #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+        {if pid==0{(noyield_sym::PID1_WORK_BEGIN,noyield_sym::PID1_WORK_END)}
+        else{(noyield_sym::PID2_WORK_BEGIN,noyield_sym::PID2_WORK_END)}}
     }
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     {
@@ -238,7 +268,15 @@ pub extern "C" fn observe_timer_irq(
     // switch events, never on INT80 or same-PID IRQ returns. This preserves
     // the existing strict eight-yield regression, which still
     // checks both ELF data counters after involuntary interruption.
-    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    let preempt_target=if in_busy {
+        // BSP-only real xAPIC IRQ: rotate among the remaining READY native
+        // users. Already EXITED PIDs are NEVER reactivated or considered.
+        (1..COUNT).map(|step|(i+step)%COUNT)
+            .find(|&j|!s.exits[j] && s.frames[j]!=0)
+    } else {None};
+    #[cfg(all(feature="p2-ring3-timer-preempt-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     let preempt_target={
         let other=1-i;
         if in_busy
@@ -758,6 +796,9 @@ pub fn enter(hhdm:u64)->!{
         #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
         {
             validate_four_nonyield_elf_admission();
+            #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+            serial::write_line("WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=0");
+            #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
             serial::write_line("WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2");
             prove_four_resident_preflight(hhdm,boot,boot_root,cs,ss);
         }
@@ -778,7 +819,9 @@ pub fn enter(hhdm:u64)->!{
     {
         let phys_apic=crate::apic_timer_smoke::trusted_user_xapic_base()
             .unwrap_or_else(||fail("no_verified_bsp_xapic_physical_base"));
-        let apic_pages=[phys[25],phys[26],phys[27]];
+        let apic_pages=[phys[ARENA_FRAMES+COUNT*PER_PID],
+            phys[ARENA_FRAMES+COUNT*PER_PID+1],
+            phys[ARENA_FRAMES+COUNT*PER_PID+2]];
         // SAFETY: three exclusive PMM frames, no active private roots,
         // original boot CR3, interrupts masked and validated LAPIC physical
         // base from the current hardware/ACPI probe.
@@ -794,11 +837,16 @@ pub fn enter(hhdm:u64)->!{
             // Isolated Q35 single-BSP test's LAPIC logical ID is 0.
             fail("high_mmio_alias_wrong_bsp_id")
         }
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        serial::write_line(
+            "WOLFOS_RING3_TIMER_HIGH_MMIO_OK uc=1 supervisor_only=1 inherited_cr3=4 eoi_high=1 owned_frames=50"
+        );
+        #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
         serial::write_line(
             "WOLFOS_RING3_TIMER_HIGH_MMIO_OK uc=1 supervisor_only=1 inherited_cr3=2 eoi_high=1 owned_frames=28"
         );
     }
-    let mut arena=GuardedArena::new([phys[0],phys[1],phys[2]],boot)
+    let mut arena=RuntimeArena::new([phys[0],phys[1],phys[2]],boot)
         .unwrap_or_else(|_|fail("guarded_arena_root"));
     let mut stacks=[None;COUNT];
     let mut leases=[[0u64;PER_PID];COUNT];
@@ -839,14 +887,13 @@ pub fn enter(hhdm:u64)->!{
             &*root(hhdm,phys[1]),&*root(hhdm,phys[2]))
             .unwrap_or_else(|_|fail("guard_root_audit"));
     }
-    for i in 0..12{tlb::flush(VirtAddr::new(BASE+i*PAGE));}
+    for i in 0..COUNT*6{tlb::flush(VirtAddr::new(BASE+i as u64*PAGE));}
     for i in 0..COUNT {
         prepare_elf(hhdm,leases[i],boot_root,i);
     }
     // CPU modifies accessed/dirty PTE bits during these stack accesses,
     // which the audited arena already tolerates, while still denying U/S.
     let first=stacks[0].unwrap_or_else(||fail("pid1_missing_stack"));
-    let second=stacks[1].unwrap_or_else(||fail("pid2_missing_stack"));
     #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     let pic_before=[pic_read(0x21),pic_read(0xa1)];
     #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
@@ -862,7 +909,7 @@ pub fn enter(hhdm:u64)->!{
     let control=unsafe{fx_state::enter()}
         .unwrap_or_else(||fail("fx_enable"));
     let baseline=unsafe{FxImage::capture_baseline()};
-    let mut fx=UserFxBank::new();
+    let mut fx=RuntimeFxBank::new();
     let mut tokens=[None;COUNT];
     for i in 0..COUNT {
         tokens[i]=Some(fx.prepare((i+1) as u64,&baseline)
@@ -875,30 +922,39 @@ pub fn enter(hhdm:u64)->!{
     let entry_flags=IRQ_USER_RFLAGS;
     #[cfg(not(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
     let entry_flags=2u64;
-    let bootstrap=UserSyscallFrame{
-        hardware:user_syscall_abi::InterruptReturn{
-            rip:entry(1),cs:cs as u64,rflags:entry_flags,
-            rsp:USER_TOP,ss:ss as u64,
-        },
-        ..UserSyscallFrame::default()
-    };
-    let second_frame=second.top-user_syscall_abi::FRAME_BYTES as u64;
-    // SAFETY: preflight-mapped, fully reserved 16 KiB supervisor-only
-    // upper-half stack leaf; frame is exactly bounded by its stack.
-    unsafe{(second_frame as *mut UserSyscallFrame).write(bootstrap);}
+    let mut saved_frames=[0u64;COUNT];
+    for i in 1..COUNT {
+        let st=stacks[i].unwrap_or_else(||fail("missing_user_stack"));
+        let bootstrap=UserSyscallFrame{
+            hardware:user_syscall_abi::InterruptReturn{
+                rip:entry(i),cs:cs as u64,rflags:entry_flags,
+                rsp:USER_TOP,ss:ss as u64,
+            },
+            ..UserSyscallFrame::default()
+        };
+        let frame=st.top-user_syscall_abi::FRAME_BYTES as u64;
+        // SAFETY: independently PMM-backed and mapped supervisor-only leaf.
+        // No other CPU/user process can access this pre-IRET frame.
+        unsafe{(frame as *mut UserSyscallFrame).write(bootstrap);}
+        saved_frames[i]=frame;
+    }
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     let (rr,rr_handles)={
         let mut q=Ring3RunQueue::<COUNT>::new();
-        let h1=q.admit(1).unwrap_or_else(|_|fail("rr_pid1_admission"));
-        let h2=q.admit(2).unwrap_or_else(|_|fail("rr_pid2_admission"));
-        if q.start_next()!=Ok(h1){fail("rr_initial_pid")}
-        (q,[h1,h2])
+        let mut handles=[None;COUNT];
+        for i in 0..COUNT {
+            handles[i]=Some(q.admit((i+1) as u64)
+                .unwrap_or_else(|_|fail("rr_pid_admission")));
+        }
+        if q.start_next()!=Ok(handles[0].unwrap()) {fail("rr_initial_pid")}
+        (q,handles.map(|h|h.unwrap()))
     };
     let state=Runtime{
         boot,hhdm,original_rsp0:rsp0,boot_rsp,before,owned:phys,
-        leases,stacks:[first,second],arena,processes,fx,
-        fx_tokens:[tokens[0].unwrap(),tokens[1].unwrap()],
-        control,frames:[0,second_frame],current:0,
+        leases,stacks:stacks.map(|x|x.unwrap_or_else(||fail("missing_runtime_stack"))),
+        arena,processes,fx,
+        fx_tokens:tokens.map(|x|x.unwrap_or_else(||fail("missing_fx_image"))),
+        control,frames:saved_frames,current:0,
         yields:[0;COUNT],exits:[false;COUNT],hardware_traps:0,
         #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
         pic_before,
@@ -908,6 +964,8 @@ pub fn enter(hhdm:u64)->!{
         timer_busy:[0;COUNT],
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         timer_preempts:[0;COUNT],
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        first_exit_timer_counts:None,
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         rr,
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
@@ -921,7 +979,10 @@ pub fn enter(hhdm:u64)->!{
     if !unsafe{interrupts::test_handoff_rsp0(first.top)}{
         fail("activate_initial_tss_rsp0")
     }
-    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_line("WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=4");
+    #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_line("WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=2");
     #[cfg(not(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     serial::write_line(
@@ -931,7 +992,12 @@ pub fn enter(hhdm:u64)->!{
     serial::write_line(
         "WOLFOS_RING3_YIELD_START_OK separate_native_elf=2 live_user_roots=2 guarded_kernel_rsp0=2 fx_images=2 owned_frames=28"
     );
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_line(
+        "WOLFOS_RING3_FOUR_START_OK native_elf=4 user_if=1 private_cr3=4 guarded_rsp0=4 fx_images=4 owned_frames=50"
+    );
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_NONYIELD_START_OK native_elf=2 user_if=1 private_cr3=2 guarded_rsp0=2 fx_images=2 owned_frames=28"
     );
@@ -1050,7 +1116,28 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             ||s.processes.exit_zero(pid,active_root).is_err(){
             fail("early_or_bad_exit")
         }
-        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        {
+            // Snapshot the genuine IRQ-source counts at the FIRST EXIT,
+            // while all four real users were still runnable. RR equality
+            // must be checked at this moment, not after early finishers stop
+            // accruing IRQs while survivors continue processing.
+            if s.exits.iter().all(|done| !*done) {
+                if s.first_exit_timer_counts.is_some() {
+                    fail("four_live_duplicate_first_exit_snapshot")
+                }
+                s.first_exit_timer_counts=Some(s.timer_preempts);
+            }
+            let target=s.rr.exit_current(s.rr_handles[i])
+                .unwrap_or_else(|_|fail("four_live_exit_queue_owner"));
+            let more=s.exits.iter().enumerate()
+                .any(|(j,done)|j!=i && !done);
+            if target.is_some()!=more {
+                fail("four_live_exit_queue_runnable_mismatch")
+            }
+        }
+        #[cfg(all(feature = "p2-ring3-timer-preempt-smoke",
+                  not(feature="p3-ring3-four-elf-live-smoke")))]
         if s.rr.exit_current(s.rr_handles[i])!=Ok(if s.exits[1-i]{None}else{Some(s.rr_handles[1-i])}) {
             fail("rr_exit_handoff_out_of_sync")
         }
@@ -1064,13 +1151,18 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         "WOLFOS_RING3_YIELD_TRAP pid={} kind={} count={} cr3_private=1 rsp0_guarded=1\n",
         pid,if is_yield{"yield"}else{"exit"},val,
     ));
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_fmt(format_args!(
+        "WOLFOS_RING3_FOUR_EXIT pid={} progress={} private_cr3=1 rsp0_guarded=1\n",
+        pid,val,
+    ));
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_fmt(format_args!(
         "WOLFOS_RING3_NONYIELD_EXIT pid={} progress={} private_cr3=1 rsp0_guarded=1\n",
         pid,val,
     ));
-    let next=1-i;
-    if s.exits[next] {
+    if s.exits.iter().all(|done|*done) {
         if !s.exits[i] { fail("unexpected_finished_other") }
         if s.hardware_traps!=TRAPS ||
             s.yields!=[if cfg!(feature="p2-ring3-timer-nonyield-smoke"){0}else{ROUNDS};COUNT] {
@@ -1098,7 +1190,12 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=1"
         );
-        #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        serial::write_line(
+            "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=4 pid_cr3_rsp0_fx_checks=4 pic_masked=1 timer_armed=1"
+        );
+        #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+                  not(feature="p3-ring3-four-elf-live-smoke")))]
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=2 pid_cr3_rsp0_fx_checks=2 pic_masked=1 timer_armed=1"
         );
@@ -1128,7 +1225,45 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 ));
                 serial::write_line("WOLFOS_RING3_RR_POLICY_OK hardware_timer_decisions=2 voluntary_yield_decisions=8 exited=2 single_running=1");
             }
-            #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+            #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+            {
+                let switches=s.timer_preempts.iter().sum::<u64>();
+                let first=s.first_exit_timer_counts
+                    .unwrap_or_else(||fail("four_live_missing_first_exit_evidence"));
+                let first_min=*first.iter().min().unwrap();
+                let first_max=*first.iter().max().unwrap();
+                let last_min=*s.timer_preempts.iter().min().unwrap();
+                let slots=s.rr.slots();
+                let bad_slot=slots.iter().enumerate().any(|(i,slot)|
+                    slot.state!=RrState::Exited
+                    || slot.handle!=s.rr_handles[i]
+                    || slot.ticks!=s.timer_preempts[i]);
+                // Strict FIFO round-robin fairness must hold WHILE all four
+                // PIDs are READY/RUNNING. After a PID legitimately EXITs,
+                // it cannot collect more IRQ counts; surviving users may
+                // accumulate additional authentic preemptions. Requiring
+                // equal *lifetime* counts would be mathematically wrong.
+                if switches<16 || last_min<4 || first_min<4
+                    || first_max-first_min>1
+                    || s.rr.timer_switches()!=switches
+                    || s.rr.running().is_some() || bad_slot {
+                    serial::write_fmt(format_args!(
+                        "WOLFOS_RING3_FOUR_DIAGNOSTIC total={} pids={:?} first_exit_pids={:?} policy_switches={} ticks=[{},{},{},{}] first_min={} first_spread={} running={:?} bad_slot={}\n",
+                        switches,s.timer_preempts,first,s.rr.timer_switches(),
+                        slots[0].ticks,slots[1].ticks,slots[2].ticks,slots[3].ticks,
+                        first_min,first_max-first_min,s.rr.running(),bad_slot
+                    ));
+                    fail("four_live_real_irq_fairness_or_ledger")
+                }
+                serial::write_fmt(format_args!(
+                    "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} fair_four_min={} fair_four_spread={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
+                    switches,s.timer_preempts[0],s.timer_preempts[1],
+                    s.timer_preempts[2],s.timer_preempts[3],
+                    first_min,first_max-first_min
+                ));
+            }
+            #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+                      not(feature="p3-ring3-four-elf-live-smoke")))]
             {
                 let switches=s.timer_preempts[0]+s.timer_preempts[1];
                 let slots=s.rr.slots();
@@ -1178,6 +1313,18 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             );
         }
     }
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    let next={
+        let active=s.rr.running().unwrap_or_else(||fail("four_live_missing_queue_target"));
+        let index=usize::try_from(active.pid-1)
+            .unwrap_or_else(|_|fail("four_live_target_pid_overflow"));
+        if index>=COUNT || s.rr_handles[index]!=active || s.exits[index] {
+            fail("four_live_wrong_queue_target")
+        }
+        index
+    };
+    #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+    let next=1-i;
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     if s.rr.running()!=Some(s.rr_handles[next]) {
         fail("rr_selected_pid_differs_from_hardware_target")
@@ -1212,7 +1359,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         "WOLFOS_RING3_YIELD_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
         pid,next+1,
     ));
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_fmt(format_args!(
+        "WOLFOS_RING3_FOUR_EXIT_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
+        pid,next+1,
+    ));
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_fmt(format_args!(
         "WOLFOS_RING3_NONYIELD_EXIT_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
         pid,next+1,
@@ -1246,7 +1399,7 @@ extern "C" fn finalize()->! {
             &mut *root(s.hhdm,s.owned[2]),
         ).unwrap_or_else(|_|fail("retire_guarded_root"));
     }
-    for i in 0..12{tlb::flush(VirtAddr::new(BASE+i*PAGE));}
+    for i in 0..COUNT*6{tlb::flush(VirtAddr::new(BASE+i as u64*PAGE));}
     for i in 0..COUNT{
         // SAFETY: first restore BSP escape stack, original CR3/TSS/FX,
         // finish ALL CPL3 tasks, retire their active roots, unpublish and
@@ -1265,7 +1418,9 @@ extern "C" fn finalize()->! {
         // safe stack, users are EXITED, and timer's LVT is masked.
         unsafe{
             crate::user_xapic_high::unpublish(
-                s.hhdm,s.boot,[s.owned[25],s.owned[26],s.owned[27]]
+                s.hhdm,s.boot,[s.owned[ARENA_FRAMES+COUNT*PER_PID],
+                    s.owned[ARENA_FRAMES+COUNT*PER_PID+1],
+                    s.owned[ARENA_FRAMES+COUNT*PER_PID+2]]
             ).unwrap_or_else(|_|fail("high_mmio_teardown"));
         }
         serial::write_line(
@@ -1310,7 +1465,12 @@ extern "C" fn finalize()->! {
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=28 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_line(
+        "WOLFOS_RING3_FOUR_CLEANUP_OK frames_freed=50 exited=4 fx_wiped=4 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
+    );
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_NONYIELD_CLEANUP_OK frames_freed=28 exited=2 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
