@@ -1217,13 +1217,21 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 let lo=*s.timer_preempts.iter().min().unwrap();
                 let hi=*s.timer_preempts.iter().max().unwrap();
                 let slots=s.rr.slots();
+                let bad_slot=slots.iter().enumerate().any(|(i,slot)|
+                    slot.state!=RrState::Exited
+                    || slot.handle!=s.rr_handles[i]
+                    || slot.ticks!=s.timer_preempts[i]);
                 if switches<16 || lo<4 || hi-lo>4
                     || s.rr.timer_switches()!=switches
-                    || s.rr.running().is_some()
-                    || slots.iter().enumerate().any(|(i,slot)|
-                        slot.state!=RrState::Exited
-                        || slot.handle!=s.rr_handles[i]
-                        || slot.ticks!=s.timer_preempts[i]) {
+                    || s.rr.running().is_some() || bad_slot {
+                    // Diagnostic only on a failed hardware acceptance.
+                    // Never weaken the IRQ/fairness assertion to achieve CI.
+                    serial::write_fmt(format_args!(
+                        "WOLFOS_RING3_FOUR_DIAGNOSTIC total={} pids={:?} policy_switches={} ticks=[{},{},{},{}] lo={} hi={} running={:?} bad_slot={}\n",
+                        switches,s.timer_preempts,s.rr.timer_switches(),
+                        slots[0].ticks,slots[1].ticks,slots[2].ticks,slots[3].ticks,
+                        lo,hi,s.rr.running(),bad_slot
+                    ));
                     fail("four_live_real_irq_fairness_or_ledger")
                 }
                 serial::write_fmt(format_args!(
