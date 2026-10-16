@@ -266,7 +266,15 @@ pub extern "C" fn observe_timer_irq(
     // switch events, never on INT80 or same-PID IRQ returns. This preserves
     // the existing strict eight-yield regression, which still
     // checks both ELF data counters after involuntary interruption.
-    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    let preempt_target=if in_busy {
+        // BSP-only real xAPIC IRQ: rotate among the remaining READY native
+        // users. Already EXITED PIDs are NEVER reactivated or considered.
+        (1..COUNT).map(|step|(i+step)%COUNT)
+            .find(|&j|!s.exits[j] && s.frames[j]!=0)
+    } else {None};
+    #[cfg(all(feature="p2-ring3-timer-preempt-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     let preempt_target={
         let other=1-i;
         if in_busy
