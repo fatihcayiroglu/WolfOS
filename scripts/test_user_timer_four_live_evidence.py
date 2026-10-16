@@ -4,7 +4,7 @@ import unittest
 
 from user_timer_four_live_smoke import (
     ORDERED, evaluate, strict_four_exit_evidence,
-    strict_four_hardware_evidence,
+    strict_four_hardware_evidence, strict_four_eoi_evidence,
 )
 
 HARDWARE = (
@@ -13,6 +13,10 @@ HARDWARE = (
     "quantum_ticks=2 eligible_irqs=88 voluntary_yields=0 exits=4 "
     "progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4"
 )
+
+
+EOI = ("WOLFOS_RING3_FOUR_EOI_OK irq_received=90 eoi_writes=90 "
+       "same_pid_iret=50 cross_pid_switches=40 drained=1")
 
 
 def exit_row(pid):
@@ -32,7 +36,7 @@ def complete():
         exit_row(2), switch_row(2, 3),
         exit_row(3), switch_row(3, 4),
         exit_row(4),
-        ORDERED[9], HARDWARE, *ORDERED[10:],
+        ORDERED[9], EOI, HARDWARE, *ORDERED[10:],
     ]
     # The real descriptor proof carries validated GDT/TR metadata. The
     # fail-closed parser intentionally rejects a bare unadorned stem.
@@ -49,6 +53,7 @@ class FourLiveHardwareEvidenceTests(unittest.TestCase):
         self.assertTrue(self.check(rows))
         self.assertTrue(strict_four_exit_evidence("\n".join(rows)))
         self.assertTrue(strict_four_hardware_evidence("\n".join(rows)))
+        self.assertTrue(strict_four_eoi_evidence("\n".join(rows)))
 
     def test_lifetime_irq_counts_can_diverge_after_early_exit(self):
         rows = complete()
@@ -58,6 +63,11 @@ class FourLiveHardwareEvidenceTests(unittest.TestCase):
                    .replace("fair_four_min=8", "fair_four_min=880")
                    .replace("eligible_irqs=88", "eligible_irqs=7500"))
         rows[rows.index(HARDWARE)] = unequal
+        rows[rows.index(EOI)] = (
+            EOI.replace("irq_received=90", "irq_received=7550")
+               .replace("eoi_writes=90", "eoi_writes=7550")
+               .replace("same_pid_iret=50", "same_pid_iret=3870")
+               .replace("cross_pid_switches=40", "cross_pid_switches=3680"))
         self.assertTrue(self.check(rows),
                         "an EXITED PID cannot keep accruing IRQ decisions")
 
@@ -65,7 +75,7 @@ class FourLiveHardwareEvidenceTests(unittest.TestCase):
         rows = complete()
         self.assertFalse(self.check(rows, code=0))
         for target in (ORDERED[3], ORDERED[4], ORDERED[5],
-                       ORDERED[8], ORDERED[9], HARDWARE, exit_row(4)):
+                       ORDERED[8], ORDERED[9], EOI, HARDWARE, exit_row(4)):
             self.assertFalse(self.check([r for r in rows if r != target]), target)
 
     def test_wrong_pid_or_progress_or_exit_order_fails(self):
@@ -108,11 +118,35 @@ class FourLiveHardwareEvidenceTests(unittest.TestCase):
             "prefix: " + switch_row(1, 2),
             "prefix: " + HARDWARE,
             HARDWARE,
+            "prefix: " + EOI,
+            EOI,
             exit_row(1),
             switch_row(3, 4),
             "WOLFOS_RING3_FOUR_EXIT pid=3",
         ):
             self.assertFalse(self.check(rows + [extra]), extra)
+
+    def test_eoi_is_exactly_once_per_irq_and_never_a_fake_switch(self):
+        valid = complete()
+        self.assertTrue(self.check(valid))
+        for source, replacement in (
+            ("irq_received=90", "irq_received=89"),
+            ("irq_received=90", "irq_received=87"),
+            ("eoi_writes=90", "eoi_writes=89"),
+            ("eoi_writes=90", "eoi_writes=91"),
+            ("same_pid_iret=50", "same_pid_iret=49"),
+            ("cross_pid_switches=40", "cross_pid_switches=39"),
+            ("cross_pid_switches=40", "cross_pid_switches=41"),
+            ("drained=1", "drained=0"),
+        ):
+            rows = complete()
+            rows[rows.index(EOI)] = EOI.replace(source, replacement)
+            self.assertFalse(self.check(rows), replacement)
+        wrong_order = complete()
+        a, b = wrong_order.index(EOI), wrong_order.index(HARDWARE)
+        wrong_order[a], wrong_order[b] = wrong_order[b], wrong_order[a]
+        self.assertFalse(self.check(wrong_order))
+        self.assertFalse(self.check(complete() + ["trace: " + EOI]))
 
     def test_no_forged_p3_preflight_or_failure_evidence(self):
         rows = complete()
