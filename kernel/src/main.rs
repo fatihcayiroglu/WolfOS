@@ -190,6 +190,10 @@ mod ring3_round_robin;
           feature = "kernel-stack-lease-smoke",
           feature = "user-context-smoke"))]
 mod ring3_runqueue;
+// Only the real four-user BSP QEMU IRQ acceptance uses this EOI audit;
+// legacy two-user and simulated policy paths are left unchanged.
+#[cfg(feature = "p3-ring3-four-elf-live-smoke")]
+mod ring3_irq_eoi_ledger;
 #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 mod user_irq_preempt_contract;
 #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
