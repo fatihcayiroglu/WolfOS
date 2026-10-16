@@ -29,6 +29,15 @@ class AggregateEvidenceTests(unittest.TestCase):
     def test_rejects_trailing_payload(self):
         self.assertIsNone(unique_aggregate_proof(VALID + " forged=1"))
 
+    def test_rejects_embedded_marker_beside_valid(self):
+        self.assertIsNone(unique_aggregate_proof(VALID + "\nlog: " + VALID))
+
+    def test_rejects_malformed_duplicate_beside_valid(self):
+        self.assertIsNone(unique_aggregate_proof(VALID + "\n" + VALID + " forged=1"))
+
+    def test_rejects_truncated_duplicate_beside_valid(self):
+        self.assertIsNone(unique_aggregate_proof(VALID + "\nWOLFOS_AP_SMP_PREEMPT_OK"))
+
     def test_rejects_truncated(self):
         self.assertIsNone(unique_aggregate_proof(VALID.rsplit(" guard_depth=", 1)[0]))
 
