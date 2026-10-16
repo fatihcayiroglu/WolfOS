@@ -1163,7 +1163,12 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=1"
         );
-        #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        serial::write_line(
+            "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=4 pid_cr3_rsp0_fx_checks=4 pic_masked=1 timer_armed=1"
+        );
+        #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+                  not(feature="p3-ring3-four-elf-live-smoke")))]
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=2 pid_cr3_rsp0_fx_checks=2 pic_masked=1 timer_armed=1"
         );
@@ -1193,7 +1198,29 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 ));
                 serial::write_line("WOLFOS_RING3_RR_POLICY_OK hardware_timer_decisions=2 voluntary_yield_decisions=8 exited=2 single_running=1");
             }
-            #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+            #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+            {
+                let switches=s.timer_preempts.iter().sum::<u64>();
+                let lo=*s.timer_preempts.iter().min().unwrap();
+                let hi=*s.timer_preempts.iter().max().unwrap();
+                let slots=s.rr.slots();
+                if switches<16 || lo<4 || hi-lo>4
+                    || s.rr.timer_switches()!=switches
+                    || s.rr.running().is_some()
+                    || slots.iter().enumerate().any(|(i,slot)|
+                        slot.state!=RrState::Exited
+                        || slot.handle!=s.rr_handles[i]
+                        || slot.ticks!=s.timer_preempts[i]) {
+                    fail("four_live_real_irq_fairness_or_ledger")
+                }
+                serial::write_fmt(format_args!(
+                    "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
+                    switches,s.timer_preempts[0],s.timer_preempts[1],
+                    s.timer_preempts[2],s.timer_preempts[3]
+                ));
+            }
+            #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+                      not(feature="p3-ring3-four-elf-live-smoke")))]
             {
                 let switches=s.timer_preempts[0]+s.timer_preempts[1];
                 let slots=s.rr.slots();
