@@ -626,6 +626,14 @@ pub fn enter(hhdm:u64)->!{
     // SAFETY: preflight-mapped, fully reserved 16 KiB supervisor-only
     // upper-half stack leaf; frame is exactly bounded by its stack.
     unsafe{(second_frame as *mut UserSyscallFrame).write(bootstrap);}
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    let (rr,rr_handles)={
+        let mut q=Ring3RunQueue::<COUNT>::new();
+        let h1=q.admit(1).unwrap_or_else(|_|fail("rr_pid1_admission"));
+        let h2=q.admit(2).unwrap_or_else(|_|fail("rr_pid2_admission"));
+        if q.start_next()!=Ok(h1){fail("rr_initial_pid")}
+        (q,[h1,h2])
+    };
     let state=Runtime{
         boot,hhdm,original_rsp0:rsp0,boot_rsp,before,owned:phys,
         leases,stacks:[first,second],arena,processes,fx,
@@ -641,15 +649,9 @@ pub fn enter(hhdm:u64)->!{
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         timer_preempts:[0;COUNT],
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-        rr:{
-            let mut q=Ring3RunQueue::<COUNT>::new();
-            q.admit(1).unwrap_or_else(|_|fail("rr_pid1_admission"));
-            q.admit(2).unwrap_or_else(|_|fail("rr_pid2_admission"));
-            q.start_next().unwrap_or_else(|_|fail("rr_initial_pid"));
-            q
-        },
+        rr,
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-        rr_handles:[RunHandle{pid:1,generation:1},RunHandle{pid:2,generation:2}],
+        rr_handles,
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
@@ -875,6 +877,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     || s.rr.timer_switches()!=switches || s.rr.running().is_some()
                     || slots[0].state!=RrState::Exited
                     || slots[1].state!=RrState::Exited
+                    || slots[0].handle!=s.rr_handles[0]
+                    || slots[1].handle!=s.rr_handles[1]
                     || slots[0].ticks!=s.timer_preempts[0]
                     || slots[1].ticks!=s.timer_preempts[1] {
                     fail("nonyield_hardware_rr_fairness_or_ledger")
