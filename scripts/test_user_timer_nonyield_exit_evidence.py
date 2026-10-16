@@ -157,5 +157,46 @@ class OrderedEvidenceTests(unittest.TestCase):
 
 
 
+# A four-ELF preflight must never be mistaken for four executing users.
+# The transient 47-frame residency proof is separately mandatory, and must
+# precede the two-user hardware proof with exact fully matched serial lines.
+FOUR_ELF = "WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2"
+FOUR_RESIDENT = ("WOLFOS_RING3_FOUR_RESIDENT_OK native_elf=4 private_cr3=4 "
+                 "guarded_rsp0=4 owned_frames=47 frame_gprs=4 executed=0 pmm_no_leak=1")
+
+
+class FourResidentEvidenceTests(unittest.TestCase):
+    MARKERS = ("WOLFOS_BOOT_OK", FOUR_ELF, FOUR_RESIDENT,
+               "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1")
+    VALID = ("WOLFOS_BOOT_OK", FOUR_ELF, FOUR_RESIDENT,
+             "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1")
+
+    def check(self, rows):
+        return ordered_evidence_lines("\n".join(rows), self.MARKERS)
+
+    def test_four_resident_evidence_must_be_present_and_ordered(self):
+        self.assertTrue(self.check(self.VALID))
+        self.assertFalse(self.check((self.VALID[0], self.VALID[1], self.VALID[3])))
+        self.assertFalse(self.check((self.VALID[0], self.VALID[2],
+                                     self.VALID[1], self.VALID[3])))
+
+    def test_four_resident_duplicate_or_embedded_forgery_is_rejected(self):
+        self.assertFalse(self.check(self.VALID + (FOUR_RESIDENT,)))
+        self.assertFalse(self.check(self.VALID + ("log: " + FOUR_RESIDENT,)))
+
+    def test_resident_counts_and_execution_claims_are_immutable(self):
+        for altered in (
+            FOUR_RESIDENT.replace("private_cr3=4", "private_cr3=2"),
+            FOUR_RESIDENT.replace("guarded_rsp0=4", "guarded_rsp0=2"),
+            FOUR_RESIDENT.replace("owned_frames=47", "owned_frames=46"),
+            FOUR_RESIDENT.replace("frame_gprs=4", "frame_gprs=0"),
+            FOUR_RESIDENT.replace("executed=0", "executed=4"),
+            FOUR_RESIDENT.replace("pmm_no_leak=1", "pmm_no_leak=0"),
+            FOUR_RESIDENT + " forged=1",
+        ):
+            rows = (self.VALID[0], self.VALID[1], altered, self.VALID[3])
+            self.assertFalse(self.check(rows), altered)
+
+
 if __name__ == '__main__':
     unittest.main()
