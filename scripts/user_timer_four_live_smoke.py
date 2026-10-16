@@ -142,7 +142,7 @@ def strict_four_eoi_evidence(output: str) -> bool:
     exits = [i for i, row in enumerate(rows)
              if EXIT_STEM in row and SWITCH_STEM not in row]
     return (len(irq_ready) == len(cleanup) == 1 and len(exits) == 4
-            and irq_ready[0] < max(exits) < eoi_at < hardware_at < cleanup[0])
+            and max(exits) < irq_ready[0] < eoi_at < hardware_at < cleanup[0])
 
 
 def evaluate(output: str, exit_code: int) -> bool:
