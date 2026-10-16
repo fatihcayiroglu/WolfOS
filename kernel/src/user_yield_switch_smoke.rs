@@ -835,6 +835,11 @@ pub fn enter(hhdm:u64)->!{
             // Isolated Q35 single-BSP test's LAPIC logical ID is 0.
             fail("high_mmio_alias_wrong_bsp_id")
         }
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        serial::write_line(
+            "WOLFOS_RING3_TIMER_HIGH_MMIO_OK uc=1 supervisor_only=1 inherited_cr3=4 eoi_high=1 owned_frames=50"
+        );
+        #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
         serial::write_line(
             "WOLFOS_RING3_TIMER_HIGH_MMIO_OK uc=1 supervisor_only=1 inherited_cr3=2 eoi_high=1 owned_frames=28"
         );
@@ -970,7 +975,10 @@ pub fn enter(hhdm:u64)->!{
     if !unsafe{interrupts::test_handoff_rsp0(first.top)}{
         fail("activate_initial_tss_rsp0")
     }
-    #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_line("WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=4");
+    #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_line("WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=2");
     #[cfg(not(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     serial::write_line(
@@ -980,7 +988,12 @@ pub fn enter(hhdm:u64)->!{
     serial::write_line(
         "WOLFOS_RING3_YIELD_START_OK separate_native_elf=2 live_user_roots=2 guarded_kernel_rsp0=2 fx_images=2 owned_frames=28"
     );
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_line(
+        "WOLFOS_RING3_FOUR_START_OK native_elf=4 user_if=1 private_cr3=4 guarded_rsp0=4 fx_images=4 owned_frames=50"
+    );
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_NONYIELD_START_OK native_elf=2 user_if=1 private_cr3=2 guarded_rsp0=2 fx_images=2 owned_frames=28"
     );
@@ -1422,7 +1435,12 @@ extern "C" fn finalize()->! {
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=28 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_line(
+        "WOLFOS_RING3_FOUR_CLEANUP_OK frames_freed=50 exited=4 fx_wiped=4 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
+    );
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_NONYIELD_CLEANUP_OK frames_freed=28 exited=2 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
