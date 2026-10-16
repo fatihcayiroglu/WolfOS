@@ -36,20 +36,75 @@ def symbol_map(elf):
     return result
 
 
-def decoded_instructions(disassembly):
+def decoded_instructions(disassembly, start, end):
+    """Decode and account for *every* byte in the executable workload span.
+
+    A truncated/malformed objdump line must never silently remove a trap from
+    the audit. x86 instructions are at most 15 bytes; --insn-width=16 keeps
+    the entire encoding on one line.
+    """
+    cursor = start
     for line in disassembly.splitlines():
-        match = re.match(r"^\s*([0-9a-f]+):\s+([a-z][a-z0-9.]*)\b(.*)$", line)
-        if match:
-            yield int(match.group(1), 16), match.group(2), match.group(3).strip()
+        match = re.match(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2}\s+)+)(.*)$", line)
+        if not match:
+            continue
+        addr = int(match.group(1), 16)
+        if not start <= addr < end:
+            continue
+        raw = match.group(2).split()
+        mnemonic = match.group(3).strip().split(maxsplit=1)
+        if addr != cursor or not mnemonic or len(raw) > 15:
+            raise AssertionError(f"incomplete/invalid disassembly at {cursor:#x}")
+        if mnemonic[0] in {"(bad)", ".byte"}:
+            raise AssertionError(f"undecodable instruction at {addr:#x}")
+        cursor += len(raw)
+        if cursor > end:
+            raise AssertionError(f"instruction crosses workload boundary {end:#x}")
+        yield addr, mnemonic[0], mnemonic[1] if len(mnemonic) > 1 else ""
+    if cursor != end:
+        raise AssertionError(f"missing instruction bytes from {cursor:#x} to {end:#x}")
+
+
+FORBIDDEN_TRAPS = frozenset({
+    "syscall", "sysenter", "sysret", "sysretq", "sysexit", "sysexitq",
+    "int3", "int1", "icebp", "into", "ud2", "hlt",
+    "cli", "sti", "iret", "iretq", "out", "outb", "outw",
+    "in", "inb", "inw", "inl",
+})
 
 
 class NoYieldOpcodeGuard(unittest.TestCase):
+    def test_decoder_rejects_missing_bytes(self):
+        sample = "401000: 90 nop\n401002: cd 80 int $0x80"
+        with self.assertRaisesRegex(AssertionError, "incomplete/invalid"):
+            list(decoded_instructions(sample, 0x401000, 0x401004))
+
+    def test_decoder_rejects_undecodable_bytes(self):
+        sample = "401000: 0f 0b (bad)"
+        with self.assertRaisesRegex(AssertionError, "undecodable"):
+            list(decoded_instructions(sample, 0x401000, 0x401002))
+
+    def test_decoder_rejects_overlap(self):
+        sample = "401000: 90 nop\n401000: 90 nop"
+        with self.assertRaisesRegex(AssertionError, "incomplete/invalid"):
+            list(decoded_instructions(sample, 0x401000, 0x401002))
+
+    def test_decoder_rejects_instruction_crossing_end(self):
+        sample = "401000: cd 80 int $0x80"
+        with self.assertRaisesRegex(AssertionError, "crosses workload boundary"):
+            list(decoded_instructions(sample, 0x401000, 0x401001))
+
+    def test_icebp_opcode_is_forbidden(self):
+        with tempfile.TemporaryDirectory(prefix="wolfos-icebp-") as tmp:
+            raw = Path(tmp) / "icebp.bin"
+            raw.write_bytes(b"\xf1")
+            disasm = run("objdump", "-D", "-b", "binary", "-m",
+                         "i386:x86-64", "--insn-width=16", str(raw))
+            instructions = list(decoded_instructions(disasm, 0, 1))
+            self.assertEqual([op for _, op, _ in instructions], ["int1"])
+            self.assertIn(instructions[0][1], FORBIDDEN_TRAPS)
+
     def test_no_hidden_software_interrupt_or_trap_before_exit(self):
-        forbidden = {
-            "syscall", "sysenter", "int3", "into", "ud2", "hlt",
-            "cli", "sti", "iret", "iretq", "out", "outb", "outw",
-            "in", "inb", "inw", "inl",
-        }
         with tempfile.TemporaryDirectory(prefix="wolfos-nonyield-opguard-") as tmp:
             for pid in (1, 2):
                 obj = Path(tmp) / f"pid{pid}.o"
@@ -64,14 +119,14 @@ class NoYieldOpcodeGuard(unittest.TestCase):
                 self.assertLess(sym["_work_end"], sym["_exit_return"])
                 instructions = [
                     (addr, op, args) for addr, op, args in decoded_instructions(
-                        run("objdump", "-d", "--no-show-raw-insn", str(elf)))
-                    if sym["_start"] <= addr < sym["_exit_return"]
+                        run("objdump", "-d", "--insn-width=16", str(elf)),
+                        sym["_start"], sym["_exit_return"])
                 ]
                 self.assertGreater(len(instructions), 10,
                                    "workload machine code must be decoded")
                 interrupts = []
                 for addr, opcode, operands in instructions:
-                    self.assertNotIn(opcode, forbidden,
+                    self.assertNotIn(opcode, FORBIDDEN_TRAPS,
                                      f"PID {pid}: forbidden {opcode} at {addr:#x}")
                     if opcode == "int":
                         interrupts.append((addr, operands))
