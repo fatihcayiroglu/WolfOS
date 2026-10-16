@@ -28,6 +28,21 @@ def fail(why, output=""):
     return 1
 
 
+
+def exit_markers_well_formed(output):
+    """Reject duplicate, truncated, or forged extra EXIT/EXIT_SWITCH evidence."""
+    lines = output.splitlines()
+    exits = [line for line in lines if line.startswith("WOLFOS_RING3_NONYIELD_EXIT ")]
+    handoffs = [line for line in lines
+                if line.startswith("WOLFOS_RING3_NONYIELD_EXIT_SWITCH ")]
+    exit_pattern = (r"WOLFOS_RING3_NONYIELD_EXIT pid=[12] progress=\d+ "
+                    r"private_cr3=1 rsp0_guarded=1")
+    handoff_pattern = (r"WOLFOS_RING3_NONYIELD_EXIT_SWITCH from=[12] to=[12] "
+                       r"private_cr3=1 tss_rsp0=1 fx_saved=1")
+    return (len(exits) == 2 and len(handoffs) == 1
+            and all(re.fullmatch(exit_pattern, line) for line in exits)
+            and re.fullmatch(handoff_pattern, handoffs[0]) is not None)
+
 def main():
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: user_timer_nonyield_smoke.py KERNEL_ISO")
@@ -73,6 +88,8 @@ def main():
             return fail("required QEMU hardware evidence missing or out of order")
         if any(output.count(x) != 1 for x in ordered):
             return fail("duplicated hardware evidence marker")
+        if not exit_markers_well_formed(output):
+            return fail("malformed, duplicate, or unexpected EXIT evidence")
         exits = re.findall(
             r"^WOLFOS_RING3_NONYIELD_EXIT pid=([12]) progress=(\d+) private_cr3=1 rsp0_guarded=1$",
             output, flags=re.MULTILINE,
