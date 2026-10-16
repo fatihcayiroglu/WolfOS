@@ -500,6 +500,148 @@ fn validate_four_nonyield_elf_admission() {
     }
 }
 
+/// Isolated four-PID **real PMM residency** proof. Four independently linked
+/// ELF64 images are materialized into disjoint physical code/data/stack
+/// pages and four private sanitized CR3 roots; four actual guarded 16KiB
+/// supervisor stack mappings are published, checked, then fully removed.
+/// These are prepared READY contexts, not executed CPL3 tasks: the existing
+/// two-ELF hardware workload starts only AFTER exact PMM reclamation.
+#[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+fn prove_four_resident_preflight(
+    hhdm:u64, boot:u64, boot_root:*mut [u64;512], cs:u16, ss:u16,
+){
+    const FOUR:usize=FOUR_PID_STACKS;
+    const OWNED:usize=FOUR_PID_OWNED+FOUR*PER_PID; // 19 guarded + 28 user = 47
+    let before=pmm::statistics().allocated_frames;
+    if actual_cr3()!=boot || unsafe{(*boot_root)[ROOT_INDEX]}!=0 {
+        fail("four_resident_requires_quiescent_boot_cr3")
+    }
+    let mut phys=[0u64;OWNED];
+    for i in 0..OWNED {
+        let frame=pmm::allocate_frame().unwrap_or_else(||fail("four_resident_pmm_exhausted"));
+        if frame==0 || frame&4095!=0 || frame==boot
+            || phys[..i].contains(&frame) {
+            fail("four_resident_duplicate_pmm_lease")
+        }
+        phys[i]=frame;
+    }
+    if pmm::statistics().allocated_frames!=before+OWNED {
+        fail("four_resident_wrong_pmm_count")
+    }
+
+    let mut arena=FourPidGuardedArena::new([phys[0],phys[1],phys[2]],boot)
+        .unwrap_or_else(|_|fail("four_resident_arena_root"));
+    let mut processes=ProcessTable::<FOUR,PER_PID>::new();
+    let mut contexts=UserContextBank::<FOUR>::new();
+    let mut stacks=[None;FOUR];
+    let mut leases=[[0u64;PER_PID];FOUR];
+    for i in 0..FOUR {
+        let n=3+i*4;
+        let owned=[phys[n],phys[n+1],phys[n+2],phys[n+3]];
+        let st=arena.reserve((i+1) as u64,owned)
+            .unwrap_or_else(|_|fail("four_resident_guarded_stack"));
+        let at=FOUR_PID_OWNED+i*PER_PID;
+        leases[i].copy_from_slice(&phys[at..at+PER_PID]);
+        let pid=processes.reserve(leases[i][0],leases[i])
+            .unwrap_or_else(|_|fail("four_resident_private_cr3_owner"));
+        if pid!=(i+1) as u64 {
+            fail("four_resident_wrong_pid")
+        }
+        stacks[i]=Some(st);
+    }
+    // SAFETY: BSP IF=0; reserved high-half PML4 slot is empty and no CPU
+    // can currently use any of these newly allocated high-half leaves.
+    unsafe {
+        for &p in &phys[..3] {
+            core::ptr::write_bytes(ptr(hhdm,p),0,PAGE as usize);
+        }
+        arena.publish(&mut *boot_root,&mut *root(hhdm,phys[0]),
+                      &mut *root(hhdm,phys[1]),&mut *root(hhdm,phys[2]))
+            .unwrap_or_else(|_|fail("four_resident_publish_guarded_stacks"));
+        arena.audit(&*boot_root,&*root(hhdm,phys[0]),
+                    &*root(hhdm,phys[1]),&*root(hhdm,phys[2]))
+            .unwrap_or_else(|_|fail("four_resident_audit_guarded_stacks"));
+    }
+    for i in 0..FOUR*6 { tlb::flush(VirtAddr::new(BASE+i as u64*PAGE)); }
+
+    for i in 0..FOUR {
+        prepare_elf(hhdm,leases[i],boot_root,i);
+        let st=stacks[i].unwrap_or_else(||fail("four_resident_missing_stack"));
+        let mut frame=UserSyscallFrame {
+            hardware:user_syscall_abi::InterruptReturn {
+                rip:entry(i),cs:cs as u64,rflags:2,
+                rsp:USER_TOP,ss:ss as u64,
+            },
+            ..UserSyscallFrame::default()
+        };
+        frame.registers.r12=0x5700_0000+i as u64;
+        frame.registers.r14=0x6400_0000+i as u64;
+        contexts.prepare_bootstrap(
+            &processes,(i+1) as u64,leases[i][0],
+            KernelStack{bottom:st.bottom,top:st.top},frame,
+        ).unwrap_or_else(|_|fail("four_resident_context_admission"));
+    }
+    if processes.occupied()!=FOUR || processes.running()!=0
+        || contexts.count()!=FOUR || arena.occupied()!=FOUR {
+        fail("four_resident_not_all_ready")
+    }
+    for i in 0..FOUR {
+        let to=(i+1) as u64;
+        let from=((i+1)%FOUR+1) as u64;
+        let plan=contexts.plan_selected(&processes,from,to,boot)
+            .unwrap_or_else(|_|fail("four_resident_context_selection"));
+        let st=stacks[i].unwrap_or_else(||fail("four_resident_missing_context_stack"));
+        if plan.pid!=to || plan.cr3_root!=leases[i][0]
+            || plan.rsp0!=st.top || plan.frame.hardware.rip!=entry(i)
+            || plan.frame.registers.r12!=0x5700_0000+i as u64
+            || plan.frame.registers.r14!=0x6400_0000+i as u64
+            || plan.frame.hardware.rsp!=USER_TOP {
+            fail("four_resident_cross_pid_frame_alias")
+        }
+    }
+    // Revoke READY ownership and invalidate every saved context before
+    // unmapping the shared supervisor arena. None ever reached CPL3.
+    for i in 0..FOUR {
+        let pid=(i+1) as u64;
+        if contexts.retire(&processes,pid).is_ok() {
+            fail("four_resident_live_context_retired")
+        }
+        let released=processes.cancel_ready(pid,boot)
+            .unwrap_or_else(|_|fail("four_resident_ready_cancel"));
+        if released!=leases[i] || contexts.retire(&processes,pid).is_err() {
+            fail("four_resident_revoke_ownership")
+        }
+    }
+    // SAFETY: no hardware user context was entered; boot CR3, BSP IF=0,
+    // no RSP/TSS use of these mappings. Complete unpublication precedes
+    // TLB invalidation, stack lease retirement and physical frame release.
+    unsafe {
+        arena.unpublish(&mut *boot_root,&mut *root(hhdm,phys[0]),
+                        &mut *root(hhdm,phys[1]),&mut *root(hhdm,phys[2]))
+            .unwrap_or_else(|_|fail("four_resident_unpublish"));
+    }
+    for i in 0..FOUR*6 { tlb::flush(VirtAddr::new(BASE+i as u64*PAGE)); }
+    for st in stacks.into_iter().flatten() {
+        if unsafe { arena.retire_after_quiescence(st.handle) }!=Ok(st.frames) {
+            fail("four_resident_guard_lease_retirement")
+        }
+    }
+    for owned in phys {
+        if pmm::free_frame(owned).is_err() {
+            fail("four_resident_double_free_or_leak")
+        }
+    }
+    if arena.occupied()!=0 || contexts.count()!=0
+        || processes.occupied()!=0 || actual_cr3()!=boot
+        || pmm::statistics().allocated_frames!=before
+        || unsafe{(*boot_root)[ROOT_INDEX]}!=0 {
+        fail("four_resident_cleanup_or_boot_cr3")
+    }
+    serial::write_line(
+        "WOLFOS_RING3_FOUR_RESIDENT_OK native_elf=4 private_cr3=4 guarded_rsp0=4 owned_frames=47 frame_gprs=4 executed=0 pmm_no_leak=1"
+    );
+}
+
 /// Enter first native ELF through a REAL IRETQ with BSP IF=0.
 /// On successful execution this function never returns.
 pub fn enter(hhdm:u64)->!{
@@ -529,6 +671,7 @@ pub fn enter(hhdm:u64)->!{
         {
             validate_four_nonyield_elf_admission();
             serial::write_line("WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2");
+            prove_four_resident_preflight(hhdm,boot,boot_root,cs,ss);
         }
     }
     let before=pmm::statistics().allocated_frames;
