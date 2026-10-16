@@ -153,6 +153,8 @@ struct Runtime{
     timer_busy:[u64;COUNT],
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     timer_preempts:[u64;COUNT],
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    first_exit_timer_counts:Option<[u64;COUNT]>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     rr:Ring3RunQueue<COUNT>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
@@ -962,6 +964,8 @@ pub fn enter(hhdm:u64)->!{
         timer_busy:[0;COUNT],
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         timer_preempts:[0;COUNT],
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        first_exit_timer_counts:None,
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         rr,
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
@@ -1114,6 +1118,16 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
         #[cfg(feature="p3-ring3-four-elf-live-smoke")]
         {
+            // Snapshot the genuine IRQ-source counts at the FIRST EXIT,
+            // while all four real users were still runnable. RR equality
+            // must be checked at this moment, not after early finishers stop
+            // accruing IRQs while survivors continue processing.
+            if s.exits.iter().all(|done| !*done) {
+                if s.first_exit_timer_counts.is_some() {
+                    fail("four_live_duplicate_first_exit_snapshot")
+                }
+                s.first_exit_timer_counts=Some(s.timer_preempts);
+            }
             let target=s.rr.exit_current(s.rr_handles[i])
                 .unwrap_or_else(|_|fail("four_live_exit_queue_owner"));
             let more=s.exits.iter().enumerate()
@@ -1214,30 +1228,38 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             #[cfg(feature="p3-ring3-four-elf-live-smoke")]
             {
                 let switches=s.timer_preempts.iter().sum::<u64>();
-                let lo=*s.timer_preempts.iter().min().unwrap();
-                let hi=*s.timer_preempts.iter().max().unwrap();
+                let first=s.first_exit_timer_counts
+                    .unwrap_or_else(||fail("four_live_missing_first_exit_evidence"));
+                let first_min=*first.iter().min().unwrap();
+                let first_max=*first.iter().max().unwrap();
+                let last_min=*s.timer_preempts.iter().min().unwrap();
                 let slots=s.rr.slots();
                 let bad_slot=slots.iter().enumerate().any(|(i,slot)|
                     slot.state!=RrState::Exited
                     || slot.handle!=s.rr_handles[i]
                     || slot.ticks!=s.timer_preempts[i]);
-                if switches<16 || lo<4 || hi-lo>4
+                // Strict FIFO round-robin fairness must hold WHILE all four
+                // PIDs are READY/RUNNING. After a PID legitimately EXITs,
+                // it cannot collect more IRQ counts; surviving users may
+                // accumulate additional authentic preemptions. Requiring
+                // equal *lifetime* counts would be mathematically wrong.
+                if switches<16 || last_min<4 || first_min<4
+                    || first_max-first_min>1
                     || s.rr.timer_switches()!=switches
                     || s.rr.running().is_some() || bad_slot {
-                    // Diagnostic only on a failed hardware acceptance.
-                    // Never weaken the IRQ/fairness assertion to achieve CI.
                     serial::write_fmt(format_args!(
-                        "WOLFOS_RING3_FOUR_DIAGNOSTIC total={} pids={:?} policy_switches={} ticks=[{},{},{},{}] lo={} hi={} running={:?} bad_slot={}\n",
-                        switches,s.timer_preempts,s.rr.timer_switches(),
+                        "WOLFOS_RING3_FOUR_DIAGNOSTIC total={} pids={:?} first_exit_pids={:?} policy_switches={} ticks=[{},{},{},{}] first_min={} first_spread={} running={:?} bad_slot={}\n",
+                        switches,s.timer_preempts,first,s.rr.timer_switches(),
                         slots[0].ticks,slots[1].ticks,slots[2].ticks,slots[3].ticks,
-                        lo,hi,s.rr.running(),bad_slot
+                        first_min,first_max-first_min,s.rr.running(),bad_slot
                     ));
                     fail("four_live_real_irq_fairness_or_ledger")
                 }
                 serial::write_fmt(format_args!(
-                    "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
+                    "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} fair_four_min={} fair_four_spread={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
                     switches,s.timer_preempts[0],s.timer_preempts[1],
-                    s.timer_preempts[2],s.timer_preempts[3]
+                    s.timer_preempts[2],s.timer_preempts[3],
+                    first_min,first_max-first_min
                 ));
             }
             #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
