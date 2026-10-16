@@ -63,6 +63,37 @@ def exit_markers_well_formed(output):
             and handoff.group(1) == first_pid
             and handoff.group(2) == second_pid)
 
+
+def ordered_evidence_lines(output, ordered):
+    """Require unique, ordered, entire serial evidence lines (not substrings).
+
+    RING_PREP carries additional audited descriptor metadata; the timer
+    HARDWARE line has variable counter values checked separately below.
+    Every other fixed marker must match its entire line exactly.
+    """
+    lines = output.splitlines()
+    positions = []
+    for expected in ordered:
+        stem = expected.split(" ", 1)[0]
+        # Look for the token ANYWHERE to catch a forged extra or embedded
+        # marker even if another genuine line is present.
+        matches = [(i, line) for i, line in enumerate(lines) if stem in line]
+        if len(matches) != 1:
+            return False
+        index, line = matches[0]
+        if not line.startswith(stem):
+            return False
+        if expected == PREFIX:
+            if not line.startswith(PREFIX):
+                return False
+        elif expected == "WOLFOS_RING_PREP_OK":
+            if not line.startswith(expected + " "):
+                return False
+        elif line != expected:
+            return False
+        positions.append(index)
+    return all(a < b for a, b in zip(positions, positions[1:]))
+
 def main():
     four_elf_preflight = len(sys.argv)==3 and sys.argv[2]=="--four-elf-preflight"
     if len(sys.argv) not in (2,3) or (len(sys.argv)==3 and not four_elf_preflight) or not Path(sys.argv[1]).is_file():
@@ -109,11 +140,8 @@ def main():
                 "WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2")
         elif "WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK" in output:
             return fail("four-ELF evidence unexpectedly appears in legacy two-ELF flavor")
-        locations = [output.find(x) for x in ordered]
-        if any(i < 0 for i in locations) or locations != sorted(locations):
-            return fail("required QEMU hardware evidence missing or out of order")
-        if any(output.count(x) != 1 for x in ordered):
-            return fail("duplicated hardware evidence marker")
+        if not ordered_evidence_lines(output, ordered):
+            return fail("required QEMU hardware evidence missing, malformed, duplicated or out of order")
         if not exit_markers_well_formed(output):
             return fail("malformed, duplicate, or unexpected EXIT evidence")
         exits = re.findall(
