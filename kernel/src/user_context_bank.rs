@@ -21,6 +21,13 @@ use standalone_table::ProcessTable;
 #[cfg(not(test))]
 use crate::process_table::ProcessTable;
 #[cfg(test)]
+#[path = "ring3_runqueue.rs"]
+mod standalone_runqueue;
+#[cfg(test)]
+use standalone_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
+#[cfg(not(test))]
+use crate::ring3_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
+#[cfg(test)]
 use standalone_table::standalone_process::ProcessState;
 #[cfg(not(test))]
 use crate::process_lifecycle::ProcessState;
@@ -37,7 +44,7 @@ pub enum ContextError {
     BadUserPointer, BadSelectors, BadFlags,
     BadKernelStack, KernelStackOverlap, FrameOutsideKernelStack,
     AlreadyPrepared, Full, NotPrepared, OnlyOnePrepared, ActiveUserCr3,
-    StaleProcess, NotRetired,
+    StaleProcess, NotRetired, SchedulerMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +267,51 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
         })
     }
 
+    /// Validate a scheduler-selected post-park handoff before any hardware
+    /// IRETQ/CR3/TSS/FX action. The *trusted trap handler* must have already
+    /// authenticated IRQ/syscall provenance, saved GPR/FX state, and parked
+    /// the source in the process registry. No hardware state is changed here.
+    ///
+    /// Require exact generation-safe source/destination queue handles and
+    /// one policy RUNNING target, then audit every runnable queue member
+    /// against resident PID/context ownership. EXited queue tombstones do not
+    /// need a live process record. This never attributes a hardware IRQ.
+    pub fn plan_queue_handoff<const N: usize>(
+        &self, table: &ProcessTable<SLOTS, N>,
+        queue: &Ring3RunQueue<SLOTS>,
+        from: RunHandle, to: RunHandle, actual_kernel_cr3: u64,
+    ) -> Result<ResumePlan, ContextError> {
+        if from.pid == 0 || to.pid == 0 || from == to {
+            return Err(ContextError::SchedulerMismatch)
+        }
+        let slots = queue.slots();
+        if queue.running() != Some(to)
+            || !slots.iter().any(|s| s.handle == from && s.state == RunState::Ready)
+            || !slots.iter().any(|s| s.handle == to && s.state == RunState::Running)
+        { return Err(ContextError::SchedulerMismatch) }
+        // All user contexts must be parked before privileged-state
+        // restoration. A RUNNING registry owner hidden behind an EXITED
+        // policy tombstone must not authorize a second CPU owner.
+        if table.running() != 0 {
+            return Err(ContextError::WrongState)
+        }
+
+        for slot in slots {
+            if !matches!(slot.state, RunState::Ready | RunState::Running) {
+                continue
+            }
+            let process = table.snapshot(slot.handle.pid).ok_or(ContextError::StaleProcess)?;
+            if process.state != ProcessState::Ready {
+                return Err(ContextError::WrongState)
+            }
+            let stored = self.snapshot(slot.handle.pid).ok_or(ContextError::NotPrepared)?;
+            if stored.cr3_root != process.cr3_root {
+                return Err(ContextError::StaleProcess)
+            }
+        }
+        self.plan_selected(table, from.pid, to.pid, actual_kernel_cr3)
+    }
+
     /// A context can be removed only after ProcessTable has revoked that
     /// PID via cancellation/reaping; never free a saved live trap frame.
     pub fn retire<const N: usize>(
@@ -299,6 +351,138 @@ mod tests {
         t.reserve(0x1000,frames(0x1000)).unwrap();
         t.reserve(0x10000,frames(0x10000)).unwrap();
         (t,UserContextBank::new())
+    }
+
+    #[test]
+    fn four_policy_handoffs_bind_generation_cr3_rsp0_and_full_gprs() {
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut contexts = UserContextBank::<4>::new();
+        let mut queue = Ring3RunQueue::<4>::new();
+        let mut handles = [RunHandle { pid: 0, generation: 0 }; 4];
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let bottom = 0xffff_8000_0300_0000;
+        for i in 0..4 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            handles[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 200 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(handles[0]));
+        for turn in 0..32 {
+            let from = handles[turn % 4];
+            let to = if turn % 2 == 0 {
+                queue.timer_tick(from).unwrap()
+            } else {
+                queue.voluntary_yield(from).unwrap()
+            };
+            assert_eq!(to, handles[(turn + 1) % 4]);
+            let planned = contexts.plan_queue_handoff(
+                &table, &queue, from, to, 0x90000,
+            ).unwrap();
+            assert_eq!(planned.pid, to.pid);
+            assert_eq!(planned.cr3_root, roots[(to.pid - 1) as usize]);
+            assert_eq!(planned.rsp0,
+                bottom + (to.pid - 1) * 0x10000 + KSTACK_BYTES);
+            assert_eq!(planned.frame.registers.rax, 200 + to.pid);
+            assert_eq!(planned.frame.registers.r12, (200 + to.pid) * 3);
+            assert_eq!(planned.origin, FrameOrigin::Bootstrap);
+        }
+        assert_eq!(queue.timer_switches(), 16,
+                   "voluntary syscall yields cannot forge timer switches");
+        assert_eq!(table.running(), 0,
+                   "policy-only planning cannot start actual user processes");
+        assert_eq!(contexts.count(), 4);
+    }
+
+    #[test]
+    fn wrong_generation_target_or_blocked_source_never_gets_a_resume_plan() {
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut contexts = UserContextBank::<4>::new();
+        let mut queue = Ring3RunQueue::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 4];
+        for i in 0..4 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(0xffff_8000_0400_0000 + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, pid),
+            ).unwrap();
+        }
+        queue.start_next().unwrap();
+        assert_eq!(queue.timer_tick(h[0]), Ok(h[1]));
+        let good = contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000);
+        assert_eq!(good.unwrap().pid, 2);
+        let forged_from = RunHandle { generation: h[0].generation + 1, ..h[0] };
+        let forged_to = RunHandle { generation: h[1].generation + 1, ..h[1] };
+        for (from, to) in [(forged_from, h[1]), (h[0], forged_to),
+                           (h[0], h[2]), (h[1], h[1])] {
+            assert_eq!(
+                contexts.plan_queue_handoff(&table, &queue, from, to, 0x90000),
+                Err(ContextError::SchedulerMismatch)
+            );
+        }
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], roots[2]),
+            Err(ContextError::ActiveUserCr3));
+        table.mark_running(h[2].pid, roots[2]).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::WrongState));
+        table.park_running(h[2].pid, roots[2]).unwrap();
+        table.cancel_ready(h[2].pid, 0x90000).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::StaleProcess));
+        assert_eq!(queue.running(), Some(h[1]));
+        assert_eq!(queue.timer_switches(), 1);
+    }
+
+    #[test]
+    fn absent_unrelated_context_and_blocked_source_fail_closed() {
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut contexts = UserContextBank::<4>::new();
+        let mut queue = Ring3RunQueue::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 4];
+        for i in 0..4 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            if i != 3 {
+                contexts.prepare_bootstrap(
+                    &table, pid, roots[i],
+                    stack(0xffff_8000_0500_0000 + (i as u64) * 0x10000),
+                    frame(0x401000 + (i as u64) * 0x1000, pid),
+                ).unwrap();
+            }
+        }
+        queue.start_next().unwrap();
+        assert_eq!(queue.timer_tick(h[0]), Ok(h[1]));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::NotPrepared),
+            "a missing fourth READY context invalidates the full ledger");
+        contexts.prepare_bootstrap(
+            &table, h[3].pid, roots[3],
+            stack(0xffff_8000_0503_0000),
+            frame(0x404000, 4),
+        ).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000)
+            .unwrap().pid, h[1].pid);
+        // A RUNNING table process hidden behind a non-runnable queue slot
+        // must not coexist with any planned new hardware activation.
+        queue.cancel(h[3]).unwrap();
+        table.mark_running(h[3].pid, roots[3]).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::WrongState));
+        table.park_running(h[3].pid, roots[3]).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000)
+            .unwrap().pid, h[1].pid);
+        // h1 becomes BLOCKED and h2 becomes RUNNING. A blocked source is
+        // not an authorized timer/yield handoff even if a target is runnable.
+        assert_eq!(queue.block_current(h[1]), Ok(Some(h[2])));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::SchedulerMismatch));
     }
 
     #[test]
