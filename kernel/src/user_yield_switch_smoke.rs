@@ -888,8 +888,14 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         fail("atomic_next_pid_activation")
     }
     s.current=next;
+    #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     serial::write_fmt(format_args!(
         "WOLFOS_RING3_YIELD_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
+        pid,next+1,
+    ));
+    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    serial::write_fmt(format_args!(
+        "WOLFOS_RING3_NONYIELD_EXIT_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
         pid,next+1,
     ));
     s.frames[next] as *mut UserSyscallFrame

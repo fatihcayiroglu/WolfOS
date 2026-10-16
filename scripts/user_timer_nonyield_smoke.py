@@ -79,9 +79,22 @@ def main():
         )
         if sorted(exits) != [("1", "16"), ("2", "16")]:
             return fail("both native ELF64 processes must actually EXIT once with progress 16")
-        if max(output.find("WOLFOS_RING3_NONYIELD_EXIT pid=1"),
-               output.find("WOLFOS_RING3_NONYIELD_EXIT pid=2")) > locations[6]:
+        exit_locations = [
+            output.find("WOLFOS_RING3_NONYIELD_EXIT pid=1"),
+            output.find("WOLFOS_RING3_NONYIELD_EXIT pid=2"),
+        ]
+        if max(exit_locations) > locations[6]:
             return fail("exit marker must precede final IRQ readiness evidence")
+        exit_switches = re.findall(
+            r"^WOLFOS_RING3_NONYIELD_EXIT_SWITCH from=([12]) to=([12]) "
+            r"private_cr3=1 tss_rsp0=1 fx_saved=1$",
+            output, flags=re.MULTILINE,
+        )
+        if len(exit_switches) != 1 or exit_switches[0][0] == exit_switches[0][1]:
+            return fail("first EXIT must activate the other remaining user PID exactly once")
+        switch_at = output.find("WOLFOS_RING3_NONYIELD_EXIT_SWITCH ")
+        if not (min(exit_locations) < switch_at < max(exit_locations)):
+            return fail("exit handoff must happen between two genuine user EXITs")
         lines = [line for line in output.splitlines() if line.startswith(PREFIX)]
         if len(lines) != 1:
             return fail("must have exactly one genuine timer switch evidence line")
