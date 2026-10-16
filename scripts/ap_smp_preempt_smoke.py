@@ -54,9 +54,6 @@ def main() -> int:
             print(f"FAIL: expected exactly one full-line AP SMP proof; found {len(matches)}")
             return 1
         proof = matches[0]
-        if proof is None:
-            print("FAIL: no genuine three-AP involuntary two-task IRQ proof")
-            return 1
         (cpus, aps, tasks, switches, a, b, ticks, eois,
          work, invalid, xmm_bad, spurious, wrong_ipi,
          offline, bsp_if, migrated, deferred, nested_aps,
