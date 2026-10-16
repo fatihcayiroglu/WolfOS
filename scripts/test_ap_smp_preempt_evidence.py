@@ -2,7 +2,7 @@
 """Offline adversarial tests for the AP SMP aggregate QEMU proof parser."""
 import unittest
 
-from ap_smp_preempt_smoke import unique_aggregate_proof
+from ap_smp_preempt_smoke import unique_aggregate_proof, prerequisite_smp_proof
 
 VALID = (
     "WOLFOS_AP_SMP_PREEMPT_OK cpus=4 aps=3 tasks_per_ap=2 "
@@ -40,6 +40,29 @@ class AggregateEvidenceTests(unittest.TestCase):
 
     def test_rejects_truncated(self):
         self.assertIsNone(unique_aggregate_proof(VALID.rsplit(" guard_depth=", 1)[0]))
+
+
+
+class PrerequisiteEvidenceTests(unittest.TestCase):
+    VALID = "WOLFOS_SMP_APS_OK total=4 bsp=1 aps=3"
+
+    def test_valid(self):
+        self.assertTrue(prerequisite_smp_proof(self.VALID))
+
+    def test_missing(self):
+        self.assertFalse(prerequisite_smp_proof("boot"))
+
+    def test_embedded(self):
+        self.assertFalse(prerequisite_smp_proof("log: " + self.VALID))
+
+    def test_duplicate(self):
+        self.assertFalse(prerequisite_smp_proof(self.VALID + "\n" + self.VALID))
+
+    def test_malformed_duplicate(self):
+        self.assertFalse(prerequisite_smp_proof(self.VALID + "\nWOLFOS_SMP_APS_OK total=4"))
+
+    def test_wrong_cpu_count(self):
+        self.assertFalse(prerequisite_smp_proof(self.VALID.replace("total=4", "total=3")))
 
 
 if __name__ == "__main__":

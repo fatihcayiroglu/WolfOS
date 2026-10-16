@@ -35,6 +35,12 @@ def unique_aggregate_proof(output: str):
     return matches[0] if len(matches) == 1 else None
 
 
+def prerequisite_smp_proof(output: str) -> bool:
+    """Require exactly one unembedded four-vCPU SMP prerequisite record."""
+    lines = [line for line in output.splitlines() if "WOLFOS_SMP_APS_OK" in line]
+    return len(lines) == 1 and lines[0].startswith("WOLFOS_SMP_APS_OK total=4 ")
+
+
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: ap_smp_preempt_smoke.py ISO")
@@ -62,7 +68,7 @@ def main() -> int:
 
         output = logfile.read_text(errors="replace") if logfile.exists() else ""
         print(output)
-        if "WOLFOS_SMP_APS_OK total=4 " not in output:
+        if not prerequisite_smp_proof(output):
             print("FAIL: prerequisite 4-vCPU SMP/CPU context tests not complete")
             return 1
         proof = unique_aggregate_proof(output)
