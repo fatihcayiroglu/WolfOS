@@ -44,8 +44,8 @@ HARDWARE_PATTERN = re.compile(
     r"private_cr3=4 tss_rsp0=4 fx_state=4 executed=4"
 )
 EOI_PATTERN = re.compile(
-    r"WOLFOS_RING3_FOUR_EOI_OK irq_received=(\\d+) eoi_writes=(\\d+) "
-    r"same_pid_iret=(\\d+) cross_pid_switches=(\\d+) drained=1"
+    r"WOLFOS_RING3_FOUR_EOI_OK irq_received=(\d+) eoi_writes=(\d+) "
+    r"same_pid_iret=(\d+) cross_pid_switches=(\d+) drained=1"
 )
 EXIT_PATTERN = re.compile(
     r"WOLFOS_RING3_FOUR_EXIT pid=([1-4]) progress=(\d+) "
