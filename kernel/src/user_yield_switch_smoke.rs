@@ -944,7 +944,7 @@ pub fn enter(hhdm:u64)->!{
             handles[i]=Some(q.admit((i+1) as u64)
                 .unwrap_or_else(|_|fail("rr_pid_admission")));
         }
-        if q.start_next()!=handles[0] {fail("rr_initial_pid")}
+        if q.start_next()!=Ok(handles[0].unwrap()) {fail("rr_initial_pid")}
         (q,handles.map(|h|h.unwrap()))
     };
     let state=Runtime{
