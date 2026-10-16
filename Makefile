@@ -375,6 +375,8 @@ test:
 	$(OUT)/user_xapic_high_tests
 	rustc --edition=2024 --test kernel/src/ring3_round_robin.rs -o $(OUT)/ring3_round_robin_tests
 	$(OUT)/ring3_round_robin_tests
+	rustc --edition=2024 --test kernel/src/ring3_runqueue.rs -o $(OUT)/ring3_runqueue_tests
+	$(OUT)/ring3_runqueue_tests
 	rustc --edition=2024 --test kernel/src/user_irq_preempt_contract.rs -o $(OUT)/user_irq_preempt_contract_tests
 	$(OUT)/user_irq_preempt_contract_tests
 	rustc --edition=2024 --test kernel/src/user_fx_bank.rs -o $(OUT)/user_fx_bank_tests
