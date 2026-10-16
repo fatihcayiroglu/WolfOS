@@ -163,26 +163,33 @@ class OrderedEvidenceTests(unittest.TestCase):
 FOUR_ELF = "WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2"
 FOUR_RESIDENT = ("WOLFOS_RING3_FOUR_RESIDENT_OK native_elf=4 private_cr3=4 "
                  "guarded_rsp0=4 owned_frames=47 frame_gprs=4 executed=0 pmm_no_leak=1")
+FOUR_POLICY_FX = ("WOLFOS_RING3_FOUR_POLICY_FX_OK processes=4 queue_handles=4 "
+                  "fx_images=4 simulated_timer_decisions=32 hardware_irqs=0 "
+                  "fx_wiped=4 executed=0")
 
 
 class FourResidentEvidenceTests(unittest.TestCase):
-    MARKERS = ("WOLFOS_BOOT_OK", FOUR_ELF, FOUR_RESIDENT,
+    MARKERS = ("WOLFOS_BOOT_OK", FOUR_ELF, FOUR_RESIDENT, FOUR_POLICY_FX,
                "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1")
-    VALID = ("WOLFOS_BOOT_OK", FOUR_ELF, FOUR_RESIDENT,
-             "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1")
+    VALID = MARKERS
 
     def check(self, rows):
         return ordered_evidence_lines("\n".join(rows), self.MARKERS)
 
     def test_four_resident_evidence_must_be_present_and_ordered(self):
         self.assertTrue(self.check(self.VALID))
-        self.assertFalse(self.check((self.VALID[0], self.VALID[1], self.VALID[3])))
-        self.assertFalse(self.check((self.VALID[0], self.VALID[2],
-                                     self.VALID[1], self.VALID[3])))
+        for missing in (1, 2, 3, 4):
+            self.assertFalse(self.check(tuple(
+                row for i, row in enumerate(self.VALID) if i != missing)))
+        for a, b in ((1, 2), (2, 3), (3, 4)):
+            rows = list(self.VALID)
+            rows[a], rows[b] = rows[b], rows[a]
+            self.assertFalse(self.check(rows))
 
     def test_four_resident_duplicate_or_embedded_forgery_is_rejected(self):
-        self.assertFalse(self.check(self.VALID + (FOUR_RESIDENT,)))
-        self.assertFalse(self.check(self.VALID + ("log: " + FOUR_RESIDENT,)))
+        for marker in (FOUR_RESIDENT, FOUR_POLICY_FX):
+            self.assertFalse(self.check(self.VALID + (marker,)))
+            self.assertFalse(self.check(self.VALID + ("log: " + marker,)))
 
     def test_resident_counts_and_execution_claims_are_immutable(self):
         for altered in (
@@ -194,7 +201,23 @@ class FourResidentEvidenceTests(unittest.TestCase):
             FOUR_RESIDENT.replace("pmm_no_leak=1", "pmm_no_leak=0"),
             FOUR_RESIDENT + " forged=1",
         ):
-            rows = (self.VALID[0], self.VALID[1], altered, self.VALID[3])
+            rows = (self.VALID[0], self.VALID[1], altered,
+                    self.VALID[3], self.VALID[4])
+            self.assertFalse(self.check(rows), altered)
+
+    def test_scheduler_fx_proof_cannot_claim_real_hardware_execution(self):
+        for altered in (
+            FOUR_POLICY_FX.replace("processes=4", "processes=2"),
+            FOUR_POLICY_FX.replace("queue_handles=4", "queue_handles=3"),
+            FOUR_POLICY_FX.replace("fx_images=4", "fx_images=2"),
+            FOUR_POLICY_FX.replace("simulated_timer_decisions=32", "simulated_timer_decisions=0"),
+            FOUR_POLICY_FX.replace("hardware_irqs=0", "hardware_irqs=32"),
+            FOUR_POLICY_FX.replace("fx_wiped=4", "fx_wiped=3"),
+            FOUR_POLICY_FX.replace("executed=0", "executed=4"),
+            FOUR_POLICY_FX + " forged=1",
+        ):
+            rows = (self.VALID[0], self.VALID[1], self.VALID[2],
+                    altered, self.VALID[4])
             self.assertFalse(self.check(rows), altered)
 
 
