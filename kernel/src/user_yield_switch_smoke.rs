@@ -9,7 +9,7 @@
 //! IRETQ resumes the other PID. Faults and unexpected syscalls fail closed.
 use core::{arch::asm,cell::UnsafeCell};
 #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-use crate::ring3_round_robin::{RoundRobin,State as RrState};
+use crate::ring3_runqueue::{Handle as RunHandle,Ring3RunQueue,State as RrState};
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
              instructions::segmentation::{CS,Segment},registers::control::Cr3};
 use crate::{
@@ -129,7 +129,9 @@ struct Runtime{
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     timer_preempts:[u64;COUNT],
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-    rr:RoundRobin,
+    rr:Ring3RunQueue<COUNT>,
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    rr_handles:[RunHandle;COUNT],
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // SAFETY: only one BSP may access the runtime; IF=0 from admission until
@@ -256,7 +258,7 @@ pub extern "C" fn observe_timer_irq(
         // on the departing PID's *own* guarded high-half kernel stack.
         // It is safe to retain across CR3 switches: this supervisor
         // high-half subtree is shared by BOTH sanitized process roots.
-        if s.rr.timer_tick(pid)!=Ok((next+1) as u64) {
+        if s.rr.timer_tick(s.rr_handles[i])!=Ok(s.rr_handles[next]) {
             fail("timer_policy_rejected_verified_irq_handoff")
         }
         s.frames[i]=raw as u64;
@@ -624,6 +626,14 @@ pub fn enter(hhdm:u64)->!{
     // SAFETY: preflight-mapped, fully reserved 16 KiB supervisor-only
     // upper-half stack leaf; frame is exactly bounded by its stack.
     unsafe{(second_frame as *mut UserSyscallFrame).write(bootstrap);}
+    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    let (rr,rr_handles)={
+        let mut q=Ring3RunQueue::<COUNT>::new();
+        let h1=q.admit(1).unwrap_or_else(|_|fail("rr_pid1_admission"));
+        let h2=q.admit(2).unwrap_or_else(|_|fail("rr_pid2_admission"));
+        if q.start_next()!=Ok(h1){fail("rr_initial_pid")}
+        (q,[h1,h2])
+    };
     let state=Runtime{
         boot,hhdm,original_rsp0:rsp0,boot_rsp,before,owned:phys,
         leases,stacks:[first,second],arena,processes,fx,
@@ -639,13 +649,9 @@ pub fn enter(hhdm:u64)->!{
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         timer_preempts:[0;COUNT],
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-        rr:{
-            let mut q=RoundRobin::new();
-            q.admit(1).unwrap_or_else(|_|fail("rr_pid1_admission"));
-            q.admit(2).unwrap_or_else(|_|fail("rr_pid2_admission"));
-            q.start(1).unwrap_or_else(|_|fail("rr_initial_pid"));
-            q
-        },
+        rr,
+        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        rr_handles,
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
@@ -773,7 +779,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             fail("nonsequential_yield_or_park")
         }
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-        if s.rr.voluntary_yield(pid)!=Ok((2-i) as u64) {
+        if s.rr.voluntary_yield(s.rr_handles[i])!=Ok(s.rr_handles[1-i]) {
             fail("rr_voluntary_handoff_out_of_sync")
         }
         s.yields[i]=val;
@@ -785,7 +791,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             fail("early_or_bad_exit")
         }
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-        if s.rr.exit(pid)!=Ok(if s.exits[1-i]{None}else{Some((2-i) as u64)}) {
+        if s.rr.exit_current(s.rr_handles[i])!=Ok(if s.exits[1-i]{None}else{Some(s.rr_handles[1-i])}) {
             fail("rr_exit_handoff_out_of_sync")
         }
         s.exits[i]=true;
@@ -849,8 +855,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     fail("missing_two_real_involuntary_pid_switches")
                 }
                 let slots=s.rr.slots();
-                if s.rr.switches()!=10 || s.rr.running().is_some()
-                   || slots[0].pid!=1 || slots[1].pid!=2
+                if s.rr.timer_switches()!=2 || s.rr.running().is_some()
+                   || slots[0].handle!=s.rr_handles[0] || slots[1].handle!=s.rr_handles[1]
                    || slots[0].state!=RrState::Exited
                    || slots[1].state!=RrState::Exited
                    || slots[0].ticks!=1 || slots[1].ticks!=1 {
@@ -868,9 +874,11 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 let slots=s.rr.slots();
                 if switches<8 || s.timer_preempts.iter().any(|&n|n<4)
                     || s.timer_preempts[0].abs_diff(s.timer_preempts[1])>1
-                    || s.rr.switches()!=switches || s.rr.running().is_some()
+                    || s.rr.timer_switches()!=switches || s.rr.running().is_some()
                     || slots[0].state!=RrState::Exited
                     || slots[1].state!=RrState::Exited
+                    || slots[0].handle!=s.rr_handles[0]
+                    || slots[1].handle!=s.rr_handles[1]
                     || slots[0].ticks!=s.timer_preempts[0]
                     || slots[1].ticks!=s.timer_preempts[1] {
                     fail("nonyield_hardware_rr_fairness_or_ledger")
@@ -911,7 +919,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
     }
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
-    if s.rr.running()!=Some((next+1) as u64) {
+    if s.rr.running()!=Some(s.rr_handles[next]) {
         fail("rr_selected_pid_differs_from_hardware_target")
     }
     if s.frames[next]==0||s.frames[next]!=
