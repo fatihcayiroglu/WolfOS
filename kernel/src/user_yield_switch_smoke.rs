@@ -786,6 +786,9 @@ pub fn enter(hhdm:u64)->!{
         #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
         {
             validate_four_nonyield_elf_admission();
+            #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+            serial::write_line("WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=0");
+            #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
             serial::write_line("WOLFOS_RING3_FOUR_ELF_PREFLIGHT_OK native_elf=4 unique_binaries=4 strict_loader=1 rx=4 rw_nx=4 executed=2");
             prove_four_resident_preflight(hhdm,boot,boot_root,cs,ss);
         }
@@ -876,7 +879,6 @@ pub fn enter(hhdm:u64)->!{
     // CPU modifies accessed/dirty PTE bits during these stack accesses,
     // which the audited arena already tolerates, while still denying U/S.
     let first=stacks[0].unwrap_or_else(||fail("pid1_missing_stack"));
-    let second=stacks[1].unwrap_or_else(||fail("pid2_missing_stack"));
     #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     let pic_before=[pic_read(0x21),pic_read(0xa1)];
     #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
@@ -905,30 +907,39 @@ pub fn enter(hhdm:u64)->!{
     let entry_flags=IRQ_USER_RFLAGS;
     #[cfg(not(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
     let entry_flags=2u64;
-    let bootstrap=UserSyscallFrame{
-        hardware:user_syscall_abi::InterruptReturn{
-            rip:entry(1),cs:cs as u64,rflags:entry_flags,
-            rsp:USER_TOP,ss:ss as u64,
-        },
-        ..UserSyscallFrame::default()
-    };
-    let second_frame=second.top-user_syscall_abi::FRAME_BYTES as u64;
-    // SAFETY: preflight-mapped, fully reserved 16 KiB supervisor-only
-    // upper-half stack leaf; frame is exactly bounded by its stack.
-    unsafe{(second_frame as *mut UserSyscallFrame).write(bootstrap);}
+    let mut saved_frames=[0u64;COUNT];
+    for i in 1..COUNT {
+        let st=stacks[i].unwrap_or_else(||fail("missing_user_stack"));
+        let bootstrap=UserSyscallFrame{
+            hardware:user_syscall_abi::InterruptReturn{
+                rip:entry(i),cs:cs as u64,rflags:entry_flags,
+                rsp:USER_TOP,ss:ss as u64,
+            },
+            ..UserSyscallFrame::default()
+        };
+        let frame=st.top-user_syscall_abi::FRAME_BYTES as u64;
+        // SAFETY: independently PMM-backed and mapped supervisor-only leaf.
+        // No other CPU/user process can access this pre-IRET frame.
+        unsafe{(frame as *mut UserSyscallFrame).write(bootstrap);}
+        saved_frames[i]=frame;
+    }
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     let (rr,rr_handles)={
         let mut q=Ring3RunQueue::<COUNT>::new();
-        let h1=q.admit(1).unwrap_or_else(|_|fail("rr_pid1_admission"));
-        let h2=q.admit(2).unwrap_or_else(|_|fail("rr_pid2_admission"));
-        if q.start_next()!=Ok(h1){fail("rr_initial_pid")}
-        (q,[h1,h2])
+        let mut handles=[None;COUNT];
+        for i in 0..COUNT {
+            handles[i]=Some(q.admit((i+1) as u64)
+                .unwrap_or_else(|_|fail("rr_pid_admission")));
+        }
+        if q.start_next()!=handles[0] {fail("rr_initial_pid")}
+        (q,handles.map(|h|h.unwrap()))
     };
     let state=Runtime{
         boot,hhdm,original_rsp0:rsp0,boot_rsp,before,owned:phys,
-        leases,stacks:[first,second],arena,processes,fx,
-        fx_tokens:[tokens[0].unwrap(),tokens[1].unwrap()],
-        control,frames:[0,second_frame],current:0,
+        leases,stacks:stacks.map(|x|x.unwrap_or_else(||fail("missing_runtime_stack"))),
+        arena,processes,fx,
+        fx_tokens:tokens.map(|x|x.unwrap_or_else(||fail("missing_fx_image"))),
+        control,frames:saved_frames,current:0,
         yields:[0;COUNT],exits:[false;COUNT],hardware_traps:0,
         #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
         pic_before,
