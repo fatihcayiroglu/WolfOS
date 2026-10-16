@@ -21,6 +21,13 @@ use standalone_table::ProcessTable;
 #[cfg(not(test))]
 use crate::process_table::ProcessTable;
 #[cfg(test)]
+#[path = "ring3_runqueue.rs"]
+mod standalone_runqueue;
+#[cfg(test)]
+use standalone_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
+#[cfg(not(test))]
+use crate::ring3_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
+#[cfg(test)]
 use standalone_table::standalone_process::ProcessState;
 #[cfg(not(test))]
 use crate::process_lifecycle::ProcessState;
@@ -37,7 +44,7 @@ pub enum ContextError {
     BadUserPointer, BadSelectors, BadFlags,
     BadKernelStack, KernelStackOverlap, FrameOutsideKernelStack,
     AlreadyPrepared, Full, NotPrepared, OnlyOnePrepared, ActiveUserCr3,
-    StaleProcess, NotRetired,
+    StaleProcess, NotRetired, SchedulerMismatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -258,6 +265,45 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             rsp0: selected.kernel_stack.top, frame: selected.frame,
             origin: selected.origin,
         })
+    }
+
+    /// Validate a scheduler-selected post-park handoff before any hardware
+    /// IRETQ/CR3/TSS/FX action. The *trusted trap handler* must have already
+    /// authenticated IRQ/syscall provenance, saved GPR/FX state, and parked
+    /// the source in the process registry. No hardware state is changed here.
+    ///
+    /// Require exact generation-safe source/destination queue handles and
+    /// one policy RUNNING target, then audit every runnable queue member
+    /// against resident PID/context ownership. EXited queue tombstones do not
+    /// need a live process record. This never attributes a hardware IRQ.
+    pub fn plan_queue_handoff<const N: usize>(
+        &self, table: &ProcessTable<SLOTS, N>,
+        queue: &Ring3RunQueue<SLOTS>,
+        from: RunHandle, to: RunHandle, actual_kernel_cr3: u64,
+    ) -> Result<ResumePlan, ContextError> {
+        if from.pid == 0 || to.pid == 0 || from == to {
+            return Err(ContextError::SchedulerMismatch)
+        }
+        let slots = queue.slots();
+        if queue.running() != Some(to)
+            || !slots.iter().any(|s| s.handle == from && s.state == RunState::Ready)
+            || !slots.iter().any(|s| s.handle == to && s.state == RunState::Running)
+        { return Err(ContextError::SchedulerMismatch) }
+
+        for slot in slots {
+            if !matches!(slot.state, RunState::Ready | RunState::Running) {
+                continue
+            }
+            let process = table.snapshot(slot.handle.pid).ok_or(ContextError::StaleProcess)?;
+            if process.state != ProcessState::Ready {
+                return Err(ContextError::WrongState)
+            }
+            let stored = self.snapshot(slot.handle.pid).ok_or(ContextError::NotPrepared)?;
+            if stored.cr3_root != process.cr3_root {
+                return Err(ContextError::StaleProcess)
+            }
+        }
+        self.plan_selected(table, from.pid, to.pid, actual_kernel_cr3)
     }
 
     /// A context can be removed only after ProcessTable has revoked that
