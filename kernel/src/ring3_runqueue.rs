@@ -221,6 +221,96 @@ mod tests {
     use super::*;
 
     #[test]
+    fn four_tasks_get_exact_two_irq_time_slices_without_fake_switches() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let h = [1, 2, 3, 4].map(|pid| q.admit(pid).unwrap());
+        assert_eq!(q.start_next(), Ok(h[0]));
+        for turn in 0..32 {
+            let from = h[turn % 4];
+            let to = h[(turn + 1) % 4];
+            assert_eq!(q.timer_quantum_tick(from, 2), Ok(from),
+                       "the first authenticated timer IRQ must stay on its PID");
+            assert_eq!(q.current_slice_ticks(), 1);
+            assert_eq!(q.timer_switches(), turn as u64);
+            assert_eq!(q.timer_quantum_tick(from, 2), Ok(to),
+                       "the second timer IRQ must rotate to a ready peer");
+            assert_eq!(q.current_slice_ticks(), 0);
+            assert_eq!(q.timer_switches(), turn as u64 + 1);
+        }
+        for slot in q.slots() {
+            assert_eq!(slot.ticks, 16, "charge ALL IRQs to the interrupted PID");
+        }
+        for (i, handle) in h.iter().enumerate() {
+            assert_eq!(q.exit_current(*handle), Ok(h.get(i + 1).copied()));
+        }
+        assert_eq!(q.timer_switches(), 32, "EXIT never forges an IRQ switch");
+        assert_eq!(q.current_slice_ticks(), 0);
+    }
+
+    #[test]
+    fn pending_quantum_is_reset_on_yield_block_and_exit() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let a = q.admit(1).unwrap();
+        let b = q.admit(2).unwrap();
+        q.start_next().unwrap();
+        assert_eq!(q.timer_quantum_tick(a, 3), Ok(a));
+        assert_eq!(q.current_slice_ticks(), 1);
+        assert_eq!(q.voluntary_yield(a), Ok(b));
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.timer_quantum_tick(b, 3), Ok(b));
+        assert_eq!(q.block_current(b), Ok(Some(a)));
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.timer_quantum_tick(a, 3), Ok(a));
+        assert_eq!(q.exit_current(a), Ok(None));
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.timer_switches(), 0);
+    }
+
+    #[test]
+    fn quantum_deadline_without_ready_peer_is_capped_and_wakeup_can_rotate() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let a = q.admit(1).unwrap();
+        q.start_next().unwrap();
+        for _ in 0..10 {
+            assert_eq!(q.timer_quantum_tick(a, 3), Ok(a));
+        }
+        assert_eq!(q.current_slice_ticks(), 3);
+        assert_eq!(q.timer_switches(), 0);
+        assert_eq!(q.slots()[0].ticks, 10);
+        let b = q.admit(2).unwrap();
+        assert_eq!(q.timer_quantum_tick(a, 3), Ok(b));
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.timer_switches(), 1);
+        assert_eq!(q.slots()[0].ticks, 11);
+    }
+
+    #[test]
+    fn quantum_errors_and_overflow_never_mutate_any_field() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let a = q.admit(1).unwrap();
+        let b = q.admit(2).unwrap();
+        q.start_next().unwrap();
+        let before = q;
+        assert_eq!(q.timer_quantum_tick(a, 0), Err(Error::InvalidQuantum));
+        assert_eq!(q.timer_quantum_tick(b, 2), Err(Error::Stale));
+        assert_eq!(q, before);
+        q.slots[0].ticks = u64::MAX;
+        let before = q;
+        assert_eq!(q.timer_quantum_tick(a, 2), Err(Error::Overflow));
+        assert_eq!(q, before);
+        q.slots[0].ticks = 0;
+        q.slice_ticks = u64::MAX;
+        let before = q;
+        assert_eq!(q.timer_quantum_tick(a, 2), Err(Error::Overflow));
+        assert_eq!(q, before);
+        q.slice_ticks = 1;
+        q.switches = u64::MAX;
+        let before = q;
+        assert_eq!(q.timer_quantum_tick(a, 2), Err(Error::Overflow));
+        assert_eq!(q, before);
+    }
+
+    #[test]
     fn four_task_cooperative_handoffs_do_not_forge_timer_switches() {
         let mut q = Ring3RunQueue::<4>::new();
         let h = [11, 22, 33, 44].map(|pid| q.admit(pid).unwrap());
