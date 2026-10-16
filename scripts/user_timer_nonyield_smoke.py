@@ -47,7 +47,15 @@ def exit_markers_well_formed(output):
         return False
     exit_pids = {re.search(r"pid=([12])", line).group(1) for line in exits}
     handoff = re.search(r"from=([12]) to=([12])", handoffs[0])
-    return exit_pids == {"1", "2"} and handoff.group(1) != handoff.group(2)
+    first_pid = re.search(r"pid=([12])", exits[0]).group(1)
+    second_pid = re.search(r"pid=([12])", exits[1]).group(1)
+    first_at = lines.index(exits[0])
+    switch_at = lines.index(handoffs[0])
+    second_at = lines.index(exits[1])
+    return (exit_pids == {"1", "2"}
+            and first_at < switch_at < second_at
+            and handoff.group(1) == first_pid
+            and handoff.group(2) == second_pid)
 
 def main():
     four_elf_preflight = len(sys.argv)==3 and sys.argv[2]=="--four-elf-preflight"
