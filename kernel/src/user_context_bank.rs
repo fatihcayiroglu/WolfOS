@@ -230,6 +230,36 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             rsp0: next.kernel_stack.top, frame: next.frame, origin: next.origin })
     }
 
+    /// Plan an explicitly selected READY PID from a trusted scheduler policy.
+    /// This is metadata only: it does NOT prove a timer IRQ, load CR3, switch
+    /// TSS/FX state, or execute IRETQ. The caller must independently check the
+    /// scheduler's generation-safe handle and authenticate both trap frames.
+    ///
+    /// Validate the *whole* resident bank first (including a stale unrelated
+    /// context), then refuse the current PID or any non-READY destination.
+    /// A policy may choose a different READY PID than the PID-order fallback.
+    pub fn plan_selected<const N: usize>(
+        &self, table: &ProcessTable<SLOTS,N>,
+        current_pid: u64, selected_pid: u64, actual_kernel_cr3: u64,
+    ) -> Result<ResumePlan, ContextError> {
+        if selected_pid == 0 || selected_pid == current_pid {
+            return Err(ContextError::InvalidPid)
+        }
+        // plan_next audits every prepared context and verifies that the
+        // supplied supervisor root is not owned by ANY live user process.
+        let _ = self.plan_next(table, current_pid, actual_kernel_cr3)?;
+        let selected = self.snapshot(selected_pid).ok_or(ContextError::NotPrepared)?;
+        let process = table.snapshot(selected_pid).ok_or(ContextError::StaleProcess)?;
+        if process.state != ProcessState::Ready {
+            return Err(ContextError::WrongState)
+        }
+        Ok(ResumePlan {
+            pid: selected.pid, cr3_root: selected.cr3_root,
+            rsp0: selected.kernel_stack.top, frame: selected.frame,
+            origin: selected.origin,
+        })
+    }
+
     /// A context can be removed only after ProcessTable has revoked that
     /// PID via cancellation/reaping; never free a saved live trap frame.
     pub fn retire<const N: usize>(
@@ -269,6 +299,73 @@ mod tests {
         t.reserve(0x1000,frames(0x1000)).unwrap();
         t.reserve(0x10000,frames(0x10000)).unwrap();
         (t,UserContextBank::new())
+    }
+
+    #[test]
+    fn four_private_contexts_follow_explicit_non_pid_order_selection() {
+        let mut t = ProcessTable::<4, 7>::new();
+        let mut bank = UserContextBank::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let bottom = 0xffff_8000_0100_0000;
+        for i in 0..4 {
+            let pid = t.reserve(roots[i], frames(roots[i])).unwrap();
+            assert_eq!(pid, (i + 1) as u64);
+            bank.prepare_bootstrap(&t, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 100 + pid)).unwrap();
+        }
+        // Deliberately NOT the PID-order sequence used by plan_next.
+        for (from, to) in [(1, 4), (4, 2), (2, 3), (3, 1)] {
+            let selected = bank.plan_selected(&t, from, to, 0x90000).unwrap();
+            assert_eq!(selected.pid, to);
+            assert_eq!(selected.cr3_root, roots[(to - 1) as usize]);
+            assert_eq!(selected.rsp0,
+                bottom + ((to - 1) as u64) * 0x10000 + KSTACK_BYTES);
+            assert_eq!(selected.frame.registers.rax, 100 + to);
+            assert_eq!(selected.frame.registers.r12, (100 + to) * 3);
+            assert_eq!(selected.origin, FrameOrigin::Bootstrap);
+        }
+        assert_eq!(bank.count(), 4);
+        assert_eq!(t.occupied(), 4);
+        assert_eq!(t.running(), 0);
+    }
+
+    #[test]
+    fn selected_context_refuses_running_stale_and_unprepared_targets() {
+        let mut t = ProcessTable::<4, 7>::new();
+        let mut bank = UserContextBank::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        for i in 0..4 {
+            let pid = t.reserve(roots[i], frames(roots[i])).unwrap();
+            bank.prepare_bootstrap(&t, pid, roots[i],
+                stack(0xffff_8000_0200_0000 + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, pid)).unwrap();
+        }
+        let first = bank.snapshot(1).unwrap();
+        assert_eq!(bank.plan_selected(&t, 1, 1, 0x90000),
+            Err(ContextError::InvalidPid));
+        assert_eq!(bank.plan_selected(&t, 1, 0, 0x90000),
+            Err(ContextError::InvalidPid));
+        assert_eq!(bank.plan_selected(&t, 1, 99, 0x90000),
+            Err(ContextError::NotPrepared));
+        assert_eq!(bank.plan_selected(&t, 1, 2, roots[2]),
+            Err(ContextError::ActiveUserCr3));
+        assert_eq!(bank.plan_selected(&t, 99, 2, 0x90000),
+            Err(ContextError::NotPrepared));
+        t.mark_running(4, roots[3]).unwrap();
+        assert_eq!(bank.plan_selected(&t, 1, 4, 0x90000),
+            Err(ContextError::WrongState));
+        t.park_running(4, roots[3]).unwrap();
+        t.cancel_ready(3, 0x90000).unwrap();
+        // A revoked unrelated PID invalidates the *whole* context bank.
+        assert_eq!(bank.plan_selected(&t, 1, 2, 0x90000),
+            Err(ContextError::StaleProcess));
+        bank.retire(&t, 3).unwrap();
+        assert_eq!(bank.plan_selected(&t, 1, 3, 0x90000),
+            Err(ContextError::NotPrepared));
+        assert_eq!(bank.plan_selected(&t, 1, 2, 0x90000).unwrap().pid, 2);
+        assert_eq!(bank.snapshot(1), Some(first));
+        assert_eq!(bank.count(), 3);
     }
 
     #[test]
