@@ -91,7 +91,7 @@ fn pic_write(port:u16,value:u8){
         options(nostack,nomem,preserves_flags));}
 }
 
-const TRAPS:usize=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {2}else{10};
+const TRAPS:usize=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {COUNT}else{10};
 const ROUNDS:u64=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {16}else{4};
 #[cfg(feature="p3-ring3-four-elf-live-smoke")]
 const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002,
@@ -177,8 +177,17 @@ pub fn timer_irq_active()->bool{
 fn user_busy(pid:usize)->(u64,u64){
     #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
     {
-        if pid==0{(noyield_sym::PID1_WORK_BEGIN,noyield_sym::PID1_WORK_END)}
-        else{(noyield_sym::PID2_WORK_BEGIN,noyield_sym::PID2_WORK_END)}
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        {match pid {
+            0=>(noyield_sym::PID1_WORK_BEGIN,noyield_sym::PID1_WORK_END),
+            1=>(noyield_sym::PID2_WORK_BEGIN,noyield_sym::PID2_WORK_END),
+            2=>(noyield_sym::PID3_WORK_BEGIN,noyield_sym::PID3_WORK_END),
+            3=>(noyield_sym::PID4_WORK_BEGIN,noyield_sym::PID4_WORK_END),
+            _=>fail("four_live_invalid_busy_pid"),
+        }}
+        #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+        {if pid==0{(noyield_sym::PID1_WORK_BEGIN,noyield_sym::PID1_WORK_END)}
+        else{(noyield_sym::PID2_WORK_BEGIN,noyield_sym::PID2_WORK_END)}}
     }
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     {
@@ -797,7 +806,9 @@ pub fn enter(hhdm:u64)->!{
     {
         let phys_apic=crate::apic_timer_smoke::trusted_user_xapic_base()
             .unwrap_or_else(||fail("no_verified_bsp_xapic_physical_base"));
-        let apic_pages=[phys[25],phys[26],phys[27]];
+        let apic_pages=[phys[ARENA_FRAMES+COUNT*PER_PID],
+            phys[ARENA_FRAMES+COUNT*PER_PID+1],
+            phys[ARENA_FRAMES+COUNT*PER_PID+2]];
         // SAFETY: three exclusive PMM frames, no active private roots,
         // original boot CR3, interrupts masked and validated LAPIC physical
         // base from the current hardware/ACPI probe.
@@ -858,7 +869,7 @@ pub fn enter(hhdm:u64)->!{
             &*root(hhdm,phys[1]),&*root(hhdm,phys[2]))
             .unwrap_or_else(|_|fail("guard_root_audit"));
     }
-    for i in 0..12{tlb::flush(VirtAddr::new(BASE+i*PAGE));}
+    for i in 0..COUNT*6{tlb::flush(VirtAddr::new(BASE+i as u64*PAGE));}
     for i in 0..COUNT {
         prepare_elf(hhdm,leases[i],boot_root,i);
     }
@@ -1265,7 +1276,7 @@ extern "C" fn finalize()->! {
             &mut *root(s.hhdm,s.owned[2]),
         ).unwrap_or_else(|_|fail("retire_guarded_root"));
     }
-    for i in 0..12{tlb::flush(VirtAddr::new(BASE+i*PAGE));}
+    for i in 0..COUNT*6{tlb::flush(VirtAddr::new(BASE+i as u64*PAGE));}
     for i in 0..COUNT{
         // SAFETY: first restore BSP escape stack, original CR3/TSS/FX,
         // finish ALL CPL3 tasks, retire their active roots, unpublish and
@@ -1284,7 +1295,9 @@ extern "C" fn finalize()->! {
         // safe stack, users are EXITED, and timer's LVT is masked.
         unsafe{
             crate::user_xapic_high::unpublish(
-                s.hhdm,s.boot,[s.owned[25],s.owned[26],s.owned[27]]
+                s.hhdm,s.boot,[s.owned[ARENA_FRAMES+COUNT*PER_PID],
+                    s.owned[ARENA_FRAMES+COUNT*PER_PID+1],
+                    s.owned[ARENA_FRAMES+COUNT*PER_PID+2]]
             ).unwrap_or_else(|_|fail("high_mmio_teardown"));
         }
         serial::write_line(
