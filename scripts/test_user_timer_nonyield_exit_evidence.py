@@ -2,7 +2,7 @@
 """Offline regression tests for strict QEMU Ring3 EXIT evidence validation."""
 import unittest
 
-from user_timer_nonyield_smoke import exit_markers_well_formed
+from user_timer_nonyield_smoke import exit_markers_well_formed, ordered_evidence_lines, PREFIX
 
 EXIT1 = "WOLFOS_RING3_NONYIELD_EXIT pid=1 progress=10 private_cr3=1 rsp0_guarded=1"
 EXIT2 = "WOLFOS_RING3_NONYIELD_EXIT pid=2 progress=20 private_cr3=1 rsp0_guarded=1"
@@ -76,6 +76,69 @@ class ExitEvidenceTests(unittest.TestCase):
         malformed = SWITCH.replace("SWITCH from=", "SWITCH" + chr(9) + "from=")
         self.assertFalse(exit_markers_well_formed('\n'.join(
             (EXIT1, SWITCH, EXIT2, malformed))))
+
+
+
+# Synthetic unit-test evidence: the real hardware smoke uses the full ordered
+# set and independently validates actual IRQ counters and process state.
+ORDERED_MARKERS = (
+    "WOLFOS_BOOT_OK",
+    "WOLFOS_RING_PREP_OK",
+    "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1",
+    PREFIX,
+    "WOLFOS_RING3_TIMER_CLEANUP_OK actual_irq_eoi=1",
+)
+VALID_EVIDENCE = (
+    "WOLFOS_BOOT_OK",
+    "WOLFOS_RING_PREP_OK tr=0x18 user_cs=0x33",
+    "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1",
+    "WOLFOS_RING3_NONYIELD_HARDWARE_OK timer_switches=8 pid1=4 pid2=4",
+    "WOLFOS_RING3_TIMER_CLEANUP_OK actual_irq_eoi=1",
+)
+
+
+class OrderedEvidenceTests(unittest.TestCase):
+    def check(self, lines):
+        return ordered_evidence_lines('\n'.join(lines), ORDERED_MARKERS)
+
+    def test_accepts_unique_ordered_full_lines_with_dynamic_counters(self):
+        self.assertTrue(self.check(VALID_EVIDENCE))
+
+    def test_rejects_missing_marker(self):
+        self.assertFalse(self.check(VALID_EVIDENCE[1:]))
+
+    def test_rejects_reordered_marker(self):
+        rows = list(VALID_EVIDENCE)
+        rows[1], rows[2] = rows[2], rows[1]
+        self.assertFalse(self.check(rows))
+
+    def test_rejects_evidence_embedded_mid_line(self):
+        rows = list(VALID_EVIDENCE)
+        rows[0] = "prefix: " + rows[0]
+        self.assertFalse(self.check(rows))
+
+    def test_rejects_embedded_duplicate_beside_genuine_evidence(self):
+        self.assertFalse(self.check(VALID_EVIDENCE + ("diagnostic: " + VALID_EVIDENCE[0],)))
+
+    def test_rejects_duplicate_with_altered_suffix(self):
+        self.assertFalse(self.check(VALID_EVIDENCE + ("WOLFOS_BOOT_OK forged=1",)))
+
+    def test_rejects_modified_static_metadata(self):
+        rows = list(VALID_EVIDENCE)
+        rows[2] = "WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=0"
+        self.assertFalse(self.check(rows))
+
+    def test_rejects_truncated_dynamic_marker(self):
+        rows = list(VALID_EVIDENCE)
+        rows[3] = "WOLFOS_RING3_NONYIELD_HARDWARE_OK"
+        self.assertFalse(self.check(rows))
+
+    def test_rejects_descriptor_marker_without_metadata_delimiter(self):
+        rows = list(VALID_EVIDENCE)
+        rows[1] = "WOLFOS_RING_PREP_OK"
+        self.assertFalse(self.check(rows))
+
+
 
 
 if __name__ == '__main__':
