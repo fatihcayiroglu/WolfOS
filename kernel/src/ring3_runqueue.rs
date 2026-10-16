@@ -187,6 +187,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn four_task_cooperative_handoffs_do_not_forge_timer_switches() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let h = [11, 22, 33, 44].map(|pid| q.admit(pid).unwrap());
+        assert_eq!(q.start_next(), Ok(h[0]));
+        for i in 0..4 {
+            assert_eq!(q.voluntary_yield(h[i]), Ok(h[(i + 1) % 4]));
+        }
+        assert_eq!(q.timer_switches(), 0);
+        assert!(q.slots().iter().all(|slot| slot.ticks == 0));
+        assert_eq!(q.timer_tick(h[0]), Ok(h[1]));
+        assert_eq!(q.voluntary_yield(h[1]), Ok(h[2]));
+        assert_eq!(q.timer_tick(h[2]), Ok(h[3]));
+        assert_eq!(q.timer_switches(), 2);
+        assert_eq!(q.slots().map(|s| s.ticks), [1, 0, 1, 0]);
+        for i in [3, 0, 1, 2] {
+            let next = q.exit_current(h[i]).unwrap();
+            assert_eq!(next, if i == 2 { None } else { Some(h[(i + 1) % 4]) });
+        }
+        assert_eq!(q.running(), None);
+        assert_eq!(q.timer_switches(), 2);
+    }
+
+    #[test]
+    fn yield_requires_live_running_handle_and_ready_peer_without_mutation() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let a = q.admit(1).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        let mut before = q;
+        assert_eq!(q.voluntary_yield(a), Err(Error::NoRunnable));
+        assert_eq!(q.voluntary_yield(Handle { pid: 2, generation: 7 }), Err(Error::Stale));
+        assert_eq!(q, before);
+        let b = q.admit(2).unwrap();
+        assert_eq!(q.block_current(a), Ok(Some(b)));
+        before = q;
+        assert_eq!(q.voluntary_yield(a), Err(Error::Stale));
+        assert_eq!(q.voluntary_yield(b), Err(Error::NoRunnable));
+        assert_eq!(q, before);
+        q.wake(a).unwrap();
+        assert_eq!(q.voluntary_yield(b), Ok(a));
+        assert_eq!(q.exit_current(a), Ok(Some(b)));
+        q.reap(a).unwrap();
+        let replacement = q.admit(1).unwrap();
+        assert_ne!(a, replacement);
+        before = q;
+        assert_eq!(q.voluntary_yield(a), Err(Error::Stale));
+        assert_eq!(q, before);
+        assert_eq!(q.voluntary_yield(b), Ok(replacement));
+        assert_eq!(q.timer_switches(), 0);
+    }
+
+    #[test]
     fn four_realistic_pids_get_equal_80_timer_quantums_without_yield() {
         let mut q = Ring3RunQueue::<4>::new();
         let handles = [11, 22, 33, 44].map(|pid| q.admit(pid).unwrap());
