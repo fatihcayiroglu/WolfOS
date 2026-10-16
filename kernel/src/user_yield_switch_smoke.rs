@@ -12,6 +12,11 @@ use core::{arch::asm,cell::UnsafeCell};
 use crate::ring3_runqueue::{Handle as RunHandle,Ring3RunQueue,State as RrState};
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
              instructions::segmentation::{CS,Segment},registers::control::Cr3};
+#[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+use crate::{
+    high_half_stack_arena::{FourPidGuardedArena,FOUR_PID_OWNED,FOUR_PID_STACKS},
+    user_context_bank::{KernelStack,UserContextBank},
+};
 use crate::{
     elf64_preflight::preflight,elf64_page_image::{materialize,PAGE_SIZE},
     high_half_stack_arena::{GuardedArena,Stack,ROOT_INDEX,BASE,PAGE,OWNED as ARENA_FRAMES},
@@ -310,7 +315,14 @@ fn active()->&'static mut Runtime{
 }
 
 fn entry(pid:usize)->u64{
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+    {match pid {
+        0=>noyield_sym::PID1_ENTRY,1=>noyield_sym::PID2_ENTRY,
+        2=>noyield_sym::PID3_ENTRY,3=>noyield_sym::PID4_ENTRY,
+        _=>fail("invalid_four_pid_entry"),
+    }}
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-preflight-smoke")))]
     {if pid==0{noyield_sym::PID1_ENTRY}else{noyield_sym::PID2_ENTRY}}
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     {if pid==0{sym::PID1_ENTRY}else{sym::PID2_ENTRY}}
@@ -320,20 +332,37 @@ fn after_yield(pid:usize)->u64{
     if pid==0{sym::PID1_AFTER_YIELD}else{sym::PID2_AFTER_YIELD}
 }
 fn after_exit(pid:usize)->u64{
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+    {match pid {
+        0=>noyield_sym::PID1_AFTER_EXIT,1=>noyield_sym::PID2_AFTER_EXIT,
+        2=>noyield_sym::PID3_AFTER_EXIT,3=>noyield_sym::PID4_AFTER_EXIT,
+        _=>fail("invalid_four_pid_exit"),
+    }}
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-preflight-smoke")))]
     {if pid==0{noyield_sym::PID1_AFTER_EXIT}else{noyield_sym::PID2_AFTER_EXIT}}
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     {if pid==0{sym::PID1_AFTER_EXIT}else{sym::PID2_AFTER_EXIT}}
 }
 fn progress(pid:usize)->u64{
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+    {match pid {
+        0=>noyield_sym::PID1_PROGRESS,1=>noyield_sym::PID2_PROGRESS,
+        2=>noyield_sym::PID3_PROGRESS,3=>noyield_sym::PID4_PROGRESS,
+        _=>fail("invalid_four_pid_progress"),
+    }}
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-preflight-smoke")))]
     {if pid==0{noyield_sym::PID1_PROGRESS}else{noyield_sym::PID2_PROGRESS}}
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     {if pid==0{sym::PID1_PROGRESS}else{sym::PID2_PROGRESS}}
 }
 fn prepare_elf(hhdm:u64,frames:[u64;7],source:*const [u64;512],
                pid:usize){
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
+    let elf=FOUR_NOYIELD_ELFS[pid];
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-preflight-smoke")))]
     let elf=NONYIELD_ELFS[pid];
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     let elf=ELFS[pid];
