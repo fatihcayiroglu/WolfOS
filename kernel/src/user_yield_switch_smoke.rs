@@ -1099,7 +1099,18 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             ||s.processes.exit_zero(pid,active_root).is_err(){
             fail("early_or_bad_exit")
         }
-        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        {
+            let target=s.rr.exit_current(s.rr_handles[i])
+                .unwrap_or_else(|_|fail("four_live_exit_queue_owner"));
+            let more=s.exits.iter().enumerate()
+                .any(|(j,done)|j!=i && !done);
+            if target.is_some()!=more {
+                fail("four_live_exit_queue_runnable_mismatch")
+            }
+        }
+        #[cfg(all(feature = "p2-ring3-timer-preempt-smoke",
+                  not(feature="p3-ring3-four-elf-live-smoke")))]
         if s.rr.exit_current(s.rr_handles[i])!=Ok(if s.exits[1-i]{None}else{Some(s.rr_handles[1-i])}) {
             fail("rr_exit_handoff_out_of_sync")
         }
@@ -1113,13 +1124,18 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         "WOLFOS_RING3_YIELD_TRAP pid={} kind={} count={} cr3_private=1 rsp0_guarded=1\n",
         pid,if is_yield{"yield"}else{"exit"},val,
     ));
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_fmt(format_args!(
+        "WOLFOS_RING3_FOUR_EXIT pid={} progress={} private_cr3=1 rsp0_guarded=1\n",
+        pid,val,
+    ));
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_fmt(format_args!(
         "WOLFOS_RING3_NONYIELD_EXIT pid={} progress={} private_cr3=1 rsp0_guarded=1\n",
         pid,val,
     ));
-    let next=1-i;
-    if s.exits[next] {
+    if s.exits.iter().all(|done|*done) {
         if !s.exits[i] { fail("unexpected_finished_other") }
         if s.hardware_traps!=TRAPS ||
             s.yields!=[if cfg!(feature="p2-ring3-timer-nonyield-smoke"){0}else{ROUNDS};COUNT] {
@@ -1227,6 +1243,18 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             );
         }
     }
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    let next={
+        let active=s.rr.running().unwrap_or_else(||fail("four_live_missing_queue_target"));
+        let index=usize::try_from(active.pid-1)
+            .unwrap_or_else(|_|fail("four_live_target_pid_overflow"));
+        if index>=COUNT || s.rr_handles[index]!=active || s.exits[index] {
+            fail("four_live_wrong_queue_target")
+        }
+        index
+    };
+    #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+    let next=1-i;
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     if s.rr.running()!=Some(s.rr_handles[next]) {
         fail("rr_selected_pid_differs_from_hardware_target")
@@ -1261,7 +1289,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         "WOLFOS_RING3_YIELD_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
         pid,next+1,
     ));
-    #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    serial::write_fmt(format_args!(
+        "WOLFOS_RING3_FOUR_EXIT_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
+        pid,next+1,
+    ));
+    #[cfg(all(feature="p2-ring3-timer-nonyield-smoke",
+              not(feature="p3-ring3-four-elf-live-smoke")))]
     serial::write_fmt(format_args!(
         "WOLFOS_RING3_NONYIELD_EXIT_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
         pid,next+1,
