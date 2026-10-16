@@ -15,6 +15,7 @@ import tempfile
 from user_timer_nonyield_smoke import ordered_evidence_lines
 
 HARDWARE_STEM = "WOLFOS_RING3_FOUR_HARDWARE_OK"
+EOI_STEM = "WOLFOS_RING3_FOUR_EOI_OK"
 EXIT_STEM = "WOLFOS_RING3_FOUR_EXIT"
 SWITCH_STEM = "WOLFOS_RING3_FOUR_EXIT_SWITCH"
 
@@ -41,6 +42,10 @@ HARDWARE_PATTERN = re.compile(
     r"quantum_ticks=2 eligible_irqs=(\d+) "
     r"voluntary_yields=0 exits=4 progress_per_pid=16 "
     r"private_cr3=4 tss_rsp0=4 fx_state=4 executed=4"
+)
+EOI_PATTERN = re.compile(
+    r"WOLFOS_RING3_FOUR_EOI_OK irq_received=(\\d+) eoi_writes=(\\d+) "
+    r"same_pid_iret=(\\d+) cross_pid_switches=(\\d+) drained=1"
 )
 EXIT_PATTERN = re.compile(
     r"WOLFOS_RING3_FOUR_EXIT pid=([1-4]) progress=(\d+) "
@@ -111,6 +116,35 @@ def strict_four_hardware_evidence(output: str) -> bool:
     return before is not None and after is not None and before < at < after
 
 
+def strict_four_eoi_evidence(output: str) -> bool:
+    """One physical xAPIC EOI for every authenticated IRQ; no fake switches."""
+    rows = output.splitlines()
+    found = [(i, row) for i, row in enumerate(rows) if EOI_STEM in row]
+    hardware = [(i, row) for i, row in enumerate(rows) if HARDWARE_STEM in row]
+    if len(found) != 1 or len(hardware) != 1:
+        return False
+    eoi_at, eoi_row = found[0]
+    hardware_at, hardware_row = hardware[0]
+    eoi = EOI_PATTERN.fullmatch(eoi_row)
+    proof = HARDWARE_PATTERN.fullmatch(hardware_row)
+    if eoi is None or proof is None:
+        return False
+    received, writes, same, cross = map(int, eoi.groups())
+    total, p1, p2, p3, p4, _, _, eligible = map(int, proof.groups())
+    if not (received == writes == same + cross
+            and cross == total == p1 + p2 + p3 + p4
+            and received >= eligible):
+        return False
+    irq_ready = [i for i, row in enumerate(rows)
+                 if row.startswith("WOLFOS_RING3_IRQ_READY_OK ")]
+    cleanup = [i for i, row in enumerate(rows)
+               if row.startswith("WOLFOS_RING3_TIMER_CLEANUP_OK ")]
+    exits = [i for i, row in enumerate(rows)
+             if EXIT_STEM in row and SWITCH_STEM not in row]
+    return (len(irq_ready) == len(cleanup) == 1 and len(exits) == 4
+            and irq_ready[0] < max(exits) < eoi_at < hardware_at < cleanup[0])
+
+
 def evaluate(output: str, exit_code: int) -> bool:
     if exit_code != 33 or any(stem in output for stem in ERROR_STEMS):
         return False
@@ -119,6 +153,8 @@ def evaluate(output: str, exit_code: int) -> bool:
     if not strict_four_exit_evidence(output):
         return False
     if not strict_four_hardware_evidence(output):
+        return False
+    if not strict_four_eoi_evidence(output):
         return False
     rows = output.splitlines()
     start = rows.index(ORDERED[8])
