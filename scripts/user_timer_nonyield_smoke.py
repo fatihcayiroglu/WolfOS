@@ -38,9 +38,11 @@ def exit_markers_well_formed(output):
     # evidence without failing the smoke test.
     exit_stem = "WOLFOS_RING3_NONYIELD_EXIT"
     handoff_stem = "WOLFOS_RING3_NONYIELD_EXIT_SWITCH"
-    handoffs = [line for line in lines if line.startswith(handoff_stem)]
+    # Inspect the entire serial line: a forged marker embedded after a
+    # diagnostic prefix is still extra evidence and must fail closed.
+    handoffs = [line for line in lines if handoff_stem in line]
     exits = [line for line in lines
-             if line.startswith(exit_stem) and not line.startswith(handoff_stem)]
+             if exit_stem in line and handoff_stem not in line]
     exit_pattern = (r"WOLFOS_RING3_NONYIELD_EXIT pid=[12] progress=\d+ "
                     r"private_cr3=1 rsp0_guarded=1")
     handoff_pattern = (r"WOLFOS_RING3_NONYIELD_EXIT_SWITCH from=[12] to=[12] "

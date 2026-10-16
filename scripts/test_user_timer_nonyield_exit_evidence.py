@@ -48,6 +48,22 @@ class ExitEvidenceTests(unittest.TestCase):
     def test_trailing_forged_data(self):
         self.assertFalse(exit_markers_well_formed('\n'.join((EXIT1, SWITCH + ' forged=1', EXIT2))))
 
+    def test_embedded_extra_exit_is_rejected(self):
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, SWITCH, EXIT2, 'diagnostic: ' + EXIT1))))
+
+    def test_embedded_extra_handoff_is_rejected(self):
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, SWITCH, EXIT2, 'diagnostic: ' + SWITCH))))
+
+    def test_embedded_only_exit_is_rejected(self):
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            ('diagnostic: ' + EXIT1, SWITCH, EXIT2))))
+
+    def test_embedded_only_handoff_is_rejected(self):
+        self.assertFalse(exit_markers_well_formed('\n'.join(
+            (EXIT1, 'diagnostic: ' + SWITCH, EXIT2))))
+
     def test_truncated_exit(self):
         self.assertFalse(exit_markers_well_formed('\n'.join((EXIT1, SWITCH, 'WOLFOS_RING3_NONYIELD_EXIT pid=2'))))
 
