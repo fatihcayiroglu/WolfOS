@@ -1277,6 +1277,18 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             {
                 let switches=s.timer_preempts.iter().sum::<u64>();
                 let eligible=s.timer_busy.iter().sum::<u64>();
+                let irq=s.irq_eoi.verify_drained()
+                    .unwrap_or_else(|_|fail("four_live_eoi_unfinished_or_double"));
+                let raw_irqs=s.timer_irqs.iter().sum::<u64>();
+                // Independent counters: one physical EOI per authenticated
+                // real xAPIC IRQ, then exactly ONE same-PID IRET or cross-PID
+                // handoff. No YIELD or EXIT can increase this IRQ ledger.
+                if irq.received!=raw_irqs || irq.eoi!=raw_irqs
+                    || irq.switched!=switches
+                    || irq.resumed_same.checked_add(irq.switched)!=Some(raw_irqs)
+                    || irq.received<eligible {
+                    fail("four_live_eoi_irqs_or_switches_disagree")
+                }
                 let first=s.first_exit_timer_counts
                     .unwrap_or_else(||fail("four_live_missing_first_exit_evidence"));
                 let first_min=*first.iter().min().unwrap();
@@ -1308,6 +1320,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     ));
                     fail("four_live_real_irq_fairness_or_ledger")
                 }
+                serial::write_fmt(format_args!(
+                    "WOLFOS_RING3_FOUR_EOI_OK irq_received={} eoi_writes={} same_pid_iret={} cross_pid_switches={} drained=1\n",
+                    irq.received,irq.eoi,irq.resumed_same,irq.switched
+                ));
                 serial::write_fmt(format_args!(
                     "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} fair_four_min={} fair_four_spread={} quantum_ticks=2 eligible_irqs={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
                     switches,s.timer_preempts[0],s.timer_preempts[1],
