@@ -1,7 +1,12 @@
 name: WolfOS P0
+# Full QEMU suite once per PR update and once after each main merge.
+# Manual dispatch remains available to exercise an unpublished branch.
 on:
   push:
+    branches:
+      - main
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-boot:
