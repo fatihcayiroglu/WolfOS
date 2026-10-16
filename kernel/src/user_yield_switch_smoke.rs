@@ -347,11 +347,7 @@ pub extern "C" fn observe_timer_irq(
         // from the CURRENT validated private-CR3 supervisor UC alias.
         // No serial I/O, blocking locks, allocations or busy waits on
         // the successful timer IRQ scheduling path.
-        unsafe{
-            crate::user_xapic_high::write(
-                crate::lapic_irq_layout::EOI_OFFSET,
-                crate::lapic_irq_layout::EOI_VALUE);
-        }
+        acknowledge_validated_timer_irq(s,i);
         unsafe{
             asm!("mov cr3, {}",in(reg)s.leases[next][0],
                 options(nostack,preserves_flags));
@@ -363,19 +359,42 @@ pub extern "C" fn observe_timer_irq(
             fail("involuntary_private_cr3_or_running_pid")
         }
         s.timer_preempts[i]+=1;
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        if s.irq_eoi.finish(i,true).is_err() {
+            fail("four_live_eoi_missing_switch_completion")
+        }
         s.current=next;
         return next_frame as *const UserSyscallFrame;
     }
     // SAFETY: this high VA is supervisor-only UC in the CURRENT private
     // user CR3 root; this is a genuine local xAPIC in-service vector.
     // Exactly one EOI per hardware IRQ, never EOI a spurious IRQ.
+    acknowledge_validated_timer_irq(s,i);
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    if s.irq_eoi.finish(i,false).is_err() {
+        fail("four_live_eoi_missing_same_pid_completion")
+    }
+    raw
+}
+/// Centralized exactly-once EOI callsite for a validated user timer IRQ.
+/// No serial I/O, locks, allocations or APIC reads on the successful path.
+#[cfg(any(feature="p2-ring3-timer-observe-smoke", feature="p2-ring3-timer-preempt-smoke"))]
+fn acknowledge_validated_timer_irq(s:&mut Runtime, i:usize){
+    #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+    let _=(s,i);
+    // SAFETY: BSP IF=0, verified in-service xAPIC timer vector and
+    // supervisor-only UC alias in the CURRENT trusted private CR3.
     unsafe{
         crate::user_xapic_high::write(
             crate::lapic_irq_layout::EOI_OFFSET,
             crate::lapic_irq_layout::EOI_VALUE);
     }
-    raw
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    if s.irq_eoi.acknowledge(i).is_err() {
+        fail("four_live_eoi_missing_or_duplicate")
+    }
 }
+
 fn active()->&'static mut Runtime{
     unsafe{(*RUNTIME.0.get()).as_mut().unwrap_or_else(||fail("not_started"))}
 }
