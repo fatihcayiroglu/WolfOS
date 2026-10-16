@@ -230,6 +230,36 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             rsp0: next.kernel_stack.top, frame: next.frame, origin: next.origin })
     }
 
+    /// Plan an explicitly selected READY PID from a trusted scheduler policy.
+    /// This is metadata only: it does NOT prove a timer IRQ, load CR3, switch
+    /// TSS/FX state, or execute IRETQ. The caller must independently check the
+    /// scheduler's generation-safe handle and authenticate both trap frames.
+    ///
+    /// Validate the *whole* resident bank first (including a stale unrelated
+    /// context), then refuse the current PID or any non-READY destination.
+    /// A policy may choose a different READY PID than the PID-order fallback.
+    pub fn plan_selected<const N: usize>(
+        &self, table: &ProcessTable<SLOTS,N>,
+        current_pid: u64, selected_pid: u64, actual_kernel_cr3: u64,
+    ) -> Result<ResumePlan, ContextError> {
+        if selected_pid == 0 || selected_pid == current_pid {
+            return Err(ContextError::InvalidPid)
+        }
+        // plan_next audits every prepared context and verifies that the
+        // supplied supervisor root is not owned by ANY live user process.
+        let _ = self.plan_next(table, current_pid, actual_kernel_cr3)?;
+        let selected = self.snapshot(selected_pid).ok_or(ContextError::NotPrepared)?;
+        let process = table.snapshot(selected_pid).ok_or(ContextError::StaleProcess)?;
+        if process.state != ProcessState::Ready {
+            return Err(ContextError::WrongState)
+        }
+        Ok(ResumePlan {
+            pid: selected.pid, cr3_root: selected.cr3_root,
+            rsp0: selected.kernel_stack.top, frame: selected.frame,
+            origin: selected.origin,
+        })
+    }
+
     /// A context can be removed only after ProcessTable has revoked that
     /// PID via cancellation/reaping; never free a saved live trap frame.
     pub fn retire<const N: usize>(
