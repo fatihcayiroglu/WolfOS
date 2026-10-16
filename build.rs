@@ -73,7 +73,8 @@ fn main() {
             // two-switch smoke and cannot alter its historical workload.
             println!("cargo:rerun-if-changed=user/timer_no_yield.S");
             let mut attest=String::new();
-            for pid in [1usize,2] {
+            let count=if env::var_os("CARGO_FEATURE_P3_RING3_FOUR_ELF_PREFLIGHT_SMOKE").is_some() {4usize} else {2usize};
+            for pid in 1usize..=count {
                 let obj=path.join(format!("wolfos-nonyield-{pid}.o"));
                 let elf=path.join(format!("wolfos-nonyield-{pid}.elf"));
                 let def=format!("WOLFOS_PID={pid}");

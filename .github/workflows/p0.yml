@@ -83,6 +83,8 @@ jobs:
         run: make p2-ring3-timer-preempt-smoke
       - name: P2 two independent native Ring3 ELFs with >=8 real xAPIC timer switches and zero voluntary yields
         run: make p2-ring3-timer-nonyield-smoke
+      - name: P3 four independent no-yield ELF64 images checked by the real kernel ELF preflight (two still execute)
+        run: make p3-ring3-four-elf-preflight-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
         run: make ap-ipi-smoke
       - name: Directed IPIs wake three AP-owned remote work mailboxes (4 vCPUs)

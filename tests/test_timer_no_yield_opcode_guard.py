@@ -1,4 +1,4 @@
-"""Fail-closed host-only machine-code audit for the two no-yield ELF fixtures.
+"""Fail-closed host-only machine-code audit for four no-yield ELF fixtures.
 
 This verifies instruction bytes after assembly/linking; it does NOT prove
 that QEMU delivered timer IRQs or performed any Ring3 context switches.
@@ -106,7 +106,7 @@ class NoYieldOpcodeGuard(unittest.TestCase):
 
     def test_no_hidden_software_interrupt_or_trap_before_exit(self):
         with tempfile.TemporaryDirectory(prefix="wolfos-nonyield-opguard-") as tmp:
-            for pid in (1, 2):
+            for pid in (1, 2, 3, 4):
                 obj = Path(tmp) / f"pid{pid}.o"
                 elf = Path(tmp) / f"pid{pid}.elf"
                 run("as", "--64", "--defsym", f"WOLFOS_PID={pid}",
