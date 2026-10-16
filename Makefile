@@ -63,6 +63,8 @@ else ifeq ($(FLAVOR),p2-ring3-timer-nonyield)
 FEATURES := --features p2-ring3-timer-nonyield-smoke
 else ifeq ($(FLAVOR),p3-ring3-four-elf-preflight)
 FEATURES := --features p3-ring3-four-elf-preflight-smoke
+else ifeq ($(FLAVOR),p3-ring3-four-live)
+FEATURES := --features p3-ring3-four-elf-live-smoke
 else ifeq ($(FLAVOR),p2-ring3-timer-observe)
 FEATURES := --features p2-ring3-timer-observe-smoke
 else ifeq ($(FLAVOR),p2-ring3-irq-ready)
