@@ -38,6 +38,7 @@ HARDWARE_PATTERN = re.compile(
     r"WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches=(\d+) "
     r"pid1=(\d+) pid2=(\d+) pid3=(\d+) pid4=(\d+) "
     r"fair_four_min=(\d+) fair_four_spread=(\d+) "
+    r"quantum_ticks=2 eligible_irqs=(\d+) "
     r"voluntary_yields=0 exits=4 progress_per_pid=16 "
     r"private_cr3=4 tss_rsp0=4 fx_state=4 executed=4"
 )
@@ -90,7 +91,7 @@ def strict_four_hardware_evidence(output: str) -> bool:
     match = HARDWARE_PATTERN.fullmatch(row)
     if match is None:
         return False
-    total, p1, p2, p3, p4, fair_min, fair_spread = map(int, match.groups())
+    total, p1, p2, p3, p4, fair_min, fair_spread, eligible_irqs = map(int, match.groups())
     counts = (p1, p2, p3, p4)
     if total != sum(counts) or total < 16 or min(counts) < 4:
         return False
@@ -98,6 +99,10 @@ def strict_four_hardware_evidence(output: str) -> bool:
     # need not remain near-equal after finished PIDs stop accumulating
     # ticks, but while all four run FIFO counts must differ by at most 1.
     if fair_min < 4 or fair_min > min(counts) or fair_spread > 1:
+        return False
+    # Every *switch* consumes at least two genuine eligible timer IRQs.
+    # Same-PID IRQs count as real CPU time, but not as cross-PID switches.
+    if eligible_irqs < 2 * total:
         return False
     before = next((i for i, r in enumerate(rows) if
                    r.startswith("WOLFOS_RING3_IRQ_READY_OK ")), None)
