@@ -11,6 +11,36 @@ import sys
 import tempfile
 
 
+AGGREGATE_PATTERN = (
+            r"WOLFOS_AP_SMP_PREEMPT_OK cpus=(\d+) aps=(\d+) tasks_per_ap=(\d+) "
+            r"switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) "
+            r"ticks=(\d+) eois=(\d+) work=(\d+) invalid=(\d+) "
+            r"xmm_bad=(\d+) spurious=(\d+) wrong_ipi=(\d+) offline=(\d+) "
+            r"bsp_if=(\d+) migrated=(\d+) deferred=(\d+) nested_aps=(\d+) guard_depth=(\d+)"
+        )
+
+
+def unique_aggregate_proof(output: str):
+    """Return one complete AP aggregate record, never a substring or duplicate."""
+    matches = []
+    for line in output.splitlines():
+        # Any appearance of the success token must be a complete, valid record.
+        # Reject malformed duplicates even when another record is genuine.
+        if "WOLFOS_AP_SMP_PREEMPT_OK" not in line:
+            continue
+        match = re.fullmatch(AGGREGATE_PATTERN, line)
+        if match is None:
+            return None
+        matches.append(match)
+    return matches[0] if len(matches) == 1 else None
+
+
+def prerequisite_smp_proof(output: str) -> bool:
+    """Require exactly one unembedded four-vCPU SMP prerequisite record."""
+    lines = [line for line in output.splitlines() if "WOLFOS_SMP_APS_OK" in line]
+    return len(lines) == 1 and lines[0].startswith("WOLFOS_SMP_APS_OK total=4 ")
+
+
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: ap_smp_preempt_smoke.py ISO")
@@ -38,19 +68,12 @@ def main() -> int:
 
         output = logfile.read_text(errors="replace") if logfile.exists() else ""
         print(output)
-        if "WOLFOS_SMP_APS_OK total=4 " not in output:
+        if not prerequisite_smp_proof(output):
             print("FAIL: prerequisite 4-vCPU SMP/CPU context tests not complete")
             return 1
-        pattern = (
-            r"WOLFOS_AP_SMP_PREEMPT_OK cpus=(\d+) aps=(\d+) tasks_per_ap=(\d+) "
-            r"switches=(\d+) task0_irqs=(\d+) task1_irqs=(\d+) "
-            r"ticks=(\d+) eois=(\d+) work=(\d+) invalid=(\d+) "
-            r"xmm_bad=(\d+) spurious=(\d+) wrong_ipi=(\d+) offline=(\d+) "
-            r"bsp_if=(\d+) migrated=(\d+) deferred=(\d+) nested_aps=(\d+) guard_depth=(\d+)"
-        )
-        proof = re.search(pattern, output)
+        proof = unique_aggregate_proof(output)
         if proof is None:
-            print("FAIL: no genuine three-AP involuntary two-task IRQ proof")
+            print("FAIL: expected exactly one full-line AP SMP proof")
             return 1
         (cpus, aps, tasks, switches, a, b, ticks, eois,
          work, invalid, xmm_bad, spurious, wrong_ipi,
