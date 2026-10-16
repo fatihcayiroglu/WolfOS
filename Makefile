@@ -317,6 +317,10 @@ p3-ring3-four-elf-preflight-smoke:
 	$(MAKE) iso FLAVOR=p3-ring3-four-elf-preflight
 	python3 scripts/user_timer_nonyield_smoke.py $(OUT)/wolfos-p3-ring3-four-elf-preflight.iso --four-elf-preflight
 
+p3-ring3-four-live-smoke:
+	$(MAKE) iso FLAVOR=p3-ring3-four-live
+	python3 scripts/user_timer_four_live_smoke.py $(OUT)/wolfos-p3-ring3-four-live.iso
+
 test:
 	python3 -m unittest discover -s tests -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
