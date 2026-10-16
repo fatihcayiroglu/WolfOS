@@ -8,6 +8,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Each PR checks only its latest head, but never cancel the mandatory
+# post-merge main workflow run (or a manually dispatched verification).
+concurrency:
+  group: wolfos-p0-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-boot:
     runs-on: ubuntu-24.04
