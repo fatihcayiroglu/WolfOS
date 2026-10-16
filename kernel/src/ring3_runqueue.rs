@@ -10,7 +10,7 @@ pub struct Handle { pub pid: u64, pub generation: u64 }
 pub enum State { Empty, Ready, Running, Blocked, Exited }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error { InvalidPid, DuplicatePid, Full, Stale, WrongState, NoRunnable, Overflow }
+pub enum Error { InvalidPid, DuplicatePid, InvalidQuantum, Full, Stale, WrongState, NoRunnable, Overflow }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
@@ -35,11 +35,14 @@ pub struct Ring3RunQueue<const N: usize> {
     active: Option<usize>,
     switches: u64,
     generation: u64,
+    // Consecutive authenticated, eligible timer IRQs in the current slice.
+    // Policy-only: caller must establish genuine xAPIC IRQ provenance.
+    slice_ticks: u64,
 }
 
 impl<const N: usize> Ring3RunQueue<N> {
     pub const fn new() -> Self {
-        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0 }
+        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0 }
     }
 
     pub fn slots(&self) -> [Slot; N] { self.slots }
@@ -49,6 +52,7 @@ impl<const N: usize> Ring3RunQueue<N> {
     /// Count only genuine policy-requested timer-origin cross-PID switches,
     /// never a syscall, EXIT, BLOCK or wakeup dispatch.
     pub fn timer_switches(&self) -> u64 { self.switches }
+    pub fn current_slice_ticks(&self) -> u64 { self.slice_ticks }
     pub fn occupied(&self) -> usize {
         self.slots.iter().filter(|s| s.state != State::Empty).count()
     }
@@ -87,6 +91,7 @@ impl<const N: usize> Ring3RunQueue<N> {
             .ok_or(Error::NoRunnable)?;
         self.slots[i].state = State::Running;
         self.active = Some(i);
+        self.slice_ticks = 0;
         Ok(self.slots[i].handle)
     }
 
@@ -95,10 +100,33 @@ impl<const N: usize> Ring3RunQueue<N> {
     /// If no peer is READY the current task continues, with one timer tick
     /// accounted but no cross-PID switch.
     pub fn timer_tick(&mut self, interrupted: Handle) -> Result<Handle, Error> {
+        self.timer_quantum_tick(interrupted, 1)
+    }
+
+    /// Count a *caller-authenticated real timer IRQ* and rotate only after
+    /// `quantum_ticks` eligible interrupts. Every tick is charged to its
+    /// source PID; only actual cross-PID rotation increments timer_switches.
+    /// A voluntary YIELD/EXIT/BLOCK never counts as a timer-origin switch.
+    ///
+    /// With no READY peer, retain the current PID and cap the consumed slice
+    /// at the deadline: the next eligible IRQ may rotate if a peer wakes.
+    /// Every error leaves all fields unchanged, including overflow cases.
+    /// This is a no_std, no-heap policy, not an IRQ provenance checker or
+    /// hardware EOI, CR3, FX, TSS or IRET implementation.
+    pub fn timer_quantum_tick(
+        &mut self, interrupted: Handle, quantum_ticks: u64,
+    ) -> Result<Handle, Error> {
+        if quantum_ticks == 0 { return Err(Error::InvalidQuantum) }
         let i = self.active.ok_or(Error::NoRunnable)?;
         if self.slots[i].state != State::Running ||
             self.slots[i].handle != interrupted { return Err(Error::Stale); }
         let ticks = self.slots[i].ticks.checked_add(1).ok_or(Error::Overflow)?;
+        let elapsed = self.slice_ticks.checked_add(1).ok_or(Error::Overflow)?;
+        if elapsed < quantum_ticks {
+            self.slots[i].ticks = ticks;
+            self.slice_ticks = elapsed;
+            return Ok(interrupted)
+        }
         let next = self.ready_after(i);
         let switches = if next.is_some() {
             self.switches.checked_add(1).ok_or(Error::Overflow)?
@@ -108,6 +136,9 @@ impl<const N: usize> Ring3RunQueue<N> {
             self.slots[i].state = State::Ready;
             self.slots[j].state = State::Running;
             self.active = Some(j);
+            self.slice_ticks = 0;
+        } else {
+            self.slice_ticks = quantum_ticks;
         }
         self.switches = switches;
         Ok(self.slots[self.active.unwrap()].handle)
@@ -127,6 +158,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.slots[i].state = State::Ready;
         self.slots[j].state = State::Running;
         self.active = Some(j);
+        self.slice_ticks = 0;
         Ok(self.slots[j].handle)
     }
 
@@ -138,6 +170,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let next = self.ready_after(i);
         self.slots[i].state = State::Blocked;
         self.active = next;
+        self.slice_ticks = 0;
         if let Some(j) = next { self.slots[j].state = State::Running; }
         Ok(self.running())
     }
@@ -168,6 +201,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let next = self.ready_after(i);
         self.slots[i].state = State::Exited;
         self.active = next;
+        self.slice_ticks = 0;
         if let Some(j) = next { self.slots[j].state = State::Running; }
         Ok(self.running())
     }
