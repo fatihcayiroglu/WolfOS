@@ -10,6 +10,8 @@
 use core::{arch::asm,cell::UnsafeCell};
 #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
 use crate::ring3_runqueue::{Handle as RunHandle,Ring3RunQueue,State as RrState};
+#[cfg(feature="p3-ring3-four-elf-live-smoke")]
+use crate::ring3_irq_eoi_ledger::Ring3IrqEoiLedger;
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
              instructions::segmentation::{CS,Segment},registers::control::Cr3};
 #[cfg(feature="p3-ring3-four-elf-preflight-smoke")]
@@ -155,6 +157,8 @@ struct Runtime{
     timer_preempts:[u64;COUNT],
     #[cfg(feature="p3-ring3-four-elf-live-smoke")]
     first_exit_timer_counts:Option<[u64;COUNT]>,
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    irq_eoi:Ring3IrqEoiLedger<COUNT>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
     rr:Ring3RunQueue<COUNT>,
     #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
@@ -253,6 +257,10 @@ pub extern "C" fn observe_timer_irq(
         ));
         fail("real_cpl3_timer_iret_gpr_or_frame_validation")
     }
+    // Frame, user selectors, private CR3, TSS.RSP0 and FX owner have
+    // passed real hardware IRQ authentication before opening this EOI.
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    if s.irq_eoi.begin(i).is_err() { fail("four_live_eoi_duplicate_irq") }
     s.timer_irqs[i]+=1;
     if in_busy{
         s.timer_busy[i]+=1;
@@ -339,11 +347,7 @@ pub extern "C" fn observe_timer_irq(
         // from the CURRENT validated private-CR3 supervisor UC alias.
         // No serial I/O, blocking locks, allocations or busy waits on
         // the successful timer IRQ scheduling path.
-        unsafe{
-            crate::user_xapic_high::write(
-                crate::lapic_irq_layout::EOI_OFFSET,
-                crate::lapic_irq_layout::EOI_VALUE);
-        }
+        acknowledge_validated_timer_irq(s,i);
         unsafe{
             asm!("mov cr3, {}",in(reg)s.leases[next][0],
                 options(nostack,preserves_flags));
@@ -355,19 +359,42 @@ pub extern "C" fn observe_timer_irq(
             fail("involuntary_private_cr3_or_running_pid")
         }
         s.timer_preempts[i]+=1;
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        if s.irq_eoi.finish(i,true).is_err() {
+            fail("four_live_eoi_missing_switch_completion")
+        }
         s.current=next;
         return next_frame as *const UserSyscallFrame;
     }
     // SAFETY: this high VA is supervisor-only UC in the CURRENT private
     // user CR3 root; this is a genuine local xAPIC in-service vector.
     // Exactly one EOI per hardware IRQ, never EOI a spurious IRQ.
+    acknowledge_validated_timer_irq(s,i);
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    if s.irq_eoi.finish(i,false).is_err() {
+        fail("four_live_eoi_missing_same_pid_completion")
+    }
+    raw
+}
+/// Centralized exactly-once EOI callsite for a validated user timer IRQ.
+/// No serial I/O, locks, allocations or APIC reads on the successful path.
+#[cfg(any(feature="p2-ring3-timer-observe-smoke", feature="p2-ring3-timer-preempt-smoke"))]
+fn acknowledge_validated_timer_irq(s:&mut Runtime, i:usize){
+    #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
+    let _=(s,i);
+    // SAFETY: BSP IF=0, verified in-service xAPIC timer vector and
+    // supervisor-only UC alias in the CURRENT trusted private CR3.
     unsafe{
         crate::user_xapic_high::write(
             crate::lapic_irq_layout::EOI_OFFSET,
             crate::lapic_irq_layout::EOI_VALUE);
     }
-    raw
+    #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+    if s.irq_eoi.acknowledge(i).is_err() {
+        fail("four_live_eoi_missing_or_duplicate")
+    }
 }
+
 fn active()->&'static mut Runtime{
     unsafe{(*RUNTIME.0.get()).as_mut().unwrap_or_else(||fail("not_started"))}
 }
@@ -985,6 +1012,8 @@ pub fn enter(hhdm:u64)->!{
         timer_preempts:[0;COUNT],
         #[cfg(feature="p3-ring3-four-elf-live-smoke")]
         first_exit_timer_counts:None,
+        #[cfg(feature="p3-ring3-four-elf-live-smoke")]
+        irq_eoi:Ring3IrqEoiLedger::new(),
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         rr,
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
@@ -1248,6 +1277,18 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             {
                 let switches=s.timer_preempts.iter().sum::<u64>();
                 let eligible=s.timer_busy.iter().sum::<u64>();
+                let irq=s.irq_eoi.verify_drained()
+                    .unwrap_or_else(|_|fail("four_live_eoi_unfinished_or_double"));
+                let raw_irqs=s.timer_irqs.iter().sum::<u64>();
+                // Independent counters: one physical EOI per authenticated
+                // real xAPIC IRQ, then exactly ONE same-PID IRET or cross-PID
+                // handoff. No YIELD or EXIT can increase this IRQ ledger.
+                if irq.received!=raw_irqs || irq.eoi!=raw_irqs
+                    || irq.switched!=switches
+                    || irq.resumed_same.checked_add(irq.switched)!=Some(raw_irqs)
+                    || irq.received<eligible {
+                    fail("four_live_eoi_irqs_or_switches_disagree")
+                }
                 let first=s.first_exit_timer_counts
                     .unwrap_or_else(||fail("four_live_missing_first_exit_evidence"));
                 let first_min=*first.iter().min().unwrap();
@@ -1279,6 +1320,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     ));
                     fail("four_live_real_irq_fairness_or_ledger")
                 }
+                serial::write_fmt(format_args!(
+                    "WOLFOS_RING3_FOUR_EOI_OK irq_received={} eoi_writes={} same_pid_iret={} cross_pid_switches={} drained=1\n",
+                    irq.received,irq.eoi,irq.resumed_same,irq.switched
+                ));
                 serial::write_fmt(format_args!(
                     "WOLFOS_RING3_FOUR_HARDWARE_OK timer_switches={} pid1={} pid2={} pid3={} pid4={} fair_four_min={} fair_four_spread={} quantum_ticks=2 eligible_irqs={} voluntary_yields=0 exits=4 progress_per_pid=16 private_cr3=4 tss_rsp0=4 fx_state=4 executed=4\n",
                     switches,s.timer_preempts[0],s.timer_preempts[1],
