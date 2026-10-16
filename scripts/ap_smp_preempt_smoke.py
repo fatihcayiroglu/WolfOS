@@ -48,7 +48,12 @@ def main() -> int:
             r"xmm_bad=(\d+) spurious=(\d+) wrong_ipi=(\d+) offline=(\d+) "
             r"bsp_if=(\d+) migrated=(\d+) deferred=(\d+) nested_aps=(\d+) guard_depth=(\d+)"
         )
-        proof = re.search(pattern, output)
+        matches = [match for line in output.splitlines()
+                   if (match := re.fullmatch(pattern, line)) is not None]
+        if len(matches) != 1:
+            print(f"FAIL: expected exactly one full-line AP SMP proof; found {len(matches)}")
+            return 1
+        proof = matches[0]
         if proof is None:
             print("FAIL: no genuine three-AP involuntary two-task IRQ proof")
             return 1
