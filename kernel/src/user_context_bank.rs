@@ -217,11 +217,19 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             if process.cr3_root == actual_kernel_cr3 {
                 return Err(ContextError::ActiveUserCr3)
             }
-            if !matches!(process.state, ProcessState::Ready | ProcessState::Running) {
+            // A BLOCKED PID stays resident and owns its CR3, frames and
+            // saved context. Audit that context, but never select it until
+            // an independently authorized wake changes its state to READY.
+            if !matches!(process.state,
+                ProcessState::Ready | ProcessState::Running | ProcessState::Blocked) {
                 return Err(ContextError::WrongState)
             }
             if !ctx.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
             Self::validate_frame(&ctx.frame)?;
+            if process.state == ProcessState::Blocked {
+                if ctx.pid == current_pid { return Err(ContextError::WrongState) }
+                continue;
+            }
             if ctx.pid != current_pid {
                 eligible += 1;
                 if best_any.is_none_or(|old| ctx.pid < old.pid) { best_any = Some(ctx); }
@@ -668,6 +676,60 @@ mod tests {
         assert_eq!(resumed.origin, FrameOrigin::Bootstrap);
         assert_eq!(queue.timer_switches(), 2);
         assert_eq!(table.running(), 0, "this is metadata only, not an IRQ proof");
+    }
+
+    #[test]
+    fn blocked_registry_pid_is_ineligible_until_wake_without_losing_ownership() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut contexts = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let bottom = 0xffff_8000_0700_0000;
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 3];
+        for i in 0..3 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 500 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(h[0]));
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+        assert_eq!(table.running(), 0);
+        assert_eq!(table.occupied(), 3);
+        assert_eq!(table.snapshot(h[0].pid).unwrap().frames, frames(roots[0]));
+        assert_eq!(queue.last_policy_handoff(), None);
+        assert_eq!(contexts.plan_next(&table, h[1].pid, 0x90000)
+            .unwrap().pid, h[2].pid);
+        assert_eq!(contexts.plan_next(&table, h[0].pid, 0x90000),
+            Err(ContextError::WrongState),
+            "a BLOCKED PID cannot masquerade as the running source");
+        assert_eq!(contexts.plan_selected(&table, h[1].pid, h[0].pid, 0x90000),
+            Err(ContextError::WrongState),
+            "a BLOCKED process still owns its context but cannot resume");
+
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap().pid, h[2].pid);
+        table.wake_blocked(h[0].pid, 0x90000).unwrap();
+        queue.wake(h[0]).unwrap();
+        assert_eq!(queue.timer_tick(h[2]), Ok(h[0]));
+        let resumed = contexts.plan_queue_handoff(
+            &table, &queue, h[2], h[0], 0x90000,
+        ).unwrap();
+        assert_eq!(resumed.pid, h[0].pid);
+        assert_eq!(resumed.cr3_root, roots[0]);
+        assert_eq!(resumed.rsp0, bottom + KSTACK_BYTES);
+        assert_eq!(resumed.frame.registers.rax, 500 + h[0].pid);
+        assert_eq!(resumed.frame.registers.r12, (500 + h[0].pid) * 3);
+        assert_eq!(resumed.origin, FrameOrigin::Bootstrap);
+        assert_eq!(contexts.count(), 3, "block/wake never reaps a user context");
+        assert_eq!(table.occupied(), 3, "block/wake never releases user PMM frames");
+        assert_eq!(table.running(), 0, "policy-only: no hardware IRQ is claimed");
     }
 
     #[test]
