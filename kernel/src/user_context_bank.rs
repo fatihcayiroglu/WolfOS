@@ -487,19 +487,23 @@ mod tests {
         ).unwrap();
         assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000)
             .unwrap().pid, h[1].pid);
-        // A RUNNING table process hidden behind a non-runnable queue slot
-        // must not coexist with any planned new hardware activation.
+        // A successful cancel invalidates an earlier timer decision.
         queue.cancel(h[3]).unwrap();
-        table.mark_running(h[3].pid, roots[3]).unwrap();
         assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+        // A RUNNING table process hidden behind an EXITED queue tombstone
+        // must still reject a FRESH selection, not just stale evidence.
+        table.mark_running(h[3].pid, roots[3]).unwrap();
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
             Err(ContextError::WrongState));
         table.park_running(h[3].pid, roots[3]).unwrap();
-        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000)
-            .unwrap().pid, h[1].pid);
-        // h1 becomes BLOCKED and h2 becomes RUNNING. A blocked source is
-        // not an authorized timer/yield handoff even if a target is runnable.
-        assert_eq!(queue.block_current(h[1]), Ok(Some(h[2])));
-        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap().pid, h[2].pid);
+        // h2 becomes BLOCKED and h0 becomes RUNNING. BLOCK is not
+        // a timer/yield handoff, even when another PID is runnable.
+        assert_eq!(queue.block_current(h[2]), Ok(Some(h[0])));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[2], h[0], 0x90000),
             Err(ContextError::SchedulerMismatch));
     }
 
@@ -771,8 +775,9 @@ mod tests {
         assert_eq!(queue.running(), Some(h[2]));
         assert_eq!(queue.timer_switches(), 1);
         queue.wake(h[0]).unwrap();
-        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
-            .unwrap().pid, h[2].pid);
+        // Both ledgers now agree, but the previous timer decision is stale.
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::SchedulerMismatch));
 
         // The other ordering must also fail: scheduler wakes first.
         assert_eq!(queue.timer_tick(h[2]), Ok(h[0]));
@@ -831,6 +836,58 @@ mod tests {
             Ok(good));
         assert_eq!(queue.timer_switches(), 1);
         assert_eq!(table.occupied(), 3);
+    }
+
+    #[test]
+    fn wake_after_timer_selection_requires_a_fresh_policy_handoff() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut contexts = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let bottom = 0xffff_8000_0a00_0000;
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 3];
+        for i in 0..3 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 700 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(h[0]));
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        assert_eq!(queue.last_policy_handoff(), Some((h[1], h[2])));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap().pid, h[2].pid);
+
+        // Both ledgers match again after this wake. That alone must not
+        // authorize replay of an OLD timer decision taken before the wake.
+        table.wake_blocked(h[0].pid, 0x90000).unwrap();
+        queue.wake(h[0]).unwrap();
+        assert_eq!(queue.last_policy_handoff(), None);
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+        assert_eq!(queue.running(), Some(h[2]));
+        assert_eq!(table.running(), 0);
+        assert_eq!(table.occupied(), 3);
+
+        assert_eq!(queue.timer_tick(h[2]), Ok(h[0]));
+        let plan = contexts.plan_queue_handoff(&table, &queue, h[2], h[0], 0x90000)
+            .unwrap();
+        assert_eq!(plan.pid, h[0].pid);
+        assert_eq!(plan.cr3_root, roots[0]);
+        assert_eq!(plan.rsp0, bottom + KSTACK_BYTES);
+        assert_eq!(plan.frame.registers.rax, 700 + h[0].pid);
+        assert_eq!(plan.frame.registers.r12, (700 + h[0].pid) * 3);
+        assert_eq!(plan.origin, FrameOrigin::Bootstrap);
+        assert_eq!(queue.timer_switches(), 2,
+            "wake cannot be counted as a hardware-origin switch");
+        assert_eq!(contexts.count(), 3, "no context was released by wake");
     }
 
     #[test]
