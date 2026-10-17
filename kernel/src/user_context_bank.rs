@@ -272,6 +272,9 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
     /// authenticated IRQ/syscall provenance, saved GPR/FX state, and parked
     /// the source in the process registry. No hardware state is changed here.
     ///
+    /// Require the last actual timer/yield policy decision to identify the
+    /// exact source and destination (a newly woken READY PID is insufficient).
+    /// This still does NOT authenticate real IRQ/syscall provenance.
     /// Require exact generation-safe source/destination queue handles and
     /// one policy RUNNING target, then audit every runnable queue member
     /// against resident PID/context ownership. EXited queue tombstones do not
@@ -286,6 +289,7 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
         }
         let slots = queue.slots();
         if queue.running() != Some(to)
+            || queue.last_policy_handoff() != Some((from, to))
             || !slots.iter().any(|s| s.handle == from && s.state == RunState::Ready)
             || !slots.iter().any(|s| s.handle == to && s.state == RunState::Running)
         { return Err(ContextError::SchedulerMismatch) }
@@ -617,6 +621,53 @@ mod tests {
         assert_eq!(bank.capture_trap(&t,1,0x1000,k,k.top - 16,x),
             Err(ContextError::FrameOutsideKernelStack));
         assert_eq!(bank.count(),1);
+    }
+
+    #[test]
+    fn woken_ready_pid_cannot_forge_the_source_of_a_resume_plan() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut contexts = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let bottom = 0xffff_8000_0600_0000;
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 3];
+        for i in 0..3 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 400 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(h[0]));
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::SchedulerMismatch),
+            "BLOCK does not authorize a hardware timer/yield transition");
+        queue.wake(h[0]).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::SchedulerMismatch),
+            "READY after wake cannot masquerade as the interrupted PID");
+
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[0], h[2], 0x90000),
+            Err(ContextError::SchedulerMismatch),
+            "an unrelated READY source cannot borrow another PID's IRQ");
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap().pid, h[2].pid);
+        assert_eq!(queue.timer_tick(h[2]), Ok(h[0]));
+        let resumed = contexts.plan_queue_handoff(
+            &table, &queue, h[2], h[0], 0x90000,
+        ).unwrap();
+        assert_eq!(resumed.pid, h[0].pid);
+        assert_eq!(resumed.cr3_root, roots[0]);
+        assert_eq!(resumed.rsp0, bottom + KSTACK_BYTES);
+        assert_eq!(resumed.frame.registers.rax, 400 + h[0].pid);
+        assert_eq!(resumed.frame.registers.r12, (400 + h[0].pid) * 3);
+        assert_eq!(resumed.origin, FrameOrigin::Bootstrap);
+        assert_eq!(queue.timer_switches(), 2);
+        assert_eq!(table.running(), 0, "this is metadata only, not an IRQ proof");
     }
 
     #[test]
