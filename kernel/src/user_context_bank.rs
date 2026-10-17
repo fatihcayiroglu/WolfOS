@@ -284,9 +284,9 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
     /// exact source and destination (a newly woken READY PID is insufficient).
     /// This still does NOT authenticate real IRQ/syscall provenance.
     /// Require exact generation-safe source/destination queue handles and
-    /// one policy RUNNING target, then audit every runnable queue member
-    /// against resident PID/context ownership. EXited queue tombstones do not
-    /// need a live process record. This never attributes a hardware IRQ.
+    /// one policy RUNNING target, then audit every READY/RUNNING/BLOCKED
+    /// queue member against resident PID/context ownership. EXITED queue
+    /// tombstones need no live process record. This never attributes an IRQ.
     pub fn plan_queue_handoff<const N: usize>(
         &self, table: &ProcessTable<SLOTS, N>,
         queue: &Ring3RunQueue<SLOTS>,
@@ -308,12 +308,18 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             return Err(ContextError::WrongState)
         }
 
+        // BLOCKED queue slots remain live owners with private CR3 and PMM
+        // leases. Reject a one-sided block/wake: the queue and registry must
+        // agree, and even a sleeping PID needs its saved return context.
+        // EXITED tombstones may already have been reclaimed by the owner.
         for slot in slots {
-            if !matches!(slot.state, RunState::Ready | RunState::Running) {
-                continue
-            }
+            let expected = match slot.state {
+                RunState::Ready | RunState::Running => ProcessState::Ready,
+                RunState::Blocked => ProcessState::Blocked,
+                RunState::Empty | RunState::Exited => continue,
+            };
             let process = table.snapshot(slot.handle.pid).ok_or(ContextError::StaleProcess)?;
-            if process.state != ProcessState::Ready {
+            if process.state != expected {
                 return Err(ContextError::WrongState)
             }
             let stored = self.snapshot(slot.handle.pid).ok_or(ContextError::NotPrepared)?;
@@ -730,6 +736,101 @@ mod tests {
         assert_eq!(contexts.count(), 3, "block/wake never reaps a user context");
         assert_eq!(table.occupied(), 3, "block/wake never releases user PMM frames");
         assert_eq!(table.running(), 0, "policy-only: no hardware IRQ is claimed");
+    }
+
+    #[test]
+    fn split_block_wake_between_queue_and_registry_fails_closed() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut contexts = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let bottom = 0xffff_8000_0800_0000;
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 3];
+        for i in 0..3 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 600 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(h[0]));
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        let plan = contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap();
+        assert_eq!(plan.pid, h[2].pid);
+
+        // Registry wakes the PID, but the scheduler still says BLOCKED.
+        table.wake_blocked(h[0].pid, 0x90000).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::WrongState));
+        assert_eq!(queue.running(), Some(h[2]));
+        assert_eq!(queue.timer_switches(), 1);
+        queue.wake(h[0]).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap().pid, h[2].pid);
+
+        // The other ordering must also fail: scheduler wakes first.
+        assert_eq!(queue.timer_tick(h[2]), Ok(h[0]));
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+        queue.wake(h[0]).unwrap();
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::WrongState));
+        assert_eq!(table.snapshot(h[0].pid).unwrap().frames, frames(roots[0]));
+        table.wake_blocked(h[0].pid, 0x90000).unwrap();
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap().pid, h[2].pid);
+        assert_eq!(contexts.count(), 3);
+        assert_eq!(table.occupied(), 3);
+        assert_eq!(table.running(), 0);
+        assert_eq!(queue.timer_switches(), 3);
+    }
+
+    #[test]
+    fn blocked_queue_member_needs_matching_saved_context_and_cr3() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut contexts = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 3];
+        for i in 0..3 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(0xffff_8000_0900_0000 + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, pid),
+            ).unwrap();
+        }
+        queue.start_next().unwrap();
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        let good = contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap();
+        assert_eq!(good.pid, h[2].pid);
+
+        let saved = contexts.entries[0];
+        contexts.entries[0] = None;
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::NotPrepared));
+        contexts.entries[0] = saved;
+        contexts.entries[0].as_mut().unwrap().cr3_root = roots[1];
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::StaleProcess));
+        contexts.entries[0] = saved;
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Ok(good));
+        assert_eq!(queue.timer_switches(), 1);
+        assert_eq!(table.occupied(), 3);
     }
 
     #[test]
