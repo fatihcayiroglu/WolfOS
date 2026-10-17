@@ -109,7 +109,7 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
         self.entries.iter().flatten().copied().find(|x| x.pid == pid)
     }
 
-    fn validate_frame(frame: &UserSyscallFrame) -> Result<(), ContextError> {
+    fn validate_frame(frame: &UserSyscallFrame, origin: FrameOrigin) -> Result<(), ContextError> {
         if !(USER_MIN..USER_END).contains(&frame.hardware.rip)
             || !(USER_MIN..USER_END).contains(&frame.hardware.rsp)
         { return Err(ContextError::BadUserPointer) }
@@ -121,9 +121,15 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             || cs & 4 != 0 || ss & 4 != 0
             || cs >> 3 == ss >> 3
         { return Err(ContextError::BadSelectors) }
-        if !valid_user_rflags(frame.hardware.rflags) {
-            return Err(ContextError::BadFlags)
-        }
+        // Bootstrap frames keep IF masked. An independently authenticated
+        // hardware IRQ can save IF=1; permitting that bit must NEVER make
+        // IOPL, TF, DF, AC, VM or any reserved RFLAGS bit acceptable.
+        let allowed = match origin {
+            FrameOrigin::Bootstrap => valid_user_rflags(frame.hardware.rflags),
+            FrameOrigin::HardwareTrap =>
+                valid_user_rflags(frame.hardware.rflags & !(1 << 9)),
+        };
+        if !allowed { return Err(ContextError::BadFlags) }
         Ok(())
     }
 
@@ -142,7 +148,7 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             FrameOrigin::HardwareTrap => ProcessState::Running,
         }) { return Err(ContextError::WrongState) }
         if !stack.valid() { return Err(ContextError::BadKernelStack) }
-        Self::validate_frame(&frame)?;
+        Self::validate_frame(&frame, origin)?;
         if let Some(at) = trap_at {
             if at & 7 != 0 || at < stack.bottom
                 || at.checked_add(FRAME_BYTES as u64)
@@ -189,6 +195,56 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
                     FrameOrigin::HardwareTrap, Some(trap_at))
     }
 
+    /// Replace a previously seeded/saved PID context with a *copied* real
+    /// CPL3 IRQ/trap frame. The caller MUST independently establish that
+    /// the active CR3, live CPL3 trap provenance, TSS.RSP0, CPU/FX owner and
+    /// interrupt lifecycle all belong to this PID, with interrupts masked.
+    ///
+    /// This does no MMIO, switching, IRETQ or FPU bookkeeping. It does not
+    /// infer CPU provenance from a caller-supplied pointer. The exact
+    /// top-of-RSP0 frame address and the entire safe IF-enabled user IRET
+    /// frame are checked BEFORE replacing the existing record. The original
+    /// PID, CR3 lease and private kernel stack remain immutable.
+    /// A failed update leaves the stored frame and origin unchanged.
+    pub fn refresh_authenticated_trap<const N: usize>(
+        &mut self, table: &ProcessTable<SLOTS,N>,
+        pid: u64, actual_cr3: u64, stack: KernelStack, trap_at: u64,
+        frame: UserSyscallFrame,
+    ) -> Result<(), ContextError> {
+        if pid == 0 { return Err(ContextError::InvalidPid) }
+        let process = table.snapshot(pid).ok_or(ContextError::NotResident)?;
+        if process.state != ProcessState::Running {
+            return Err(ContextError::WrongState)
+        }
+        if actual_cr3 == 0 || actual_cr3 & 4095 != 0
+            || actual_cr3 >= PHYS_END || process.cr3_root != actual_cr3
+        { return Err(ContextError::BadCr3) }
+        let index = self.entries.iter().position(|e|
+            e.is_some_and(|stored| stored.pid == pid))
+            .ok_or(ContextError::NotPrepared)?;
+        let stored = self.entries[index].unwrap();
+        if stored.cr3_root != process.cr3_root {
+            return Err(ContextError::StaleProcess)
+        }
+        if !stack.valid() || stack != stored.kernel_stack {
+            return Err(ContextError::BadKernelStack)
+        }
+        if stack.top.checked_sub(FRAME_BYTES as u64) != Some(trap_at)
+            || trap_at & 7 != 0
+        { return Err(ContextError::FrameOutsideKernelStack) }
+        // Real IF-enabled Ring3 task preemption. Bootstrap metadata may
+        // be IF-masked, but a supposedly timer-interrupted CPL3 frame may
+        // not silently disable interrupts upon its later restoration.
+        if frame.hardware.rflags & (1 << 9) == 0 {
+            return Err(ContextError::BadFlags)
+        }
+        Self::validate_frame(&frame, FrameOrigin::HardwareTrap)?;
+        self.entries[index] = Some(StoredUserFrame {
+            frame, origin: FrameOrigin::HardwareTrap, ..stored
+        });
+        Ok(())
+    }
+
     /// Return next *metadata* candidate in PID order. The supplied boot CR3
     /// MUST be read from actual hardware on a disjoint supervisor stack.
     /// Does not mutate process state or activate any context. It refuses a
@@ -225,7 +281,7 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
                 return Err(ContextError::WrongState)
             }
             if !ctx.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
-            Self::validate_frame(&ctx.frame)?;
+            Self::validate_frame(&ctx.frame, ctx.origin)?;
             if process.state == ProcessState::Blocked {
                 if ctx.pid == current_pid { return Err(ContextError::WrongState) }
                 continue;
@@ -296,7 +352,7 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
                 return Err(ContextError::StaleProcess)
             }
             if !stored.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
-            Self::validate_frame(&stored.frame)?;
+            Self::validate_frame(&stored.frame, stored.origin)?;
         }
         Ok(())
     }
@@ -385,7 +441,7 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
                 return Err(ContextError::WrongState)
             }
             if !ctx.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
-            Self::validate_frame(&ctx.frame)?;
+            Self::validate_frame(&ctx.frame, ctx.origin)?;
         }
         let target = self.snapshot(selected.pid).ok_or(ContextError::NotPrepared)?;
         Ok(ResumePlan {
