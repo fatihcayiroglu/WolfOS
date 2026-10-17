@@ -41,11 +41,14 @@ pub struct Ring3RunQueue<const N: usize> {
     // Last successful timer/yield rotation, only while the queue snapshot
     // has not changed since that decision (NOT hardware IRQ provenance).
     last_handoff: Option<(Handle, Handle)>,
+    // Last BLOCK transition to a peer, invalidated by every subsequent
+    // successful policy operation. This is NOT trusted trap provenance.
+    last_block_handoff: Option<(Handle, Handle)>,
 }
 
 impl<const N: usize> Ring3RunQueue<N> {
     pub const fn new() -> Self {
-        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0, last_handoff: None }
+        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0, last_handoff: None, last_block_handoff: None }
     }
 
     pub fn slots(&self) -> [Slot; N] { self.slots }
@@ -62,6 +65,9 @@ impl<const N: usize> Ring3RunQueue<N> {
     /// This is metadata only: never a substitute for IRQ/syscall provenance
     /// or independently authenticated CPU/FX/CR3/TSS state.
     pub fn last_policy_handoff(&self) -> Option<(Handle, Handle)> { self.last_handoff }
+    /// The last policy-only BLOCK dispatch, if it has not been superseded.
+    /// A trusted caller must still prove a real trap and saved CPU state.
+    pub fn last_block_handoff(&self) -> Option<(Handle, Handle)> { self.last_block_handoff }
     pub fn occupied(&self) -> usize {
         self.slots.iter().filter(|s| s.state != State::Empty).count()
     }
@@ -90,6 +96,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.slots[i] = Slot { handle, state: State::Ready, ticks: 0 };
         self.generation = generation;
         self.last_handoff = None;
+        self.last_block_handoff = None;
         Ok(handle)
     }
 
@@ -103,6 +110,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.active = Some(i);
         self.slice_ticks = 0;
         self.last_handoff = None;
+        self.last_block_handoff = None;
         Ok(self.slots[i].handle)
     }
 
@@ -137,6 +145,7 @@ impl<const N: usize> Ring3RunQueue<N> {
             self.slots[i].ticks = ticks;
             self.slice_ticks = elapsed;
             self.last_handoff = None;
+            self.last_block_handoff = None;
             return Ok(interrupted)
         }
         let next = self.ready_after(i);
@@ -155,6 +164,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         }
         self.switches = switches;
         self.last_handoff = handoff;
+        self.last_block_handoff = None;
         Ok(self.slots[self.active.unwrap()].handle)
     }
 
@@ -174,6 +184,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.active = Some(j);
         self.slice_ticks = 0;
         self.last_handoff = Some((running, self.slots[j].handle));
+        self.last_block_handoff = None;
         Ok(self.slots[j].handle)
     }
 
@@ -188,6 +199,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.slice_ticks = 0;
         if let Some(j) = next { self.slots[j].state = State::Running; }
         self.last_handoff = None;
+        self.last_block_handoff = next.map(|j| (running, self.slots[j].handle));
         Ok(self.running())
     }
 
@@ -196,6 +208,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         if self.slots[i].state != State::Blocked { return Err(Error::WrongState); }
         self.slots[i].state = State::Ready;
         self.last_handoff = None;
+        self.last_block_handoff = None;
         Ok(())
     }
 
@@ -208,6 +221,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         }
         self.slots[i].state = State::Exited;
         self.last_handoff = None;
+        self.last_block_handoff = None;
         Ok(())
     }
 
@@ -222,6 +236,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.slice_ticks = 0;
         if let Some(j) = next { self.slots[j].state = State::Running; }
         self.last_handoff = None;
+        self.last_block_handoff = None;
         Ok(self.running())
     }
 
@@ -232,6 +247,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         if self.slots[i].state != State::Exited { return Err(Error::WrongState); }
         self.slots[i] = Slot::EMPTY;
         self.last_handoff = None;
+        self.last_block_handoff = None;
         Ok(())
     }
 }
@@ -616,6 +632,58 @@ mod tests {
         assert_eq!(q.last_policy_handoff(), Some((d, a)));
         assert_eq!(q.timer_switches(), 6,
             "admit/wake/cancel/reap must not forge timer switches");
+    }
+
+    #[test]
+    fn block_handoff_proof_is_single_use_until_next_policy_mutation() {
+        let mut q = Ring3RunQueue::<3>::new();
+        let a = q.admit(10).unwrap();
+        let b = q.admit(11).unwrap();
+        let c = q.admit(12).unwrap();
+        assert_eq!(q.last_block_handoff(), None);
+        assert_eq!(q.start_next(), Ok(a));
+        assert_eq!(q.block_current(a), Ok(Some(b)));
+        assert_eq!(q.last_block_handoff(), Some((a, b)));
+        assert_eq!(q.last_policy_handoff(), None);
+        assert_eq!(q.timer_switches(), 0);
+        let before = q;
+        assert_eq!(q.block_current(a), Err(Error::Stale));
+        assert_eq!(q.wake(b), Err(Error::WrongState));
+        assert_eq!(q.cancel(b), Err(Error::WrongState));
+        assert_eq!(q, before,
+            "failed operations must not corrupt the pending BLOCK evidence");
+
+        assert_eq!(q.timer_tick(b), Ok(c));
+        assert_eq!(q.last_block_handoff(), None,
+            "a real timer decision supersedes a BLOCK policy decision");
+        assert_eq!(q.block_current(c), Ok(Some(b)));
+        assert_eq!(q.last_block_handoff(), Some((c, b)));
+        q.wake(a).unwrap();
+        assert_eq!(q.last_block_handoff(), None);
+        assert_eq!(q.block_current(b), Ok(Some(a)));
+        assert_eq!(q.last_block_handoff(), Some((b, a)));
+        q.cancel(c).unwrap();
+        assert_eq!(q.last_block_handoff(), None);
+        assert_eq!(q.exit_current(a), Ok(None));
+        assert_eq!(q.last_block_handoff(), None);
+        assert_eq!(q.reap(c), Ok(()));
+        assert_eq!(q.last_block_handoff(), None);
+        assert_eq!(q.timer_switches(), 1,
+            "BLOCK, WAKE, CANCEL and REAP never forge timer switches");
+    }
+
+    #[test]
+    fn blocking_the_last_ready_pid_produces_no_forged_handoff() {
+        let mut q = Ring3RunQueue::<1>::new();
+        let a = q.admit(7).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        assert_eq!(q.block_current(a), Ok(None));
+        assert_eq!(q.last_block_handoff(), None);
+        assert_eq!(q.running(), None);
+        assert_eq!(q.timer_switches(), 0);
+        assert_eq!(q.wake(a), Ok(()));
+        assert_eq!(q.start_next(), Ok(a));
+        assert_eq!(q.last_block_handoff(), None);
     }
 
     #[test]

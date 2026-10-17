@@ -275,6 +275,32 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
         })
     }
 
+    /// Ensure READY/RUNNING/BLOCKED scheduler slots agree with the entire
+    /// surviving process registry and have matching saved CR3 ownership.
+    /// This shared audit is policy-only: it cannot authenticate a hardware
+    /// trap, detect a physical IRQ or prove a saved FPU image.
+    fn audit_live_queue_members<const N: usize>(
+        &self, table: &ProcessTable<SLOTS, N>,
+        queue: &Ring3RunQueue<SLOTS>,
+    ) -> Result<(), ContextError> {
+        for slot in queue.slots() {
+            let expected = match slot.state {
+                RunState::Ready | RunState::Running => ProcessState::Ready,
+                RunState::Blocked => ProcessState::Blocked,
+                RunState::Empty | RunState::Exited => continue,
+            };
+            let process = table.snapshot(slot.handle.pid).ok_or(ContextError::StaleProcess)?;
+            if process.state != expected { return Err(ContextError::WrongState) }
+            let stored = self.snapshot(slot.handle.pid).ok_or(ContextError::NotPrepared)?;
+            if stored.cr3_root != process.cr3_root {
+                return Err(ContextError::StaleProcess)
+            }
+            if !stored.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
+            Self::validate_frame(&stored.frame)?;
+        }
+        Ok(())
+    }
+
     /// Validate a scheduler-selected post-park handoff before any hardware
     /// IRETQ/CR3/TSS/FX action. The *trusted trap handler* must have already
     /// authenticated IRQ/syscall provenance, saved GPR/FX state, and parked
@@ -308,26 +334,65 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             return Err(ContextError::WrongState)
         }
 
-        // BLOCKED queue slots remain live owners with private CR3 and PMM
-        // leases. Reject a one-sided block/wake: the queue and registry must
-        // agree, and even a sleeping PID needs its saved return context.
-        // EXITED tombstones may already have been reclaimed by the owner.
-        for slot in slots {
-            let expected = match slot.state {
-                RunState::Ready | RunState::Running => ProcessState::Ready,
-                RunState::Blocked => ProcessState::Blocked,
-                RunState::Empty | RunState::Exited => continue,
-            };
-            let process = table.snapshot(slot.handle.pid).ok_or(ContextError::StaleProcess)?;
-            if process.state != expected {
-                return Err(ContextError::WrongState)
-            }
-            let stored = self.snapshot(slot.handle.pid).ok_or(ContextError::NotPrepared)?;
-            if stored.cr3_root != process.cr3_root {
+        // BLOCKED slots are still live owners. A one-sided block/wake,
+        // missing saved context or stale CR3 must invalidate the whole plan.
+        self.audit_live_queue_members(table, queue)?;
+        self.plan_selected(table, from.pid, to.pid, actual_kernel_cr3)
+    }
+
+    /// Plan the *destination* of an already authenticated BLOCK trap when
+    /// the source is BLOCKED and the queue has dispatched a READY peer.
+    ///
+    /// A BLOCK event is NOT a timer/yield handoff. It must not increase
+    /// timer_switches or fabricate IRQ proof. The caller must independently
+    /// authenticate the actual CPL3 trap, saved GPR/IRET and FPU state,
+    /// read the active kernel CR3 and ensure that the source has been
+    /// parked/blocked BEFORE using this read-only metadata authorization.
+    /// The output is not itself permission to perform a hardware IRETQ.
+    pub fn plan_blocked_handoff<const N: usize>(
+        &self, table: &ProcessTable<SLOTS, N>,
+        queue: &Ring3RunQueue<SLOTS>,
+        blocked: RunHandle, selected: RunHandle, actual_kernel_cr3: u64,
+    ) -> Result<ResumePlan, ContextError> {
+        if blocked.pid == 0 || selected.pid == 0 || blocked == selected {
+            return Err(ContextError::SchedulerMismatch)
+        }
+        let slots = queue.slots();
+        if queue.running() != Some(selected)
+            || queue.last_block_handoff() != Some((blocked, selected))
+            || !slots.iter().any(|s|
+                s.handle == blocked && s.state == RunState::Blocked)
+            || !slots.iter().any(|s|
+                s.handle == selected && s.state == RunState::Running)
+        { return Err(ContextError::SchedulerMismatch) }
+        if table.running() != 0 { return Err(ContextError::WrongState) }
+        if actual_kernel_cr3 == 0 || actual_kernel_cr3 & 4095 != 0
+            || actual_kernel_cr3 >= PHYS_END
+        { return Err(ContextError::BadCr3) }
+        if table.owns_live_cr3(actual_kernel_cr3) {
+            return Err(ContextError::ActiveUserCr3)
+        }
+        // Unlike timer/yield, the source is BLOCKED. Calling plan_selected
+        // would reject this source in plan_next; audit the complete saved
+        // context bank without making the BLOCKED PID runnable.
+        self.audit_live_queue_members(table, queue)?;
+        for ctx in self.entries.iter().flatten() {
+            let process = table.snapshot(ctx.pid).ok_or(ContextError::StaleProcess)?;
+            if process.cr3_root != ctx.cr3_root {
                 return Err(ContextError::StaleProcess)
             }
+            if !matches!(process.state, ProcessState::Ready | ProcessState::Blocked) {
+                return Err(ContextError::WrongState)
+            }
+            if !ctx.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
+            Self::validate_frame(&ctx.frame)?;
         }
-        self.plan_selected(table, from.pid, to.pid, actual_kernel_cr3)
+        let target = self.snapshot(selected.pid).ok_or(ContextError::NotPrepared)?;
+        Ok(ResumePlan {
+            pid: target.pid, cr3_root: target.cr3_root,
+            rsp0: target.kernel_stack.top, frame: target.frame,
+            origin: target.origin,
+        })
     }
 
     /// A context can be removed only after ProcessTable has revoked that
@@ -888,6 +953,102 @@ mod tests {
         assert_eq!(queue.timer_switches(), 2,
             "wake cannot be counted as a hardware-origin switch");
         assert_eq!(contexts.count(), 3, "no context was released by wake");
+    }
+
+    #[test]
+    fn blocked_handoff_plans_only_exact_source_target_and_keeps_owned_frames() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut bank = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let bottom = 0xffff_8000_0b00_0000;
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 3];
+        for i in 0..3 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            bank.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 900 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(h[0]));
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+        assert_eq!(queue.last_policy_handoff(), None);
+        assert_eq!(queue.last_block_handoff(), Some((h[0], h[1])));
+
+        let plan = bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000)
+            .unwrap();
+        assert_eq!(plan.pid, h[1].pid);
+        assert_eq!(plan.cr3_root, roots[1]);
+        assert_eq!(plan.rsp0, bottom + 0x10000 + KSTACK_BYTES);
+        assert_eq!(plan.frame.registers.rax, 900 + h[1].pid);
+        assert_eq!(plan.frame.registers.r12, (900 + h[1].pid) * 3);
+        assert_eq!(plan.origin, FrameOrigin::Bootstrap);
+        assert_eq!(table.snapshot(h[0].pid).unwrap().frames, frames(roots[0]));
+        assert_eq!(table.occupied(), 3);
+        assert_eq!(table.running(), 0);
+        assert_eq!(queue.timer_switches(), 0);
+
+        let stale = RunHandle { generation: h[0].generation + 1, ..h[0] };
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, stale, h[1], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[2], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], roots[1]),
+            Err(ContextError::ActiveUserCr3));
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0),
+            Err(ContextError::BadCr3));
+        let saved = bank.entries[0];
+        bank.entries[0] = None;
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::NotPrepared));
+        bank.entries[0] = saved;
+        bank.entries[0].as_mut().unwrap().cr3_root = roots[2];
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::StaleProcess));
+        bank.entries[0] = saved;
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Ok(plan));
+
+        table.wake_blocked(h[0].pid, 0x90000).unwrap();
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::WrongState),
+            "a registry-only wake invalidates the block handoff");
+        queue.wake(h[0]).unwrap();
+        assert_eq!(queue.last_block_handoff(), None);
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(table.snapshot(h[0].pid).unwrap().frames, frames(roots[0]));
+    }
+
+    #[test]
+    fn blocked_handoff_is_not_replayable_after_a_timer_tick() {
+        let mut table = ProcessTable::<2, 7>::new();
+        let mut bank = UserContextBank::<2>::new();
+        let mut queue = Ring3RunQueue::<2>::new();
+        let roots = [0x10000, 0x20000];
+        let h = roots.map(|root| {
+            let pid = table.reserve(root, frames(root)).unwrap();
+            let handle = queue.admit(pid).unwrap();
+            bank.prepare_bootstrap(&table, pid, root,
+                stack(0xffff_8000_0c00_0000 + (pid - 1) * 0x10000),
+                frame(0x401000 + pid * 0x1000, pid)).unwrap();
+            handle
+        });
+        queue.start_next().unwrap();
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+        assert!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000).is_ok());
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[1]));
+        assert_eq!(queue.last_block_handoff(), None);
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+        assert_eq!(queue.timer_switches(), 0);
     }
 
     #[test]
