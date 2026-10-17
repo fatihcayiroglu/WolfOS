@@ -2,7 +2,7 @@
 """Adversarial offline tests for the standalone Ring3 GDT/TR/TSS QEMU gate."""
 import unittest
 
-from user_ring_prep_smoke import strict_ring_prep_evidence
+from user_ring_prep_smoke import strict_ring_prep_evidence, strict_boot_evidence
 
 PROOF = (
     "WOLFOS_RING_PREP_OK tr=0x18 user_cs=0x33 user_ds=0x2b "
@@ -12,6 +12,14 @@ PROOF = (
 
 
 class RingPrepEvidenceTests(unittest.TestCase):
+    def test_boot_marker_exactly_once(self):
+        self.assertTrue(strict_boot_evidence("diagnostic\nWOLFOS_BOOT_OK\n"))
+        for output in ("", "WOLFOS_BOOT_OK_FAKE", "prefix WOLFOS_BOOT_OK",
+                       "WOLFOS_BOOT_OK\nWOLFOS_BOOT_OK",
+                       "WOLFOS_BOOT_OK\nprefix WOLFOS_BOOT_OK"):
+            with self.subTest(output=output):
+                self.assertFalse(strict_boot_evidence(output))
+
     def test_accepts_one_complete_proof_with_unrelated_output(self):
         self.assertTrue(strict_ring_prep_evidence(
             "WOLFOS_BOOT_OK\n" + PROOF + "\ndiagnostic: unrelated output"))
