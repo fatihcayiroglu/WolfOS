@@ -38,11 +38,13 @@ pub struct Ring3RunQueue<const N: usize> {
     // Consecutive authenticated, eligible timer IRQs in the current slice.
     // Policy-only: caller must establish genuine xAPIC IRQ provenance.
     slice_ticks: u64,
+    // Latest successful cross-PID policy rotation (NOT hardware IRQ proof).
+    last_handoff: Option<(Handle, Handle)>,
 }
 
 impl<const N: usize> Ring3RunQueue<N> {
     pub const fn new() -> Self {
-        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0 }
+        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0, last_handoff: None }
     }
 
     pub fn slots(&self) -> [Slot; N] { self.slots }
@@ -53,6 +55,10 @@ impl<const N: usize> Ring3RunQueue<N> {
     /// never a syscall, EXIT, BLOCK or wakeup dispatch.
     pub fn timer_switches(&self) -> u64 { self.switches }
     pub fn current_slice_ticks(&self) -> u64 { self.slice_ticks }
+    /// Identifies the last successful timer/yield cross-PID policy decision.
+    /// This is only metadata corroboration; the trusted caller must still
+    /// independently authenticate the IRQ or syscall and saved CPU state.
+    pub fn last_policy_handoff(&self) -> Option<(Handle, Handle)> { self.last_handoff }
     pub fn occupied(&self) -> usize {
         self.slots.iter().filter(|s| s.state != State::Empty).count()
     }
@@ -92,6 +98,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.slots[i].state = State::Running;
         self.active = Some(i);
         self.slice_ticks = 0;
+        self.last_handoff = None;
         Ok(self.slots[i].handle)
     }
 
@@ -125,12 +132,14 @@ impl<const N: usize> Ring3RunQueue<N> {
         if elapsed < quantum_ticks {
             self.slots[i].ticks = ticks;
             self.slice_ticks = elapsed;
+            self.last_handoff = None;
             return Ok(interrupted)
         }
         let next = self.ready_after(i);
         let switches = if next.is_some() {
             self.switches.checked_add(1).ok_or(Error::Overflow)?
         } else { self.switches };
+        let handoff = next.map(|j| (interrupted, self.slots[j].handle));
         self.slots[i].ticks = ticks;
         if let Some(j) = next {
             self.slots[i].state = State::Ready;
@@ -141,6 +150,7 @@ impl<const N: usize> Ring3RunQueue<N> {
             self.slice_ticks = quantum_ticks;
         }
         self.switches = switches;
+        self.last_handoff = handoff;
         Ok(self.slots[self.active.unwrap()].handle)
     }
 
@@ -159,6 +169,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.slots[j].state = State::Running;
         self.active = Some(j);
         self.slice_ticks = 0;
+        self.last_handoff = Some((running, self.slots[j].handle));
         Ok(self.slots[j].handle)
     }
 
@@ -172,6 +183,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.active = next;
         self.slice_ticks = 0;
         if let Some(j) = next { self.slots[j].state = State::Running; }
+        self.last_handoff = None;
         Ok(self.running())
     }
 
@@ -203,6 +215,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         self.active = next;
         self.slice_ticks = 0;
         if let Some(j) = next { self.slots[j].state = State::Running; }
+        self.last_handoff = None;
         Ok(self.running())
     }
 
@@ -521,6 +534,34 @@ mod tests {
         assert_eq!(q, before);
         assert_eq!(q.start_next(), Ok(replacement));
         assert_eq!(q.timer_switches(), 0);
+    }
+
+    #[test]
+    fn only_real_policy_rotation_records_its_exact_handoff_pair() {
+        let mut q = Ring3RunQueue::<3>::new();
+        let a = q.admit(1).unwrap();
+        let b = q.admit(2).unwrap();
+        let c = q.admit(3).unwrap();
+        assert_eq!(q.last_policy_handoff(), None);
+        assert_eq!(q.start_next(), Ok(a));
+        assert_eq!(q.timer_quantum_tick(a, 2), Ok(a));
+        assert_eq!(q.last_policy_handoff(), None);
+        assert_eq!(q.block_current(a), Ok(Some(b)));
+        assert_eq!(q.last_policy_handoff(), None);
+        q.wake(a).unwrap();
+        assert_eq!(q.last_policy_handoff(), None,
+            "a wake cannot fabricate a transition from the woken PID");
+        assert_eq!(q.timer_tick(b), Ok(c));
+        assert_eq!(q.last_policy_handoff(), Some((b, c)));
+        let before = q;
+        assert_eq!(q.timer_tick(a), Err(Error::Stale));
+        assert_eq!(q, before, "a rejected tick must preserve handoff evidence");
+        assert_eq!(q.voluntary_yield(c), Ok(a));
+        assert_eq!(q.last_policy_handoff(), Some((c, a)));
+        assert_eq!(q.block_current(a), Ok(Some(b)));
+        assert_eq!(q.last_policy_handoff(), None,
+            "a blocking handoff is not a timer/yield rotation");
+        assert_eq!(q.timer_switches(), 1);
     }
 
     #[test]
