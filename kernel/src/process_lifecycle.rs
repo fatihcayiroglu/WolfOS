@@ -24,7 +24,7 @@ const MAX_PHYSICAL: u64 = 1 << 52;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessState {
-    Empty, Ready, Running, Exited, Reaped,
+    Empty, Ready, Running, Blocked, Exited, Reaped,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessError {
@@ -105,6 +105,41 @@ impl<const N: usize> ProcessRecord<N> {
         if active_cr3 != self.cr3_root {
             return Err(ProcessError::WrongAddressSpace)
         }
+        self.state = ProcessState::Ready;
+        Ok(())
+    }
+
+    /// Suspend a RUNNING user after the trusted trap has saved its full
+    /// GPR/IRET and FPU state. The supplied root must be the actual user CR3.
+    /// All private PMM frames and the PID generation remain owned; this does
+    /// not yet implement a wait event or any hardware scheduling.
+    pub fn block_running(&mut self, pid: u64, active_cr3: u64)
+        -> Result<(), ProcessError>
+    {
+        self.identity(pid)?;
+        if self.state != ProcessState::Running {
+            return Err(ProcessError::WrongState)
+        }
+        if active_cr3 != self.cr3_root {
+            return Err(ProcessError::WrongAddressSpace)
+        }
+        self.state = ProcessState::Blocked;
+        Ok(())
+    }
+
+    /// Wake only an existing BLOCKED owner from a trusted kernel event.
+    /// Caller must independently verify the actual supervisor CR3 and event;
+    /// this metadata check alone cannot authenticate an interrupt/wakeup.
+    pub fn wake_blocked(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<(), ProcessError>
+    {
+        self.identity(pid)?;
+        if self.state != ProcessState::Blocked {
+            return Err(ProcessError::WrongState)
+        }
+        if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
+            || supervisor_cr3 >= MAX_PHYSICAL || supervisor_cr3 == self.cr3_root
+        { return Err(ProcessError::ActiveCr3) }
         self.state = ProcessState::Ready;
         Ok(())
     }
@@ -303,6 +338,44 @@ mod tests {
         p.admit(12, owned()[0], owned()).unwrap();
         p.mark_running(12, owned()[0]).unwrap();
         assert_eq!(p.cancel_ready(12, 0x9000), Err(ProcessError::WrongState));
+    }
+
+    #[test]
+    fn blocked_owner_retains_all_frames_and_requires_exact_wake() {
+        let mut p = ProcessRecord::<7>::empty();
+        p.admit(17, owned()[0], owned()).unwrap();
+        p.mark_running(17, owned()[0]).unwrap();
+        let before = p;
+        assert_eq!(p.block_running(18, owned()[0]), Err(ProcessError::StalePid));
+        assert_eq!(p.block_running(17, 0x9000), Err(ProcessError::WrongAddressSpace));
+        assert_eq!(p, before);
+
+        p.block_running(17, owned()[0]).unwrap();
+        assert_eq!(p.state, ProcessState::Blocked);
+        assert_eq!(p.frames, owned());
+        assert_eq!(p.cr3_root, owned()[0]);
+        let blocked = p;
+        assert_eq!(p.block_running(17, owned()[0]), Err(ProcessError::WrongState));
+        assert_eq!(p.mark_running(17, owned()[0]), Err(ProcessError::WrongState));
+        assert_eq!(p.cancel_ready(17, 0x9000), Err(ProcessError::WrongState));
+        assert_eq!(p.reap(17, 0x9000), Err(ProcessError::WrongState));
+        assert_eq!(p.exit_zero(17, owned()[0]), Err(ProcessError::WrongState));
+        assert_eq!(p.wake_blocked(18, 0x9000), Err(ProcessError::StalePid));
+        for invalid_root in [0, owned()[0], 0x9001, 1 << 52] {
+            assert_eq!(p.wake_blocked(17, invalid_root), Err(ProcessError::ActiveCr3));
+        }
+        assert_eq!(p, blocked, "rejected operations cannot free a sleeping PID");
+
+        p.wake_blocked(17, 0x9000).unwrap();
+        assert_eq!(p.state, ProcessState::Ready);
+        let ready = p;
+        assert_eq!(p.wake_blocked(17, 0x9000), Err(ProcessError::WrongState));
+        assert_eq!(p, ready);
+        p.mark_running(17, owned()[0]).unwrap();
+        p.exit_zero(17, owned()[0]).unwrap();
+        assert_eq!(p.reap(17, 0x9000), Ok(owned()));
+        assert_eq!(p.frames, [0; 7]);
+        assert_eq!(p.wake_blocked(17, 0x9000), Err(ProcessError::WrongState));
     }
 
     #[test]
