@@ -16,9 +16,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[path = "process_lifecycle.rs"]
 pub(crate) mod standalone_process;
 #[cfg(test)]
-use standalone_process::{ProcessError, ProcessRecord, ProcessState};
+use standalone_process::{ProcessError, ProcessRecord, ProcessState, PAGE};
 #[cfg(not(test))]
-use crate::process_lifecycle::{ProcessError, ProcessRecord, ProcessState};
+use crate::process_lifecycle::{ProcessError, ProcessRecord, ProcessState, PAGE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableError {
@@ -63,7 +63,7 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
     }
 
     fn live(state: ProcessState) -> bool {
-        matches!(state, ProcessState::Ready | ProcessState::Running | ProcessState::Exited)
+        matches!(state, ProcessState::Ready | ProcessState::Running | ProcessState::Blocked | ProcessState::Exited)
     }
 
     /// A snapshot cannot mutate resources or authenticate a PID. A reaped
@@ -129,6 +129,29 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         -> Result<(), TableError>
     {
         self.record_mut(pid)?.park_running(pid, actual_cr3)
+            .map_err(TableError::from)
+    }
+
+    /// Block only the active RUNNING owner after the trusted CPL3 trap has
+    /// saved its registers, IRET frame and FX state. Retain PMM/CR3 ownership.
+    pub fn block_running(&mut self, pid: u64, actual_cr3: u64)
+        -> Result<(), TableError>
+    {
+        self.record_mut(pid)?.block_running(pid, actual_cr3)
+            .map_err(TableError::from)
+    }
+
+    /// Wake a BLOCKED owner, keeping all private frames pinned. The caller
+    /// authenticates the event and reads the actual supervisor CR3 separately.
+    /// Reject a supervisor CR3 that aliases ANY still-resident userspace root.
+    /// No runtime scheduling, IRQ dispatch or frame handoff occurs here.
+    pub fn wake_blocked(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<(), TableError>
+    {
+        if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
+            || supervisor_cr3 >= (1 << 52) || self.owns_live_cr3(supervisor_cr3)
+        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
+        self.record_mut(pid)?.wake_blocked(pid, supervisor_cr3)
             .map_err(TableError::from)
     }
 
@@ -300,6 +323,53 @@ mod tests {
         assert_eq!(t.reap(y, 0x90000), Ok(b));
         assert_eq!(t.cancel_ready(z, 0x90000), Ok(c));
         assert_eq!(t.occupied(), 0);
+    }
+
+    #[test]
+    fn blocked_pid_stays_resident_until_authenticated_wake_and_cleanup() {
+        let mut t = ProcessTable::<3, 7>::new();
+        let a_frames = frames(0x1000);
+        let b_frames = frames(0x10000);
+        let a = t.reserve(a_frames[0], a_frames).unwrap();
+        let b = t.reserve(b_frames[0], b_frames).unwrap();
+        t.mark_running(a, a_frames[0]).unwrap();
+        assert_eq!(t.block_running(a, b_frames[0]),
+            Err(TableError::Process(ProcessError::WrongAddressSpace)));
+        t.block_running(a, a_frames[0]).unwrap();
+        assert_eq!(t.running(), 0);
+        assert_eq!(t.occupied(), 2);
+        assert_eq!(t.snapshot(a).unwrap().state, ProcessState::Blocked);
+        assert_eq!(t.snapshot(a).unwrap().frames, a_frames);
+        assert!(t.owns_live_cr3(a_frames[0]));
+
+        let mut colliding = frames(0x30000);
+        colliding[6] = a_frames[4];
+        assert_eq!(t.reserve(colliding[0], colliding), Err(TableError::PhysicalAlias));
+        assert_eq!(t.mark_running(a, a_frames[0]),
+            Err(TableError::Process(ProcessError::WrongState)));
+        assert_eq!(t.cancel_ready(a, 0x90000),
+            Err(TableError::Process(ProcessError::WrongState)));
+        assert_eq!(t.reap(a, 0x90000),
+            Err(TableError::Process(ProcessError::WrongState)));
+
+        t.mark_running(b, b_frames[0]).unwrap();
+        t.park_running(b, b_frames[0]).unwrap();
+        for invalid_cr3 in [0, a_frames[0], b_frames[0], 0x90001, 1 << 52] {
+            assert_eq!(t.wake_blocked(a, invalid_cr3),
+                Err(TableError::Process(ProcessError::ActiveCr3)));
+        }
+        assert_eq!(t.wake_blocked(99, 0x90000), Err(TableError::UnknownPid));
+        assert_eq!(t.snapshot(a).unwrap().state, ProcessState::Blocked);
+        assert_eq!(t.wake_blocked(a, 0x90000), Ok(()));
+        assert_eq!(t.wake_blocked(a, 0x90000),
+            Err(TableError::Process(ProcessError::WrongState)));
+        assert_eq!(t.snapshot(a).unwrap().state, ProcessState::Ready);
+        t.mark_running(a, a_frames[0]).unwrap();
+        t.exit_zero(a, a_frames[0]).unwrap();
+        assert_eq!(t.reap(a, 0x90000), Ok(a_frames));
+        assert_eq!(t.cancel_ready(b, 0x90000), Ok(b_frames));
+        assert_eq!(t.occupied(), 0);
+        assert_eq!(t.wake_blocked(a, 0x90000), Err(TableError::UnknownPid));
     }
 
     #[test]
