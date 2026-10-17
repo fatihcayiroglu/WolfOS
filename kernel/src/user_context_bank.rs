@@ -763,6 +763,158 @@ mod tests {
     }
 
     #[test]
+    fn refresh_running_trap_keeps_pid_cr3_stack_and_updates_all_registers() {
+        let (mut table,mut bank) = two();
+        let a = stack(0xffff_8000_0110_0000);
+        let b = stack(0xffff_8000_0111_0000);
+        let boot = frame(0x401000, 11);
+        let other = frame(0x402000, 22);
+        bank.prepare_bootstrap(&table,1,0x1000,a,boot).unwrap();
+        bank.prepare_bootstrap(&table,2,0x10000,b,other).unwrap();
+        table.mark_running(1,0x1000).unwrap();
+
+        let mut captured = frame(0x401080, 67);
+        captured.hardware.rflags = 0x202;
+        captured.registers.r15 = 0xabc0_0015;
+        captured.registers.r14 = 0xabc0_0014;
+        captured.registers.r13 = 0xabc0_0013;
+        captured.registers.rdx = 0xabc0_0003;
+        captured.registers.rbx = 0xabc0_0002;
+        bank.refresh_authenticated_trap(
+            &table,1,0x1000,a,a.top-FRAME_BYTES as u64,captured
+        ).unwrap();
+        let stored = bank.snapshot(1).unwrap();
+        assert_eq!(stored.pid,1);
+        assert_eq!(stored.cr3_root,0x1000);
+        assert_eq!(stored.kernel_stack,a);
+        assert_eq!(stored.origin,FrameOrigin::HardwareTrap);
+        assert_eq!(stored.frame,captured);
+        assert_eq!(bank.snapshot(2).unwrap().frame,other);
+        assert_eq!(bank.count(),2);
+
+        table.park_running(1,0x1000).unwrap();
+        let plan = bank.plan_next(&table,2,0x90000).unwrap();
+        assert_eq!(plan.pid,1);
+        assert_eq!(plan.origin,FrameOrigin::HardwareTrap);
+        assert_eq!(plan.rsp0,a.top);
+        assert_eq!(plan.frame,captured);
+        table.mark_running(1,0x1000).unwrap();
+        captured.hardware.rip=0x4010a0;
+        captured.registers.r15=0xffff_f00d;
+        captured.registers.rax=0x45;
+        bank.refresh_authenticated_trap(
+            &table,1,0x1000,a,a.top-FRAME_BYTES as u64,captured
+        ).unwrap();
+        assert_eq!(bank.snapshot(1).unwrap().frame,captured);
+        assert_eq!(bank.snapshot(2).unwrap().frame,other);
+        assert_eq!(bank.count(),2);
+    }
+
+    #[test]
+    fn forged_or_late_trap_refresh_is_transactional() {
+        let (mut table,mut bank) = two();
+        let a=stack(0xffff_8000_0120_0000);
+        let b=stack(0xffff_8000_0121_0000);
+        bank.prepare_bootstrap(&table,1,0x1000,a,frame(0x401000,1)).unwrap();
+        bank.prepare_bootstrap(&table,2,0x10000,b,frame(0x402000,2)).unwrap();
+        let mut captured=frame(0x401080,73);
+        captured.hardware.rflags=0x202;
+        let at=a.top-FRAME_BYTES as u64;
+        let before=bank.snapshot(1).unwrap();
+        let other=bank.snapshot(2).unwrap();
+
+        assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,a,at,captured),
+            Err(ContextError::WrongState));
+        table.mark_running(1,0x1000).unwrap();
+        assert_eq!(bank.refresh_authenticated_trap(&table,0,0x1000,a,at,captured),
+            Err(ContextError::InvalidPid));
+        assert_eq!(bank.refresh_authenticated_trap(&table,99,0x1000,a,at,captured),
+            Err(ContextError::NotResident));
+        assert_eq!(bank.refresh_authenticated_trap(&table,2,0x10000,b,
+            b.top-FRAME_BYTES as u64,captured),Err(ContextError::WrongState));
+        for root in [0,0x10000,0x1001,1<<52] {
+            assert_eq!(bank.refresh_authenticated_trap(&table,1,root,a,at,captured),
+                Err(ContextError::BadCr3));
+        }
+        assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,b,
+            b.top-FRAME_BYTES as u64,captured),Err(ContextError::BadKernelStack));
+        for addr in [a.bottom,at-8,at+8,a.top] {
+            assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,a,addr,captured),
+                Err(ContextError::FrameOutsideKernelStack));
+        }
+        let mut bad=captured;
+        bad.hardware.rflags=2;
+        assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,a,at,bad),
+            Err(ContextError::BadFlags));
+        bad=captured;bad.hardware.rflags|=1<<12;
+        assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,a,at,bad),
+            Err(ContextError::BadFlags));
+        bad=captured;bad.hardware.cs=8;
+        assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,a,at,bad),
+            Err(ContextError::BadSelectors));
+        bad=captured;bad.hardware.rsp=u64::MAX;
+        assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,a,at,bad),
+            Err(ContextError::BadUserPointer));
+        assert_eq!(bank.snapshot(1),Some(before),
+            "no rejected capture may change any stored GPR or frame origin");
+        assert_eq!(bank.snapshot(2),Some(other));
+
+        table.block_running(1,0x1000).unwrap();
+        assert_eq!(bank.refresh_authenticated_trap(&table,1,0x1000,a,at,captured),
+            Err(ContextError::WrongState));
+        assert_eq!(bank.snapshot(1),Some(before));
+        assert_eq!(bank.count(),2);
+    }
+
+    #[test]
+    fn blocked_then_woken_pid_resumes_the_saved_irq_frame_not_bootstrap() {
+        let mut table=ProcessTable::<3,7>::new();
+        let mut bank=UserContextBank::<3>::new();
+        let mut queue=Ring3RunQueue::<3>::new();
+        let roots=[0x10000,0x20000,0x30000];
+        let bottom=0xffff_8000_0d00_0000;
+        let mut h=[RunHandle{pid:0,generation:0};3];
+        for i in 0..3 {
+            let pid=table.reserve(roots[i],frames(roots[i])).unwrap();
+            h[i]=queue.admit(pid).unwrap();
+            bank.prepare_bootstrap(&table,pid,roots[i],
+                stack(bottom+(i as u64)*0x10000),
+                frame(0x401000+(i as u64)*0x1000,100+pid)).unwrap();
+        }
+        assert_eq!(queue.start_next(),Ok(h[0]));
+        table.mark_running(h[0].pid,roots[0]).unwrap();
+        let a=stack(bottom);
+        let mut captured=frame(0x4010f0,765);
+        captured.hardware.rflags=0x202;
+        captured.registers.r15=0x150015;
+        captured.registers.r12=0x120012;
+        bank.refresh_authenticated_trap(
+            &table,h[0].pid,roots[0],a,a.top-FRAME_BYTES as u64,captured
+        ).unwrap();
+        table.block_running(h[0].pid,roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]),Ok(Some(h[1])));
+        assert_eq!(bank.plan_blocked_handoff(
+            &table,&queue,h[0],h[1],0x90000).unwrap().pid,h[1].pid);
+        assert_eq!(bank.snapshot(h[0].pid).unwrap().origin,FrameOrigin::HardwareTrap);
+        assert_eq!(table.snapshot(h[0].pid).unwrap().frames,frames(roots[0]));
+
+        table.wake_blocked(h[0].pid,0x90000).unwrap();
+        queue.wake(h[0]).unwrap();
+        assert_eq!(queue.timer_tick(h[1]),Ok(h[2]));
+        assert_eq!(queue.timer_tick(h[2]),Ok(h[0]));
+        let resumed=bank.plan_queue_handoff(
+            &table,&queue,h[2],h[0],0x90000).unwrap();
+        assert_eq!(resumed.origin,FrameOrigin::HardwareTrap);
+        assert_eq!(resumed.frame,captured);
+        assert_eq!(resumed.cr3_root,roots[0]);
+        assert_eq!(resumed.rsp0,a.top);
+        assert_eq!(bank.count(),3);
+        assert_eq!(table.occupied(),3);
+        assert_eq!(table.running(),0,"policy-only metadata, no real IRQ proof");
+        assert_eq!(queue.timer_switches(),2);
+    }
+
+    #[test]
     fn woken_ready_pid_cannot_forge_the_source_of_a_resume_plan() {
         let mut table = ProcessTable::<3, 7>::new();
         let mut contexts = UserContextBank::<3>::new();
