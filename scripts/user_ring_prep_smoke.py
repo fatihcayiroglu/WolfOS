@@ -29,6 +29,14 @@ def strict_ring_prep_evidence(output: str) -> bool:
     return tr == 0x18 and cs & 7 == 3 and ds & 7 == 3 and cs != ds
 
 
+def strict_boot_evidence(output: str) -> bool:
+    """Require exactly one standalone successful boot marker."""
+    return sum(row == "WOLFOS_BOOT_OK" for row in output.splitlines()) == 1 and not any(
+        "WOLFOS_BOOT_OK" in row and row != "WOLFOS_BOOT_OK"
+        for row in output.splitlines()
+    )
+
+
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: user_ring_prep_smoke.py path/to/wolfos-user-ring-prep.iso")
@@ -54,7 +62,7 @@ def main() -> int:
             return 2
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
-        if not strict_ring_prep_evidence(output) or "WOLFOS_BOOT_OK" not in output:
+        if not strict_ring_prep_evidence(output) or not strict_boot_evidence(output):
             print("FAIL: missing, forged, duplicated or invalid GDT/TSS/TR proof or regular kernel boot")
             return 1
         for bad in (
