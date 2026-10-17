@@ -834,6 +834,58 @@ mod tests {
     }
 
     #[test]
+    fn wake_after_timer_selection_requires_a_fresh_policy_handoff() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut contexts = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let bottom = 0xffff_8000_0a00_0000;
+        let mut h = [RunHandle { pid: 0, generation: 0 }; 3];
+        for i in 0..3 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            h[i] = queue.admit(pid).unwrap();
+            contexts.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(bottom + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, 700 + pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(h[0]));
+        table.mark_running(h[0].pid, roots[0]).unwrap();
+        table.block_running(h[0].pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current(h[0]), Ok(Some(h[1])));
+
+        assert_eq!(queue.timer_tick(h[1]), Ok(h[2]));
+        assert_eq!(queue.last_policy_handoff(), Some((h[1], h[2])));
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000)
+            .unwrap().pid, h[2].pid);
+
+        // Both ledgers match again after this wake. That alone must not
+        // authorize replay of an OLD timer decision taken before the wake.
+        table.wake_blocked(h[0].pid, 0x90000).unwrap();
+        queue.wake(h[0]).unwrap();
+        assert_eq!(queue.last_policy_handoff(), None);
+        assert_eq!(contexts.plan_queue_handoff(&table, &queue, h[1], h[2], 0x90000),
+            Err(ContextError::SchedulerMismatch));
+        assert_eq!(queue.running(), Some(h[2]));
+        assert_eq!(table.running(), 0);
+        assert_eq!(table.occupied(), 3);
+
+        assert_eq!(queue.timer_tick(h[2]), Ok(h[0]));
+        let plan = contexts.plan_queue_handoff(&table, &queue, h[2], h[0], 0x90000)
+            .unwrap();
+        assert_eq!(plan.pid, h[0].pid);
+        assert_eq!(plan.cr3_root, roots[0]);
+        assert_eq!(plan.rsp0, bottom + KSTACK_BYTES);
+        assert_eq!(plan.frame.registers.rax, 700 + h[0].pid);
+        assert_eq!(plan.frame.registers.r12, (700 + h[0].pid) * 3);
+        assert_eq!(plan.origin, FrameOrigin::Bootstrap);
+        assert_eq!(queue.timer_switches(), 2,
+            "wake cannot be counted as a hardware-origin switch");
+        assert_eq!(contexts.count(), 3, "no context was released by wake");
+    }
+
+    #[test]
     fn empty_banks_and_unavailable_next_fail_closed() {
         let (t,mut bank) = two();
         assert_eq!(bank.plan_next(&t,1,0x90000),Err(ContextError::NotPrepared));
