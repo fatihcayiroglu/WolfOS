@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 from user_timer_nonyield_smoke import ordered_evidence_lines
+from user_ring_prep_smoke import PROOF as RING_PREP_PROOF
 
 HARDWARE_STEM = "WOLFOS_RING3_FOUR_HARDWARE_OK"
 EOI_STEM = "WOLFOS_RING3_FOUR_EOI_OK"
@@ -61,6 +62,18 @@ ERROR_STEMS = (
     "WOLFOS_RING3_YIELD_TRAP", "WOLFOS_RING3_YIELD_SWITCH",
     "WOLFOS_RING3_NONYIELD_EXIT", "WOLFOS_RING3_NONYIELD_HARDWARE_OK",
 )
+
+
+def strict_four_descriptor_evidence(output: str) -> bool:
+    """Require the full GDT/TR/RSP0 proof before accepting live Ring3 IRQs."""
+    matches = [row for row in output.splitlines() if "WOLFOS_RING_PREP_OK" in row]
+    if len(matches) != 1:
+        return False
+    proof = RING_PREP_PROOF.fullmatch(matches[0])
+    if proof is None:
+        return False
+    tr, cs, ds = (int(value, 16) for value in proof.groups())
+    return tr == 0x18 and cs & 7 == 3 and ds & 7 == 3 and cs != ds
 
 
 def strict_four_exit_evidence(output: str) -> bool:
@@ -149,6 +162,8 @@ def evaluate(output: str, exit_code: int) -> bool:
     if exit_code != 33 or any(stem in output for stem in ERROR_STEMS):
         return False
     if not ordered_evidence_lines(output, ORDERED):
+        return False
+    if not strict_four_descriptor_evidence(output):
         return False
     if not strict_four_exit_evidence(output):
         return False

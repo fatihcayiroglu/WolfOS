@@ -3,7 +3,7 @@
 import unittest
 
 from user_timer_four_live_smoke import (
-    ORDERED, evaluate, strict_four_exit_evidence,
+    ORDERED, evaluate, strict_four_descriptor_evidence, strict_four_exit_evidence,
     strict_four_hardware_evidence, strict_four_eoi_evidence,
 )
 
@@ -38,9 +38,12 @@ def complete():
         exit_row(4),
         ORDERED[9], EOI, HARDWARE, *ORDERED[10:],
     ]
-    # The real descriptor proof carries validated GDT/TR metadata. The
-    # fail-closed parser intentionally rejects a bare unadorned stem.
-    rows[1] = "WOLFOS_RING_PREP_OK tr=0x18 user_cs=0x33"
+    # Match the actual GDT/TR/TSS evidence, not an abbreviated marker.
+    rows[1] = (
+        "WOLFOS_RING_PREP_OK tr=0x18 user_cs=0x33 user_ds=0x2b "
+        "rsp0_aligned=1 rsp0_stack_kib=16 ist_disjoint=1 guards=1 "
+        "cpl=0 ring3=0"
+    )
     return rows
 
 
@@ -54,6 +57,37 @@ class FourLiveHardwareEvidenceTests(unittest.TestCase):
         self.assertTrue(strict_four_exit_evidence("\n".join(rows)))
         self.assertTrue(strict_four_hardware_evidence("\n".join(rows)))
         self.assertTrue(strict_four_eoi_evidence("\n".join(rows)))
+
+    def test_descriptor_proof_rejects_forged_or_incomplete_metadata(self):
+        valid = complete()
+        descriptor = valid[1]
+        self.assertTrue(strict_four_descriptor_evidence("\n".join(valid)))
+        for before, after in (
+            ("tr=0x18", "tr=0x20"),
+            ("user_cs=0x33", "user_cs=0x30"),
+            ("user_ds=0x2b", "user_ds=0x28"),
+            ("user_ds=0x2b", "user_ds=0x33"),
+            ("rsp0_aligned=1", "rsp0_aligned=0"),
+            ("rsp0_stack_kib=16", "rsp0_stack_kib=8"),
+            ("ist_disjoint=1", "ist_disjoint=0"),
+            ("guards=1", "guards=0"),
+            ("cpl=0", "cpl=3"),
+            ("ring3=0", "ring3=1"),
+        ):
+            rows = valid.copy()
+            rows[1] = descriptor.replace(before, after)
+            self.assertFalse(self.check(rows), after)
+        for bad in (
+            "WOLFOS_RING_PREP_OK",
+            "WOLFOS_RING_PREP_OK tr=0x18 user_cs=0x33",
+            "prefix: " + descriptor,
+            descriptor + " forged=1",
+        ):
+            rows = valid.copy()
+            rows[1] = bad
+            self.assertFalse(self.check(rows), bad)
+        self.assertFalse(self.check(valid + [descriptor]),
+                         "duplicate descriptor proof must fail")
 
     def test_lifetime_irq_counts_can_diverge_after_early_exit(self):
         rows = complete()
