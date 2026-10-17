@@ -38,7 +38,8 @@ pub struct Ring3RunQueue<const N: usize> {
     // Consecutive authenticated, eligible timer IRQs in the current slice.
     // Policy-only: caller must establish genuine xAPIC IRQ provenance.
     slice_ticks: u64,
-    // Latest successful cross-PID policy rotation (NOT hardware IRQ proof).
+    // Last successful timer/yield rotation, only while the queue snapshot
+    // has not changed since that decision (NOT hardware IRQ provenance).
     last_handoff: Option<(Handle, Handle)>,
 }
 
@@ -55,9 +56,11 @@ impl<const N: usize> Ring3RunQueue<N> {
     /// never a syscall, EXIT, BLOCK or wakeup dispatch.
     pub fn timer_switches(&self) -> u64 { self.switches }
     pub fn current_slice_ticks(&self) -> u64 { self.slice_ticks }
-    /// Identifies the last successful timer/yield cross-PID policy decision.
-    /// This is only metadata corroboration; the trusted caller must still
-    /// independently authenticate the IRQ or syscall and saved CPU state.
+    /// Identifies the most recent timer/yield cross-PID policy decision.
+    /// Any subsequent successful admission, wake, cancel, reap, block, exit
+    /// or dispatch invalidates it; a failed operation leaves it unchanged.
+    /// This is metadata only: never a substitute for IRQ/syscall provenance
+    /// or independently authenticated CPU/FX/CR3/TSS state.
     pub fn last_policy_handoff(&self) -> Option<(Handle, Handle)> { self.last_handoff }
     pub fn occupied(&self) -> usize {
         self.slots.iter().filter(|s| s.state != State::Empty).count()
@@ -86,6 +89,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let handle = Handle { pid, generation };
         self.slots[i] = Slot { handle, state: State::Ready, ticks: 0 };
         self.generation = generation;
+        self.last_handoff = None;
         Ok(handle)
     }
 
@@ -191,6 +195,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let i = self.locate(handle)?;
         if self.slots[i].state != State::Blocked { return Err(Error::WrongState); }
         self.slots[i].state = State::Ready;
+        self.last_handoff = None;
         Ok(())
     }
 
@@ -202,6 +207,7 @@ impl<const N: usize> Ring3RunQueue<N> {
             return Err(Error::WrongState);
         }
         self.slots[i].state = State::Exited;
+        self.last_handoff = None;
         Ok(())
     }
 
@@ -225,6 +231,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let i = self.locate(handle)?;
         if self.slots[i].state != State::Exited { return Err(Error::WrongState); }
         self.slots[i] = Slot::EMPTY;
+        self.last_handoff = None;
         Ok(())
     }
 }
@@ -562,6 +569,53 @@ mod tests {
         assert_eq!(q.last_policy_handoff(), None,
             "a blocking handoff is not a timer/yield rotation");
         assert_eq!(q.timer_switches(), 1);
+    }
+
+    #[test]
+    fn successful_membership_mutations_revoke_stale_handoff_evidence() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let a = q.admit(1).unwrap();
+        let b = q.admit(2).unwrap();
+        let c = q.admit(3).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        assert_eq!(q.timer_tick(a), Ok(b));
+        assert_eq!(q.last_policy_handoff(), Some((a, b)));
+        let unchanged = q;
+        assert_eq!(q.admit(1), Err(Error::DuplicatePid));
+        assert_eq!(q.wake(a), Err(Error::WrongState));
+        assert_eq!(q.cancel(b), Err(Error::WrongState));
+        assert_eq!(q.reap(a), Err(Error::WrongState));
+        assert_eq!(q, unchanged,
+            "rejected membership operations may not consume valid evidence");
+
+        let d = q.admit(4).unwrap();
+        assert_eq!(q.last_policy_handoff(), None,
+            "new admission must invalidate an earlier timer decision");
+        assert_eq!(q.timer_tick(b), Ok(c));
+        assert_eq!(q.last_policy_handoff(), Some((b, c)));
+        assert_eq!(q.block_current(c), Ok(Some(d)));
+        assert_eq!(q.last_policy_handoff(), None);
+        assert_eq!(q.timer_tick(d), Ok(a));
+        assert_eq!(q.last_policy_handoff(), Some((d, a)));
+        q.wake(c).unwrap();
+        assert_eq!(q.last_policy_handoff(), None,
+            "waking a sleeping PID changes the runnable snapshot");
+
+        assert_eq!(q.timer_tick(a), Ok(b));
+        assert_eq!(q.last_policy_handoff(), Some((a, b)));
+        q.cancel(c).unwrap();
+        assert_eq!(q.last_policy_handoff(), None,
+            "cancelling a READY PID changes the scheduler membership");
+        assert_eq!(q.timer_tick(b), Ok(d));
+        assert_eq!(q.last_policy_handoff(), Some((b, d)));
+        q.reap(c).unwrap();
+        assert_eq!(q.last_policy_handoff(), None,
+            "reaping an EXITED slot invalidates earlier handoff evidence");
+
+        assert_eq!(q.timer_tick(d), Ok(a));
+        assert_eq!(q.last_policy_handoff(), Some((d, a)));
+        assert_eq!(q.timer_switches(), 6,
+            "admit/wake/cancel/reap must not forge timer switches");
     }
 
     #[test]
