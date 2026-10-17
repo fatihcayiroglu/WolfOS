@@ -492,6 +492,38 @@ mod tests {
     }
 
     #[test]
+    fn wake_lifecycle_rejects_duplicates_cancelled_and_stale_handles_without_mutation() {
+        let mut q = Ring3RunQueue::<3>::new();
+        let a = q.admit(7).unwrap();
+        let b = q.admit(8).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        assert_eq!(q.timer_quantum_tick(a, 2), Ok(a));
+        assert_eq!(q.block_current(a), Ok(Some(b)));
+        let before = q;
+        assert_eq!(q.wake(Handle { pid: a.pid, generation: a.generation + 1 }), Err(Error::Stale));
+        assert_eq!(q.wake(b), Err(Error::WrongState));
+        assert_eq!(q, before);
+
+        assert_eq!(q.wake(a), Ok(()));
+        let before = q;
+        assert_eq!(q.wake(a), Err(Error::WrongState));
+        assert_eq!(q, before);
+        assert_eq!(q.block_current(b), Ok(Some(a)));
+        assert_eq!(q.cancel(b), Ok(()));
+        let before = q;
+        assert_eq!(q.wake(b), Err(Error::WrongState));
+        assert_eq!(q, before);
+        assert_eq!(q.exit_current(a), Ok(None));
+        assert_eq!(q.reap(a), Ok(()));
+        let replacement = q.admit(7).unwrap();
+        let before = q;
+        assert_eq!(q.wake(a), Err(Error::Stale));
+        assert_eq!(q, before);
+        assert_eq!(q.start_next(), Ok(replacement));
+        assert_eq!(q.timer_switches(), 0);
+    }
+
+    #[test]
     fn zero_capacity_queue_remains_inert() {
         let mut q = Ring3RunQueue::<0>::new();
         assert_eq!(q.admit(1), Err(Error::Full));
