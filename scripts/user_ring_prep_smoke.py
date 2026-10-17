@@ -16,6 +16,19 @@ PROOF = re.compile(
     r"ist_disjoint=1 guards=1 cpl=0 ring3=0"
 )
 
+def strict_ring_prep_evidence(output: str) -> bool:
+    """Require one complete GDT/TR/TSS proof, rejecting embedded or extra records."""
+    rows = [row for row in output.splitlines()
+            if "WOLFOS_RING_PREP_OK" in row]
+    if len(rows) != 1:
+        return False
+    match = PROOF.fullmatch(rows[0])
+    if match is None:
+        return False
+    tr, cs, ds = (int(value, 16) for value in match.groups())
+    return tr == 0x18 and cs & 7 == 3 and ds & 7 == 3 and cs != ds
+
+
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: user_ring_prep_smoke.py path/to/wolfos-user-ring-prep.iso")
@@ -41,13 +54,8 @@ def main() -> int:
             return 2
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
-        match = PROOF.search(output)
-        if not match or "WOLFOS_BOOT_OK" not in output:
-            print("FAIL: incomplete GDT/TSS/TR proof or regular kernel boot")
-            return 1
-        tr, cs, ds = (int(value, 16) for value in match.groups())
-        if tr != 0x18 or cs & 7 != 3 or ds & 7 != 3 or cs == ds:
-            print(f"FAIL: unexpected TR/GDT selectors: tr={tr:#x} cs={cs:#x} ds={ds:#x}")
+        if not strict_ring_prep_evidence(output) or "WOLFOS_BOOT_OK" not in output:
+            print("FAIL: missing, forged, duplicated or invalid GDT/TSS/TR proof or regular kernel boot")
             return 1
         for bad in (
             "WOLFOS_RING_PREP_ERROR", "WOLFOS_RING_PREP_TEST_FAILED",
