@@ -1289,6 +1289,58 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_irq_rflags_exhaustive_bit_policy_is_transactional() {
+        let (mut table, mut bank) = two();
+        let owned_stack = stack(0xffff_8000_0010_0000);
+        bank.prepare_bootstrap(&table, 1, 0x1000, owned_stack,
+            frame(0x401000, 1)).unwrap();
+        table.mark_running(1, 0x1000).unwrap();
+        let trap_at = owned_stack.top - FRAME_BYTES as u64;
+        let mut valid = frame(0x401000, 1);
+        valid.hardware.rflags = 0x202;
+        bank.refresh_authenticated_trap(
+            &table, 1, 0x1000, owned_stack, trap_at, valid).unwrap();
+        let baseline = bank.snapshot(1).unwrap();
+        const OPTIONAL: [u32; 6] = [0, 2, 4, 6, 7, 11];
+        for bit in OPTIONAL {
+            let mut candidate = valid;
+            candidate.hardware.rflags |= 1u64 << bit;
+            bank.refresh_authenticated_trap(
+                &table, 1, 0x1000, owned_stack, trap_at, candidate).unwrap();
+        }
+        // Arithmetic status flags may coexist after ordinary user instructions.
+        let mut all_arithmetic = valid;
+        for bit in OPTIONAL {
+            all_arithmetic.hardware.rflags |= 1u64 << bit;
+        }
+        bank.refresh_authenticated_trap(
+            &table, 1, 0x1000, owned_stack, trap_at, all_arithmetic).unwrap();
+        assert_eq!(bank.snapshot(1).unwrap().frame.hardware.rflags,
+            all_arithmetic.hardware.rflags);
+        bank.refresh_authenticated_trap(
+            &table, 1, 0x1000, owned_stack, trap_at, valid).unwrap();
+        assert_eq!(bank.snapshot(1), Some(baseline));
+        for bit in 0..64u32 {
+            if bit == 1 || bit == 9 || OPTIONAL.contains(&bit) { continue; }
+            let mut forged = valid;
+            forged.hardware.rflags |= 1u64 << bit;
+            forged.registers.rax = 0xdead_beef;
+            assert_eq!(bank.refresh_authenticated_trap(
+                &table, 1, 0x1000, owned_stack, trap_at, forged),
+                Err(ContextError::BadFlags), "RFLAGS bit {bit}");
+            assert_eq!(bank.snapshot(1), Some(baseline));
+        }
+        for bit in [1u32, 9] {
+            let mut forged = valid;
+            forged.hardware.rflags &= !(1u64 << bit);
+            assert_eq!(bank.refresh_authenticated_trap(
+                &table, 1, 0x1000, owned_stack, trap_at, forged),
+                Err(ContextError::BadFlags), "required RFLAGS bit {bit}");
+            assert_eq!(bank.snapshot(1), Some(baseline));
+        }
+    }
+
+    #[test]
     fn empty_banks_and_unavailable_next_fail_closed() {
         let (t,mut bank) = two();
         assert_eq!(bank.plan_next(&t,1,0x90000),Err(ContextError::NotPrepared));
