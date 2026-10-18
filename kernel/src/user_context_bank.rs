@@ -24,7 +24,7 @@ use crate::process_table::ProcessTable;
 #[path = "ring3_runqueue.rs"]
 mod standalone_runqueue;
 #[cfg(test)]
-use standalone_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
+use standalone_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState, Error as RunError};
 #[cfg(not(test))]
 use crate::ring3_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
 #[cfg(test)]
@@ -912,6 +912,64 @@ mod tests {
         assert_eq!(table.occupied(),3);
         assert_eq!(table.running(),0,"policy-only metadata, no real IRQ proof");
         assert_eq!(queue.timer_switches(),2);
+    }
+
+    #[test]
+    fn event_bound_block_wake_resumes_the_authenticated_ring3_frame_only_after_signal() {
+        let mut table = ProcessTable::<2, 7>::new();
+        let mut bank = UserContextBank::<2>::new();
+        let mut queue = Ring3RunQueue::<2>::new();
+        let roots = [0x10000, 0x20000];
+        let stacks = [stack(0xffff_8000_0f00_0000), stack(0xffff_8000_0f01_0000)];
+        let mut handles = [RunHandle { pid: 0, generation: 0 }; 2];
+        for i in 0..2 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            handles[i] = queue.admit(pid).unwrap();
+            bank.prepare_bootstrap(&table, pid, roots[i], stacks[i],
+                frame(0x401000 + (i as u64) * 0x1000, pid)).unwrap();
+        }
+        let source = handles[0];
+        let peer = handles[1];
+        assert_eq!(queue.start_next(), Ok(source));
+        table.mark_running(source.pid, roots[0]).unwrap();
+
+        let mut saved_irq = frame(0x401080, 0xabc);
+        saved_irq.hardware.rflags = 0x202;
+        saved_irq.registers.r12 = 0xabcd;
+        saved_irq.registers.r15 = 0x1515;
+        bank.refresh_authenticated_trap(&table, source.pid, roots[0],
+            stacks[0], stacks[0].top - FRAME_BYTES as u64, saved_irq).unwrap();
+        table.block_running(source.pid, roots[0]).unwrap();
+        assert_eq!(queue.block_current_for_event(source, 0x707), Ok(Some(peer)));
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue,
+            source, peer, 0x90000).unwrap().pid, peer.pid);
+
+        let captured = bank.snapshot(source.pid).unwrap();
+        assert_eq!(queue.wake(source), Err(RunError::WrongEvent));
+        assert_eq!(queue.wake_for_event(source, 0x708),
+            Err(RunError::WrongEvent));
+        assert_eq!(bank.snapshot(source.pid), Some(captured));
+        assert_eq!(table.snapshot(source.pid).unwrap().state, ProcessState::Blocked);
+        assert_eq!(queue.timer_switches(), 0);
+
+        // A registry-only wake cannot authorize a resume while the
+        // generation-safe event-bound scheduler still says BLOCKED.
+        table.wake_blocked(source.pid, 0x90000).unwrap();
+        assert_eq!(bank.plan_blocked_handoff(&table, &queue, source, peer, 0x90000),
+            Err(ContextError::WrongState));
+        queue.wake_for_event(source, 0x707).unwrap();
+        assert_eq!(queue.timer_switches(), 0, "wake must not fabricate an IRQ");
+        assert_eq!(queue.timer_tick(peer), Ok(source));
+        let plan = bank.plan_queue_handoff(&table, &queue, peer, source, 0x90000)
+            .unwrap();
+        assert_eq!(plan.origin, FrameOrigin::HardwareTrap);
+        assert_eq!(plan.frame, saved_irq);
+        assert_eq!(plan.cr3_root, roots[0]);
+        assert_eq!(plan.rsp0, stacks[0].top);
+        assert_eq!(bank.snapshot(source.pid), Some(captured));
+        assert_eq!(table.snapshot(source.pid).unwrap().frames, frames(roots[0]));
+        assert_eq!(queue.timer_switches(), 1,
+            "only the caller-authenticated later timer decision counts");
     }
 
     #[test]
