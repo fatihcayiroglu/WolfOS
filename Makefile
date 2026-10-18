@@ -57,6 +57,8 @@ else ifeq ($(FLAVOR),user-ramfs)
 FEATURES := --features user-ramfs-smoke
 else ifeq ($(FLAVOR),user-vfs)
 FEATURES := --features user-vfs-smoke
+else ifeq ($(FLAVOR),p3-ring3-event-wait-hardware)
+FEATURES := --features p3-ring3-event-wait-hardware-smoke
 else ifeq ($(FLAVOR),p2-ring3-timer-preempt)
 FEATURES := --features p2-ring3-timer-preempt-smoke
 else ifeq ($(FLAVOR),p2-ring3-timer-nonyield)
@@ -103,7 +105,7 @@ else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke p2-ring3-timer-observe-smoke p2-ring3-timer-preempt-smoke p2-ring3-timer-nonyield-smoke p3-ring3-four-elf-preflight-smoke p3-ring3-four-live-smoke check clean test doctor
+.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p3-ring3-event-wait-hardware-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke p2-ring3-timer-observe-smoke p2-ring3-timer-preempt-smoke p2-ring3-timer-nonyield-smoke p3-ring3-four-elf-preflight-smoke p3-ring3-four-live-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -297,6 +299,10 @@ p2-ring3-yield-smoke:
 	$(MAKE) iso FLAVOR=p2-ring3-yield
 	python3 scripts/user_yield_switch_smoke.py $(OUT)/wolfos-p2-ring3-yield.iso
 
+p3-ring3-event-wait-hardware-smoke:
+	$(MAKE) iso FLAVOR=p3-ring3-event-wait-hardware
+	python3 scripts/user_event_wait_smoke.py $(OUT)/wolfos-p3-ring3-event-wait-hardware.iso
+
 p2-ring3-irq-ready-smoke:
 	$(MAKE) iso FLAVOR=p2-ring3-irq-ready
 	python3 scripts/user_yield_switch_smoke.py $(OUT)/wolfos-p2-ring3-irq-ready.iso --irq-ready
@@ -325,6 +331,7 @@ test:
 	python3 -m unittest discover -s tests -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_four_live_evidence.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_event_wait_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_ring_prep_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_smp_preempt_evidence.py' -v
 	mkdir -p $(OUT)
