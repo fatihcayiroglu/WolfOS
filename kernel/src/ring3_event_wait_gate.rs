@@ -195,6 +195,162 @@ impl<const N: usize> EventWaitGate<N> {
     }
 }
 
+
+/// Opaque receipt for exactly one independently authenticated BSP device IRQ.
+/// Its private identity prevents replaying an earlier callback's EOI marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrqEventReceipt { sequence: u64, vector: u8 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IrqEventError {
+    WrongVector, InvalidEvent, Busy, Stale, WrongPhase, Overflow,
+    NotDrained, Event(Error),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IrqEventTotals {
+    pub entered: u64,
+    pub acknowledged: u64,
+    pub delivered: u64,
+    pub discarded: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IrqPhase { Entered, EoiAcknowledged }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InFlightIrq {
+    receipt: IrqEventReceipt,
+    token: EventToken,
+    delivered_event: u64,
+    phase: IrqPhase,
+}
+
+/// One BSP interrupt callback can be in flight at a time. The trusted
+/// interrupt handler must independently validate its vector, CPU/APIC source,
+/// interrupt frame and supervisor CR3, physically send the exact EOI, and
+/// serialize the mailbox + EventWaitGate + Ring3RunQueue under one protected
+/// critical section. Merely calling acknowledge_physical_eoi here does NOT
+/// perform an MMIO EOI or prove that hardware delivered an interrupt.
+///
+/// An IRQ must be EOI-acknowledged before its notification can be forwarded to
+/// EventWaitGate. Replayed, mismatched and nested IRQ receipts fail closed.
+/// This is BSP policy/evidence plumbing ONLY, not general IF=1 device wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BspIrqEventBridge {
+    active: Option<InFlightIrq>,
+    next_sequence: u64,
+    entered: u64,
+    acknowledged: u64,
+    delivered: u64,
+    discarded: u64,
+}
+impl BspIrqEventBridge {
+    pub const fn new() -> Self {
+        Self {
+            active: None, next_sequence: 0, entered: 0,
+            acknowledged: 0, delivered: 0, discarded: 0,
+        }
+    }
+
+    /// The caller guarantees that the observed vector and pending token were
+    /// independently authenticated; this rejects mismatches but cannot
+    /// authenticate physical APIC ISR or its MMIO mapping by itself.
+    pub fn capture<const N: usize>(
+        &mut self, gate: &EventWaitGate<N>, token: EventToken,
+        observed_vector: u8, expected_vector: u8, delivered_event: u64,
+    ) -> Result<IrqEventReceipt, IrqEventError> {
+        if observed_vector < 32 || observed_vector != expected_vector {
+            return Err(IrqEventError::WrongVector)
+        }
+        if delivered_event == 0 { return Err(IrqEventError::InvalidEvent) }
+        if self.active.is_some() { return Err(IrqEventError::Busy) }
+        gate.locate(token).map_err(IrqEventError::Event)?;
+        let sequence = self.next_sequence.checked_add(1)
+            .ok_or(IrqEventError::Overflow)?;
+        let entered = self.entered.checked_add(1)
+            .ok_or(IrqEventError::Overflow)?;
+        let receipt = IrqEventReceipt { sequence, vector: observed_vector };
+        self.active = Some(InFlightIrq {
+            receipt, token, delivered_event, phase: IrqPhase::Entered,
+        });
+        self.next_sequence = sequence;
+        self.entered = entered;
+        Ok(receipt)
+    }
+
+    /// Must be called ONLY AFTER the trusted handler writes real xAPIC EOI.
+    /// This is evidence bookkeeping, never hardware access.
+    pub fn acknowledge_physical_eoi(
+        &mut self, receipt: IrqEventReceipt,
+    ) -> Result<(), IrqEventError> {
+        let pending = self.active.ok_or(IrqEventError::Stale)?;
+        if pending.receipt != receipt { return Err(IrqEventError::Stale) }
+        if pending.phase != IrqPhase::Entered {
+            return Err(IrqEventError::WrongPhase)
+        }
+        let acknowledged = self.acknowledged.checked_add(1)
+            .ok_or(IrqEventError::Overflow)?;
+        if acknowledged != self.entered { return Err(IrqEventError::WrongPhase) }
+        self.acknowledged = acknowledged;
+        self.active.as_mut().unwrap().phase = IrqPhase::EoiAcknowledged;
+        Ok(())
+    }
+
+    /// Deliver only an acknowledged IRQ. An invalid event/ticket leaves the
+    /// IRQ envelope and both scheduler structures unchanged; its owner may
+    /// explicitly discard the acknowledged envelope before processing more.
+    pub fn deliver_after_eoi<const N: usize>(
+        &mut self, gate: &mut EventWaitGate<N>,
+        queue: &mut Ring3RunQueue<N>, receipt: IrqEventReceipt,
+    ) -> Result<Delivery, IrqEventError> {
+        let pending = self.active.ok_or(IrqEventError::Stale)?;
+        if pending.receipt != receipt { return Err(IrqEventError::Stale) }
+        if pending.phase != IrqPhase::EoiAcknowledged {
+            return Err(IrqEventError::WrongPhase)
+        }
+        let delivered = self.delivered.checked_add(1)
+            .ok_or(IrqEventError::Overflow)?;
+        let outcome = gate.signal(queue, pending.token, pending.delivered_event)
+            .map_err(IrqEventError::Event)?;
+        self.active = None;
+        self.delivered = delivered;
+        Ok(outcome)
+    }
+
+    /// An already acknowledged IRQ can be explicitly discarded if its wait
+    /// was canceled or its event was rejected. The caller retains responsibility
+    /// for safely handling the originating physical device interrupt.
+    pub fn discard_after_eoi(
+        &mut self, receipt: IrqEventReceipt,
+    ) -> Result<(), IrqEventError> {
+        let pending = self.active.ok_or(IrqEventError::Stale)?;
+        if pending.receipt != receipt { return Err(IrqEventError::Stale) }
+        if pending.phase != IrqPhase::EoiAcknowledged {
+            return Err(IrqEventError::WrongPhase)
+        }
+        let discarded = self.discarded.checked_add(1)
+            .ok_or(IrqEventError::Overflow)?;
+        self.discarded = discarded;
+        self.active = None;
+        Ok(())
+    }
+
+    /// Source/EOI/finalization accounting. This cannot prove the trusted
+    /// caller actually wrote EOI; QEMU hardware must separately test that.
+    pub fn verify_drained(&self) -> Result<IrqEventTotals, IrqEventError> {
+        if self.active.is_some() || self.entered != self.acknowledged {
+            return Err(IrqEventError::NotDrained)
+        }
+        if self.delivered.checked_add(self.discarded)
+            .ok_or(IrqEventError::Overflow)? != self.entered {
+            return Err(IrqEventError::NotDrained)
+        }
+        Ok(IrqEventTotals {
+            entered: self.entered, acknowledged: self.acknowledged,
+            delivered: self.delivered, discarded: self.discarded,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +466,137 @@ mod tests {
         assert_eq!(gate.arm(&q, a, 7), Err(Error::Overflow));
         assert_eq!((gate, q), state);
         assert_eq!(q.running(), Some(a));
+    }
+
+    #[test]
+    fn authenticated_irq_before_park_is_latched_only_after_eoi() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(1).unwrap();
+        q.admit(2).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        let mut gate = EventWaitGate::<2>::new();
+        let mut irq = BspIrqEventBridge::new();
+        let t = gate.arm(&q, a, 77).unwrap();
+        let proof = irq.capture(&gate, t, 0x51, 0x51, 77).unwrap();
+        assert_eq!(irq.verify_drained(), Err(IrqEventError::NotDrained));
+        let unchanged = (irq, gate, q);
+        assert_eq!(irq.deliver_after_eoi(&mut gate, &mut q, proof),
+            Err(IrqEventError::WrongPhase));
+        assert_eq!((irq, gate, q), unchanged);
+        irq.acknowledge_physical_eoi(proof).unwrap();
+        assert_eq!(irq.deliver_after_eoi(&mut gate, &mut q, proof),
+            Ok(Delivery::Latched));
+        assert_eq!(gate.commit(&mut q, t), Ok(Commit::DeliveredBeforePark));
+        assert_eq!(q.running(), Some(a));
+        assert_eq!(q.timer_switches(), 0);
+        assert_eq!(irq.verify_drained(), Ok(IrqEventTotals {
+            entered: 1, acknowledged: 1, delivered: 1, discarded: 0,
+        }));
+        assert_eq!(irq.deliver_after_eoi(&mut gate, &mut q, proof),
+            Err(IrqEventError::Stale));
+    }
+
+    #[test]
+    fn after_park_irq_delivery_wakes_exact_ticket_without_forged_timer() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(11).unwrap();
+        let b = q.admit(22).unwrap();
+        q.start_next().unwrap();
+        let mut gate = EventWaitGate::<2>::new();
+        let mut irq = BspIrqEventBridge::new();
+        let t = gate.arm(&q, a, 13).unwrap();
+        assert_eq!(gate.commit(&mut q, t), Ok(Commit::Parked(Some(b))));
+        let proof = irq.capture(&gate, t, 0x52, 0x52, 13).unwrap();
+        irq.acknowledge_physical_eoi(proof).unwrap();
+        assert_eq!(irq.deliver_after_eoi(&mut gate, &mut q, proof),
+            Ok(Delivery::Woken(a)));
+        assert_eq!(q.timer_switches(), 0);
+        assert_eq!(q.timer_tick(b), Ok(a));
+        assert_eq!(q.timer_switches(), 1);
+        assert_eq!(irq.verify_drained().unwrap().delivered, 1);
+    }
+
+    #[test]
+    fn wrong_event_nesting_and_replayed_ack_preserve_all_owners() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(1).unwrap();
+        let b = q.admit(2).unwrap();
+        q.start_next().unwrap();
+        let mut gate = EventWaitGate::<2>::new();
+        let mut irq = BspIrqEventBridge::new();
+        let t = gate.arm(&q, a, 91).unwrap();
+        assert_eq!(gate.commit(&mut q, t), Ok(Commit::Parked(Some(b))));
+        let before = (irq, gate, q);
+        assert_eq!(irq.capture(&gate, t, 0x50, 0x51, 91),
+            Err(IrqEventError::WrongVector));
+        assert_eq!(irq.capture(&gate, t, 0x51, 0x51, 0),
+            Err(IrqEventError::InvalidEvent));
+        assert_eq!((irq, gate, q), before);
+        let bad = irq.capture(&gate, t, 0x51, 0x51, 92).unwrap();
+        let entered = (irq, gate, q);
+        assert_eq!(irq.capture(&gate, t, 0x51, 0x51, 91),
+            Err(IrqEventError::Busy));
+        assert_eq!(irq.discard_after_eoi(bad), Err(IrqEventError::WrongPhase));
+        assert_eq!((irq, gate, q), entered);
+        let fake = IrqEventReceipt { sequence: bad.sequence + 1, ..bad };
+        assert_eq!(irq.acknowledge_physical_eoi(fake),
+            Err(IrqEventError::Stale));
+        irq.acknowledge_physical_eoi(bad).unwrap();
+        let acknowledged = (irq, gate, q);
+        assert_eq!(irq.acknowledge_physical_eoi(bad),
+            Err(IrqEventError::WrongPhase));
+        assert_eq!(irq.deliver_after_eoi(&mut gate, &mut q, bad),
+            Err(IrqEventError::Event(Error::WrongEvent)));
+        assert_eq!((irq, gate, q), acknowledged);
+        irq.discard_after_eoi(bad).unwrap();
+        assert_eq!(irq.discard_after_eoi(bad), Err(IrqEventError::Stale));
+        assert_eq!(q.slots()[0].state, State::Blocked);
+        let good = irq.capture(&gate, t, 0x51, 0x51, 91).unwrap();
+        assert_ne!(bad, good);
+        irq.acknowledge_physical_eoi(good).unwrap();
+        assert_eq!(irq.deliver_after_eoi(&mut gate, &mut q, good),
+            Ok(Delivery::Woken(a)));
+        assert_eq!(q.timer_switches(), 0);
+        assert_eq!(irq.verify_drained(), Ok(IrqEventTotals {
+            entered: 2, acknowledged: 2, delivered: 1, discarded: 1,
+        }));
+    }
+
+    #[test]
+    fn canceled_wait_and_overflow_never_resurrect_or_fake_eoi() {
+        let mut q = Ring3RunQueue::<1>::new();
+        let a = q.admit(1).unwrap();
+        q.start_next().unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let mut irq = BspIrqEventBridge::new();
+        let t = gate.arm(&q, a, 3).unwrap();
+        assert_eq!(gate.commit(&mut q, t), Ok(Commit::Parked(None)));
+        let proof = irq.capture(&gate, t, 0x60, 0x60, 3).unwrap();
+        gate.retire_parked(&mut q, t).unwrap();
+        irq.acknowledge_physical_eoi(proof).unwrap();
+        let before = (irq, gate, q);
+        assert_eq!(irq.deliver_after_eoi(&mut gate, &mut q, proof),
+            Err(IrqEventError::Event(Error::Stale)));
+        assert_eq!((irq, gate, q), before);
+        irq.discard_after_eoi(proof).unwrap();
+        assert_eq!(irq.verify_drained().unwrap().discarded, 1);
+        q.reap(a).unwrap();
+        let replacement = q.admit(1).unwrap();
+        assert_ne!(replacement, a);
+        assert_eq!(irq.capture(&gate, t, 0x60, 0x60, 3),
+            Err(IrqEventError::Event(Error::Stale)));
+
+        let mut q = Ring3RunQueue::<1>::new();
+        let a = q.admit(9).unwrap();
+        q.start_next().unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let t = gate.arm(&q, a, 8).unwrap();
+        let mut irq = BspIrqEventBridge::new();
+        irq.next_sequence = u64::MAX;
+        let frozen = (irq, gate, q);
+        assert_eq!(irq.capture(&gate, t, 0x50, 0x50, 8),
+            Err(IrqEventError::Overflow));
+        assert_eq!((irq, gate, q), frozen);
     }
 
     #[test]
