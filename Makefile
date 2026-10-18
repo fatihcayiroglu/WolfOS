@@ -400,6 +400,8 @@ test:
 	$(OUT)/ring3_round_robin_tests
 	rustc --edition=2024 --test kernel/src/ring3_runqueue.rs -o $(OUT)/ring3_runqueue_tests
 	$(OUT)/ring3_runqueue_tests
+	rustc --edition=2024 --test kernel/src/ring3_event_wait_gate.rs -o $(OUT)/ring3_event_wait_gate_tests
+	$(OUT)/ring3_event_wait_gate_tests
 	rustc --edition=2024 --test kernel/src/ring3_irq_eoi_ledger.rs -o $(OUT)/ring3_irq_eoi_ledger_tests
 	$(OUT)/ring3_irq_eoi_ledger_tests
 	rustc --edition=2024 --test kernel/src/user_irq_preempt_contract.rs -o $(OUT)/user_irq_preempt_contract_tests

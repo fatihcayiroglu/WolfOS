@@ -12,7 +12,10 @@ use core::{arch::asm,cell::UnsafeCell};
           feature = "p3-ring3-event-wait-hardware-smoke"))]
 use crate::ring3_runqueue::{Handle as RunHandle,Ring3RunQueue,State as RrState};
 #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
-use crate::ring3_runqueue::{WaitTicket,Error as RunError};
+use crate::ring3_event_wait_gate::{
+    Commit as EventCommit, Delivery as EventDelivery, Error as EventError,
+    EventToken, EventWaitGate,
+};
 #[cfg(feature="p3-ring3-four-elf-live-smoke")]
 use crate::ring3_irq_eoi_ledger::Ring3IrqEoiLedger;
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
@@ -179,7 +182,9 @@ struct Runtime{
               feature = "p3-ring3-event-wait-hardware-smoke"))]
     rr_handles:[RunHandle;COUNT],
     #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
-    event_wait:Option<WaitTicket>,
+    event_wait:Option<EventToken>,
+    #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+    event_gate:EventWaitGate<COUNT>,
     #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
     event_wakes:u64,
     #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
@@ -1045,6 +1050,8 @@ pub fn enter(hhdm:u64)->!{
         #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
         event_wait:None,
         #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+        event_gate:EventWaitGate::new(),
+        #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
         event_wakes:0,
         #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
         event_rejections:0,
@@ -1197,13 +1204,15 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         let ticket=s.event_wait
             .unwrap_or_else(||fail("bad_signal_missing_pending_ticket"));
         let queue_before=s.rr;
+        let gate_before=s.event_gate;
         let blocked_before=s.processes.snapshot(1);
         let active_before=s.processes.snapshot(2);
         let saved_frame_before=s.frames[0];
         let fx_before=s.fx.active_pid();
-        if s.rr.wake_for_event(ticket,f.registers.rdi)
-                !=Err(RunError::WrongEvent)
+        if s.event_gate.signal(&mut s.rr,ticket,f.registers.rdi)
+                !=Err(EventError::WrongEvent)
             || s.rr!=queue_before
+            || s.event_gate!=gate_before
             || s.processes.snapshot(1)!=blocked_before
             || s.processes.snapshot(2)!=active_before
             || s.frames[0]!=saved_frame_before
@@ -1253,13 +1262,15 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     || s.processes.block_running(pid,active_root).is_err(){
                     fail("real_wait_registry_block")
                 }
-                let (target,ticket)=s.rr.block_current_for_event(
-                    s.rr_handles[0],EVENT_ID
-                ).unwrap_or_else(|_|fail("real_wait_queue_block"));
-                if target!=Some(s.rr_handles[1]) || s.rr.timer_switches()!=0 {
+                let token=s.event_gate.arm(&s.rr,s.rr_handles[0],EVENT_ID)
+                    .unwrap_or_else(|_|fail("real_wait_event_registration"));
+                let outcome=s.event_gate.commit(&mut s.rr,token)
+                    .unwrap_or_else(|_|fail("real_wait_event_park"));
+                if outcome!=EventCommit::Parked(Some(s.rr_handles[1]))
+                    || s.rr.timer_switches()!=0 {
                     fail("real_wait_wrong_dispatch")
                 }
-                s.event_wait=Some(ticket);
+                s.event_wait=Some(token);
             }else{
                 // Only PID2's authenticated SIGNAL syscall can reach this
                 // branch. The trusted event and exact nonreused ticket must
@@ -1269,7 +1280,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 }
                 let ticket=s.event_wait
                     .take().unwrap_or_else(||fail("missing_user_wait_ticket"));
-                if s.rr.wake_for_event(ticket,EVENT_ID).is_err(){
+                if s.event_gate.signal(&mut s.rr,ticket,EVENT_ID)
+                    !=Ok(EventDelivery::Woken(s.rr_handles[0])) {
                     fail("trusted_event_ticket_invalid")
                 }
                 // The ProcessTable correctly forbids using *any other
@@ -1398,7 +1410,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
         {
             if s.event_wait.is_some() || s.event_wakes!=1
-                || s.event_rejections!=1
+                || s.event_rejections!=1 || s.event_gate.in_flight()!=0
                 || s.rr.running().is_some() || s.rr.timer_switches()!=0
                 || s.rr.slots().iter().any(|slot|slot.state!=RrState::Exited){
                 fail("real_event_wait_policy_or_irq_counter_corrupted")
