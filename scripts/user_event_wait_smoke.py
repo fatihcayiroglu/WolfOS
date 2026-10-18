@@ -63,12 +63,21 @@ def evaluate(output: str, code: int) -> bool:
     # Full-line, once-only evidence: no substring, duplicate or reordering
     # may pass. In particular, PID1 must resume and genuinely EXIT before
     # the signaller PID2 can finish its own interrupted syscall.
-    for line in expected_order:
-        if rows.count(line) != 1:
+    # The hardware sequence legitimately switches PID1→PID2 twice: once
+    # at WAIT, again after PID1 exits. Demand the EXACT expected multiplicity
+    # of every marker, then match each occurrence in order. A simple count=1
+    # check would incorrectly reject this genuine three-handoff sequence.
+    from collections import Counter
+    for line, required in Counter(expected_order).items():
+        if rows.count(line) != required:
             return False
-    positions = [rows.index(line) for line in expected_order]
-    if positions != sorted(positions):
-        return False
+    after = 0
+    for line in expected_order:
+        try:
+            index = rows.index(line, after)
+        except ValueError:
+            return False
+        after = index + 1
     traps = [row for row in rows if row.startswith("WOLFOS_RING3_EVENT_TRAP ")]
     switches = [row for row in rows if row.startswith("WOLFOS_RING3_EVENT_SWITCH ")]
     return traps == TRAPS and switches == SWITCHES
