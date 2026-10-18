@@ -1248,6 +1248,55 @@ mod tests {
     }
 
     #[test]
+    fn blocked_handoff_rejects_unprepared_ready_and_exited_user_roots() {
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut bank = UserContextBank::<3>::new();
+        let mut queue = Ring3RunQueue::<3>::new();
+        let roots = [0x10000, 0x20000, 0x30000];
+        let pids = roots.map(|root| table.reserve(root, frames(root)).unwrap());
+        let source = queue.admit(pids[0]).unwrap();
+        let target = queue.admit(pids[1]).unwrap();
+
+        for i in 0..2 {
+            bank.prepare_bootstrap(
+                &table, pids[i], roots[i],
+                stack(0xffff_8000_0e00_0000 + (i as u64) * 0x10000),
+                frame(0x401000 + (i as u64) * 0x1000, pids[i]),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(source));
+        table.mark_running(pids[0], roots[0]).unwrap();
+        table.block_running(pids[0], roots[0]).unwrap();
+        assert_eq!(queue.block_current(source), Ok(Some(target)));
+        assert_eq!(bank.snapshot(pids[2]), None,
+            "a resident process can own CR3 before it has a saved context");
+        let saved = [bank.snapshot(pids[0]), bank.snapshot(pids[1])];
+        let authorized = bank.plan_blocked_handoff(
+            &table, &queue, source, target, 0x90000).unwrap();
+        assert_eq!(authorized.pid, pids[1]);
+
+        // A third READY user CR3 is live even without a bank/queue entry.
+        assert_eq!(bank.plan_blocked_handoff(
+            &table, &queue, source, target, roots[2]),
+            Err(ContextError::ActiveUserCr3));
+
+        // EXIT does not release the CR3 until verified reaping: refuse it too.
+        table.mark_running(pids[2], roots[2]).unwrap();
+        table.exit_zero(pids[2], roots[2]).unwrap();
+        assert_eq!(table.snapshot(pids[2]).unwrap().state, ProcessState::Exited);
+        assert!(table.owns_live_cr3(roots[2]));
+        assert_eq!(bank.plan_blocked_handoff(
+            &table, &queue, source, target, roots[2]),
+            Err(ContextError::ActiveUserCr3));
+        assert_eq!([bank.snapshot(pids[0]), bank.snapshot(pids[1])], saved);
+        assert_eq!(table.snapshot(pids[2]).unwrap().frames, frames(roots[2]));
+        assert_eq!(table.running(), 0);
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(bank.plan_blocked_handoff(
+            &table, &queue, source, target, 0x90000), Ok(authorized));
+    }
+
+    #[test]
     fn blocked_handoff_is_not_replayable_after_a_timer_tick() {
         let mut table = ProcessTable::<2, 7>::new();
         let mut bank = UserContextBank::<2>::new();
