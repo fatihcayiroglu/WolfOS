@@ -1221,6 +1221,20 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     ||s.rr.voluntary_yield(s.rr_handles[1])!=Ok(s.rr_handles[0]) {
                     fail("trusted_event_wake_or_dispatch")
                 }
+                // Before resuming PID1, verify the original blocked INT80
+                // frame remains pinned on its *own* guarded RSP0 stack.
+                let saved=s.frames[0] as *const UserSyscallFrame;
+                if s.frames[0]!=s.stacks[0].top
+                        -user_syscall_abi::FRAME_BYTES as u64
+                    || unsafe{(*saved).hardware.rip}!=after_yield(0)
+                    || unsafe{(*saved).registers.rax}!=0
+                    || unsafe{(*saved).registers.r12}!=1
+                    || unsafe{(*saved).registers.r14}!=USER_ID[0]
+                    || s.processes.snapshot(1).is_none_or(|p|
+                        p.state!=ProcessState::Ready
+                        || p.cr3_root!=s.leases[0][0]) {
+                    fail("trusted_wake_lost_saved_hardware_frame")
+                }
                 s.event_wakes+=1;
             }
         }
@@ -1238,6 +1252,11 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
         #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
         {
+            if i==0 && (s.event_wait.is_some() || s.event_wakes!=1
+                || s.rr.running()!=Some(s.rr_handles[0])
+                || s.rr.timer_switches()!=0){
+                fail("woken_pid_did_not_resume_own_cpl3_iret")
+            }
             if s.rr.exit_current(s.rr_handles[i])
                 !=Ok(if i==0 {Some(s.rr_handles[1])}else{None}){
                 fail("real_event_exit_queue_owner")
@@ -1273,6 +1292,19 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     s.frames[i]=raw as u64;
     s.hardware_traps+=1;
     if s.hardware_traps>TRAPS{fail("extra_user_trap")}
+    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    {
+        serial::write_fmt(format_args!(
+            "WOLFOS_RING3_EVENT_TRAP pid={} kind={} count={} cr3_private=1 rsp0_guarded=1\n",
+            pid,
+            if is_yield {if i==0{"wait"}else{"signal"}}else{"exit"},
+            val,
+        ));
+        if !is_yield && i==0 {
+            serial::write_line(
+                "WOLFOS_RING3_EVENT_RESUME_OK pid=1 wait_return=0 saved_gprs=1 fx_state=1 real_iret=1");
+        }
+    }
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     serial::write_fmt(format_args!(
         "WOLFOS_RING3_YIELD_TRAP pid={} kind={} count={} cr3_private=1 rsp0_guarded=1\n",
@@ -1294,6 +1326,16 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         if s.hardware_traps!=TRAPS ||
             s.yields!=[if cfg!(feature="p2-ring3-timer-nonyield-smoke"){0}else{ROUNDS};COUNT] {
             fail("incomplete_two_ELF_schedule")
+        }
+        #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+        {
+            if s.event_wait.is_some() || s.event_wakes!=1
+                || s.rr.running().is_some() || s.rr.timer_switches()!=0
+                || s.rr.slots().iter().any(|slot|slot.state!=RrState::Exited){
+                fail("real_event_wait_policy_or_irq_counter_corrupted")
+            }
+            serial::write_line(
+                "WOLFOS_RING3_EVENT_HARDWARE_OK user_wait=1 trusted_signal=1 resumed_wait=1 exits=2 traps=4 timer_switches=0 real_int80_iret=1 independent_cr3=2 rsp0=2 fx=2");
         }
         if unsafe{s.fx.suspend(s.fx_tokens[i])}.is_err(){
             fail("capture_last_pid_fx")
@@ -1444,7 +1486,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 s.timer_busy[0],s.timer_busy[1]
             ));
         }
-        #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
+        #[cfg(all(not(feature="p2-ring3-timer-nonyield-smoke"),
+                  not(feature="p3-ring3-event-wait-hardware-smoke")))]
         serial::write_line(
             "WOLFOS_RING3_YIELD_HARDWARE_OK native_elves=2 real_cpl3=1 total_traps=10 yields=8 exits=2 iret_cross_pid=9 separate_cr3=1 distinct_guarded_rsp0=1 xmm0_preserved=1"
         );
@@ -1473,7 +1516,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     };
     #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
     let next=1-i;
-    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
+              feature = "p3-ring3-event-wait-hardware-smoke"))]
     if s.rr.running()!=Some(s.rr_handles[next]) {
         fail("rr_selected_pid_differs_from_hardware_target")
     }
@@ -1502,6 +1546,11 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         fail("atomic_next_pid_activation")
     }
     s.current=next;
+    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    serial::write_fmt(format_args!(
+        "WOLFOS_RING3_EVENT_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
+        pid,next+1,
+    ));
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     serial::write_fmt(format_args!(
         "WOLFOS_RING3_YIELD_SWITCH from={} to={} private_cr3=1 tss_rsp0=1 fx_saved=1\n",
@@ -1608,6 +1657,10 @@ extern "C" fn finalize()->! {
     #[cfg(not(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=25 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
+    );
+    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    serial::write_line(
+        "WOLFOS_RING3_EVENT_CLEANUP_OK frames_freed=25 wait_ticket_drained=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
     #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),not(feature="p2-ring3-timer-nonyield-smoke")))]
     serial::write_line(
