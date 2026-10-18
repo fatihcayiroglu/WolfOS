@@ -186,6 +186,7 @@ mod ring3_round_robin;
 // context-preflight flavors. It never performs hardware state transitions.
 #[cfg(any(feature = "p2-ring3-timer-nonyield-smoke",
           feature = "p2-ring3-timer-preempt-smoke",
+          feature = "p3-ring3-event-wait-hardware-smoke",
           feature = "p2-handoff-preflight-smoke",
           feature = "kernel-stack-lease-smoke",
           feature = "user-context-smoke"))]
