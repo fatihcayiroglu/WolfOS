@@ -19,7 +19,27 @@ _start:
     // SYS_WAIT_EVENT: syscall and separate event must both be authenticated.
     mov eax, 10
 .else
-    // SYS_SIGNAL_EVENT: only the second task is allowed to signal PID1.
+    // Malicious or stale event delivered by real PID2 CPL3 code must
+    // return an explicit error and never release PID1's blocked frame.
+    // This intentionally exercises the syscall boundary, not a synthetic
+    // direct kernel ledger call.
+    mov eax, 11
+    mov edi, 78
+    xor esi, esi
+    int 0x80
+.global _bad_signal_return
+_bad_signal_return:
+    cmp eax, 1
+    jne failed
+    cmp r12d, WOLFOS_PID
+    jne failed
+    cmp r13, 1
+    jne failed
+    cmp qword ptr [rip + progress], 1
+    jne failed
+    movq r15, xmm0
+    cmp r15, r14
+    jne failed
     mov eax, 11
 .endif
     mov edi, 77

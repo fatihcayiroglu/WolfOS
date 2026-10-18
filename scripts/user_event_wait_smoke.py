@@ -16,8 +16,8 @@ START = (
     "guarded_kernel_rsp0=2 fx_images=2 owned_frames=25"
 )
 HARDWARE = (
-    "WOLFOS_RING3_EVENT_HARDWARE_OK user_wait=1 trusted_signal=1 "
-    "resumed_wait=1 exits=2 traps=4 timer_switches=0 real_int80_iret=1 "
+    "WOLFOS_RING3_EVENT_HARDWARE_OK user_wait=1 rejected_signal=1 "
+    "trusted_signal=1 resumed_wait=1 exits=2 traps=5 timer_switches=0 real_int80_iret=1 "
     "independent_cr3=2 rsp0=2 fx=2"
 )
 CLEANUP = (
@@ -28,10 +28,15 @@ RESUME = (
     "WOLFOS_RING3_EVENT_RESUME_OK pid=1 wait_return=0 saved_gprs=1 "
     "fx_state=1 real_iret=1"
 )
+REJECTED = (
+    "WOLFOS_RING3_EVENT_REJECTED_OK wrong_event=78 pid1_still_blocked=1 "
+    "queue_unchanged=1 saved_iret=1 no_fake_irq=1"
+)
 TRAPS = [
     f"WOLFOS_RING3_EVENT_TRAP pid={pid} kind={kind} count=1 "
     "cr3_private=1 rsp0_guarded=1"
-    for pid, kind in [(1, "wait"), (2, "signal"), (1, "exit"), (2, "exit")]
+    for pid, kind in [(1, "wait"), (2, "signal_rejected"), (2, "signal"),
+                      (1, "exit"), (2, "exit")]
 ]
 SWITCHES = [
     f"WOLFOS_RING3_EVENT_SWITCH from={a} to={b} "
@@ -56,8 +61,8 @@ def evaluate(output: str, code: int) -> bool:
     expected_order = [
         "WOLFOS_BOOT_OK",
         START,
-        TRAPS[0], SWITCHES[0], TRAPS[1], SWITCHES[1],
-        TRAPS[2], RESUME, SWITCHES[2], TRAPS[3], HARDWARE,
+        TRAPS[0], SWITCHES[0], TRAPS[1], REJECTED, TRAPS[2],
+        SWITCHES[1], TRAPS[3], RESUME, SWITCHES[2], TRAPS[4], HARDWARE,
         CLEANUP,
     ]
     # Full-line, once-only evidence: no substring, duplicate or reordering
@@ -112,7 +117,8 @@ def main() -> int:
                   f" proof (exit={proc.returncode})")
             print(proc.stderr.decode(errors="replace"))
             return 1
-        print("PASS: two actual CPL3 ELFs, WAIT→trusted SIGNAL→original saved "
+        print("PASS: two actual CPL3 ELFs, wrong CPL3 SIGNAL rejected without wake, "
+              "then WAIT→trusted SIGNAL→original saved "
               "IRET, three private-CR3/RSP0/FX handoffs, two exits and "
               "exact zero-leak PMM teardown; no timer IRQ credited")
         return 0

@@ -2,7 +2,7 @@
 import unittest
 
 from user_event_wait_smoke import (
-    CLEANUP, HARDWARE, RESUME, START, SWITCHES, TRAPS, evaluate,
+    CLEANUP, HARDWARE, REJECTED, RESUME, START, SWITCHES, TRAPS, evaluate,
 )
 
 
@@ -10,9 +10,9 @@ def valid_evidence():
     return "\n".join([
         "WOLFOS_BOOT_OK", START,
         TRAPS[0], SWITCHES[0],
-        TRAPS[1], SWITCHES[1],
-        TRAPS[2], RESUME, SWITCHES[2],
-        TRAPS[3], HARDWARE, CLEANUP,
+        TRAPS[1], REJECTED, TRAPS[2], SWITCHES[1],
+        TRAPS[3], RESUME, SWITCHES[2],
+        TRAPS[4], HARDWARE, CLEANUP,
     ]) + "\n"
 
 
@@ -24,19 +24,32 @@ class EventWaitEvidenceTests(unittest.TestCase):
         source = valid_evidence()
         for code in (0, 1, 35):
             self.assertFalse(evaluate(source, code))
-        for line in TRAPS + SWITCHES + [HARDWARE, CLEANUP, RESUME, START]:
+        for line in TRAPS + SWITCHES + [HARDWARE, CLEANUP, REJECTED, RESUME, START]:
             self.assertFalse(evaluate(source.replace(line + "\n", ""), 33))
 
     def test_duplicate_and_reordered_events_fail(self):
         source = valid_evidence()
-        for line in TRAPS + SWITCHES + [HARDWARE, CLEANUP]:
+        for line in TRAPS + SWITCHES + [HARDWARE, CLEANUP, REJECTED]:
             self.assertFalse(evaluate(source + line + "\n", 33))
-        moved = source.replace(TRAPS[2] + "\n" + RESUME + "\n",
-                               RESUME + "\n" + TRAPS[2] + "\n")
+        moved = source.replace(TRAPS[3] + "\n" + RESUME + "\n",
+                               RESUME + "\n" + TRAPS[3] + "\n")
         self.assertFalse(evaluate(moved, 33))
-        moved = source.replace(TRAPS[1] + "\n" + SWITCHES[1] + "\n",
-                               SWITCHES[1] + "\n" + TRAPS[1] + "\n")
+        moved = source.replace(TRAPS[2] + "\n" + SWITCHES[1] + "\n",
+                               SWITCHES[1] + "\n" + TRAPS[2] + "\n")
         self.assertFalse(evaluate(moved, 33))
+
+    def test_wrong_event_signal_must_precede_the_valid_one(self):
+        source = valid_evidence()
+        reordered = source.replace(
+            TRAPS[1] + "\n" + REJECTED + "\n" + TRAPS[2] + "\n",
+            TRAPS[2] + "\n" + TRAPS[1] + "\n" + REJECTED + "\n",
+        )
+        self.assertFalse(evaluate(reordered, 33))
+        self.assertFalse(evaluate(source.replace("wrong_event=78",
+                                                "wrong_event=77"), 33))
+        self.assertFalse(evaluate(source.replace("pid1_still_blocked=1",
+                                                "pid1_still_blocked=0"), 33))
+        self.assertFalse(evaluate(source.replace("traps=5", "traps=4"), 33))
 
     def test_wrong_pid_event_or_fake_irq_cannot_pass(self):
         source = valid_evidence()

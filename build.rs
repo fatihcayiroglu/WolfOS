@@ -62,6 +62,10 @@ fn main() {
                 let addr=nm_symbol(&map,name);
                 symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\n");
             }
+            if event_wait && pid==2 {
+                let addr=nm_symbol(&map,"_bad_signal_return");
+                symbols+=&format!("pub const PID2_BAD_SIGNAL_RETURN:u64={addr:#x};\n");
+            }
             if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some(){
                 for (name,suffix) in [("_busy_begin","BUSY_BEGIN"),("_busy_end","BUSY_END")] {
                     let addr=nm_symbol(&map,name);
