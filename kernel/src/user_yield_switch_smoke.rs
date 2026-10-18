@@ -1133,12 +1133,17 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     // stack + 15 complete GPRs in this precise owned TSS.RSP0 interval.
     let f=unsafe{&mut *raw};
     let (cs,ss,_)=interrupts::ring3_cpu_state();
+    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    let valid_arguments=f.registers.rsi==0
+        && f.registers.rdi==if f.registers.rax==3 {0}else{EVENT_ID};
+    #[cfg(not(feature="p3-ring3-event-wait-hardware-smoke"))]
+    let valid_arguments=f.registers.rdi==0&&f.registers.rsi==0;
     if f.hardware.cs!=cs as u64||f.hardware.ss!=ss as u64
         ||f.hardware.rsp!=USER_TOP
         ||!valid_test_user_flags(f.hardware.rflags)
         ||f.registers.r12!=pid
         ||f.registers.r14!=USER_ID[i]
-        ||f.registers.rdi!=0||f.registers.rsi!=0 {
+        ||!valid_arguments {
         fail("real_user_gpr_iret_frame")
     }
     #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
@@ -1165,8 +1170,12 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     }
     let val=unsafe{(ptr(s.hhdm,s.leases[i][5]) as *const u64).read_volatile()};
     let n=f.registers.rax;
-    #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
+    #[cfg(all(not(feature="p2-ring3-timer-nonyield-smoke"),
+              not(feature="p3-ring3-event-wait-hardware-smoke")))]
     let is_yield=n==TEST_YIELD&&f.hardware.rip==after_yield(i);
+    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    let is_yield=(if i==0 {n==SYS_WAIT_EVENT}else{n==SYS_SIGNAL_EVENT})
+        && f.hardware.rip==after_yield(i);
     #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
     let is_yield=false; // no syscall may act as a cooperative yield
     let is_exit=n==3&&f.hardware.rip==after_exit(i);
@@ -1174,9 +1183,46 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         fail("real_ELF_rip_private_data_or_syscall")
     }
     if is_yield{
-        if val!=s.yields[i]+1||val>ROUNDS||
-            s.processes.park_running(pid,active_root).is_err(){
+        if val!=s.yields[i]+1||val>ROUNDS{
             fail("nonsequential_yield_or_park")
+        }
+        #[cfg(not(feature="p3-ring3-event-wait-hardware-smoke"))]
+        if s.processes.park_running(pid,active_root).is_err(){
+            fail("nonsequential_yield_or_park")
+        }
+        #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+        {
+            if i==0 {
+                // A genuine user INT80 has supplied and authenticated this
+                // full hardware GPR/IRET frame on the PID's pinned RSP0.
+                // Block the real registry owner, then arm a one-use event
+                // ticket *before* allowing the other user to execute.
+                if s.event_wait.is_some()
+                    || s.processes.block_running(pid,active_root).is_err(){
+                    fail("real_wait_registry_block")
+                }
+                let (target,ticket)=s.rr.block_current_for_event(
+                    s.rr_handles[0],EVENT_ID
+                ).unwrap_or_else(|_|fail("real_wait_queue_block"));
+                if target!=Some(s.rr_handles[1]) || s.rr.timer_switches()!=0 {
+                    fail("real_wait_wrong_dispatch")
+                }
+                s.event_wait=Some(ticket);
+            }else{
+                // Only PID2's authenticated SIGNAL syscall can reach this
+                // branch. The trusted event and exact nonreused ticket must
+                // both match; this signal is not a timer IRQ and writes no EOI.
+                if s.event_wakes!=0 { fail("duplicate_user_signal") }
+                let ticket=s.event_wait
+                    .take().unwrap_or_else(||fail("missing_user_wait_ticket"));
+                if s.processes.wake_blocked(1,active_root).is_err()
+                    ||s.rr.wake_for_event(ticket,EVENT_ID).is_err()
+                    ||s.processes.park_running(pid,active_root).is_err()
+                    ||s.rr.voluntary_yield(s.rr_handles[1])!=Ok(s.rr_handles[0]) {
+                    fail("trusted_event_wake_or_dispatch")
+                }
+                s.event_wakes+=1;
+            }
         }
         #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
         if s.rr.voluntary_yield(s.rr_handles[i])!=Ok(s.rr_handles[1-i]) {
@@ -1189,6 +1235,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             ||s.yields[i]!=(if cfg!(feature="p2-ring3-timer-nonyield-smoke"){0}else{ROUNDS})
             ||s.processes.exit_zero(pid,active_root).is_err(){
             fail("early_or_bad_exit")
+        }
+        #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+        {
+            if s.rr.exit_current(s.rr_handles[i])
+                !=Ok(if i==0 {Some(s.rr_handles[1])}else{None}){
+                fail("real_event_exit_queue_owner")
+            }
         }
         #[cfg(feature="p3-ring3-four-elf-live-smoke")]
         {
