@@ -1205,8 +1205,22 @@ mod tests {
             Err(ContextError::SchedulerMismatch));
         assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[2], 0x90000),
             Err(ContextError::SchedulerMismatch));
-        assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], roots[1]),
-            Err(ContextError::ActiveUserCr3));
+        // Any live userspace CR3 is unsafe as the purported supervisor CR3:
+        // this includes the BLOCKED source, selected target and third READY PID.
+        let snapshots_before = [
+            bank.snapshot(h[0].pid), bank.snapshot(h[1].pid), bank.snapshot(h[2].pid),
+        ];
+        for user_cr3 in roots {
+            assert_eq!(bank.plan_blocked_handoff(
+                &table, &queue, h[0], h[1], user_cr3),
+                Err(ContextError::ActiveUserCr3),
+                "live user CR3 {user_cr3:#x} cannot authorize block handoff");
+            assert_eq!([
+                bank.snapshot(h[0].pid), bank.snapshot(h[1].pid), bank.snapshot(h[2].pid),
+            ], snapshots_before, "rejected CR3 cannot mutate saved user frames");
+            assert_eq!(queue.timer_switches(), 0);
+            assert_eq!(table.running(), 0);
+        }
         assert_eq!(bank.plan_blocked_handoff(&table, &queue, h[0], h[1], 0),
             Err(ContextError::BadCr3));
         let saved = bank.entries[0];
