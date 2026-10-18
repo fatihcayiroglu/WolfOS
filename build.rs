@@ -25,13 +25,17 @@ fn nm_symbol(output: &str, name: &str) -> u64 {
 
 fn main() {
     println!("cargo:rerun-if-changed=user/yield.S");
+    println!("cargo:rerun-if-changed=user/event_wait.S");
     if env::var_os("CARGO_FEATURE_P2_RING3_YIELD_SMOKE").is_some()
+        || env::var_os("CARGO_FEATURE_P3_RING3_EVENT_WAIT_HARDWARE_SMOKE").is_some()
         || env::var_os("CARGO_FEATURE_P2_RING3_IRQ_READY_SMOKE").is_some()
         || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some() {
         println!("cargo:rerun-if-changed=user/hello.ld");
         let path=PathBuf::from(env::var_os("OUT_DIR").unwrap());
         fs::create_dir_all(&path).expect("make yield OUT_DIR");
         let mut symbols=String::new();
+        let event_wait=env::var_os("CARGO_FEATURE_P3_RING3_EVENT_WAIT_HARDWARE_SMOKE").is_some();
+        let asm_source=if event_wait {"user/event_wait.S"}else{"user/yield.S"};
         for pid in [1usize,2] {
             let obj=path.join(format!("wolfos-yield-{pid}.o"));
             let elf=path.join(format!("wolfos-yield-{pid}.elf"));
@@ -39,10 +43,10 @@ fn main() {
             if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some() {
                 checked("as",&["--64","--defsym",&def,
                     "--defsym","WOLFOS_TIMER_IRQ_PROBE=1","-o",
-                    obj.to_str().unwrap(),"user/yield.S"]);
+                    obj.to_str().unwrap(),asm_source]);
             } else {
                 checked("as",&["--64","--defsym",&def,"-o",
-                    obj.to_str().unwrap(),"user/yield.S"]);
+                    obj.to_str().unwrap(),asm_source]);
             }
             checked("ld",&["-m","elf_x86_64","-nostdlib","-static",
                 "-T","user/hello.ld","-o",elf.to_str().unwrap(),
