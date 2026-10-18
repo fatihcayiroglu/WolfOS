@@ -940,13 +940,14 @@ mod tests {
         bank.refresh_authenticated_trap(&table, source.pid, roots[0],
             stacks[0], stacks[0].top - FRAME_BYTES as u64, saved_irq).unwrap();
         table.block_running(source.pid, roots[0]).unwrap();
-        assert_eq!(queue.block_current_for_event(source, 0x707), Ok(Some(peer)));
+        let (next, wait_ticket) = queue.block_current_for_event(source, 0x707).unwrap();
+        assert_eq!(next, Some(peer));
         assert_eq!(bank.plan_blocked_handoff(&table, &queue,
             source, peer, 0x90000).unwrap().pid, peer.pid);
 
         let captured = bank.snapshot(source.pid).unwrap();
         assert_eq!(queue.wake(source), Err(RunError::WrongEvent));
-        assert_eq!(queue.wake_for_event(source, 0x708),
+        assert_eq!(queue.wake_for_event(wait_ticket, 0x708),
             Err(RunError::WrongEvent));
         assert_eq!(bank.snapshot(source.pid), Some(captured));
         assert_eq!(table.snapshot(source.pid).unwrap().state, ProcessState::Blocked);
@@ -957,7 +958,7 @@ mod tests {
         table.wake_blocked(source.pid, 0x90000).unwrap();
         assert_eq!(bank.plan_blocked_handoff(&table, &queue, source, peer, 0x90000),
             Err(ContextError::WrongState));
-        queue.wake_for_event(source, 0x707).unwrap();
+        queue.wake_for_event(wait_ticket, 0x707).unwrap();
         assert_eq!(queue.timer_switches(), 0, "wake must not fabricate an IRQ");
         assert_eq!(queue.timer_tick(peer), Ok(source));
         let plan = bank.plan_queue_handoff(&table, &queue, peer, source, 0x90000)

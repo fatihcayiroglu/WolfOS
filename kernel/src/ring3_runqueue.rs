@@ -6,6 +6,12 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Handle { pub pid: u64, pub generation: u64 }
 
+/// Opaque proof of one specific event-bound wait, including a nonreusable
+/// monotonically increasing sequence. Neither a PID nor an event ID alone
+/// can authenticate a later wake. Caller still authenticates event origin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitTicket { handle: Handle, event: u64, sequence: u64 }
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State { Empty, Ready, Running, Blocked, Exited }
 
@@ -47,11 +53,13 @@ pub struct Ring3RunQueue<const N: usize> {
     // Optional trusted wait-event ID per slot; zero is legacy untagged BLOCK.
     // Bound waits may only be released via matching wake_for_event.
     wait_events: [u64; N],
+    wait_sequences: [u64; N],
+    next_wait_sequence: u64,
 }
 
 impl<const N: usize> Ring3RunQueue<N> {
     pub const fn new() -> Self {
-        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0, last_handoff: None, last_block_handoff: None, wait_events: [0; N] }
+        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0, last_handoff: None, last_block_handoff: None, wait_events: [0; N], wait_sequences: [0; N], next_wait_sequence: 0 }
     }
 
     pub fn slots(&self) -> [Slot; N] { self.slots }
@@ -98,6 +106,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let handle = Handle { pid, generation };
         self.slots[i] = Slot { handle, state: State::Ready, ticks: 0 };
         self.wait_events[i] = 0;
+        self.wait_sequences[i] = 0;
         self.generation = generation;
         self.last_handoff = None;
         self.last_block_handoff = None;
@@ -207,21 +216,28 @@ impl<const N: usize> Ring3RunQueue<N> {
         Ok(self.running())
     }
 
-    /// Bind a blocked Ring3 task to a nonzero trusted event ID. The caller
-    /// MUST authenticate the original CPL3 trap, complete GPR/IRET/FX save,
-    /// and event registration before invoking this policy-only operation.
-    /// Neither this nor wake_for_event proves a real hardware event.
+    /// Bind a blocked Ring3 task to a nonzero trusted event ID and issue an
+    /// opaque one-use wait ticket. Caller MUST first authenticate the CPL3
+    /// trap, save GPR/IRET/FX and register the kernel wait event. This
+    /// metadata operation cannot prove hardware event provenance.
+    ///
+    /// Checked sequence allocation happens BEFORE blocking, so exhaustion
+    /// leaves all queue fields unchanged. Reusing an event ID for the same PID
+    /// will not authorize delayed signals from a previous wait instance.
     pub fn block_current_for_event(
         &mut self, running: Handle, event: u64,
-    ) -> Result<Option<Handle>, Error> {
+    ) -> Result<(Option<Handle>, WaitTicket), Error> {
         if event == 0 { return Err(Error::InvalidEvent) }
         let i = self.active.ok_or(Error::NoRunnable)?;
         if self.slots[i].handle != running || self.slots[i].state != State::Running {
             return Err(Error::Stale)
         }
+        let sequence = self.next_wait_sequence.checked_add(1).ok_or(Error::Overflow)?;
         let selected = self.block_current(running)?;
+        self.next_wait_sequence = sequence;
         self.wait_events[i] = event;
-        Ok(selected)
+        self.wait_sequences[i] = sequence;
+        Ok((selected, WaitTicket { handle: running, event, sequence }))
     }
 
     /// Legacy untagged wake. It cannot bypass event-bound waits.
@@ -229,23 +245,32 @@ impl<const N: usize> Ring3RunQueue<N> {
     pub fn wake(&mut self, handle: Handle) -> Result<(), Error> {
         let i = self.locate(handle)?;
         if self.slots[i].state != State::Blocked { return Err(Error::WrongState); }
-        if self.wait_events[i] != 0 { return Err(Error::WrongEvent) }
+        if self.wait_events[i] != 0 || self.wait_sequences[i] != 0 {
+            return Err(Error::WrongEvent)
+        }
         self.slots[i].state = State::Ready;
         self.last_handoff = None;
         self.last_block_handoff = None;
         Ok(())
     }
 
-    /// Only a caller-authenticated matching event may make the PID runnable.
-    /// The handle's generation and event ID must both match; failure changes
-    /// no queue field. This does not credit an xAPIC IRQ or a timer switch.
-    pub fn wake_for_event(&mut self, handle: Handle, event: u64) -> Result<(), Error> {
+    /// A caller-authenticated event may wake ONLY the exact wait instance
+    /// named in the kernel-issued ticket. Delayed signals from a previous
+    /// wait with the same PID/event ID fail closed on sequence mismatch.
+    /// The ticket alone is not evidence of real event provenance.
+    pub fn wake_for_event(&mut self, ticket: WaitTicket, event: u64) -> Result<(), Error> {
         if event == 0 { return Err(Error::InvalidEvent) }
-        let i = self.locate(handle)?;
+        let i = self.locate(ticket.handle)?;
         if self.slots[i].state != State::Blocked { return Err(Error::WrongState) }
-        if self.wait_events[i] != event { return Err(Error::WrongEvent) }
+        if self.wait_sequences[i] != ticket.sequence {
+            return Err(Error::Stale)
+        }
+        if self.wait_events[i] != event || ticket.event != event {
+            return Err(Error::WrongEvent)
+        }
         self.slots[i].state = State::Ready;
         self.wait_events[i] = 0;
+        self.wait_sequences[i] = 0;
         self.last_handoff = None;
         self.last_block_handoff = None;
         Ok(())
@@ -260,6 +285,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         }
         self.slots[i].state = State::Exited;
         self.wait_events[i] = 0;
+        self.wait_sequences[i] = 0;
         self.last_handoff = None;
         self.last_block_handoff = None;
         Ok(())
@@ -287,6 +313,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         if self.slots[i].state != State::Exited { return Err(Error::WrongState); }
         self.slots[i] = Slot::EMPTY;
         self.wait_events[i] = 0;
+        self.wait_sequences[i] = 0;
         self.last_handoff = None;
         self.last_block_handoff = None;
         Ok(())
@@ -612,27 +639,30 @@ mod tests {
         assert_eq!(q.block_current_for_event(b, 57), Err(Error::Stale));
         assert_eq!(q, before);
 
-        assert_eq!(q.block_current_for_event(a, 57), Ok(Some(b)));
+        let (next, ticket) = q.block_current_for_event(a, 57).unwrap();
+        assert_eq!(next, Some(b));
         assert_eq!(q.wait_events[0], 57);
         assert_eq!(q.last_block_handoff(), Some((a, b)));
         assert_eq!(q.timer_switches(), 0);
         let blocked = q;
         assert_eq!(q.wake(a), Err(Error::WrongEvent),
             "untagged wake must not bypass event authentication");
-        assert_eq!(q.wake_for_event(a, 58), Err(Error::WrongEvent));
-        assert_eq!(q.wake_for_event(a, 0), Err(Error::InvalidEvent));
-        assert_eq!(q.wake_for_event(b, 57), Err(Error::WrongState));
-        assert_eq!(q.wake_for_event(Handle { generation: a.generation + 1, ..a }, 57),
-            Err(Error::Stale));
+        assert_eq!(q.wake_for_event(ticket, 58), Err(Error::WrongEvent));
+        assert_eq!(q.wake_for_event(ticket, 0), Err(Error::InvalidEvent));
+        assert_eq!(q.wake_for_event(WaitTicket { handle: b, ..ticket }, 57),
+            Err(Error::WrongState));
+        assert_eq!(q.wake_for_event(WaitTicket {
+            handle: Handle { generation: a.generation + 1, ..a }, ..ticket
+        }, 57), Err(Error::Stale));
         assert_eq!(q, blocked, "rejected wakes must preserve the entire policy");
-        assert_eq!(q.wake_for_event(a, 57), Ok(()));
+        assert_eq!(q.wake_for_event(ticket, 57), Ok(()));
         assert_eq!(q.wait_events[0], 0);
         assert_eq!(q.last_block_handoff(), None);
         assert_eq!(q.timer_switches(), 0);
         assert_eq!(q.timer_tick(b), Ok(a));
         assert_eq!(q.last_policy_handoff(), Some((b, a)));
         assert_eq!(q.timer_switches(), 1);
-        assert_eq!(q.wake_for_event(a, 57), Err(Error::WrongState));
+        assert_eq!(q.wake_for_event(ticket, 57), Err(Error::WrongState));
     }
 
     #[test]
@@ -640,25 +670,65 @@ mod tests {
         let mut q = Ring3RunQueue::<1>::new();
         let old = q.admit(7).unwrap();
         assert_eq!(q.start_next(), Ok(old));
-        assert_eq!(q.block_current_for_event(old, 99), Ok(None));
+        let (next, first) = q.block_current_for_event(old, 99).unwrap();
+        assert_eq!(next, None);
         assert_eq!(q.running(), None);
         assert_eq!(q.start_next(), Err(Error::NoRunnable));
         assert_eq!(q.wake(old), Err(Error::WrongEvent));
-        assert_eq!(q.wake_for_event(old, 99), Ok(()));
+        assert_eq!(q.wake_for_event(first, 99), Ok(()));
         assert_eq!(q.start_next(), Ok(old));
         assert_eq!(q.timer_switches(), 0);
 
-        assert_eq!(q.block_current_for_event(old, 101), Ok(None));
+        let (next, second) = q.block_current_for_event(old, 101).unwrap();
+        assert_eq!(next, None);
         assert_eq!(q.cancel(old), Ok(()));
         assert_eq!(q.wait_events[0], 0);
-        assert_eq!(q.wake_for_event(old, 101), Err(Error::WrongState));
+        assert_eq!(q.wake_for_event(second, 101), Err(Error::WrongState));
         assert_eq!(q.reap(old), Ok(()));
         let replacement = q.admit(7).unwrap();
         assert_ne!(replacement, old);
         let before = q;
-        assert_eq!(q.wake_for_event(old, 101), Err(Error::Stale));
+        assert_eq!(q.wake_for_event(second, 101), Err(Error::Stale));
         assert_eq!(q, before);
         assert_eq!(q.start_next(), Ok(replacement));
+        assert_eq!(q.timer_switches(), 0);
+    }
+
+    #[test]
+    fn delayed_event_cannot_wake_a_second_wait_using_same_pid_and_event() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(10).unwrap();
+        let b = q.admit(20).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        let (next, first) = q.block_current_for_event(a, 77).unwrap();
+        assert_eq!(next, Some(b));
+        assert_eq!(q.wake_for_event(first, 77), Ok(()));
+        assert_eq!(q.timer_tick(b), Ok(a));
+        let (next, second) = q.block_current_for_event(a, 77).unwrap();
+        assert_eq!(next, Some(b));
+        assert_ne!(first, second, "the wait sequence cannot be reused");
+        let before = q;
+        assert_eq!(q.wake_for_event(first, 77), Err(Error::Stale));
+        assert_eq!(q.wake_for_event(second, 78), Err(Error::WrongEvent));
+        assert_eq!(q, before);
+        assert_eq!(q.wake_for_event(second, 77), Ok(()));
+        assert_eq!(q.timer_switches(), 1);
+        assert_eq!(q.timer_tick(b), Ok(a));
+        assert_eq!(q.timer_switches(), 2);
+    }
+
+    #[test]
+    fn wait_ticket_exhaustion_is_transactional_and_never_blocks() {
+        let mut q = Ring3RunQueue::<1>::new();
+        let a = q.admit(1).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        q.next_wait_sequence = u64::MAX;
+        let before = q;
+        assert_eq!(q.block_current_for_event(a, 123), Err(Error::Overflow));
+        assert_eq!(q, before);
+        assert_eq!(q.running(), Some(a));
+        assert_eq!(q.wait_events[0], 0);
+        assert_eq!(q.wait_sequences[0], 0);
         assert_eq!(q.timer_switches(), 0);
     }
 
