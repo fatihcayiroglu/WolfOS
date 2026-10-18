@@ -44,7 +44,12 @@ impl<const N: usize> Ring3IrqEoiLedger<N> {
     /// Only for an independently authenticated genuine xAPIC timer IRQ.
     pub fn begin(&mut self, index: usize) -> Result<(), Error> {
         if index >= N { return Err(Error::InvalidPid) }
-        if self.phase[index] != Phase::Idle { return Err(Error::WrongPhase) }
+        // The BSP test admits only one in-flight timer IRQ, regardless of
+        // source PID. Per-PID phase checking alone would accept a nested
+        // IRQ attributed to another user while the first EOI is pending.
+        if self.phase.iter().any(|phase| *phase != Phase::Idle) {
+            return Err(Error::WrongPhase)
+        }
         let next = self.received[index].checked_add(1).ok_or(Error::Overflow)?;
         self.received[index] = next;
         self.phase[index] = Phase::Entered;
@@ -140,6 +145,41 @@ mod tests {
         assert_eq!(q.finish(0, false), Err(Error::WrongPhase));
         assert_eq!(q, before);
         assert_eq!(q.verify_drained().unwrap().received, 1);
+    }
+
+    #[test]
+    fn nested_different_pid_irq_is_denied_without_stealing_eoi() {
+        let mut q = Ring3IrqEoiLedger::<4>::new();
+
+        q.begin(0).unwrap();
+        let entered = q;
+        for other in [1, 2, 3] {
+            assert_eq!(q.begin(other), Err(Error::WrongPhase));
+            assert_eq!(q, entered, "second PID cannot begin before EOI");
+        }
+        assert_eq!(q.verify_drained(), Err(Error::Undrained));
+        q.acknowledge(0).unwrap();
+        let acknowledged = q;
+        for other in [1, 2, 3] {
+            assert_eq!(q.begin(other), Err(Error::WrongPhase));
+            assert_eq!(q, acknowledged,
+                "another PID cannot begin between EOI and IRQ completion");
+        }
+        assert_eq!(q.finish(1, false), Err(Error::WrongPhase));
+        assert_eq!(q, acknowledged);
+        q.finish(0, true).unwrap();
+        assert_eq!(q.verify_drained(), Ok(Totals {
+            received: 1, eoi: 1, resumed_same: 0, switched: 1,
+        }));
+
+        // Releasing the BSP in-flight slot must permit later independent
+        // sources; no legitimate sequential timer activity is suppressed.
+        q.begin(1).unwrap();
+        q.acknowledge(1).unwrap();
+        q.finish(1, false).unwrap();
+        assert_eq!(q.verify_drained(), Ok(Totals {
+            received: 2, eoi: 2, resumed_same: 1, switched: 1,
+        }));
     }
 
     #[test]
