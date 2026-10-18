@@ -191,6 +191,11 @@ mod ring3_round_robin;
           feature = "kernel-stack-lease-smoke",
           feature = "user-context-smoke"))]
 mod ring3_runqueue;
+// A no-heap event registration/notification gate for the isolated real
+// two-ELF WAIT/SIGNAL QEMU feature. The caller must serialize it against
+// BSP interrupts and independently authenticate producer provenance.
+#[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+mod ring3_event_wait_gate;
 // Only the real four-user BSP QEMU IRQ acceptance uses this EOI audit;
 // legacy two-user and simulated policy paths are left unchanged.
 #[cfg(feature = "p3-ring3-four-elf-live-smoke")]
