@@ -1308,6 +1308,15 @@ mod tests {
             bank.refresh_authenticated_trap(
                 &table, 1, 0x1000, owned_stack, trap_at, candidate).unwrap();
         }
+        // Arithmetic status flags may coexist after ordinary user instructions.
+        let mut all_arithmetic = valid;
+        for bit in OPTIONAL {
+            all_arithmetic.hardware.rflags |= 1u64 << bit;
+        }
+        bank.refresh_authenticated_trap(
+            &table, 1, 0x1000, owned_stack, trap_at, all_arithmetic).unwrap();
+        assert_eq!(bank.snapshot(1).unwrap().frame.hardware.rflags,
+            all_arithmetic.hardware.rflags);
         bank.refresh_authenticated_trap(
             &table, 1, 0x1000, owned_stack, trap_at, valid).unwrap();
         assert_eq!(bank.snapshot(1), Some(baseline));
