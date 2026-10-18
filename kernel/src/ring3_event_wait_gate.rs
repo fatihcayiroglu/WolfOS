@@ -75,6 +75,12 @@ impl<const N: usize> EventWaitGate<N> {
         Self { records: [Record::EMPTY; N], next_sequence: 0 }
     }
 
+    /// Number of not-yet-consumed registrations; zero is required before
+    /// the owner can retire all physical process/FX/stack resources.
+    pub fn in_flight(&self) -> usize {
+        self.records.iter().filter(|r| r.phase != Phase::Empty).count()
+    }
+
     fn locate(&self, token: EventToken) -> Result<usize, Error> {
         self.records.iter().position(|r|
             r.phase != Phase::Empty && r.token == token
