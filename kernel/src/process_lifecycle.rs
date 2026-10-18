@@ -171,9 +171,9 @@ impl<const N: usize> ProcessRecord<N> {
         if self.state != ProcessState::Ready {
             return Err(ProcessError::WrongState)
         }
-        if active_cr3 == 0 || active_cr3 == self.cr3_root {
-            return Err(ProcessError::ActiveCr3)
-        }
+        if active_cr3 == 0 || active_cr3 & (PAGE - 1) != 0
+            || active_cr3 >= MAX_PHYSICAL || active_cr3 == self.cr3_root
+        { return Err(ProcessError::ActiveCr3) }
         let owned = self.frames;
         self.frames = [0; N];
         self.cr3_root = 0;
@@ -192,9 +192,9 @@ impl<const N: usize> ProcessRecord<N> {
         if self.state != ProcessState::Exited {
             return Err(ProcessError::WrongState)
         }
-        if active_cr3 == self.cr3_root || active_cr3 == 0 {
-            return Err(ProcessError::ActiveCr3)
-        }
+        if active_cr3 == 0 || active_cr3 & (PAGE - 1) != 0
+            || active_cr3 >= MAX_PHYSICAL || active_cr3 == self.cr3_root
+        { return Err(ProcessError::ActiveCr3) }
         if self.exit_status != 0 { return Err(ProcessError::ExitNotZero) }
         let owned = self.frames;
         self.frames = [0; N];
@@ -338,6 +338,33 @@ mod tests {
         p.admit(12, owned()[0], owned()).unwrap();
         p.mark_running(12, owned()[0]).unwrap();
         assert_eq!(p.cancel_ready(12, 0x9000), Err(ProcessError::WrongState));
+    }
+
+    #[test]
+    fn release_requires_bounded_page_aligned_supervisor_cr3_without_mutation() {
+        let mut ready = ProcessRecord::<7>::empty();
+        ready.admit(41, owned()[0], owned()).unwrap();
+        let ready_before = ready;
+        for invalid in [0, owned()[0], 0x9001, MAX_PHYSICAL, u64::MAX] {
+            assert_eq!(ready.cancel_ready(41, invalid), Err(ProcessError::ActiveCr3));
+            assert_eq!(ready, ready_before, "failed cancellation must keep all PMM leases");
+        }
+        assert_eq!(ready.cancel_ready(41, 0x9000), Ok(owned()));
+        assert_eq!(ready.state, ProcessState::Reaped);
+        assert_eq!(ready.frames, [0; 7]);
+
+        let mut exited = ProcessRecord::<7>::empty();
+        exited.admit(42, owned()[0], owned()).unwrap();
+        exited.mark_running(42, owned()[0]).unwrap();
+        exited.exit_zero(42, owned()[0]).unwrap();
+        let exited_before = exited;
+        for invalid in [0, owned()[0], 0x9001, MAX_PHYSICAL, u64::MAX] {
+            assert_eq!(exited.reap(42, invalid), Err(ProcessError::ActiveCr3));
+            assert_eq!(exited, exited_before, "failed reap must keep all PMM leases");
+        }
+        assert_eq!(exited.reap(42, 0x9000), Ok(owned()));
+        assert_eq!(exited.state, ProcessState::Reaped);
+        assert_eq!(exited.frames, [0; 7]);
     }
 
     #[test]
