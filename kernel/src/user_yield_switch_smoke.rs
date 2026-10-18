@@ -8,8 +8,11 @@
 //! The existing 15-GPR INT80 entry restores the POINTER we return, then
 //! IRETQ resumes the other PID. Faults and unexpected syscalls fail closed.
 use core::{arch::asm,cell::UnsafeCell};
-#[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+#[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
+          feature = "p3-ring3-event-wait-hardware-smoke"))]
 use crate::ring3_runqueue::{Handle as RunHandle,Ring3RunQueue,State as RrState};
+#[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+use crate::ring3_runqueue::WaitTicket;
 #[cfg(feature="p3-ring3-four-elf-live-smoke")]
 use crate::ring3_irq_eoi_ledger::Ring3IrqEoiLedger;
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
@@ -46,6 +49,8 @@ const FOUR_NOYIELD_ELFS:[&[u8];4]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-3.elf")),
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-nonyield-4.elf")),
 ];
+// The independent event-WAIT QEMU flavor links different native programs
+// into these exact slots without changing historical yield/timer fixtures.
 const ELFS:[&[u8];2]=[
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-1.elf")),
     include_bytes!(concat!(env!("OUT_DIR"),"/wolfos-yield-2.elf")),
@@ -75,6 +80,12 @@ const P:u64=1;const W:u64=2;const U:u64=4;const NX:u64=1<<63;
 const CODE:u64=0x401000;const DATA:u64=0x403000;
 const STACK:u64=0x404000;const USER_TOP:u64=STACK+PAGE;
 const TEST_YIELD:u64=9;
+#[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+const EVENT_ID:u64=77;
+#[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+const SYS_WAIT_EVENT:u64=10;
+#[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+const SYS_SIGNAL_EVENT:u64=11;
 #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
 const IRQ_USER_RFLAGS:u64=0x202;
 #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
@@ -93,8 +104,10 @@ fn pic_write(port:u16,value:u8){
         options(nostack,nomem,preserves_flags));}
 }
 
-const TRAPS:usize=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {COUNT}else{10};
-const ROUNDS:u64=if cfg!(feature="p2-ring3-timer-nonyield-smoke") {16}else{4};
+const TRAPS:usize=if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){4}
+    else if cfg!(feature="p2-ring3-timer-nonyield-smoke"){COUNT}else{10};
+const ROUNDS:u64=if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){1}
+    else if cfg!(feature="p2-ring3-timer-nonyield-smoke"){16}else{4};
 #[cfg(feature="p3-ring3-four-elf-live-smoke")]
 const USER_ID:[u64;COUNT]=[0x5a5a_0001_0000_0001,0x5a5a_0001_0000_0002,
     0x5a5a_0001_0000_0003,0x5a5a_0001_0000_0004];
@@ -159,10 +172,16 @@ struct Runtime{
     first_exit_timer_counts:Option<[u64;COUNT]>,
     #[cfg(feature="p3-ring3-four-elf-live-smoke")]
     irq_eoi:Ring3IrqEoiLedger<COUNT>,
-    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
+              feature = "p3-ring3-event-wait-hardware-smoke"))]
     rr:Ring3RunQueue<COUNT>,
-    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
+              feature = "p3-ring3-event-wait-hardware-smoke"))]
     rr_handles:[RunHandle;COUNT],
+    #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+    event_wait:Option<WaitTicket>,
+    #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+    event_wakes:u64,
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // SAFETY: only one BSP may access the runtime; IF=0 from admission until
@@ -984,7 +1003,8 @@ pub fn enter(hhdm:u64)->!{
         unsafe{(frame as *mut UserSyscallFrame).write(bootstrap);}
         saved_frames[i]=frame;
     }
-    #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+    #[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
+              feature = "p3-ring3-event-wait-hardware-smoke"))]
     let (rr,rr_handles)={
         let mut q=Ring3RunQueue::<COUNT>::new();
         let mut handles=[None;COUNT];
@@ -1014,10 +1034,16 @@ pub fn enter(hhdm:u64)->!{
         first_exit_timer_counts:None,
         #[cfg(feature="p3-ring3-four-elf-live-smoke")]
         irq_eoi:Ring3IrqEoiLedger::new(),
-        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        #[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
+                  feature = "p3-ring3-event-wait-hardware-smoke"))]
         rr,
-        #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
+        #[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
+                  feature = "p3-ring3-event-wait-hardware-smoke"))]
         rr_handles,
+        #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+        event_wait:None,
+        #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+        event_wakes:0,
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
