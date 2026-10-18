@@ -373,6 +373,40 @@ mod tests {
     }
 
     #[test]
+    fn cr3_ownership_survives_exit_until_verified_reap_and_slot_reuse() {
+        let mut table = ProcessTable::<1, 7>::new();
+        let owned = frames(0x1000);
+        let pid = table.reserve(owned[0], owned).unwrap();
+        assert!(table.owns_live_cr3(owned[0]));
+
+        table.mark_running(pid, owned[0]).unwrap();
+        table.exit_zero(pid, owned[0]).unwrap();
+        assert_eq!(table.snapshot(pid).unwrap().state, ProcessState::Exited);
+        assert!(table.owns_live_cr3(owned[0]),
+            "EXITED processes retain their CR3 and PMM ownership");
+
+        assert_eq!(table.reap(pid, owned[0]),
+            Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!(table.snapshot(pid).unwrap().frames, owned);
+        assert!(table.owns_live_cr3(owned[0]),
+            "refused reap must not release a live user CR3");
+
+        assert_eq!(table.reap(pid, 0x90000), Ok(owned));
+        assert_eq!(table.snapshot(pid), None);
+        assert!(!table.owns_live_cr3(owned[0]));
+
+        // The slot and frames may be reused, but the old PID must not be.
+        let replacement = table.reserve(owned[0], owned).unwrap();
+        assert!(replacement > pid);
+        assert!(table.owns_live_cr3(owned[0]));
+        assert_eq!(table.reap(pid, 0x90000), Err(TableError::UnknownPid));
+        assert_eq!(table.snapshot(replacement).unwrap().frames, owned);
+        assert_eq!(table.cancel_ready(replacement, 0x90000), Ok(owned));
+        assert!(!table.owns_live_cr3(owned[0]));
+        assert_eq!(table.occupied(), 0);
+    }
+
+    #[test]
     fn no_slots_and_exhausted_pid_fail_closed() {
         let mut empty = ProcessTable::<0,7>::new();
         assert_eq!(empty.reserve(0x1000, frames(0x1000)), Err(TableError::Full));
