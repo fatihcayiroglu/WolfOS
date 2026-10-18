@@ -24,7 +24,7 @@ use crate::process_table::ProcessTable;
 #[path = "ring3_runqueue.rs"]
 mod standalone_runqueue;
 #[cfg(test)]
-use standalone_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
+use standalone_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState, Error as RunError};
 #[cfg(not(test))]
 use crate::ring3_runqueue::{Handle as RunHandle, Ring3RunQueue, State as RunState};
 #[cfg(test)]
@@ -945,9 +945,9 @@ mod tests {
             source, peer, 0x90000).unwrap().pid, peer.pid);
 
         let captured = bank.snapshot(source.pid).unwrap();
-        assert_eq!(queue.wake(source), Err(crate::ring3_runqueue::Error::WrongEvent));
+        assert_eq!(queue.wake(source), Err(RunError::WrongEvent));
         assert_eq!(queue.wake_for_event(source, 0x708),
-            Err(crate::ring3_runqueue::Error::WrongEvent));
+            Err(RunError::WrongEvent));
         assert_eq!(bank.snapshot(source.pid), Some(captured));
         assert_eq!(table.snapshot(source.pid).unwrap().state, ProcessState::Blocked);
         assert_eq!(queue.timer_switches(), 0);
