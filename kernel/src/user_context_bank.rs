@@ -1260,6 +1260,35 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_irq_rejects_forbidden_rflags_without_mutation() {
+        let (mut table, mut bank) = two();
+        let owned_stack = stack(0xffff_8000_0010_0000);
+        bank.prepare_bootstrap(&table, 1, 0x1000, owned_stack,
+            frame(0x401000, 1)).unwrap();
+        table.mark_running(1, 0x1000).unwrap();
+        let trap_at = owned_stack.top - FRAME_BYTES as u64;
+        let mut valid = frame(0x401000, 1);
+        valid.hardware.rflags = 0x202;
+        bank.refresh_authenticated_trap(
+            &table, 1, 0x1000, owned_stack, trap_at, valid).unwrap();
+        let before = bank.snapshot(1).unwrap();
+        for bit in [8, 10, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 63] {
+            let mut forged = valid;
+            forged.hardware.rflags |= 1u64 << bit;
+            assert_eq!(bank.refresh_authenticated_trap(
+                &table, 1, 0x1000, owned_stack, trap_at, forged),
+                Err(ContextError::BadFlags), "forbidden RFLAGS bit {bit}");
+            assert_eq!(bank.snapshot(1), Some(before));
+        }
+        let mut missing_if = valid;
+        missing_if.hardware.rflags &= !(1 << 9);
+        assert_eq!(bank.refresh_authenticated_trap(
+            &table, 1, 0x1000, owned_stack, trap_at, missing_if),
+            Err(ContextError::BadFlags));
+        assert_eq!(bank.snapshot(1), Some(before));
+    }
+
+    #[test]
     fn empty_banks_and_unavailable_next_fail_closed() {
         let (t,mut bank) = two();
         assert_eq!(bank.plan_next(&t,1,0x90000),Err(ContextError::NotPrepared));
