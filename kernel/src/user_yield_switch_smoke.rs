@@ -1215,10 +1215,24 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 if s.event_wakes!=0 { fail("duplicate_user_signal") }
                 let ticket=s.event_wait
                     .take().unwrap_or_else(||fail("missing_user_wait_ticket"));
-                if s.processes.wake_blocked(1,active_root).is_err()
-                    ||s.rr.wake_for_event(ticket,EVENT_ID).is_err()
-                    ||s.processes.park_running(pid,active_root).is_err()
-                    ||s.rr.voluntary_yield(s.rr_handles[1])!=Ok(s.rr_handles[0]) {
+                if s.rr.wake_for_event(ticket,EVENT_ID).is_err(){
+                    fail("trusted_event_ticket_invalid")
+                }
+                // The ProcessTable correctly forbids using *any other
+                // resident USER CR3* as an alleged supervisor root. Since
+                // PID2 is still active, genuinely switch to the trusted,
+                // still-mapped BOOT CR3 (IF=0) to perform the wake, then
+                // restore PID2's private CR3 before scheduling it away.
+                // High-half RSP0 and kernel mappings are pinned in both.
+                unsafe{asm!("mov cr3, {}",in(reg)s.boot,
+                           options(nostack,preserves_flags));}
+                if actual_cr3()!=s.boot{fail("event_wake_boot_cr3_not_active")}
+                let wake=s.processes.wake_blocked(1,s.boot);
+                unsafe{asm!("mov cr3, {}",in(reg)active_root,
+                           options(nostack,preserves_flags));}
+                if actual_cr3()!=active_root || wake.is_err()
+                    || s.processes.park_running(pid,active_root).is_err()
+                    || s.rr.voluntary_yield(s.rr_handles[1])!=Ok(s.rr_handles[0]){
                     fail("trusted_event_wake_or_dispatch")
                 }
                 // Before resuming PID1, verify the original blocked INT80
