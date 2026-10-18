@@ -12,7 +12,7 @@ use core::{arch::asm,cell::UnsafeCell};
           feature = "p3-ring3-event-wait-hardware-smoke"))]
 use crate::ring3_runqueue::{Handle as RunHandle,Ring3RunQueue,State as RrState};
 #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
-use crate::ring3_runqueue::WaitTicket;
+use crate::ring3_runqueue::{WaitTicket,Error as RunError};
 #[cfg(feature="p3-ring3-four-elf-live-smoke")]
 use crate::ring3_irq_eoi_ledger::Ring3IrqEoiLedger;
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
@@ -104,7 +104,7 @@ fn pic_write(port:u16,value:u8){
         options(nostack,nomem,preserves_flags));}
 }
 
-const TRAPS:usize=if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){4}
+const TRAPS:usize=if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){5}
     else if cfg!(feature="p2-ring3-timer-nonyield-smoke"){COUNT}else{10};
 const ROUNDS:u64=if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){1}
     else if cfg!(feature="p2-ring3-timer-nonyield-smoke"){16}else{4};
@@ -182,6 +182,8 @@ struct Runtime{
     event_wait:Option<WaitTicket>,
     #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
     event_wakes:u64,
+    #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+    event_rejections:u64,
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // SAFETY: only one BSP may access the runtime; IF=0 from admission until
@@ -1044,6 +1046,8 @@ pub fn enter(hhdm:u64)->!{
         event_wait:None,
         #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
         event_wakes:0,
+        #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
+        event_rejections:0,
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
@@ -1134,8 +1138,11 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     let f=unsafe{&mut *raw};
     let (cs,ss,_)=interrupts::ring3_cpu_state();
     #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
-    let valid_arguments=f.registers.rsi==0
-        && f.registers.rdi==if f.registers.rax==3 {0}else{EVENT_ID};
+    let valid_arguments=f.registers.rsi==0 &&
+        (if f.registers.rax==3 {f.registers.rdi==0}
+         else if i==1 && f.registers.rax==SYS_SIGNAL_EVENT {
+             f.registers.rdi==EVENT_ID || f.registers.rdi==EVENT_ID+1
+         }else{f.registers.rdi==EVENT_ID});
     #[cfg(not(feature="p3-ring3-event-wait-hardware-smoke"))]
     let valid_arguments=f.registers.rdi==0&&f.registers.rsi==0;
     if f.hardware.cs!=cs as u64||f.hardware.ss!=ss as u64
@@ -1170,6 +1177,51 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     }
     let val=unsafe{(ptr(s.hhdm,s.leases[i][5]) as *const u64).read_volatile()};
     let n=f.registers.rax;
+    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    if i==1 && n==SYS_SIGNAL_EVENT
+            && f.hardware.rip==sym::PID2_BAD_SIGNAL_RETURN {
+        // The source is a genuine CPL3 syscall with a deliberately
+        // incorrect event argument. It must return an error to PID2's
+        // ORIGINAL hardware IRET frame without waking PID1, scheduling
+        // a peer, changing PMM/FX ownership or claiming a timer IRQ.
+        if f.registers.rdi!=EVENT_ID+1 || f.registers.r13!=1
+            || val!=1 || s.yields[1]!=0 || s.event_wakes!=0
+            || s.event_rejections!=0 || s.rr.timer_switches()!=0
+            || s.rr.running()!=Some(s.rr_handles[1])
+            || s.rr.slots()[0].state!=RrState::Blocked
+            || s.processes.snapshot(1).is_none_or(|p|
+                p.state!=ProcessState::Blocked
+                || p.cr3_root!=s.leases[0][0]) {
+            fail("bad_signal_invalid_hardware_provenance")
+        }
+        let ticket=s.event_wait
+            .unwrap_or_else(||fail("bad_signal_missing_pending_ticket"));
+        let queue_before=s.rr;
+        let blocked_before=s.processes.snapshot(1);
+        let active_before=s.processes.snapshot(2);
+        let saved_frame_before=s.frames[0];
+        let fx_before=s.fx.active_pid();
+        if s.rr.wake_for_event(ticket,f.registers.rdi)
+                !=Err(RunError::WrongEvent)
+            || s.rr!=queue_before
+            || s.processes.snapshot(1)!=blocked_before
+            || s.processes.snapshot(2)!=active_before
+            || s.frames[0]!=saved_frame_before
+            || s.fx.active_pid()!=fx_before {
+            fail("bad_signal_mutated_blocked_user_or_scheduler")
+        }
+        s.event_rejections=1;
+        s.hardware_traps+=1;
+        if s.hardware_traps>TRAPS {fail("extra_bad_signal_trap")}
+        f.registers.rax=1; // explicit invalid-event status to Ring3
+        serial::write_line(
+            "WOLFOS_RING3_EVENT_TRAP pid=2 kind=signal_rejected count=1 cr3_private=1 rsp0_guarded=1"
+        );
+        serial::write_line(
+            "WOLFOS_RING3_EVENT_REJECTED_OK wrong_event=78 pid1_still_blocked=1 queue_unchanged=1 saved_iret=1 no_fake_irq=1"
+        );
+        return raw;
+    }
     #[cfg(all(not(feature="p2-ring3-timer-nonyield-smoke"),
               not(feature="p3-ring3-event-wait-hardware-smoke")))]
     let is_yield=n==TEST_YIELD&&f.hardware.rip==after_yield(i);
@@ -1212,7 +1264,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 // Only PID2's authenticated SIGNAL syscall can reach this
                 // branch. The trusted event and exact nonreused ticket must
                 // both match; this signal is not a timer IRQ and writes no EOI.
-                if s.event_wakes!=0 { fail("duplicate_user_signal") }
+                if s.event_wakes!=0 || s.event_rejections!=1 {
+                    fail("duplicate_or_missing_rejected_user_signal")
+                }
                 let ticket=s.event_wait
                     .take().unwrap_or_else(||fail("missing_user_wait_ticket"));
                 if s.rr.wake_for_event(ticket,EVENT_ID).is_err(){
@@ -1344,12 +1398,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
         {
             if s.event_wait.is_some() || s.event_wakes!=1
+                || s.event_rejections!=1
                 || s.rr.running().is_some() || s.rr.timer_switches()!=0
                 || s.rr.slots().iter().any(|slot|slot.state!=RrState::Exited){
                 fail("real_event_wait_policy_or_irq_counter_corrupted")
             }
             serial::write_line(
-                "WOLFOS_RING3_EVENT_HARDWARE_OK user_wait=1 trusted_signal=1 resumed_wait=1 exits=2 traps=4 timer_switches=0 real_int80_iret=1 independent_cr3=2 rsp0=2 fx=2");
+                "WOLFOS_RING3_EVENT_HARDWARE_OK user_wait=1 rejected_signal=1 trusted_signal=1 resumed_wait=1 exits=2 traps=5 timer_switches=0 real_int80_iret=1 independent_cr3=2 rsp0=2 fx=2");
         }
         if unsafe{s.fx.suspend(s.fx_tokens[i])}.is_err(){
             fail("capture_last_pid_fx")
