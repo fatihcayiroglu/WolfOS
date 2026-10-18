@@ -10,7 +10,7 @@ pub struct Handle { pub pid: u64, pub generation: u64 }
 pub enum State { Empty, Ready, Running, Blocked, Exited }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error { InvalidPid, DuplicatePid, InvalidQuantum, Full, Stale, WrongState, NoRunnable, Overflow }
+pub enum Error { InvalidPid, DuplicatePid, InvalidQuantum, InvalidEvent, WrongEvent, Full, Stale, WrongState, NoRunnable, Overflow }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
@@ -44,11 +44,14 @@ pub struct Ring3RunQueue<const N: usize> {
     // Last BLOCK transition to a peer, invalidated by every subsequent
     // successful policy operation. This is NOT trusted trap provenance.
     last_block_handoff: Option<(Handle, Handle)>,
+    // Optional trusted wait-event ID per slot; zero is legacy untagged BLOCK.
+    // Bound waits may only be released via matching wake_for_event.
+    wait_events: [u64; N],
 }
 
 impl<const N: usize> Ring3RunQueue<N> {
     pub const fn new() -> Self {
-        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0, last_handoff: None, last_block_handoff: None }
+        Self { slots: [Slot::EMPTY; N], active: None, switches: 0, generation: 0, slice_ticks: 0, last_handoff: None, last_block_handoff: None, wait_events: [0; N] }
     }
 
     pub fn slots(&self) -> [Slot; N] { self.slots }
@@ -94,6 +97,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let generation = self.generation.checked_add(1).ok_or(Error::Overflow)?;
         let handle = Handle { pid, generation };
         self.slots[i] = Slot { handle, state: State::Ready, ticks: 0 };
+        self.wait_events[i] = 0;
         self.generation = generation;
         self.last_handoff = None;
         self.last_block_handoff = None;
@@ -203,10 +207,45 @@ impl<const N: usize> Ring3RunQueue<N> {
         Ok(self.running())
     }
 
+    /// Bind a blocked Ring3 task to a nonzero trusted event ID. The caller
+    /// MUST authenticate the original CPL3 trap, complete GPR/IRET/FX save,
+    /// and event registration before invoking this policy-only operation.
+    /// Neither this nor wake_for_event proves a real hardware event.
+    pub fn block_current_for_event(
+        &mut self, running: Handle, event: u64,
+    ) -> Result<Option<Handle>, Error> {
+        if event == 0 { return Err(Error::InvalidEvent) }
+        let i = self.active.ok_or(Error::NoRunnable)?;
+        if self.slots[i].handle != running || self.slots[i].state != State::Running {
+            return Err(Error::Stale)
+        }
+        let selected = self.block_current(running)?;
+        self.wait_events[i] = event;
+        Ok(selected)
+    }
+
+    /// Legacy untagged wake. It cannot bypass event-bound waits.
+    /// The caller still MUST independently authenticate wake provenance.
     pub fn wake(&mut self, handle: Handle) -> Result<(), Error> {
         let i = self.locate(handle)?;
         if self.slots[i].state != State::Blocked { return Err(Error::WrongState); }
+        if self.wait_events[i] != 0 { return Err(Error::WrongEvent) }
         self.slots[i].state = State::Ready;
+        self.last_handoff = None;
+        self.last_block_handoff = None;
+        Ok(())
+    }
+
+    /// Only a caller-authenticated matching event may make the PID runnable.
+    /// The handle's generation and event ID must both match; failure changes
+    /// no queue field. This does not credit an xAPIC IRQ or a timer switch.
+    pub fn wake_for_event(&mut self, handle: Handle, event: u64) -> Result<(), Error> {
+        if event == 0 { return Err(Error::InvalidEvent) }
+        let i = self.locate(handle)?;
+        if self.slots[i].state != State::Blocked { return Err(Error::WrongState) }
+        if self.wait_events[i] != event { return Err(Error::WrongEvent) }
+        self.slots[i].state = State::Ready;
+        self.wait_events[i] = 0;
         self.last_handoff = None;
         self.last_block_handoff = None;
         Ok(())
@@ -220,6 +259,7 @@ impl<const N: usize> Ring3RunQueue<N> {
             return Err(Error::WrongState);
         }
         self.slots[i].state = State::Exited;
+        self.wait_events[i] = 0;
         self.last_handoff = None;
         self.last_block_handoff = None;
         Ok(())
@@ -246,6 +286,7 @@ impl<const N: usize> Ring3RunQueue<N> {
         let i = self.locate(handle)?;
         if self.slots[i].state != State::Exited { return Err(Error::WrongState); }
         self.slots[i] = Slot::EMPTY;
+        self.wait_events[i] = 0;
         self.last_handoff = None;
         self.last_block_handoff = None;
         Ok(())
@@ -554,6 +595,68 @@ mod tests {
         let replacement = q.admit(7).unwrap();
         let before = q;
         assert_eq!(q.wake(a), Err(Error::Stale));
+        assert_eq!(q, before);
+        assert_eq!(q.start_next(), Ok(replacement));
+        assert_eq!(q.timer_switches(), 0);
+    }
+
+    #[test]
+    fn event_bound_block_requires_matching_wake_and_never_forges_timer_irq() {
+        let mut q = Ring3RunQueue::<3>::new();
+        let a = q.admit(11).unwrap();
+        let b = q.admit(22).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+
+        let before = q;
+        assert_eq!(q.block_current_for_event(a, 0), Err(Error::InvalidEvent));
+        assert_eq!(q.block_current_for_event(b, 57), Err(Error::Stale));
+        assert_eq!(q, before);
+
+        assert_eq!(q.block_current_for_event(a, 57), Ok(Some(b)));
+        assert_eq!(q.wait_events[0], 57);
+        assert_eq!(q.last_block_handoff(), Some((a, b)));
+        assert_eq!(q.timer_switches(), 0);
+        let blocked = q;
+        assert_eq!(q.wake(a), Err(Error::WrongEvent),
+            "untagged wake must not bypass event authentication");
+        assert_eq!(q.wake_for_event(a, 58), Err(Error::WrongEvent));
+        assert_eq!(q.wake_for_event(a, 0), Err(Error::InvalidEvent));
+        assert_eq!(q.wake_for_event(b, 57), Err(Error::WrongState));
+        assert_eq!(q.wake_for_event(Handle { generation: a.generation + 1, ..a }, 57),
+            Err(Error::Stale));
+        assert_eq!(q, blocked, "rejected wakes must preserve the entire policy");
+        assert_eq!(q.wake_for_event(a, 57), Ok(()));
+        assert_eq!(q.wait_events[0], 0);
+        assert_eq!(q.last_block_handoff(), None);
+        assert_eq!(q.timer_switches(), 0);
+        assert_eq!(q.timer_tick(b), Ok(a));
+        assert_eq!(q.last_policy_handoff(), Some((b, a)));
+        assert_eq!(q.timer_switches(), 1);
+        assert_eq!(q.wake_for_event(a, 57), Err(Error::WrongState));
+    }
+
+    #[test]
+    fn all_blocked_event_wake_and_cancelled_stale_event_never_resurrect_pid() {
+        let mut q = Ring3RunQueue::<1>::new();
+        let old = q.admit(7).unwrap();
+        assert_eq!(q.start_next(), Ok(old));
+        assert_eq!(q.block_current_for_event(old, 99), Ok(None));
+        assert_eq!(q.running(), None);
+        assert_eq!(q.start_next(), Err(Error::NoRunnable));
+        assert_eq!(q.wake(old), Err(Error::WrongEvent));
+        assert_eq!(q.wake_for_event(old, 99), Ok(()));
+        assert_eq!(q.start_next(), Ok(old));
+        assert_eq!(q.timer_switches(), 0);
+
+        assert_eq!(q.block_current_for_event(old, 101), Ok(None));
+        assert_eq!(q.cancel(old), Ok(()));
+        assert_eq!(q.wait_events[0], 0);
+        assert_eq!(q.wake_for_event(old, 101), Err(Error::WrongState));
+        assert_eq!(q.reap(old), Ok(()));
+        let replacement = q.admit(7).unwrap();
+        assert_ne!(replacement, old);
+        let before = q;
+        assert_eq!(q.wake_for_event(old, 101), Err(Error::Stale));
         assert_eq!(q, before);
         assert_eq!(q.start_next(), Ok(replacement));
         assert_eq!(q.timer_switches(), 0);
