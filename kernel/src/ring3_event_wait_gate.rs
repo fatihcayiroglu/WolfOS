@@ -263,6 +263,8 @@ impl BspIrqEventBridge {
         }
         if delivered_event == 0 { return Err(IrqEventError::InvalidEvent) }
         if self.active.is_some() { return Err(IrqEventError::Busy) }
+        // Do not admit another IRQ when idle counters are already corrupt.
+        self.verify_drained()?;
         gate.locate(token).map_err(IrqEventError::Event)?;
         let sequence = self.next_sequence.checked_add(1)
             .ok_or(IrqEventError::Overflow)?;
@@ -355,6 +357,39 @@ impl BspIrqEventBridge {
 mod tests {
     use super::*;
     use standalone_queue::State;
+
+    #[test]
+    fn idle_irq_bridge_corruption_rejects_capture_without_mutation() {
+        let mut q = Ring3RunQueue::<1>::new();
+        let h = q.admit(1).unwrap();
+        q.start_next().unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let token = gate.arm(&q, h, 7).unwrap();
+        let mut bridge = BspIrqEventBridge::new();
+        bridge.entered = 1;
+        let before = bridge;
+        assert_eq!(bridge.capture(&gate, token, 48, 48, 7), Err(IrqEventError::NotDrained));
+        assert_eq!(bridge, before);
+        bridge.acknowledged = 1;
+        bridge.delivered = 1;
+        assert!(bridge.capture(&gate, token, 48, 48, 7).is_ok());
+    }
+
+    #[test]
+    fn idle_irq_bridge_counter_overflow_rejects_capture_without_mutation() {
+        let mut q = Ring3RunQueue::<1>::new();
+        let h = q.admit(1).unwrap();
+        q.start_next().unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let token = gate.arm(&q, h, 7).unwrap();
+        let mut bridge = BspIrqEventBridge::new();
+        bridge.entered = u64::MAX;
+        bridge.acknowledged = u64::MAX;
+        bridge.delivered = u64::MAX;
+        let before = bridge;
+        assert_eq!(bridge.capture(&gate, token, 48, 48, 7), Err(IrqEventError::Overflow));
+        assert_eq!(bridge, before);
+    }
 
     #[test]
     fn signal_between_registration_and_park_is_latched_without_lost_wake() {
