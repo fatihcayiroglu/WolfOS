@@ -38,7 +38,15 @@ def unique_aggregate_proof(output: str):
 def prerequisite_smp_proof(output: str) -> bool:
     """Require exactly one unembedded four-vCPU SMP prerequisite record."""
     lines = [line for line in output.splitlines() if "WOLFOS_SMP_APS_OK" in line]
-    return len(lines) == 1 and lines[0].startswith("WOLFOS_SMP_APS_OK total=4 ")
+    if len(lines) != 1:
+        return False
+    # Match the exact field names emitted by kernel/src/smp.rs, not just
+    # the CPU count prefix. In particular, all three APs must acknowledge.
+    proof = re.fullmatch(
+        r"WOLFOS_SMP_APS_OK total=4 bsp_lapic=(\d+) ap_acks=3",
+        lines[0],
+    )
+    return proof is not None and int(proof.group(1)) <= 0xFFFFFFFF
 
 
 def main() -> int:
