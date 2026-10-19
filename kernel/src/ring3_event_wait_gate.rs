@@ -152,6 +152,12 @@ impl<const N: usize> EventWaitGate<N> {
         if token.event != delivered_event { return Err(Error::WrongEvent) }
         match self.records[i].phase {
             Phase::Armed => {
+                // The ARM-to-COMMIT window belongs to the running task.
+                // Reject a stale/out-of-contract signal if policy execution
+                // moved elsewhere before the notification was delivered.
+                if queue.running() != Some(token.handle) {
+                    return Err(Error::InvalidHandle)
+                }
                 self.records[i].phase = Phase::Pending;
                 Ok(Delivery::Latched)
             }
@@ -419,6 +425,31 @@ mod tests {
         assert_eq!(gate.signal(&mut q, second, 77), Err(Error::Stale));
         assert_eq!(q.timer_tick(b), Ok(a));
         assert_eq!(q.timer_switches(), 1);
+    }
+
+    #[test]
+    fn armed_notification_requires_its_owner_still_running() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(11).unwrap();
+        let b = q.admit(22).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        let mut gate = EventWaitGate::<2>::new();
+        let token = gate.arm(&q, a, 77).unwrap();
+
+        // A caller that violates the IRQ-masked ARM/COMMIT critical
+        // section must not latch a notification for the former runner.
+        assert_eq!(q.voluntary_yield(a), Ok(b));
+        let before = (gate, q);
+        assert_eq!(gate.signal(&mut q, token, 77), Err(Error::InvalidHandle));
+        assert_eq!((gate, q), before);
+
+        // Rejecting the stale timing does not consume the registration:
+        // after dispatching its rightful owner, a valid signal still works.
+        assert_eq!(q.voluntary_yield(b), Ok(a));
+        assert_eq!(gate.signal(&mut q, token, 77), Ok(Delivery::Latched));
+        assert_eq!(gate.commit(&mut q, token), Ok(Commit::DeliveredBeforePark));
+        assert_eq!(q.running(), Some(a));
+        assert_eq!(gate.in_flight(), 0);
     }
 
     #[test]
