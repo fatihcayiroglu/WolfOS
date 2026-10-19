@@ -44,7 +44,7 @@ class AggregateEvidenceTests(unittest.TestCase):
 
 
 class PrerequisiteEvidenceTests(unittest.TestCase):
-    VALID = "WOLFOS_SMP_APS_OK total=4 bsp=1 aps=3"
+    VALID = "WOLFOS_SMP_APS_OK total=4 bsp_lapic=0 ap_acks=3"
 
     def test_valid(self):
         self.assertTrue(prerequisite_smp_proof(self.VALID))
@@ -63,6 +63,30 @@ class PrerequisiteEvidenceTests(unittest.TestCase):
 
     def test_wrong_cpu_count(self):
         self.assertFalse(prerequisite_smp_proof(self.VALID.replace("total=4", "total=3")))
+
+    def test_requires_exact_ap_acknowledgement(self):
+        for acks in (0, 1, 2, 4):
+            with self.subTest(acks=acks):
+                self.assertFalse(prerequisite_smp_proof(
+                    self.VALID.replace("ap_acks=3", f"ap_acks={acks}")))
+
+    def test_rejects_wrong_fields_and_trailing_payload(self):
+        for record in (
+            "WOLFOS_SMP_APS_OK total=4 bsp=1 aps=3",
+            self.VALID.replace("bsp_lapic", "bsp"),
+            self.VALID.replace("ap_acks", "aps"),
+            self.VALID + " forged=1",
+            self.VALID + " ",
+            "prefix: " + self.VALID,
+        ):
+            with self.subTest(record=record):
+                self.assertFalse(prerequisite_smp_proof(record))
+
+    def test_bsp_apic_id_must_fit_u32(self):
+        self.assertTrue(prerequisite_smp_proof(
+            self.VALID.replace("bsp_lapic=0", "bsp_lapic=4294967295")))
+        self.assertFalse(prerequisite_smp_proof(
+            self.VALID.replace("bsp_lapic=0", "bsp_lapic=4294967296")))
 
 
 if __name__ == "__main__":
