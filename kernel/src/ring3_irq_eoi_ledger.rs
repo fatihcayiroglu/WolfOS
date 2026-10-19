@@ -50,6 +50,8 @@ impl<const N: usize> Ring3IrqEoiLedger<N> {
         if self.phase.iter().any(|phase| *phase != Phase::Idle) {
             return Err(Error::WrongPhase)
         }
+        let totals = self.verify_drained()?;
+        totals.received.checked_add(1).ok_or(Error::Overflow)?;
         let next = self.received[index].checked_add(1).ok_or(Error::Overflow)?;
         self.received[index] = next;
         self.phase[index] = Phase::Entered;
@@ -192,6 +194,8 @@ mod tests {
         assert_eq!(q, before);
 
         q.received[0] = u64::MAX;
+        q.eoi[0] = u64::MAX;
+        q.resumed_same[0] = u64::MAX;
         let before = q;
         assert_eq!(q.begin(0), Err(Error::Overflow));
         assert_eq!(q, before);
@@ -223,6 +227,46 @@ mod tests {
         q.eoi[1] = u64::MAX;
         q.switched[1] = u64::MAX;
         assert_eq!(q.verify_drained(), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn idle_corrupt_balances_reject_new_irq_without_mutation() {
+        let mut q = Ring3IrqEoiLedger::<4>::new();
+        q.received[0] = 2;
+        q.eoi[0] = 1;
+        let before = q;
+        assert_eq!(q.begin(1), Err(Error::Undrained));
+        assert_eq!(q, before);
+        q.eoi[0] = 2;
+        q.resumed_same[0] = 1;
+        let before = q;
+        assert_eq!(q.begin(1), Err(Error::Undrained));
+        assert_eq!(q, before);
+        q.switched[0] = 1;
+        q.begin(1).unwrap();
+        q.acknowledge(1).unwrap();
+        q.finish(1, false).unwrap();
+        assert_eq!(q.verify_drained().unwrap().received, 3);
+    }
+
+    #[test]
+    fn idle_aggregate_overflow_rejects_new_irq_without_mutation() {
+        let mut q = Ring3IrqEoiLedger::<4>::new();
+        q.received[0] = u64::MAX;
+        q.eoi[0] = u64::MAX;
+        q.switched[0] = u64::MAX;
+        let before = q;
+        assert_eq!(q.begin(1), Err(Error::Overflow));
+        assert_eq!(q, before);
+        q.received[0] = u64::MAX - 1;
+        q.eoi[0] = u64::MAX - 1;
+        q.switched[0] = u64::MAX - 1;
+        q.received[1] = 2;
+        q.eoi[1] = 2;
+        q.resumed_same[1] = 2;
+        let before = q;
+        assert_eq!(q.begin(2), Err(Error::Overflow));
+        assert_eq!(q, before);
     }
 
     #[test]
