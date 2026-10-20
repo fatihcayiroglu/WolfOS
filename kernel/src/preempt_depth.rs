@@ -28,7 +28,7 @@ impl PreemptDepth {
     /// Enter an IRQ-preempt-disabled critical section. Hardware IRQs remain
     /// enabled. Overflow is refused without mutating the depth.
     pub fn disable(&self) -> Result<usize, DepthError> {
-        self.depth.fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+        self.depth.try_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
             depth.checked_add(1)
         })
         .map(|old| old + 1)
@@ -38,7 +38,7 @@ impl PreemptDepth {
     /// Exit exactly one critical section. An unbalanced enable is rejected,
     /// not allowed to silently underflow and re-enable task switching.
     pub fn enable(&self) -> Result<usize, DepthError> {
-        self.depth.fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+        self.depth.try_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
             depth.checked_sub(1)
         })
         .map(|old| old - 1)
