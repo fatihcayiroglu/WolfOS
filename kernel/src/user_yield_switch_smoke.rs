@@ -1426,11 +1426,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     if s.exits.iter().all(|done|*done) {
         if !s.exits[i] { fail("unexpected_finished_other") }
         if s.hardware_traps!=TRAPS ||
-            s.yields!=(if cfg!(feature="p3-ring3-irq-event-wake-smoke"){
-                [ROUNDS,0]
-            }else{
-                [if cfg!(feature="p2-ring3-timer-nonyield-smoke"){0}else{ROUNDS};COUNT]
-            }) {
+            s.yields!=core::array::from_fn(|idx|
+                if cfg!(feature="p2-ring3-timer-nonyield-smoke")
+                    || (cfg!(feature="p3-ring3-irq-event-wake-smoke") && idx==1)
+                {0}else{ROUNDS}) {
             fail("incomplete_two_ELF_schedule")
         }
         #[cfg(all(feature="p3-ring3-event-wait-hardware-smoke",
@@ -1454,7 +1453,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 ||s.event_rejections!=0||s.event_gate.in_flight()!=0
                 ||s.rr.running().is_some()||s.rr.timer_switches()!=1
                 ||s.rr.slots().iter().any(|slot|slot.state!=RrState::Exited)
-                ||totals!=IrqEventTotals{entered:1,acknowledged:1,delivered:1,discarded:0}
+                ||totals!=(IrqEventTotals{entered:1,acknowledged:1,delivered:1,discarded:0})
                 ||s.irq_eoi_writes!=total_irqs||s.timer_busy[1]==0
                 ||total_irqs==0 {
                 fail("IRQ_real_event_wake_accounting_or_EOI")
