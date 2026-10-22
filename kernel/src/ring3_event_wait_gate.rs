@@ -50,6 +50,8 @@ pub enum CoordinatedError {
     Gate(Error),
     Process(TableError),
     WrongOwner,
+    /// At least one IRQ receipt is not yet finalized after its physical EOI.
+    IrqNotDrained,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +283,44 @@ impl<const N: usize> EventWaitGate<N> {
         queue.cancel(token.handle).map_err(Error::Queue)?;
         self.records[i] = Record::EMPTY;
         Ok(())
+    }
+
+    /// Atomically retire a parked wait and relinquish its BLOCKED process
+    /// lease. Refuse a still-live BSP IRQ receipt, a stale ticket, an invalid
+    /// supervisor CR3, or a process that is no longer BLOCKED.
+    ///
+    /// The trusted BSP caller MUST first independently prove that saved
+    /// GPR/IRET/FX/TSS contexts have no remaining CPU references, read the
+    /// *actual* supervisor CR3, and serialize the entire operation with
+    /// IRQ/preemption disabled. This verifies policy state only; it performs
+    /// NO hardware EOI, PMM free or hardware quiescence.
+    ///
+    /// The returned frames are still the caller's PMM lease. The queue's
+    /// Exited tombstone must not be reaped until PMM reclamation succeeds.
+    pub fn retire_parked_with_process<const FRAMES: usize>(
+        &mut self, queue: &mut Ring3RunQueue<N>,
+        table: &mut ProcessTable<N, FRAMES>,
+        irq: &BspIrqEventBridge, token: EventToken, supervisor_cr3: u64,
+    ) -> Result<[u64; FRAMES], CoordinatedError> {
+        if irq.verify_drained().is_err() {
+            return Err(CoordinatedError::IrqNotDrained)
+        }
+        let owner = table.snapshot(token.handle.pid)
+            .ok_or(CoordinatedError::WrongOwner)?;
+        if owner.state != ProcessState::Blocked {
+            return Err(CoordinatedError::WrongOwner)
+        }
+        let previous_gate = *self;
+        let previous_queue = *queue;
+        self.retire_parked(queue, token).map_err(CoordinatedError::Gate)?;
+        match table.cancel_blocked(token.handle.pid, supervisor_cr3) {
+            Ok(frames) => Ok(frames),
+            Err(error) => {
+                *self = previous_gate;
+                *queue = previous_queue;
+                Err(CoordinatedError::Process(error))
+            }
+        }
     }
 }
 
@@ -942,6 +982,69 @@ mod tests {
         assert_eq!(queue.running(), Some(a));
         assert_eq!(queue.timer_switches(), 0);
         assert_eq!(irq.verify_drained().unwrap().delivered, 1);
+    }
+
+    #[test]
+    fn blocked_owner_cannot_relinquish_frames_until_irq_and_wait_are_retired() {
+        let a_frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let b_frames = core::array::from_fn(|i| 0x10000 + i as u64 * 4096);
+        let mut table = ProcessTable::<2, 7>::new();
+        let a_pid = table.reserve(a_frames[0], a_frames).unwrap();
+        let b_pid = table.reserve(b_frames[0], b_frames).unwrap();
+        let mut queue = Ring3RunQueue::<2>::new();
+        let a = queue.admit(a_pid).unwrap();
+        let b = queue.admit(b_pid).unwrap();
+        assert_eq!(queue.start_next(), Ok(a));
+        table.mark_running(a_pid, a_frames[0]).unwrap();
+        let mut gate = EventWaitGate::<2>::new();
+        let token = gate.arm(&queue, a, 97).unwrap();
+        assert_eq!(gate.commit_with_process(&mut queue, &mut table, token, a_frames[0]),
+            Ok(Commit::Parked(Some(b))));
+        table.mark_running(b_pid, b_frames[0]).unwrap();
+        let mut irq = BspIrqEventBridge::new();
+        let receipt = irq.capture(&gate, token, 0x55, 0x55, 97).unwrap();
+        let before = (gate, queue, table.snapshot(a_pid), table.snapshot(b_pid));
+        assert_eq!(gate.retire_parked_with_process(
+            &mut queue, &mut table, &irq, token, 0x90000,
+        ), Err(CoordinatedError::IrqNotDrained));
+        assert_eq!((gate, queue, table.snapshot(a_pid), table.snapshot(b_pid)), before);
+        irq.acknowledge_physical_eoi(receipt).unwrap();
+        assert_eq!(gate.retire_parked_with_process(
+            &mut queue, &mut table, &irq, token, 0x90000,
+        ), Err(CoordinatedError::IrqNotDrained));
+        irq.discard_after_eoi(receipt).unwrap();
+        assert_eq!(irq.verify_drained().unwrap().discarded, 1);
+
+        // The supervisor root must not alias the victim OR a different PID.
+        for wrong_root in [a_frames[0], b_frames[0], 0, 0x90001] {
+            assert_eq!(gate.retire_parked_with_process(
+                &mut queue, &mut table, &irq, token, wrong_root,
+            ), Err(CoordinatedError::Process(TableError::Process(
+                standalone_process_table::standalone_process::ProcessError::ActiveCr3,
+            ))));
+            assert_eq!((gate, queue, table.snapshot(a_pid), table.snapshot(b_pid)), before);
+        }
+        let stale = EventToken { sequence: token.sequence + 1, ..token };
+        assert_eq!(gate.retire_parked_with_process(
+            &mut queue, &mut table, &irq, stale, 0x90000,
+        ), Err(CoordinatedError::Gate(Error::Stale)));
+        assert_eq!((gate, queue, table.snapshot(a_pid), table.snapshot(b_pid)), before);
+
+        let owned = gate.retire_parked_with_process(
+            &mut queue, &mut table, &irq, token, 0x90000,
+        ).unwrap();
+        assert_eq!(owned, a_frames);
+        assert_eq!(table.snapshot(a_pid), None);
+        assert_eq!(table.snapshot(b_pid).unwrap().frames, b_frames);
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(queue.slots()[0].state, State::Exited);
+        assert_eq!(queue.running(), Some(b));
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(gate.retire_parked_with_process(
+            &mut queue, &mut table, &irq, token, 0x90000,
+        ), Err(CoordinatedError::WrongOwner));
+        assert_eq!(gate.signal(&mut queue, token, 97), Err(Error::Stale));
+        // Do not call queue.reap until the real PMM has reclaimed the lease.
     }
 
     #[test]
