@@ -525,7 +525,7 @@ fn irq_wake_blocked_user(
 #[cfg(any(feature="p2-ring3-timer-observe-smoke", feature="p2-ring3-timer-preempt-smoke"))]
 fn acknowledge_validated_timer_irq(s:&mut Runtime, i:usize){
     #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
-    let _=(s,i);
+    let _=(&*s,i);
     // SAFETY: BSP IF=0, verified in-service xAPIC timer vector and
     // supervisor-only UC alias in the CURRENT trusted private CR3.
     unsafe{
