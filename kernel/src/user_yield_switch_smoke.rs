@@ -301,6 +301,13 @@ pub extern "C" fn observe_timer_irq(
     if s.timer_irqs[i]>100_000{
         fail("unexpected_interrupt_storm")
     }
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    if i==1 && in_busy && s.event_wait.is_some() {
+        // Only reached via the real installed local xAPIC vector and a
+        // validated CPL3 hardware IRQ frame, NEVER a syscall or a policy
+        // test calling the event gate directly.
+        return irq_wake_blocked_user(s,raw);
+    }
     // A REAL hardware timer IRQ may choose an independently mapped
     // OTHER PID's full hardware IRET frame, without a voluntary INT80.
     // Limit this isolated proof to one preemption PER PID in its assembly
@@ -409,6 +416,110 @@ pub extern "C" fn observe_timer_irq(
     }
     raw
 }
+/// P3 isolated hardware acceptance: an actual BSP xAPIC timer IRQ taken
+/// inside PID2's no-syscall Ring3 busy loop releases PID1's original parked
+/// INT80 wait frame, then resumes the saved IRET/GPR/FX image for PID1.
+///
+/// This handler runs on PID2's pinned supervisor RSP0 with IF=0, private
+/// CR3 and independently validated hardware frame. The APIC ISR register
+/// proves vector E0 is genuinely in-service before the single physical EOI.
+/// All process/event/queue bookkeeping is serialized under the same IRQ.
+#[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+fn irq_wake_blocked_user(
+    s:&mut Runtime, raw:*const UserSyscallFrame,
+)->*const UserSyscallFrame{
+    if cpu_interrupts::are_enabled()
+        || s.current!=1 || s.exits.iter().any(|done|*done)
+        || s.rr.running()!=Some(s.rr_handles[1])
+        || s.rr.slots()[0].state!=RrState::Blocked
+        || s.processes.running()!=1 || s.event_wakes!=0
+        || s.event_rejections!=0 || s.rr.timer_switches()!=0 {
+        fail("real_IRQ_wake_invalid_running_or_blocked_owner")
+    }
+    let ticket=s.event_wait.unwrap_or_else(||fail("real_IRQ_missing_wait_token"));
+    let saved=s.frames[0];
+    if saved!=s.stacks[0].top-user_syscall_abi::FRAME_BYTES as u64
+        || unsafe{(*(saved as *const UserSyscallFrame)).hardware.rip}!=after_yield(0)
+        || unsafe{(*(saved as *const UserSyscallFrame)).registers.rax}!=0
+        || unsafe{(*(saved as *const UserSyscallFrame)).registers.r12}!=1
+        || unsafe{(*(saved as *const UserSyscallFrame)).registers.r14}!=USER_ID[0] {
+        fail("real_IRQ_original_WAIT_frame_not_pinned")
+    }
+    // xAPIC ISR7 bit 0 corresponds exactly to the installed vector E0.
+    // Checking the hardware's in-service bit rejects a synthetic callback,
+    // EOI-after-the-fact replay and an unrelated interrupt vector.
+    let vector=crate::apic_timer_smoke::TIMER_VECTOR;
+    let isr_offset=0x100usize+usize::from(vector/32)*0x10;
+    let isr_mask=1u32<<(vector%32);
+    if vector!=0xe0 || isr_offset!=0x170
+        || unsafe{crate::user_xapic_high::read(isr_offset)}&isr_mask==0 {
+        fail("real_IRQ_wrong_vector_or_not_in_service")
+    }
+    let receipt=s.irq_event_bridge.capture(
+        &s.event_gate,ticket,vector,vector,EVENT_ID
+    ).unwrap_or_else(|_|fail("real_IRQ_duplicate_or_forged_receipt"));
+    // Exactly one physical write while E0 is still in service.
+    acknowledge_validated_timer_irq(s,1);
+    s.irq_event_bridge.acknowledge_physical_eoi(receipt)
+        .unwrap_or_else(|_|fail("real_IRQ_EOI_receipt_refused"));
+
+    // A wake may not alias PID2's currently executing USER CR3. The
+    // still-pinned high-half kernel stack is mapped in the trusted boot
+    // supervisor root; IF remains masked through the entire handoff.
+    let outgoing_root=s.leases[1][0];
+    unsafe{asm!("mov cr3, {}",in(reg)s.boot,
+                options(nostack,preserves_flags));}
+    if actual_cr3()!=s.boot {
+        fail("real_IRQ_supervisor_root_switch_failed")
+    }
+    let delivered=s.irq_event_bridge.deliver_after_eoi_with_process(
+        &mut s.event_gate,&mut s.rr,&mut s.processes,receipt,s.boot
+    );
+    unsafe{asm!("mov cr3, {}",in(reg)outgoing_root,
+                options(nostack,preserves_flags));}
+    if actual_cr3()!=outgoing_root
+        || delivered!=Ok(EventDelivery::Woken(s.rr_handles[0]))
+        || s.irq_event_bridge.verify_drained()!=Ok(IrqEventTotals{
+            entered:1,acknowledged:1,delivered:1,discarded:0,
+        }) {
+        fail("real_IRQ_after_EOI_wake_or_process_owner")
+    }
+    // This is an actual cross-PID timer IRQ decision, not a voluntary
+    // SIGNAL/YIELD syscall. Retain the source's complete hardware frame.
+    if s.rr.timer_tick(s.rr_handles[1])!=Ok(s.rr_handles[0])
+        || s.rr.timer_switches()!=1 {
+        fail("real_IRQ_round_robin_handoff")
+    }
+    s.frames[1]=raw as u64;
+    if s.processes.park_running(2,outgoing_root).is_err(){
+        fail("real_IRQ_source_process_not_parked")
+    }
+    if unsafe{s.fx.switch_to(s.fx_tokens[0])}.is_err()
+        || s.fx.image_xmm0(s.fx_tokens[1])!=Ok(USER_ID[1]){
+        fail("real_IRQ_fx_state_not_saved")
+    }
+    if !unsafe{interrupts::test_handoff_rsp0(s.stacks[0].top)}{
+        fail("real_IRQ_target_stack_not_mapped")
+    }
+    unsafe{asm!("mov cr3, {}",in(reg)s.leases[0][0],
+                options(nostack,preserves_flags));}
+    if actual_cr3()!=s.leases[0][0]
+        || s.processes.mark_running(1,s.leases[0][0]).is_err()
+        || s.processes.running()!=1 {
+        fail("real_IRQ_target_private_cr3_or_running_pid")
+    }
+    s.event_wait=None;
+    s.event_wakes=1;
+    s.current=0;
+    serial::write_line(
+        "WOLFOS_RING3_IRQ_WAKE_EOI_OK vector=224 source_pid=2 isr=1 physical_eoi=1 event_receipt=1"
+    );
+    serial::write_line(
+        "WOLFOS_RING3_IRQ_WAKE_HANDOFF_OK from=2 to=1 real_timer_switch=1 original_wait_iret=1 cr3_private=1 rsp0_guarded=1 fx_saved=1"
+    );
+    saved as *const UserSyscallFrame
+}
+
 /// Centralized exactly-once EOI callsite for a validated user timer IRQ.
 /// No serial I/O, locks, allocations or APIC reads on the successful path.
 #[cfg(any(feature="p2-ring3-timer-observe-smoke", feature="p2-ring3-timer-preempt-smoke"))]
@@ -421,6 +532,11 @@ fn acknowledge_validated_timer_irq(s:&mut Runtime, i:usize){
         crate::user_xapic_high::write(
             crate::lapic_irq_layout::EOI_OFFSET,
             crate::lapic_irq_layout::EOI_VALUE);
+    }
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    {
+        s.irq_eoi_writes=s.irq_eoi_writes.checked_add(1)
+            .unwrap_or_else(||fail("real_IRQ_EOI_counter_overflow"));
     }
     #[cfg(feature="p3-ring3-four-elf-live-smoke")]
     if s.irq_eoi.acknowledge(i).is_err() {
