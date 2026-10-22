@@ -57,6 +57,9 @@ p2-ring3-yield-smoke = ["smoke-exit"]
 # Isolated, truly executing two-user CPL3 WAIT→SIGNAL→IRET proof.
 # The historical cooperative/timer QEMU flavors are NOT modified.
 p3-ring3-event-wait-hardware-smoke = ["p2-ring3-yield-smoke"]
+# Isolated genuine xAPIC IRQ → BLOCKED Ring3 wait → original saved IRET QEMU gate.
+# Reuses existing IF-enabled timer evidence but does not alter prior QEMU flavors.
+p3-ring3-irq-event-wake-smoke = ["p3-ring3-event-wait-hardware-smoke", "p2-ring3-timer-observe-smoke"]
 p2-ring3-irq-ready-smoke = ["smoke-exit"]
 p2-ring3-timer-observe-smoke = ["smoke-exit"]
 p2-ring3-timer-preempt-smoke = ["smoke-exit"]
