@@ -536,6 +536,69 @@ mod tests {
         assert_eq!(contexts.count(), 4);
     }
 
+
+    #[test]
+    fn every_context_handoff_refuses_supervisor_cr3_on_nonroot_user_lease_frames() {
+        // Four valid independent user address spaces: the supervisor root
+        // may not alias ANY page still leased to ANY resident user, even
+        // when it is not a user's PML4 page-table root.
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut bank = UserContextBank::<4>::new();
+        let mut queue = Ring3RunQueue::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let mut handles = [RunHandle { pid: 0, generation: 0 }; 4];
+        for i in 0..4 {
+            let pid = table.reserve(roots[i], frames(roots[i])).unwrap();
+            handles[i] = queue.admit(pid).unwrap();
+            bank.prepare_bootstrap(
+                &table, pid, roots[i],
+                stack(0xffff_8000_0700_0000 + i as u64 * 0x10000),
+                frame(0x401000 + i as u64 * 0x1000, pid),
+            ).unwrap();
+        }
+        assert_eq!(queue.start_next(), Ok(handles[0]));
+        assert_eq!(queue.timer_tick(handles[0]), Ok(handles[1]));
+        assert_eq!(bank.plan_queue_handoff(
+            &table, &queue, handles[0], handles[1], 0x90000,
+        ).unwrap().pid, handles[1].pid);
+        let stored = handles.map(|handle| bank.snapshot(handle.pid));
+
+        for leased in [0x11000, 0x26000, 0x33000, 0x45000] {
+            assert!(table.owns_live_cr3(leased));
+            assert_eq!(bank.plan_next(&table, handles[0].pid, leased),
+                Err(ContextError::ActiveUserCr3));
+            assert_eq!(bank.plan_selected(
+                &table, handles[0].pid, handles[1].pid, leased,
+            ), Err(ContextError::ActiveUserCr3));
+            assert_eq!(bank.plan_queue_handoff(
+                &table, &queue, handles[0], handles[1], leased,
+            ), Err(ContextError::ActiveUserCr3));
+            assert_eq!(handles.map(|handle| bank.snapshot(handle.pid)), stored);
+            assert_eq!(queue.running(), Some(handles[1]));
+            assert_eq!(queue.timer_switches(), 1);
+        }
+
+        // An authenticated source BLOCK transition has different policy
+        // provenance from a timer switch; it must enforce the same CR3
+        // lease exclusion before authorizing its READY destination.
+        table.mark_running(handles[1].pid, roots[1]).unwrap();
+        table.block_running(handles[1].pid, roots[1]).unwrap();
+        assert_eq!(queue.block_current(handles[1]), Ok(Some(handles[2])));
+        assert_eq!(table.running(), 0);
+        for leased in [0x11000, 0x26000, 0x33000, 0x45000] {
+            assert_eq!(bank.plan_blocked_handoff(
+                &table, &queue, handles[1], handles[2], leased,
+            ), Err(ContextError::ActiveUserCr3));
+            assert_eq!(handles.map(|handle| bank.snapshot(handle.pid)), stored);
+        }
+        assert_eq!(bank.plan_blocked_handoff(
+            &table, &queue, handles[1], handles[2], 0x90000,
+        ).unwrap().pid, handles[2].pid);
+        assert_eq!(queue.timer_switches(), 1,
+            "BLOCK handoff must not invent a second timer IRQ");
+        assert_eq!(table.occupied(), 4);
+    }
+
     #[test]
     fn wrong_generation_target_or_blocked_source_never_gets_a_resume_plan() {
         let mut table = ProcessTable::<4, 7>::new();
