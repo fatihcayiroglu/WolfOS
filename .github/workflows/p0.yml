@@ -22,8 +22,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install VM build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xorriso qemu-system-x86 make git binutils
+          # Fail closed on hung mirrors without skipping any build/QEMU gate.
+          sudo timeout --signal=TERM --kill-after=15s 420s apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=40 \
+            -o Acquire::https::Timeout=40 update
+          sudo env DEBIAN_FRONTEND=noninteractive timeout \
+            --signal=TERM --kill-after=15s 420s apt-get \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=40 \
+            -o Acquire::https::Timeout=40 install -y xorriso qemu-system-x86 make git binutils
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
