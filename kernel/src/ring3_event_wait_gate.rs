@@ -268,6 +268,46 @@ impl<const N: usize> EventWaitGate<N> {
         Ok(())
     }
 
+    /// Retire one EXACT blocked wait and transfer its PMM frame leases
+    /// only if both the scheduler's wait ticket and the process table agree.
+    ///
+    /// TRUST BOUNDARY: the caller must disable local IRQ/preemption, verify
+    /// that any in-flight hardware IRQ is acknowledged/discarded, quiesce
+    /// saved IRET/GPR/FX references and observe the real supervisor CR3.
+    /// These software ledgers cannot prove any of those hardware facts.
+    /// No memory is freed here: returned frames are still the caller's
+    /// exact-once PMM release responsibility.
+    pub fn retire_parked_with_process<const FRAMES: usize>(
+        &mut self, queue: &mut Ring3RunQueue<N>,
+        table: &mut ProcessTable<N, FRAMES>, token: EventToken,
+        supervisor_cr3: u64,
+    ) -> Result<[u64; FRAMES], CoordinatedError> {
+        let i = self.locate(token).map_err(CoordinatedError::Gate)?;
+        if self.records[i].phase != Phase::Parked {
+            return Err(CoordinatedError::Gate(Error::WrongState))
+        }
+        let owner = table.snapshot(token.handle.pid)
+            .ok_or(CoordinatedError::WrongOwner)?;
+        if owner.state != ProcessState::Blocked {
+            return Err(CoordinatedError::WrongOwner)
+        }
+        // First retire the exact one-use ticket. An invalid queue ticket
+        // must not touch process/PMM ownership.
+        let gate_before = *self;
+        let queue_before = *queue;
+        self.retire_parked(queue, token).map_err(CoordinatedError::Gate)?;
+        // The process layer rejects every active user CR3, including those
+        // of unrelated PIDs; on rejection restore BOTH software ledgers.
+        match table.cancel_blocked(token.handle.pid, supervisor_cr3) {
+            Ok(frames) => Ok(frames),
+            Err(error) => {
+                *self = gate_before;
+                *queue = queue_before;
+                Err(CoordinatedError::Process(error))
+            }
+        }
+    }
+
     /// Cancel a parked queue task without resurrecting an old notification.
     /// Caller remains responsible for separately coordinated ProcessTable
     /// cancellation and quiesced physical resource retirement.
@@ -942,6 +982,89 @@ mod tests {
         assert_eq!(queue.running(), Some(a));
         assert_eq!(queue.timer_switches(), 0);
         assert_eq!(irq.verify_drained().unwrap().delivered, 1);
+    }
+
+    #[test]
+    fn coordinated_parked_retirement_returns_exact_frames_once() {
+        let a_frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let b_frames = core::array::from_fn(|i| 0x10000 + i as u64 * 4096);
+        let mut table = ProcessTable::<2, 7>::new();
+        let a_pid = table.reserve(a_frames[0], a_frames).unwrap();
+        let b_pid = table.reserve(b_frames[0], b_frames).unwrap();
+        let mut queue = Ring3RunQueue::<2>::new();
+        let a = queue.admit(a_pid).unwrap();
+        let b = queue.admit(b_pid).unwrap();
+        assert_eq!(queue.start_next(), Ok(a));
+        table.mark_running(a_pid, a_frames[0]).unwrap();
+        let mut gate = EventWaitGate::<2>::new();
+        let token = gate.arm(&queue, a, 101).unwrap();
+        assert_eq!(
+            gate.commit_with_process(&mut queue, &mut table, token, a_frames[0]),
+            Ok(Commit::Parked(Some(b))),
+        );
+        table.mark_running(b_pid, b_frames[0]).unwrap();
+        let before = (gate, queue, table.snapshot(a_pid), table.snapshot(b_pid));
+        // Neither the blocked user's nor a different live user's CR3 can
+        // authorize PMM release. Both entire software ledgers roll back.
+        for invalid_cr3 in [a_frames[0], b_frames[0], 0, 0x90001] {
+            assert_eq!(
+                gate.retire_parked_with_process(
+                    &mut queue, &mut table, token, invalid_cr3,
+                ),
+                Err(CoordinatedError::Process(TableError::Process(
+                    standalone_process_table::standalone_process::ProcessError::ActiveCr3,
+                ))),
+            );
+            assert_eq!(
+                (gate, queue, table.snapshot(a_pid), table.snapshot(b_pid)),
+                before,
+            );
+        }
+        assert_eq!(
+            gate.retire_parked_with_process(
+                &mut queue, &mut table, token, 0x90000,
+            ),
+            Ok(a_frames),
+        );
+        assert_eq!(table.snapshot(a_pid), None);
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(queue.running(), Some(b));
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(gate.signal(&mut queue, token, 101), Err(Error::Stale));
+        assert_eq!(
+            gate.retire_parked_with_process(
+                &mut queue, &mut table, token, 0x90000,
+            ),
+            Err(CoordinatedError::Gate(Error::Stale)),
+        );
+        assert_eq!(table.snapshot(b_pid).unwrap().frames, b_frames);
+        assert_eq!(queue.reap(a), Ok(()));
+        assert_eq!(table.cancel_ready(b_pid, 0x90000),
+            Err(TableError::Process(
+                standalone_process_table::standalone_process::ProcessError::WrongState,
+            )));
+    }
+
+    #[test]
+    fn coordinated_parked_retirement_rejects_unparked_or_stale_wait() {
+        let frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let mut table = ProcessTable::<1, 7>::new();
+        let pid = table.reserve(frames[0], frames).unwrap();
+        let mut queue = Ring3RunQueue::<1>::new();
+        let handle = queue.admit(pid).unwrap();
+        assert_eq!(queue.start_next(), Ok(handle));
+        table.mark_running(pid, frames[0]).unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let token = gate.arm(&queue, handle, 12).unwrap();
+        let before = (gate, queue, table.snapshot(pid));
+        assert_eq!(
+            gate.retire_parked_with_process(
+                &mut queue, &mut table, token, 0x9000,
+            ),
+            Err(CoordinatedError::Gate(Error::WrongState)),
+        );
+        assert_eq!((gate, queue, table.snapshot(pid)), before);
+        assert_eq!(gate.in_flight(), 1);
     }
 
     #[test]
