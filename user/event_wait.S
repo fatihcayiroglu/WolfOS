@@ -35,6 +35,9 @@ _busy_end:
     xor edi, edi
     xor esi, esi
     int 0x80
+    // Authenticate the genuine PID2 EXIT RIP exactly like PID1's EXIT;
+    // this path has no SIGNAL/YIELD and no earlier _yield_return.
+_exit_return:
     jmp failed
 .else
     // Malicious or stale event delivered by real PID2 CPL3 code must
@@ -82,7 +85,15 @@ _yield_return:
     xor edi, edi
     xor esi, esi
     int 0x80
+// PID2's isolated IRQ-wake workload already declared this symbol at
+// its no-SIGNAL EXIT above; all other flavors reach the normal exit RIP.
+.ifndef WOLFOS_IRQ_EVENT_WAKE
 _exit_return:
+.else
+.if WOLFOS_PID == 1
+_exit_return:
+.endif
+.endif
 failed:
     ud2
 
