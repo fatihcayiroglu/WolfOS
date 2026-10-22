@@ -606,8 +606,16 @@ fn prepare_elf(hhdm:u64,frames:[u64;7],source:*const [u64;512],
         after_exit(pid)>CODE && after_exit(pid)<DATA;
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     let symbols_ok=entry(pid)==CODE && progress(pid)==DATA &&
-        after_yield(pid)>CODE && after_exit(pid)>after_yield(pid) &&
-        after_exit(pid)<DATA;
+        after_yield(pid)>CODE && after_yield(pid)<DATA &&
+        after_exit(pid)>CODE && after_exit(pid)<DATA &&
+        (if cfg!(feature="p3-ring3-irq-event-wake-smoke") && pid==1 {
+            // PID2's intentional no-SIGNAL EXIT is inside the busy
+            // section, before the unreachable legacy yield return.
+            // Both targets MUST still fall inside the real ELF RX page.
+            after_exit(pid)<after_yield(pid)
+        }else{
+            after_exit(pid)>after_yield(pid)
+        });
     if plan.entry!=CODE||plan.len!=2||!symbols_ok{
         fail("native_elf_symbols_or_layout")
     }
