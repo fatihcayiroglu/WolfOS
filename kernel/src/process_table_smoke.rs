@@ -55,10 +55,11 @@ pub fn verify() {
     { fail("allocated_frames_or_boot_root") }
 
     let mut table = ProcessTable::<RESIDENT, FRAMES>::new();
-    for at in 0..RESIDENT {
-        if table.reserve(groups[at][0], groups[at]) != Ok(at as u64 + 1) {
-            fail("three_resident_admissions")
-        }
+    // Admit three REAL 7-frame PMM leases atomically. A failed fourth
+    // candidate must not publish an earlier member or mint partial PIDs.
+    let residents = core::array::from_fn(|i| (groups[i][0], groups[i]));
+    if table.reserve_batch(residents) != Ok([1, 2, 3]) {
+        fail("three_resident_batch_admissions")
     }
     if table.occupied() != RESIDENT || table.running() != 0
         || table.reserve(groups[3][0], groups[3]) != Err(TableError::Full)
@@ -78,6 +79,17 @@ pub fn verify() {
     if pmm::statistics().allocated_frames != baseline + 3 * FRAMES {
         fail("cancelled_frame_count")
     }
+
+    // Only one table slot remains. A TWO-owner batch must fail as a
+    // whole, even though its first new member passes all PMM checks.
+    // Real physical pages are held by the caller and never freed by policy.
+    if table.reserve_batch([
+        (groups[3][0], groups[3]),
+        (groups[3][0], groups[3]),
+    ]) != Err(TableError::Full)
+        || table.occupied() != RESIDENT - 1
+        || table.snapshot(4).is_some()
+    { fail("batch_partial_publish_or_pid_burn") }
 
     // Claiming an existing PID's PMM leaf as a new CR3 root is forbidden.
     let mut alias = groups[3];
