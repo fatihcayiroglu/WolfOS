@@ -183,6 +183,27 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
         self.insert(table, pid, root, stack, frame, FrameOrigin::Bootstrap, None)
     }
 
+    /// Atomically seed multiple audited bootstrap contexts. A late invalid
+    /// PID, root, stack overlap or user frame must never publish the earlier
+    /// members of this batch or replace any previously stored context.
+    ///
+    /// Validation is shared with prepare_bootstrap(), including cross-batch
+    /// kernel RSP0 stack exclusivity. Physical PMM stack allocations, ELF
+    /// mappings, queue admission and real CPU state remain caller-owned.
+    /// Staging only copies a bounded fixed-size no-heap context bank.
+    pub fn prepare_bootstrap_batch<const N: usize, const COUNT: usize>(
+        &mut self,
+        table: &ProcessTable<SLOTS, N>,
+        requests: [(u64, u64, KernelStack, UserSyscallFrame); COUNT],
+    ) -> Result<(), ContextError> {
+        let mut staged = Self { entries: self.entries };
+        for (pid, root, stack, frame) in requests {
+            staged.prepare_bootstrap(table, pid, root, stack, frame)?;
+        }
+        *self = staged;
+        Ok(())
+    }
+
     /// Snapshot the entire hardware trap, but only from a live PID whose
     /// actual CR3 is independently checked by the caller at the trap site.
     /// This DOES NOT suspend the process or switch the CPU.
@@ -490,6 +511,143 @@ mod tests {
         t.reserve(0x1000,frames(0x1000)).unwrap();
         t.reserve(0x10000,frames(0x10000)).unwrap();
         (t,UserContextBank::new())
+    }
+
+
+
+    #[test]
+    fn multi_pid_batch_then_bootstrap_failure_requires_exact_owned_rollback() {
+        // Integrate the two bounded transaction layers without claiming
+        // they form one global transaction. The trusted caller must release
+        // process-table leases after a rejected *context* preparation.
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut bank = UserContextBank::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let owned = roots.map(frames);
+        let pids = table.reserve_batch([
+            (roots[0], owned[0]), (roots[1], owned[1]),
+            (roots[2], owned[2]), (roots[3], owned[3]),
+        ]).unwrap();
+        assert_eq!(pids, [1, 2, 3, 4]);
+        assert_eq!(table.occupied(), 4);
+        assert_eq!(table.running(), 0);
+        let bottom = 0xffff_8000_0a00_0000;
+        let stacks = core::array::from_fn::<_, 4, _>(|i|
+            stack(bottom + i as u64 * 0x10000)
+        );
+        let mut bad = frame(0x404000, pids[3]);
+        bad.hardware.rflags = 0x202;
+        assert_eq!(bank.prepare_bootstrap_batch(&table, [
+            (pids[0], roots[0], stacks[0], frame(0x401000, pids[0])),
+            (pids[1], roots[1], stacks[1], frame(0x402000, pids[1])),
+            (pids[2], roots[2], stacks[2], frame(0x403000, pids[2])),
+            (pids[3], roots[3], stacks[3], bad),
+        ]), Err(ContextError::BadFlags));
+        assert_eq!(bank.count(), 0,
+            "a late malformed frame may not publish earlier PID contexts");
+        assert_eq!(table.occupied(), 4,
+            "a separate context failure must NOT silently lose PMM ownership");
+        // Explicit caller compensation releases exact PMM lease metadata,
+        // with no actual frees or CR3 activation performed by either ledger.
+        for i in [3, 1, 0, 2] {
+            assert_eq!(table.cancel_ready(pids[i], 0x90000), Ok(owned[i]));
+            assert_eq!(table.snapshot(pids[i]), None);
+        }
+        assert_eq!(table.occupied(), 0);
+        assert_eq!(bank.count(), 0);
+        assert_eq!(table.reserve_batch([(roots[0], owned[0])]), Ok([5]),
+            "failed bootstrap must not resurrect stale PID generations");
+        assert_eq!(table.cancel_ready(5, 0x90000), Ok(owned[0]));
+    }
+
+    #[test]
+    fn atomic_bootstrap_batch_rejects_late_invalid_context_without_partial_publish() {
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut bank = UserContextBank::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let pids = core::array::from_fn::<_, 4, _>(|i| {
+            table.reserve(roots[i], frames(roots[i])).unwrap()
+        });
+        let base = 0xffff_8000_0800_0000;
+        let stacks = core::array::from_fn::<_, 4, _>(|i|
+            stack(base + (i as u64) * 0x10000)
+        );
+        bank.prepare_bootstrap(
+            &table, pids[0], roots[0], stacks[0], frame(0x401000, 1),
+        ).unwrap();
+        let retained = bank.snapshot(pids[0]);
+        assert_eq!(bank.count(), 1);
+
+        // Two proposed contexts share a kernel RSP0 stack. The first
+        // candidate is valid but must NOT become visible after rejection.
+        assert_eq!(
+            bank.prepare_bootstrap_batch(&table, [
+                (pids[1], roots[1], stacks[1], frame(0x402000, 2)),
+                (pids[2], roots[2], stacks[1], frame(0x403000, 3)),
+            ]),
+            Err(ContextError::KernelStackOverlap),
+        );
+        assert_eq!(bank.count(), 1);
+        assert_eq!(bank.snapshot(pids[0]), retained);
+        assert_eq!(bank.snapshot(pids[1]), None);
+        assert_eq!(bank.snapshot(pids[2]), None);
+
+        // Reject a late invalid user RFLAGS even though earlier pending
+        // contexts are individually valid. No GPR/IRET state leaks.
+        let mut bad = frame(0x404000, 4);
+        bad.hardware.rflags = 0x202;
+        assert_eq!(
+            bank.prepare_bootstrap_batch(&table, [
+                (pids[1], roots[1], stacks[1], frame(0x402000, 2)),
+                (pids[2], roots[2], stacks[2], frame(0x403000, 3)),
+                (pids[3], roots[3], stacks[3], bad),
+            ]),
+            Err(ContextError::BadFlags),
+        );
+        assert_eq!(bank.count(), 1);
+        assert_eq!(bank.snapshot(pids[0]), retained);
+        for pid in pids[1..].iter().copied() {
+            assert_eq!(bank.snapshot(pid), None);
+        }
+
+        // A root borrowed from a different resident owner cannot publish
+        // a context, and a second batch member cannot reuse a staged PID.
+        assert_eq!(
+            bank.prepare_bootstrap_batch(&table, [
+                (pids[1], roots[1], stacks[1], frame(0x402000, 2)),
+                (pids[2], roots[1], stacks[2], frame(0x403000, 3)),
+            ]),
+            Err(ContextError::BadCr3),
+        );
+        assert_eq!(
+            bank.prepare_bootstrap_batch(&table, [
+                (pids[1], roots[1], stacks[1], frame(0x402000, 2)),
+                (pids[1], roots[1], stacks[1], frame(0x402800, 2)),
+            ]),
+            Err(ContextError::AlreadyPrepared),
+        );
+        assert_eq!(bank.count(), 1);
+
+        // A correct batch commits all three separately owned private
+        // RSP0 stacks, full user GPR/IRET frames, and immutable CR3 roots.
+        bank.prepare_bootstrap_batch(&table, [
+            (pids[1], roots[1], stacks[1], frame(0x402000, 2)),
+            (pids[2], roots[2], stacks[2], frame(0x403000, 3)),
+            (pids[3], roots[3], stacks[3], frame(0x404000, 4)),
+        ]).unwrap();
+        assert_eq!(bank.count(), 4);
+        for i in 0..4 {
+            let stored = bank.snapshot(pids[i]).unwrap();
+            assert_eq!(stored.cr3_root, roots[i]);
+            assert_eq!(stored.kernel_stack, stacks[i]);
+            assert_eq!(stored.frame.registers.rax, pids[i]);
+            assert_eq!(stored.frame.registers.r12, pids[i] * 3);
+            assert_eq!(stored.origin, FrameOrigin::Bootstrap);
+        }
+        assert_eq!(bank.prepare_bootstrap_batch::<7, 0>(&table, []), Ok(()));
+        assert_eq!(bank.count(), 4);
+        assert_eq!(table.occupied(), 4);
+        assert_eq!(table.running(), 0);
     }
 
     #[test]
