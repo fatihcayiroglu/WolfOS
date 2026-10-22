@@ -1143,4 +1143,149 @@ mod tests {
         assert_eq!(q.start_next(), Ok(a));
         assert_eq!(q.timer_switches(), 0);
     }
+
+    #[test]
+    fn four_owners_irq_wake_and_out_of_order_retirement_preserve_exact_leases() {
+        // Host policy regression only: physical EOI, CR3/FX/IRET handoff and
+        // PMM reclamation remain independent trusted hardware obligations.
+        let owned: [[u64; 7]; 4] = core::array::from_fn(|owner| {
+            core::array::from_fn(|page| {
+                (owner as u64 + 1) * 0x10000 + page as u64 * 0x1000
+            })
+        });
+        let mut table = ProcessTable::<4, 7>::new();
+        let pids = owned.map(|frames| table.reserve(frames[0], frames).unwrap());
+        let mut queue = Ring3RunQueue::<4>::new();
+        let handles = pids.map(|pid| queue.admit(pid).unwrap());
+        assert_eq!(queue.start_next(), Ok(handles[0]));
+
+        let mut gate = EventWaitGate::<4>::new();
+        let mut tickets = [None; 4];
+        for i in 0..4 {
+            assert_eq!(queue.running(), Some(handles[i]));
+            table.mark_running(pids[i], owned[i][0]).unwrap();
+            let event = 300 + i as u64;
+            let token = gate.arm(&queue, handles[i], event).unwrap();
+            let next = handles.get(i + 1).copied();
+            assert_eq!(
+                gate.commit_with_process(&mut queue, &mut table, token, owned[i][0]),
+                Ok(Commit::Parked(next)),
+            );
+            assert_eq!(table.snapshot(pids[i]).unwrap().state, ProcessState::Blocked);
+            assert_eq!(table.snapshot(pids[i]).unwrap().frames, owned[i]);
+            tickets[i] = Some(token);
+        }
+        let tickets = tickets.map(Option::unwrap);
+        assert_eq!(queue.running(), None);
+        assert_eq!(table.running(), 0);
+        assert_eq!(gate.in_flight(), 4);
+        assert_eq!(queue.timer_switches(), 0);
+
+        // PID 3's event arrives while ALL four owners are blocked. The IRQ
+        // envelope is unusable until a separately authenticated real EOI.
+        let mut irq = BspIrqEventBridge::new();
+        let receipt = irq.capture(&gate, tickets[2], 0x63, 0x63, 302).unwrap();
+        let before_eoi = (irq, gate, queue, pids.map(|pid| table.snapshot(pid)));
+        assert_eq!(
+            irq.deliver_after_eoi_with_process(
+                &mut gate, &mut queue, &mut table, receipt, 0x90000,
+            ),
+            Err(IrqEventError::WrongPhase),
+        );
+        assert_eq!((irq, gate, queue, pids.map(|pid| table.snapshot(pid))), before_eoi);
+        irq.acknowledge_physical_eoi(receipt).unwrap();
+
+        // Not only the target's CR3, but every OTHER resident user root
+        // must be refused as release/wake authority, without side effects.
+        let before = (irq, gate, queue, pids.map(|pid| table.snapshot(pid)));
+        for root in owned.map(|frames| frames[0]) {
+            assert_eq!(
+                irq.deliver_after_eoi_with_process(
+                    &mut gate, &mut queue, &mut table, receipt, root,
+                ),
+                Err(IrqEventError::Coordinated(CoordinatedError::Process(
+                    TableError::Process(
+                        standalone_process_table::standalone_process::ProcessError::ActiveCr3,
+                    ),
+                ))),
+            );
+            assert_eq!((irq, gate, queue, pids.map(|pid| table.snapshot(pid))), before);
+        }
+        assert_eq!(irq.verify_drained(), Err(IrqEventError::NotDrained));
+        assert_eq!(
+            irq.deliver_after_eoi_with_process(
+                &mut gate, &mut queue, &mut table, receipt, 0x90000,
+            ),
+            Ok(Delivery::Woken(handles[2])),
+        );
+        assert_eq!(irq.verify_drained().unwrap().delivered, 1);
+        assert_eq!(queue.running(), None);
+        assert_eq!(table.snapshot(pids[2]).unwrap().state, ProcessState::Ready);
+        for i in [0, 1, 3] {
+            assert_eq!(table.snapshot(pids[i]).unwrap().state, ProcessState::Blocked);
+            assert_eq!(table.snapshot(pids[i]).unwrap().frames, owned[i]);
+        }
+        assert_eq!(
+            irq.deliver_after_eoi_with_process(
+                &mut gate, &mut queue, &mut table, receipt, 0x90000,
+            ),
+            Err(IrqEventError::Stale),
+        );
+
+        // No owner is running: independently retire PID 2 then PID 1,
+        // transferring their exact leases only once. Queue tombstones
+        // cannot be reaped until the caller has REALLY reclaimed PMM pages.
+        assert_eq!(
+            gate.retire_parked_with_process(
+                &mut queue, &mut table, &irq, tickets[1], 0x90000,
+            ),
+            Ok(owned[1]),
+        );
+        assert_eq!(
+            gate.retire_parked_with_process(
+                &mut queue, &mut table, &irq, tickets[0], 0x90000,
+            ),
+            Ok(owned[0]),
+        );
+        assert_eq!(table.snapshot(pids[0]), None);
+        assert_eq!(table.snapshot(pids[1]), None);
+        assert_eq!(table.snapshot(pids[2]).unwrap().frames, owned[2]);
+        assert_eq!(table.snapshot(pids[3]).unwrap().frames, owned[3]);
+        let frozen = (irq, gate, queue, pids.map(|pid| table.snapshot(pid)));
+        assert_eq!(
+            gate.signal(&mut queue, tickets[0], 300),
+            Err(Error::Stale),
+        );
+        assert_eq!((irq, gate, queue, pids.map(|pid| table.snapshot(pid))), frozen);
+
+        // A second, independently EOI-acknowledged IRQ selectively wakes
+        // PID 4. Explicit dispatch, not wake, creates the RUNNING owner;
+        // only the following timer policy tick can count a timer switch.
+        let second = irq.capture(&gate, tickets[3], 0x63, 0x63, 303).unwrap();
+        irq.acknowledge_physical_eoi(second).unwrap();
+        assert_eq!(
+            irq.deliver_after_eoi_with_process(
+                &mut gate, &mut queue, &mut table, second, 0x90000,
+            ),
+            Ok(Delivery::Woken(handles[3])),
+        );
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(queue.start_next(), Ok(handles[2]));
+        table.mark_running(pids[2], owned[2][0]).unwrap();
+        assert_eq!(queue.timer_tick(handles[2]), Ok(handles[3]));
+        table.park_running(pids[2], owned[2][0]).unwrap();
+        table.mark_running(pids[3], owned[3][0]).unwrap();
+        assert_eq!(table.running(), 1);
+        assert_eq!(queue.running(), Some(handles[3]));
+        assert_eq!(queue.timer_switches(), 1);
+        assert_eq!(
+            irq.verify_drained(),
+            Ok(IrqEventTotals {
+                entered: 2, acknowledged: 2, delivered: 2, discarded: 0,
+            }),
+        );
+        assert_eq!(table.snapshot(pids[2]).unwrap().frames, owned[2]);
+        assert_eq!(table.snapshot(pids[3]).unwrap().frames, owned[3]);
+    }
 }
