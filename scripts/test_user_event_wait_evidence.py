@@ -51,6 +51,21 @@ class EventWaitEvidenceTests(unittest.TestCase):
                                                 "pid1_still_blocked=0"), 33))
         self.assertFalse(evaluate(source.replace("traps=5", "traps=4"), 33))
 
+    def test_extra_malformed_or_embedded_evidence_fails_closed(self):
+        source = valid_evidence()
+        for marker in (
+            "WOLFOS_BOOT_OK", START, REJECTED, RESUME, HARDWARE,
+            CLEANUP, TRAPS[0], SWITCHES[0],
+        ):
+            stem = marker.split(" ", 1)[0]
+            for forged in (
+                "diagnostic: " + marker,
+                marker + " forged=1",
+                stem + "_FORGED",
+                stem + "\tforged",
+            ):
+                self.assertFalse(evaluate(source + forged + "\n", 33), forged)
+
     def test_wrong_pid_event_or_fake_irq_cannot_pass(self):
         source = valid_evidence()
         self.assertFalse(evaluate(source.replace("pid=1 kind=wait",

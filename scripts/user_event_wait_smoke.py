@@ -73,7 +73,18 @@ def evaluate(output: str, code: int) -> bool:
     # of every marker, then match each occurrence in order. A simple count=1
     # check would incorrectly reject this genuine three-handoff sequence.
     from collections import Counter
-    for line, required in Counter(expected_order).items():
+    expected_counts = Counter(expected_order)
+    # Reject forged, truncated, embedded or suffixed evidence even when a
+    # genuine complete record exists. Count-only validation misses these
+    # extra lines because it counts exact strings, not marker stems.
+    marker_stems = {line.split(" ", 1)[0] for line in expected_order}
+    if any(
+        any(stem in row for stem in marker_stems)
+        and row not in expected_counts
+        for row in rows
+    ):
+        return False
+    for line, required in expected_counts.items():
         if rows.count(line) != required:
             return False
     after = 0
