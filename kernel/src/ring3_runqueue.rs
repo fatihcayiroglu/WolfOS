@@ -333,6 +333,74 @@ mod tests {
     use super::*;
 
     #[test]
+    fn four_owners_interleave_irq_block_event_wake_exit_and_stale_reuse() {
+        let mut q = Ring3RunQueue::<4>::new();
+        let h = [1, 2, 3, 4].map(|pid| q.admit(pid).unwrap());
+        assert_eq!(q.start_next(), Ok(h[0]));
+        // Two authenticated timer policy ticks, exactly one handoff.
+        assert_eq!(q.timer_quantum_tick(h[0], 2), Ok(h[0]));
+        assert_eq!(q.timer_quantum_tick(h[0], 2), Ok(h[1]));
+        assert_eq!(q.timer_switches(), 1);
+        assert_eq!(q.last_policy_handoff(), Some((h[0], h[1])));
+
+        // PID2 blocks; PID3 installs a one-use event wait; PID4 and PID1
+        // then block independently, leaving no fabricated RUNNING owner.
+        assert_eq!(q.block_current(h[1]), Ok(Some(h[2])));
+        let (next, ticket) = q.block_current_for_event(h[2], 77).unwrap();
+        assert_eq!(next, Some(h[3]));
+        assert_eq!(q.block_current(h[3]), Ok(Some(h[0])));
+        assert_eq!(q.block_current(h[0]), Ok(None));
+        assert_eq!(q.running(), None);
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.last_policy_handoff(), None);
+        assert_eq!(q.timer_switches(), 1);
+
+        let before = q;
+        assert_eq!(q.wake(h[2]), Err(Error::WrongEvent));
+        assert_eq!(q.wake_for_event(ticket, 78), Err(Error::WrongEvent));
+        assert_eq!(q.timer_quantum_tick(h[0], 2), Err(Error::NoRunnable));
+        assert_eq!(q, before, "all failures must preserve every ledger field");
+
+        // The exact ticket wakes only PID3; it is the sole runnable PID.
+        assert_eq!(q.wake_for_event(ticket, 77), Ok(()));
+        assert_eq!(q.start_next(), Ok(h[2]));
+        assert_eq!(q.timer_quantum_tick(h[2], 2), Ok(h[2]));
+        assert_eq!(q.timer_quantum_tick(h[2], 2), Ok(h[2]));
+        assert_eq!(q.current_slice_ticks(), 2);
+        assert_eq!(q.timer_switches(), 1);
+        let pre_wake = q;
+        assert_eq!(q.wake_for_event(ticket, 77), Err(Error::WrongState));
+        assert_eq!(q, pre_wake);
+
+        // A ready peer can rotate on the next authentic timer tick despite
+        // a capped solitary quantum. Exits and cancels never forge switches.
+        assert_eq!(q.wake(h[1]), Ok(()));
+        assert_eq!(q.timer_quantum_tick(h[2], 2), Ok(h[1]));
+        assert_eq!(q.timer_switches(), 2);
+        assert_eq!(q.exit_current(h[1]), Ok(Some(h[2])));
+        assert_eq!(q.cancel(h[0]), Ok(()));
+        assert_eq!(q.cancel(h[3]), Ok(()));
+        assert_eq!(q.exit_current(h[2]), Ok(None));
+        assert_eq!(q.running(), None);
+        assert_eq!(q.timer_switches(), 2);
+        assert!(q.slots().iter().all(|s| s.state == State::Exited));
+
+        // Trusted hardware/PMM quiescence is a PRECONDITION of reap;
+        // the host policy cannot claim the real resources were freed.
+        for handle in h { assert_eq!(q.reap(handle), Ok(())); }
+        assert_eq!(q.occupied(), 0);
+        let fresh = q.admit(3).unwrap();
+        assert!(fresh.generation > h[2].generation);
+        assert_ne!(fresh, h[2]);
+        assert_eq!(q.start_next(), Ok(fresh));
+        let snapshot = q;
+        assert_eq!(q.wake_for_event(ticket, 77), Err(Error::Stale));
+        assert_eq!(q.timer_quantum_tick(h[2], 2), Err(Error::Stale));
+        assert_eq!(q, snapshot);
+        assert_eq!(q.timer_switches(), 2);
+    }
+
+    #[test]
     fn four_tasks_get_exact_two_irq_time_slices_without_fake_switches() {
         let mut q = Ring3RunQueue::<4>::new();
         let h = [1, 2, 3, 4].map(|pid| q.admit(pid).unwrap());
