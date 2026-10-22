@@ -272,6 +272,11 @@ impl BspIrqEventBridge {
         // Do not admit another IRQ when idle counters are already corrupt.
         self.verify_drained()?;
         gate.locate(token).map_err(IrqEventError::Event)?;
+        // Refuse an event/token mismatch BEFORE allocating an IRQ receipt.
+        // The physical handler must still issue any required hardware EOI.
+        if delivered_event != token.event {
+            return Err(IrqEventError::Event(Error::WrongEvent))
+        }
         let sequence = self.next_sequence.checked_add(1)
             .ok_or(IrqEventError::Overflow)?;
         let entered = self.entered.checked_add(1)
@@ -597,8 +602,13 @@ mod tests {
             Err(IrqEventError::WrongVector));
         assert_eq!(irq.capture(&gate, t, 0x51, 0x51, 0),
             Err(IrqEventError::InvalidEvent));
+        assert_eq!(irq.capture(&gate, t, 0x51, 0x51, 92),
+            Err(IrqEventError::Event(Error::WrongEvent)));
         assert_eq!((irq, gate, q), before);
-        let bad = irq.capture(&gate, t, 0x51, 0x51, 92).unwrap();
+        let bad = irq.capture(&gate, t, 0x51, 0x51, 91).unwrap();
+        // Simulate a corrupted envelope AFTER validation to retain the
+        // deliver-after-EOI rejection/discard regression independently.
+        irq.active.as_mut().unwrap().delivered_event = 92;
         let entered = (irq, gate, q);
         assert_eq!(irq.capture(&gate, t, 0x51, 0x51, 91),
             Err(IrqEventError::Busy));
