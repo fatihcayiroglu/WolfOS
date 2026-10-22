@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install VM build tools
         run: |
           # Fail closed on hung mirrors without skipping any build/QEMU gate.
@@ -137,7 +137,7 @@ jobs:
         run: make apic-preempt-smoke
       - name: Preserve ISO on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: wolfos-p0-iso
           path: out/*.iso
