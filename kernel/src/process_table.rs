@@ -366,15 +366,21 @@ mod tests {
             Err(TableError::Process(ProcessError::WrongAddressSpace)));
         t.mark_running(x, a[0]).unwrap();
         assert_eq!(t.mark_running(y, b[0]), Err(TableError::AnotherRunning));
-        assert_eq!(t.reap(x, b[0]),
+        assert_eq!(t.reap(x, 0x90000),
             Err(TableError::Process(ProcessError::WrongState)));
         t.exit_zero(x, a[0]).unwrap();
         t.mark_running(y, b[0]).unwrap();
         assert_eq!(t.running(), 1);
         assert_eq!(t.reap(x, a[0]),
             Err(TableError::Process(ProcessError::ActiveCr3)));
-        assert_eq!(t.reap(x, b[0]), Ok(a));
-        assert_eq!(t.reap(x, b[0]), Err(TableError::UnknownPid));
+        // Even a different PID's active user CR3 cannot authorize a reap.
+        assert_eq!(t.reap(x, b[0]),
+            Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!(t.snapshot(x).unwrap().frames, a);
+        // The trusted caller separately verifies a supervisor CR3 and
+        // quiesces this exited owner's CPU/FX before PMM reclamation.
+        assert_eq!(t.reap(x, 0x90000), Ok(a));
+        assert_eq!(t.reap(x, 0x90000), Err(TableError::UnknownPid));
         t.exit_zero(y, b[0]).unwrap();
         assert_eq!(t.reap(y, 0x90000), Ok(b));
         assert_eq!(t.cancel_ready(z, 0x90000), Ok(c));
