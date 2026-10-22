@@ -54,11 +54,14 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
     pub fn running(&self) -> usize {
         self.slots.iter().filter(|p| p.state == ProcessState::Running).count()
     }
-    /// A supplied supervisor CR3 must not alias ANY resident user process,
-    /// including a READY process with no prepared resume context yet.
+    /// A supplied supervisor CR3 must not use ANY frame leased to a live
+    /// userspace process, even a non-root page-table/data frame. Looking only
+    /// at the process PML4 root could wrongly authorize a handoff/reap under
+    /// another page of the same live PMM lease. READY/BLOCKED/EXITED owners
+    /// keep those frames pinned until their exact lease is relinquished.
     pub fn owns_live_cr3(&self, root: u64) -> bool {
         root != 0 && self.slots.iter().any(|p|
-            Self::live(p.state) && p.cr3_root == root
+            Self::live(p.state) && p.frames.contains(&root)
         )
     }
 
@@ -315,6 +318,62 @@ mod tests {
             assert_eq!(t.snapshot(*id), None, "PID {i} must be retired");
             assert_eq!(t.cancel_ready(*id, 0x90000), Err(TableError::UnknownPid));
         }
+    }
+
+
+    #[test]
+    fn nonroot_user_frames_cannot_authorize_foreign_supervisor_lease_release() {
+        let mut t = ProcessTable::<3, 7>::new();
+        let a = frames(0x1000);
+        let b = frames(0x10000);
+        let c = frames(0x20000);
+        let x = t.reserve(a[0], a).unwrap();
+        let y = t.reserve(b[0], b).unwrap();
+        let z = t.reserve(c[0], c).unwrap();
+
+        t.mark_running(x, a[0]).unwrap();
+        t.block_running(x, a[0]).unwrap();
+        t.mark_running(y, b[0]).unwrap();
+        t.exit_zero(y, b[0]).unwrap();
+        assert_eq!(t.running(), 0);
+        let snapshot = (t.snapshot(x), t.snapshot(y), t.snapshot(z));
+        let forbidden = [a[1], a[6], b[2], c[4], c[6]];
+        for borrowed in forbidden {
+            assert_ne!(borrowed, a[0]);
+            assert_ne!(borrowed, b[0]);
+            assert_ne!(borrowed, c[0]);
+            assert!(t.owns_live_cr3(borrowed));
+            assert_eq!(
+                t.wake_blocked(x, borrowed),
+                Err(TableError::Process(ProcessError::ActiveCr3)),
+            );
+            assert_eq!(
+                t.cancel_blocked(x, borrowed),
+                Err(TableError::Process(ProcessError::ActiveCr3)),
+            );
+            assert_eq!(
+                t.reap(y, borrowed),
+                Err(TableError::Process(ProcessError::ActiveCr3)),
+            );
+            assert_eq!(
+                t.cancel_ready(z, borrowed),
+                Err(TableError::Process(ProcessError::ActiveCr3)),
+            );
+            assert_eq!(
+                (t.snapshot(x), t.snapshot(y), t.snapshot(z)),
+                snapshot,
+                "a live user-owned non-root frame must never pass for supervisor CR3",
+            );
+        }
+
+        // Only a separately authenticated and unowned supervisor root
+        // may authorize metadata transfer; this still does not free PMM pages.
+        assert!(!t.owns_live_cr3(0x90000));
+        assert_eq!(t.cancel_blocked(x, 0x90000), Ok(a));
+        assert_eq!(t.reap(y, 0x90000), Ok(b));
+        assert_eq!(t.cancel_ready(z, 0x90000), Ok(c));
+        assert_eq!(t.running(), 0);
+        assert_eq!(t.occupied(), 0);
     }
 
     #[test]
