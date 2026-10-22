@@ -177,18 +177,26 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         self.record_mut(pid)?.exit_zero(pid, actual_cr3).map_err(TableError::from)
     }
 
-    /// Only AFTER CPU CR3 is no longer this process's address space:
-    /// return exact PMM-owned frames, and invalidate its live PID.
+    /// Only AFTER independently verifying supervisor CR3 is not ANY live
+    /// user's address space: relinquish exact PMM frame ownership once.
+    /// The caller separately proves hardware quiescence and releases PMM.
     pub fn reap(&mut self, pid: u64, actual_cr3: u64)
         -> Result<[u64; FRAMES], TableError>
     {
+        if actual_cr3 == 0 || actual_cr3 & (PAGE - 1) != 0
+            || actual_cr3 >= (1 << 52) || self.owns_live_cr3(actual_cr3)
+        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
         self.record_mut(pid)?.reap(pid, actual_cr3).map_err(TableError::from)
     }
 
-    /// Failure/rollback path for a never-running READY process.
+    /// Failure/rollback path for a never-running READY process. Reject an
+    /// observed CR3 owned by any other still-resident user, not only this PID.
     pub fn cancel_ready(&mut self, pid: u64, actual_cr3: u64)
         -> Result<[u64; FRAMES], TableError>
     {
+        if actual_cr3 == 0 || actual_cr3 & (PAGE - 1) != 0
+            || actual_cr3 >= (1 << 52) || self.owns_live_cr3(actual_cr3)
+        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
         self.record_mut(pid)?.cancel_ready(pid, actual_cr3).map_err(TableError::from)
     }
 }
@@ -253,6 +261,38 @@ mod tests {
         assert_eq!(t.cancel_ready(y,0x9000),Ok(b));
         assert_eq!(t.occupied(),0);
     }
+    #[test]
+    fn reap_and_ready_cancel_reject_every_resident_foreign_cr3() {
+        let mut t = ProcessTable::<3, 7>::new();
+        let a = frames(0x1000);
+        let b = frames(0x10000);
+        let c = frames(0x20000);
+        let x = t.reserve(a[0], a).unwrap();
+        let y = t.reserve(b[0], b).unwrap();
+        let z = t.reserve(c[0], c).unwrap();
+        t.mark_running(x, a[0]).unwrap();
+        t.exit_zero(x, a[0]).unwrap();
+        let original = (t.snapshot(x), t.snapshot(y), t.snapshot(z));
+        for foreign in [a[0], b[0], c[0], 0, 0x90001, 1 << 52] {
+            assert_eq!(t.reap(x, foreign),
+                Err(TableError::Process(ProcessError::ActiveCr3)));
+            assert_eq!(t.cancel_ready(z, foreign),
+                Err(TableError::Process(ProcessError::ActiveCr3)));
+            assert_eq!((t.snapshot(x), t.snapshot(y), t.snapshot(z)), original,
+                "rejected user CR3 may not transfer any PMM ownership");
+        }
+        assert_eq!(t.reap(x, 0x90000), Ok(a));
+        assert_eq!(t.snapshot(x), None);
+        assert_eq!(t.cancel_ready(z, b[0]),
+            Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!(t.snapshot(z).unwrap().frames, c);
+        assert_eq!(t.cancel_ready(z, 0x90000), Ok(c));
+        assert_eq!(t.snapshot(z), None);
+        assert_eq!(t.snapshot(y).unwrap().frames, b);
+        assert_eq!(t.cancel_ready(y, 0x90000), Ok(b));
+        assert_eq!(t.occupied(), 0);
+    }
+
     #[test]
     fn three_resident_pids_reuse_slot_without_reusing_pid() {
         let mut t = ProcessTable::<3, 7>::new();
@@ -326,15 +366,21 @@ mod tests {
             Err(TableError::Process(ProcessError::WrongAddressSpace)));
         t.mark_running(x, a[0]).unwrap();
         assert_eq!(t.mark_running(y, b[0]), Err(TableError::AnotherRunning));
-        assert_eq!(t.reap(x, b[0]),
+        assert_eq!(t.reap(x, 0x90000),
             Err(TableError::Process(ProcessError::WrongState)));
         t.exit_zero(x, a[0]).unwrap();
         t.mark_running(y, b[0]).unwrap();
         assert_eq!(t.running(), 1);
         assert_eq!(t.reap(x, a[0]),
             Err(TableError::Process(ProcessError::ActiveCr3)));
-        assert_eq!(t.reap(x, b[0]), Ok(a));
-        assert_eq!(t.reap(x, b[0]), Err(TableError::UnknownPid));
+        // Even a different PID's active user CR3 cannot authorize a reap.
+        assert_eq!(t.reap(x, b[0]),
+            Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!(t.snapshot(x).unwrap().frames, a);
+        // The trusted caller separately verifies a supervisor CR3 and
+        // quiesces this exited owner's CPU/FX before PMM reclamation.
+        assert_eq!(t.reap(x, 0x90000), Ok(a));
+        assert_eq!(t.reap(x, 0x90000), Err(TableError::UnknownPid));
         t.exit_zero(y, b[0]).unwrap();
         assert_eq!(t.reap(y, 0x90000), Ok(b));
         assert_eq!(t.cancel_ready(z, 0x90000), Ok(c));
