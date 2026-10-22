@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install VM build tools
         run: |
           # Fail closed on hung mirrors without skipping any build/QEMU gate.
@@ -29,7 +29,12 @@ jobs:
           sudo env DEBIAN_FRONTEND=noninteractive timeout \
             --signal=TERM --kill-after=15s 420s apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=40 \
-            -o Acquire::https::Timeout=40 install -y xorriso qemu-system-x86 make git binutils
+            -o Acquire::https::Timeout=40 install -y --no-install-recommends \
+            xorriso qemu-system-x86 seabios make git binutils
+          # QEMU smoke runs from an ISO using PC BIOS, not GUI/audio backends.
+          # Explicitly fail if the headless emulator or ISO builder is absent.
+          command -v qemu-system-x86_64
+          command -v xorriso
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -132,7 +137,7 @@ jobs:
         run: make apic-preempt-smoke
       - name: Preserve ISO on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: wolfos-p0-iso
           path: out/*.iso
