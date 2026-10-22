@@ -155,6 +155,22 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
             .map_err(TableError::from)
     }
 
+    /// Cancel a BLOCKED process only after the trusted caller has retired
+    /// its matching EventWaitGate and Ring3RunQueue wait instance, quiesced
+    /// saved interrupt/user CPU+FX contexts, and verified the real supervisor
+    /// CR3. Reject every resident userspace root (not merely the victim's).
+    /// Returned PMM leases remain the caller's exactly-once responsibility.
+    /// No physical memory is freed here.
+    pub fn cancel_blocked(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<[u64; FRAMES], TableError>
+    {
+        if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
+            || supervisor_cr3 >= (1 << 52) || self.owns_live_cr3(supervisor_cr3)
+        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
+        self.record_mut(pid)?.cancel_blocked(pid, supervisor_cr3)
+            .map_err(TableError::from)
+    }
+
     pub fn exit_zero(&mut self, pid: u64, actual_cr3: u64)
         -> Result<(), TableError>
     {
@@ -370,6 +386,42 @@ mod tests {
         assert_eq!(t.cancel_ready(b, 0x90000), Ok(b_frames));
         assert_eq!(t.occupied(), 0);
         assert_eq!(t.wake_blocked(a, 0x90000), Err(TableError::UnknownPid));
+    }
+
+    #[test]
+    fn blocked_cancellation_rejects_every_live_user_cr3_and_stale_pid() {
+        let mut t = ProcessTable::<2, 7>::new();
+        let a = frames(0x1000);
+        let b = frames(0x10000);
+        let pid_a = t.reserve(a[0], a).unwrap();
+        let pid_b = t.reserve(b[0], b).unwrap();
+        t.mark_running(pid_a, a[0]).unwrap();
+        t.block_running(pid_a, a[0]).unwrap();
+        assert_eq!(t.snapshot(pid_a).unwrap().state, ProcessState::Blocked);
+        let prior_a = t.snapshot(pid_a);
+        let prior_b = t.snapshot(pid_b);
+        for invalid in [0, a[0], b[0], 0x90001, 1 << 52, u64::MAX] {
+            assert_eq!(t.cancel_blocked(pid_a, invalid),
+                Err(TableError::Process(ProcessError::ActiveCr3)));
+            assert_eq!(t.snapshot(pid_a), prior_a);
+            assert_eq!(t.snapshot(pid_b), prior_b);
+        }
+        assert_eq!(t.cancel_blocked(pid_b, 0x90000),
+            Err(TableError::Process(ProcessError::WrongState)));
+        assert_eq!(t.snapshot(pid_a), prior_a);
+        assert_eq!(t.cancel_blocked(pid_a, 0x90000), Ok(a));
+        assert_eq!(t.snapshot(pid_a), None);
+        assert_eq!(t.occupied(), 1);
+        assert!(!t.owns_live_cr3(a[0]));
+        assert!(t.owns_live_cr3(b[0]));
+        assert_eq!(t.wake_blocked(pid_a, 0x90000), Err(TableError::UnknownPid));
+        assert_eq!(t.cancel_blocked(pid_a, 0x90000), Err(TableError::UnknownPid));
+        assert_eq!(t.reap(pid_a, 0x90000), Err(TableError::UnknownPid));
+        let replacement = t.reserve(a[0], a).unwrap();
+        assert!(replacement > pid_b);
+        assert_eq!(t.cancel_ready(replacement, 0x90000), Ok(a));
+        assert_eq!(t.cancel_ready(pid_b, 0x90000), Ok(b));
+        assert_eq!(t.occupied(), 0);
     }
 
     #[test]
