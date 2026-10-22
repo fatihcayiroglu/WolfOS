@@ -181,6 +181,29 @@ impl<const N: usize> ProcessRecord<N> {
         Ok(owned)
     }
 
+    /// Cancel a BLOCKED process only after its exact wait registration and
+    /// queue ticket have been retired, all saved GPR/IRET/FX references are
+    /// quiesced, and hardware is executing a distinct supervisor CR3.
+    /// This is ownership bookkeeping ONLY: caller must independently prove
+    /// those conditions and release the returned pages exactly once via PMM.
+    /// A rejected request never changes this process or any frame lease.
+    pub fn cancel_blocked(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<[u64; N], ProcessError>
+    {
+        self.identity(pid)?;
+        if self.state != ProcessState::Blocked {
+            return Err(ProcessError::WrongState)
+        }
+        if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
+            || supervisor_cr3 >= MAX_PHYSICAL || supervisor_cr3 == self.cr3_root
+        { return Err(ProcessError::ActiveCr3) }
+        let owned = self.frames;
+        self.frames = [0; N];
+        self.cr3_root = 0;
+        self.state = ProcessState::Reaped;
+        Ok(owned)
+    }
+
     /// Release authorization requires: correct PID, exited state and
     /// restored CR3 not equal to the private root. A successful reap
     /// marks ownership relinquished exactly once before any caller frees
@@ -403,6 +426,30 @@ mod tests {
         assert_eq!(p.reap(17, 0x9000), Ok(owned()));
         assert_eq!(p.frames, [0; 7]);
         assert_eq!(p.wake_blocked(17, 0x9000), Err(ProcessError::WrongState));
+    }
+
+    #[test]
+    fn blocked_cancellation_retains_leases_on_refusal_and_never_releases_twice() {
+        let mut p = ProcessRecord::<7>::empty();
+        p.admit(17, owned()[0], owned()).unwrap();
+        assert_eq!(p.cancel_blocked(17, 0x9000), Err(ProcessError::WrongState));
+        p.mark_running(17, owned()[0]).unwrap();
+        p.block_running(17, owned()[0]).unwrap();
+        let blocked = p;
+        assert_eq!(p.cancel_blocked(18, 0x9000), Err(ProcessError::StalePid));
+        for wrong_root in [0, owned()[0], 0x9001, MAX_PHYSICAL, u64::MAX] {
+            assert_eq!(p.cancel_blocked(17, wrong_root), Err(ProcessError::ActiveCr3));
+        }
+        assert_eq!(p, blocked);
+        assert_eq!(p.cancel_blocked(17, 0x9000), Ok(owned()));
+        assert_eq!(p.state, ProcessState::Reaped);
+        assert_eq!(p.frames, [0; 7]);
+        assert_eq!(p.cr3_root, 0);
+        assert_eq!(p.cancel_blocked(17, 0x9000), Err(ProcessError::WrongState));
+        assert_eq!(p.wake_blocked(17, 0x9000), Err(ProcessError::WrongState));
+        assert_eq!(p.reap(17, 0x9000), Err(ProcessError::WrongState));
+        p.admit(18, owned()[0], owned()).unwrap();
+        assert_eq!(p.cancel_blocked(17, 0x9000), Err(ProcessError::StalePid));
     }
 
     #[test]
