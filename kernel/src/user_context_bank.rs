@@ -514,6 +514,52 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn multi_pid_batch_then_bootstrap_failure_requires_exact_owned_rollback() {
+        // Integrate the two bounded transaction layers without claiming
+        // they form one global transaction. The trusted caller must release
+        // process-table leases after a rejected *context* preparation.
+        let mut table = ProcessTable::<4, 7>::new();
+        let mut bank = UserContextBank::<4>::new();
+        let roots = [0x10000, 0x20000, 0x30000, 0x40000];
+        let owned = roots.map(frames);
+        let pids = table.reserve_batch([
+            (roots[0], owned[0]), (roots[1], owned[1]),
+            (roots[2], owned[2]), (roots[3], owned[3]),
+        ]).unwrap();
+        assert_eq!(pids, [1, 2, 3, 4]);
+        assert_eq!(table.occupied(), 4);
+        assert_eq!(table.running(), 0);
+        let bottom = 0xffff_8000_0a00_0000;
+        let stacks = core::array::from_fn::<_, 4, _>(|i|
+            stack(bottom + i as u64 * 0x10000)
+        );
+        let mut bad = frame(0x404000, pids[3]);
+        bad.hardware.rflags = 0x202;
+        assert_eq!(bank.prepare_bootstrap_batch(&table, [
+            (pids[0], roots[0], stacks[0], frame(0x401000, pids[0])),
+            (pids[1], roots[1], stacks[1], frame(0x402000, pids[1])),
+            (pids[2], roots[2], stacks[2], frame(0x403000, pids[2])),
+            (pids[3], roots[3], stacks[3], bad),
+        ]), Err(ContextError::BadFlags));
+        assert_eq!(bank.count(), 0,
+            "a late malformed frame may not publish earlier PID contexts");
+        assert_eq!(table.occupied(), 4,
+            "a separate context failure must NOT silently lose PMM ownership");
+        // Explicit caller compensation releases exact PMM lease metadata,
+        // with no actual frees or CR3 activation performed by either ledger.
+        for i in [3, 1, 0, 2] {
+            assert_eq!(table.cancel_ready(pids[i], 0x90000), Ok(owned[i]));
+            assert_eq!(table.snapshot(pids[i]), None);
+        }
+        assert_eq!(table.occupied(), 0);
+        assert_eq!(bank.count(), 0);
+        assert_eq!(table.reserve_batch([(roots[0], owned[0])]), Ok([5]),
+            "failed bootstrap must not resurrect stale PID generations");
+        assert_eq!(table.cancel_ready(5, 0x90000), Ok(owned[0]));
+    }
+
     #[test]
     fn atomic_bootstrap_batch_rejects_late_invalid_context_without_partial_publish() {
         let mut table = ProcessTable::<4, 7>::new();

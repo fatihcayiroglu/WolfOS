@@ -55,10 +55,25 @@ pub fn verify() {
     { fail("allocated_frames_or_boot_root") }
 
     let mut table = ProcessTable::<RESIDENT, FRAMES>::new();
-    for at in 0..RESIDENT {
-        if table.reserve(groups[at][0], groups[at]) != Ok(at as u64 + 1) {
-            fail("three_resident_admissions")
-        }
+    // Exercise a real-PMM physical alias BETWEEN members of one proposed
+    // transaction, not just aliases against previously published PIDs.
+    // Failure must preserve both the empty table and its starting PID.
+    let mut in_batch_alias = groups[1];
+    in_batch_alias[6] = groups[0][3];
+    if table.reserve_batch([
+        (groups[0][0], groups[0]),
+        (groups[1][0], in_batch_alias),
+    ]) != Err(TableError::PhysicalAlias)
+        || table.occupied() != 0
+        || table.running() != 0
+        || table.snapshot(1).is_some()
+    { fail("batch_cross_lease_alias_or_partial_pid") }
+
+    // Admit three REAL 7-frame PMM leases atomically. A failed fourth
+    // candidate must not publish an earlier member or mint partial PIDs.
+    let residents = core::array::from_fn(|i| (groups[i][0], groups[i]));
+    if table.reserve_batch(residents) != Ok([1, 2, 3]) {
+        fail("three_resident_batch_admissions")
     }
     if table.occupied() != RESIDENT || table.running() != 0
         || table.reserve(groups[3][0], groups[3]) != Err(TableError::Full)
@@ -78,6 +93,17 @@ pub fn verify() {
     if pmm::statistics().allocated_frames != baseline + 3 * FRAMES {
         fail("cancelled_frame_count")
     }
+
+    // Only one table slot remains. A TWO-owner batch must fail as a
+    // whole, even though its first new member passes all PMM checks.
+    // Real physical pages are held by the caller and never freed by policy.
+    if table.reserve_batch([
+        (groups[3][0], groups[3]),
+        (groups[3][0], groups[3]),
+    ]) != Err(TableError::Full)
+        || table.occupied() != RESIDENT - 1
+        || table.snapshot(4).is_some()
+    { fail("batch_partial_publish_or_pid_burn") }
 
     // Claiming an existing PID's PMM leaf as a new CR3 root is forbidden.
     let mut alias = groups[3];

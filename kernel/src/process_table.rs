@@ -112,6 +112,31 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         Ok(pid)
     }
 
+
+    /// Stage several independently allocated user PMM leases as one bounded,
+    /// all-or-nothing metadata admission. Validate all roots and frames using
+    /// the existing per-PID checks, including aliases BETWEEN new entrants.
+    ///
+    /// Nothing is published on failure: no partial READY owner, no spent PID
+    /// generation and no altered frame lease. Tentative physical allocations
+    /// remain the caller's responsibility regardless of the outcome. This
+    /// does NOT launch ELFs, prepare user GPR/FX/IRET or start a scheduler.
+    pub fn reserve_batch<const COUNT: usize>(
+        &mut self, leases: [(u64, [u64; FRAMES]); COUNT],
+    ) -> Result<[u64; COUNT], TableError> {
+        // Stage on a private bounded stack copy rather than admitting the
+        // first PID to the live ledger and attempting fallible rollback.
+        // Reuse reserve(), so future single-owner validation also applies
+        // to each member of a batch.
+        let mut staged = Self { slots: self.slots, last_pid: self.last_pid };
+        let mut minted = [0; COUNT];
+        for (i, (root, frames)) in leases.into_iter().enumerate() {
+            minted[i] = staged.reserve(root, frames)?;
+        }
+        *self = staged;
+        Ok(minted)
+    }
+
     /// Current phase admits multiple READY entries but only ONE running
     /// task. A CPU scheduler requires separately saved user GPR/FPU/TSS
     /// context and explicit per-CPU CR3 before relaxing this restriction.
@@ -617,6 +642,88 @@ mod tests {
         assert_eq!(table.cancel_ready(replacement, 0x90000), Ok(owned));
         assert!(!table.owns_live_cr3(owned[0]));
         assert_eq!(table.occupied(), 0);
+    }
+
+
+    #[test]
+    fn batched_admission_is_atomic_across_alias_full_and_invalid_members() {
+        let mut t = ProcessTable::<3, 7>::new();
+        let a = frames(0x1000);
+        let b = frames(0x10000);
+        let c = frames(0x20000);
+        let d = frames(0x30000);
+        let initial = t.reserve(a[0], a).unwrap();
+        assert_eq!(initial, 1);
+        let before = (t.slots, t.last_pid, t.occupied());
+        // The third candidate aliases a frame belonging to the second
+        // tentative process. The first successful *staged* PID is not spent.
+        let mut alias = c;
+        alias[5] = b[2];
+        assert_eq!(
+            t.reserve_batch([(b[0], b), (alias[0], alias)]),
+            Err(TableError::PhysicalAlias),
+        );
+        assert_eq!((t.slots, t.last_pid, t.occupied()), before);
+
+        // The third new process would exceed fixed capacity; no partial
+        // transaction survives, even when the first two are valid.
+        assert_eq!(
+            t.reserve_batch([(b[0], b), (c[0], c), (d[0], d)]),
+            Err(TableError::Full),
+        );
+        assert_eq!((t.slots, t.last_pid, t.occupied()), before);
+
+        let mut duplicate = c;
+        duplicate[6] = duplicate[4];
+        assert_eq!(
+            t.reserve_batch([(b[0], b), (duplicate[0], duplicate)]),
+            Err(TableError::Process(ProcessError::DuplicateFrame)),
+        );
+        assert_eq!((t.slots, t.last_pid, t.occupied()), before);
+
+        assert_eq!(t.reserve_batch([(b[0], b), (c[0], c)]), Ok([2, 3]));
+        assert_eq!(t.occupied(), 3);
+        assert_eq!(t.running(), 0);
+        for (pid, lease) in [(1, a), (2, b), (3, c)] {
+            assert_eq!(t.snapshot(pid).unwrap().frames, lease);
+            assert_eq!(t.cancel_ready(pid, 0x90000), Ok(lease));
+            assert_eq!(t.snapshot(pid), None);
+        }
+        assert_eq!(t.occupied(), 0);
+        assert_eq!(t.reserve_batch::<0>([]), Ok([]));
+        assert_eq!(t.last_pid, 3);
+    }
+
+    #[test]
+    fn batched_admission_rejects_live_alias_and_pid_exhaustion_without_mutation() {
+        let mut t = ProcessTable::<3, 7>::new();
+        let a = frames(0x1000);
+        let b = frames(0x10000);
+        let c = frames(0x20000);
+        let pid = t.reserve(a[0], a).unwrap();
+        t.mark_running(pid, a[0]).unwrap();
+        t.block_running(pid, a[0]).unwrap();
+        let frozen = (t.slots, t.last_pid);
+        let mut live_alias = b;
+        live_alias[3] = a[6];
+        assert_eq!(
+            t.reserve_batch([(b[0], live_alias), (c[0], c)]),
+            Err(TableError::PhysicalAlias),
+        );
+        assert_eq!((t.slots, t.last_pid), frozen);
+        assert_eq!(t.snapshot(pid).unwrap().state, ProcessState::Blocked);
+        t.cancel_blocked(pid, 0x90000).unwrap();
+
+        // Even with empty slots, a two-PID batch cannot partially mint
+        // u64::MAX and then wrap to zero on its second member.
+        t.last_pid = u64::MAX - 1;
+        let before = (t.slots, t.last_pid);
+        assert_eq!(
+            t.reserve_batch([(b[0], b), (c[0], c)]),
+            Err(TableError::PidExhausted),
+        );
+        assert_eq!((t.slots, t.last_pid), before);
+        assert_eq!(t.occupied(), 0);
     }
 
     #[test]
