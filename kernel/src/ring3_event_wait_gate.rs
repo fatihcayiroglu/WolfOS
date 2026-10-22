@@ -19,6 +19,20 @@ use standalone_queue::{Error as QueueError, Handle, Ring3RunQueue, WaitTicket};
 #[cfg(not(test))]
 use crate::ring3_runqueue::{Error as QueueError, Handle, Ring3RunQueue, WaitTicket};
 
+// The process ownership ledger is intentionally separate from the IRQ gate.
+// Only the BSP caller may combine them, with interrupts/preemption excluded.
+#[cfg(test)]
+#[path = "process_table.rs"]
+mod standalone_process_table;
+#[cfg(test)]
+use standalone_process_table::{ProcessTable, TableError};
+#[cfg(test)]
+use standalone_process_table::standalone_process::ProcessState;
+#[cfg(not(test))]
+use crate::process_table::{ProcessTable, TableError};
+#[cfg(not(test))]
+use crate::process_lifecycle::ProcessState;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EventToken {
     handle: Handle,
@@ -30,6 +44,14 @@ pub enum Error {
     InvalidEvent, InvalidHandle, Duplicate, Full, Stale, WrongEvent,
     WrongState, AlreadyDelivered, Overflow, Queue(QueueError),
 }
+/// Policy-only cross-ledger failure; rejected calls never change ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinatedError {
+    Gate(Error),
+    Process(TableError),
+    WrongOwner,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Commit {
     /// Signal was registered before park: user remains Running.
@@ -172,6 +194,67 @@ impl<const N: usize> EventWaitGate<N> {
             }
             Phase::Empty => Err(Error::Stale),
         }
+    }
+
+    /// Coordinate a trusted WAIT trap with the process ownership table.
+    /// On a failed process transition, restore both in-memory policy ledgers.
+    /// This never captures registers or changes real CR3, TSS, FX, IRET or IRQs.
+    /// Caller MUST hold the same BSP IRQ/preemption critical section across
+    /// this operation and independently authenticate the interrupted frame.
+    pub fn commit_with_process<const FRAMES: usize>(
+        &mut self, queue: &mut Ring3RunQueue<N>,
+        table: &mut ProcessTable<N, FRAMES>, token: EventToken,
+        actual_cr3: u64,
+    ) -> Result<Commit, CoordinatedError> {
+        let owner = table.snapshot(token.handle.pid)
+            .ok_or(CoordinatedError::WrongOwner)?;
+        if owner.state != ProcessState::Running ||
+            owner.cr3_root != actual_cr3 || table.running() != 1
+        { return Err(CoordinatedError::WrongOwner) }
+        let previous_gate = *self;
+        let previous_queue = *queue;
+        let result = self.commit(queue, token).map_err(CoordinatedError::Gate)?;
+        if matches!(result, Commit::Parked(_)) {
+            if let Err(error) = table.block_running(token.handle.pid, actual_cr3) {
+                *self = previous_gate;
+                *queue = previous_queue;
+                return Err(CoordinatedError::Process(error));
+            }
+        }
+        Ok(result)
+    }
+
+    /// Coordinate an independently authenticated event with the blocked
+    /// process ledger. Failed supervisor CR3 / process wake rolls back the
+    /// queue and event gate, never releases PMM frames or forges IRQ evidence.
+    /// For ARM-before-park delivery, the Running owner remains unchanged.
+    /// Hardware EOI and source authentication are STRICTLY external duties.
+    pub fn signal_with_process<const FRAMES: usize>(
+        &mut self, queue: &mut Ring3RunQueue<N>,
+        table: &mut ProcessTable<N, FRAMES>, token: EventToken,
+        delivered_event: u64, supervisor_cr3: u64,
+    ) -> Result<Delivery, CoordinatedError> {
+        let i = self.locate(token).map_err(CoordinatedError::Gate)?;
+        let expected_state = match self.records[i].phase {
+            Phase::Armed | Phase::Pending => ProcessState::Running,
+            Phase::Parked => ProcessState::Blocked,
+            Phase::Empty => return Err(CoordinatedError::Gate(Error::Stale)),
+        };
+        if table.snapshot(token.handle.pid).map(|r| r.state) != Some(expected_state) {
+            return Err(CoordinatedError::WrongOwner)
+        }
+        let previous_gate = *self;
+        let previous_queue = *queue;
+        let result = self.signal(queue, token, delivered_event)
+            .map_err(CoordinatedError::Gate)?;
+        if let Delivery::Woken(handle) = result {
+            if let Err(error) = table.wake_blocked(handle.pid, supervisor_cr3) {
+                *self = previous_gate;
+                *queue = previous_queue;
+                return Err(CoordinatedError::Process(error));
+            }
+        }
+        Ok(result)
     }
 
     /// Abort only a not-yet-parked registration. A parked user needs
@@ -673,6 +756,84 @@ mod tests {
         assert_eq!(irq.capture(&gate, t, 0x50, 0x50, 8),
             Err(IrqEventError::Overflow));
         assert_eq!((irq, gate, q), frozen);
+    }
+
+    #[test]
+    fn coordinated_park_wake_keeps_process_and_event_ledgers_in_sync() {
+        let mut table = ProcessTable::<2, 7>::new();
+        let a_frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let b_frames = core::array::from_fn(|i| 0x10000 + i as u64 * 4096);
+        let a_pid = table.reserve(a_frames[0], a_frames).unwrap();
+        let b_pid = table.reserve(b_frames[0], b_frames).unwrap();
+        let mut queue = Ring3RunQueue::<2>::new();
+        let a = queue.admit(a_pid).unwrap();
+        let b = queue.admit(b_pid).unwrap();
+        assert_eq!(queue.start_next(), Ok(a));
+        table.mark_running(a_pid, a_frames[0]).unwrap();
+        let mut gate = EventWaitGate::<2>::new();
+        let token = gate.arm(&queue, a, 77).unwrap();
+        assert_eq!(gate.commit_with_process(&mut queue, &mut table, token, a_frames[0]),
+            Ok(Commit::Parked(Some(b))));
+        assert_eq!(table.snapshot(a_pid).unwrap().state, ProcessState::Blocked);
+        assert_eq!(table.snapshot(a_pid).unwrap().frames, a_frames);
+        assert_eq!(queue.running(), Some(b));
+        assert_eq!(table.running(), 0);
+        table.mark_running(b_pid, b_frames[0]).unwrap();
+        let original = (gate, queue, table.snapshot(a_pid));
+        assert_eq!(gate.signal_with_process(&mut queue, &mut table, token, 77, a_frames[0]),
+            Err(CoordinatedError::Process(TableError::Process(
+                standalone_process_table::standalone_process::ProcessError::ActiveCr3))));
+        assert_eq!((gate, queue, table.snapshot(a_pid)), original);
+        assert_eq!(gate.signal_with_process(&mut queue, &mut table, token, 77, 0x90000),
+            Ok(Delivery::Woken(a)));
+        assert_eq!(table.snapshot(a_pid).unwrap().state, ProcessState::Ready);
+        assert_eq!(table.snapshot(a_pid).unwrap().frames, a_frames);
+        assert_eq!(queue.timer_switches(), 0);
+        table.park_running(b_pid, b_frames[0]).unwrap();
+        assert_eq!(queue.timer_tick(b), Ok(a));
+        table.mark_running(a_pid, a_frames[0]).unwrap();
+        assert_eq!(table.snapshot(a_pid).unwrap().state, ProcessState::Running);
+        assert_eq!(gate.in_flight(), 0);
+    }
+
+    #[test]
+    fn coordinated_prepark_notification_does_not_block_or_mutate_process() {
+        let mut table = ProcessTable::<1, 7>::new();
+        let frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let pid = table.reserve(frames[0], frames).unwrap();
+        let mut queue = Ring3RunQueue::<1>::new();
+        let handle = queue.admit(pid).unwrap();
+        queue.start_next().unwrap();
+        table.mark_running(pid, frames[0]).unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let token = gate.arm(&queue, handle, 93).unwrap();
+        assert_eq!(gate.signal_with_process(&mut queue, &mut table, token, 93, 0),
+            Ok(Delivery::Latched));
+        assert_eq!(gate.commit_with_process(&mut queue, &mut table, token, frames[0]),
+            Ok(Commit::DeliveredBeforePark));
+        assert_eq!(table.snapshot(pid).unwrap().state, ProcessState::Running);
+        assert_eq!(queue.running(), Some(handle));
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(queue.timer_switches(), 0);
+    }
+
+    #[test]
+    fn coordinated_wrong_owner_or_bad_event_cannot_change_any_ledger() {
+        let mut table = ProcessTable::<1, 7>::new();
+        let frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let pid = table.reserve(frames[0], frames).unwrap();
+        let mut queue = Ring3RunQueue::<1>::new();
+        let handle = queue.admit(pid).unwrap();
+        queue.start_next().unwrap();
+        table.mark_running(pid, frames[0]).unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let token = gate.arm(&queue, handle, 77).unwrap();
+        let before = (gate, queue, table.snapshot(pid));
+        assert_eq!(gate.commit_with_process(&mut queue, &mut table, token, 0x9000),
+            Err(CoordinatedError::WrongOwner));
+        assert_eq!(gate.signal_with_process(&mut queue, &mut table, token, 78, 0x9000),
+            Err(CoordinatedError::Gate(Error::WrongEvent)));
+        assert_eq!((gate, queue, table.snapshot(pid)), before);
     }
 
     #[test]
