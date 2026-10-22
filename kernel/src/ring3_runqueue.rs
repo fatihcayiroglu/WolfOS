@@ -153,7 +153,15 @@ impl<const N: usize> Ring3RunQueue<N> {
         if self.slots[i].state != State::Running ||
             self.slots[i].handle != interrupted { return Err(Error::Stale); }
         let ticks = self.slots[i].ticks.checked_add(1).ok_or(Error::Overflow)?;
-        let elapsed = self.slice_ticks.checked_add(1).ok_or(Error::Overflow)?;
+        // A slice already at its deadline stays capped when no peer was
+        // READY. In particular, a valid u64::MAX quantum must not overflow
+        // simply because the sole runnable task receives one more real IRQ.
+        // Per-PID tick and switch counters remain checked independently.
+        let elapsed = if self.slice_ticks == quantum_ticks {
+            quantum_ticks
+        } else {
+            self.slice_ticks.checked_add(1).ok_or(Error::Overflow)?
+        };
         if elapsed < quantum_ticks {
             self.slots[i].ticks = ticks;
             self.slice_ticks = elapsed;
@@ -386,6 +394,25 @@ mod tests {
         assert_eq!(q.current_slice_ticks(), 0);
         assert_eq!(q.timer_switches(), 1);
         assert_eq!(q.slots()[0].ticks, 11);
+    }
+
+    #[test]
+    fn max_quantum_deadline_does_not_deadlock_a_lone_runnable_pid() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(10).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        // Model the fully consumed quantum without looping u64::MAX times.
+        q.slice_ticks = u64::MAX;
+        assert_eq!(q.timer_quantum_tick(a, u64::MAX), Ok(a));
+        assert_eq!(q.current_slice_ticks(), u64::MAX);
+        assert_eq!(q.timer_switches(), 0);
+        assert_eq!(q.slots()[0].ticks, 1);
+        let b = q.admit(20).unwrap();
+        assert_eq!(q.timer_quantum_tick(a, u64::MAX), Ok(b));
+        assert_eq!(q.running(), Some(b));
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.timer_switches(), 1);
+        assert_eq!(q.slots()[0].ticks, 2);
     }
 
     #[test]
