@@ -142,6 +142,8 @@ impl<const N: usize> Ring3RunQueue<N> {
     ///
     /// With no READY peer, retain the current PID and cap the consumed slice
     /// at the deadline: the next eligible IRQ may rotate if a peer wakes.
+    /// If the caller lowers quantum_ticks after a longer slice, the next
+    /// authenticated tick treats the new deadline as already consumed.
     /// Every error leaves all fields unchanged, including overflow cases.
     /// This is a no_std, no-heap policy, not an IRQ provenance checker or
     /// hardware EOI, CR3, FX, TSS or IRET implementation.
@@ -157,7 +159,10 @@ impl<const N: usize> Ring3RunQueue<N> {
         // READY. In particular, a valid u64::MAX quantum must not overflow
         // simply because the sole runnable task receives one more real IRQ.
         // Per-PID tick and switch counters remain checked independently.
-        let elapsed = if self.slice_ticks == quantum_ticks {
+        let elapsed = if self.slice_ticks >= quantum_ticks {
+            // The caller may shorten a previously valid time slice.
+            // Treat the new deadline as already reached rather than
+            // overflowing the old saturated counter or postponing dispatch.
             quantum_ticks
         } else {
             self.slice_ticks.checked_add(1).ok_or(Error::Overflow)?
@@ -483,6 +488,55 @@ mod tests {
         assert_eq!(q.slots()[0].ticks, 2);
     }
 
+
+    #[test]
+    fn reducing_quantum_rotates_at_the_next_authenticated_timer_tick() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(11).unwrap();
+        let b = q.admit(12).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+
+        // Four real-policy ticks of a six-tick slice have elapsed.
+        for elapsed in 1..=4 {
+            assert_eq!(q.timer_quantum_tick(a, 6), Ok(a));
+            assert_eq!(q.current_slice_ticks(), elapsed);
+        }
+        assert_eq!(q.timer_switches(), 0);
+
+        // A policy change to quantum=2 must not allow two more ticks,
+        // lose the fifth tick, or claim a fake voluntary switch.
+        assert_eq!(q.timer_quantum_tick(a, 2), Ok(b));
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.slots()[0].ticks, 5);
+        assert_eq!(q.timer_switches(), 1);
+        assert_eq!(q.timer_quantum_tick(b, 2), Ok(b));
+        assert_eq!(q.timer_quantum_tick(b, 2), Ok(a));
+        assert_eq!(q.slots()[1].ticks, 2);
+        assert_eq!(q.timer_switches(), 2);
+    }
+
+    #[test]
+    fn saturated_max_quantum_can_be_reduced_without_overflow_or_starvation() {
+        let mut q = Ring3RunQueue::<2>::new();
+        let a = q.admit(1).unwrap();
+        assert_eq!(q.start_next(), Ok(a));
+        // Model a valid u64::MAX quantum at its full deadline without
+        // iterating through all u64::MAX physical timer interrupts.
+        q.slice_ticks = u64::MAX;
+        assert_eq!(q.timer_quantum_tick(a, 1), Ok(a));
+        assert_eq!(q.current_slice_ticks(), 1);
+        assert_eq!(q.slots()[0].ticks, 1);
+        assert_eq!(q.timer_switches(), 0);
+        // Once a peer is admitted, the very next accounted timer IRQ
+        // may select it instead of overflowing the old slice counter.
+        let b = q.admit(2).unwrap();
+        assert_eq!(q.timer_quantum_tick(a, 1), Ok(b));
+        assert_eq!(q.running(), Some(b));
+        assert_eq!(q.current_slice_ticks(), 0);
+        assert_eq!(q.slots()[0].ticks, 2);
+        assert_eq!(q.timer_switches(), 1);
+    }
+
     #[test]
     fn quantum_errors_and_overflow_never_mutate_any_field() {
         let mut q = Ring3RunQueue::<4>::new();
@@ -498,10 +552,6 @@ mod tests {
         assert_eq!(q.timer_quantum_tick(a, 2), Err(Error::Overflow));
         assert_eq!(q, before);
         q.slots[0].ticks = 0;
-        q.slice_ticks = u64::MAX;
-        let before = q;
-        assert_eq!(q.timer_quantum_tick(a, 2), Err(Error::Overflow));
-        assert_eq!(q, before);
         q.slice_ticks = 1;
         q.switches = u64::MAX;
         let before = q;
