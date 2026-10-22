@@ -1597,7 +1597,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0"
         );
-        #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),not(feature="p2-ring3-timer-nonyield-smoke")))]
+        #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),
+                  not(feature="p2-ring3-timer-nonyield-smoke"),
+                  not(feature="p3-ring3-irq-event-wake-smoke")))]
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=1"
         );
