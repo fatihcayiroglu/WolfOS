@@ -1256,15 +1256,16 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             if i==0 {
                 // A genuine user INT80 has supplied and authenticated this
                 // full hardware GPR/IRET frame on the PID's pinned RSP0.
-                // Block the real registry owner, then arm a one-use event
-                // ticket *before* allowing the other user to execute.
-                if s.event_wait.is_some()
-                    || s.processes.block_running(pid,active_root).is_err(){
+                // Arm before parking; atomically coordinate both software
+                // ledgers while the authentic INT80 handler keeps IF=0.
+                // Never make the process Blocked before event registration.
+                if s.event_wait.is_some() {
                     fail("real_wait_registry_block")
                 }
                 let token=s.event_gate.arm(&s.rr,s.rr_handles[0],EVENT_ID)
                     .unwrap_or_else(|_|fail("real_wait_event_registration"));
-                let outcome=s.event_gate.commit(&mut s.rr,token)
+                let outcome=s.event_gate.commit_with_process(
+                    &mut s.rr,&mut s.processes,token,active_root)
                     .unwrap_or_else(|_|fail("real_wait_event_park"));
                 if outcome!=EventCommit::Parked(Some(s.rr_handles[1]))
                     || s.rr.timer_switches()!=0 {
@@ -1280,10 +1281,6 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 }
                 let ticket=s.event_wait
                     .take().unwrap_or_else(||fail("missing_user_wait_ticket"));
-                if s.event_gate.signal(&mut s.rr,ticket,EVENT_ID)
-                    !=Ok(EventDelivery::Woken(s.rr_handles[0])) {
-                    fail("trusted_event_ticket_invalid")
-                }
                 // The ProcessTable correctly forbids using *any other
                 // resident USER CR3* as an alleged supervisor root. Since
                 // PID2 is still active, genuinely switch to the trusted,
@@ -1293,10 +1290,12 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 unsafe{asm!("mov cr3, {}",in(reg)s.boot,
                            options(nostack,preserves_flags));}
                 if actual_cr3()!=s.boot{fail("event_wake_boot_cr3_not_active")}
-                let wake=s.processes.wake_blocked(1,s.boot);
+                let wake=s.event_gate.signal_with_process(
+                    &mut s.rr,&mut s.processes,ticket,EVENT_ID,s.boot);
                 unsafe{asm!("mov cr3, {}",in(reg)active_root,
                            options(nostack,preserves_flags));}
-                if actual_cr3()!=active_root || wake.is_err()
+                if actual_cr3()!=active_root
+                    || wake!=Ok(EventDelivery::Woken(s.rr_handles[0]))
                     || s.processes.park_running(pid,active_root).is_err()
                     || s.rr.voluntary_yield(s.rr_handles[1])!=Ok(s.rr_handles[0]){
                     fail("trusted_event_wake_or_dispatch")
