@@ -293,7 +293,7 @@ pub struct IrqEventReceipt { sequence: u64, vector: u8 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IrqEventError {
     WrongVector, InvalidEvent, Busy, Stale, WrongPhase, Overflow,
-    NotDrained, Event(Error),
+    NotDrained, Event(Error), Coordinated(CoordinatedError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,6 +410,36 @@ impl BspIrqEventBridge {
         self.active = None;
         self.delivered = delivered;
         Ok(outcome)
+    }
+
+    /// Finalize an independently authenticated and physically EOI-acknowledged
+    /// IRQ by coordinating event delivery with BOTH Ring3 policy ledgers and
+    /// ProcessTable ownership. A rejected table wake leaves this IRQ receipt
+    /// acknowledged but live, so the trusted caller may retry with the real
+    /// supervisor CR3 or explicitly discard it; no PMM frame is released.
+    ///
+    /// This is BSP policy plumbing ONLY. The caller must validate the physical
+    /// IRQ source, saved frame, CPU/CR3/TSS/FX and actual EOI independently,
+    /// and serialize all operations under the same IRQ-disabled section.
+    pub fn deliver_after_eoi_with_process<const N: usize, const FRAMES: usize>(
+        &mut self, gate: &mut EventWaitGate<N>,
+        queue: &mut Ring3RunQueue<N>,
+        table: &mut ProcessTable<N, FRAMES>,
+        receipt: IrqEventReceipt, supervisor_cr3: u64,
+    ) -> Result<Delivery, IrqEventError> {
+        let pending = self.active.ok_or(IrqEventError::Stale)?;
+        if pending.receipt != receipt { return Err(IrqEventError::Stale) }
+        if pending.phase != IrqPhase::EoiAcknowledged {
+            return Err(IrqEventError::WrongPhase)
+        }
+        let delivered = self.delivered.checked_add(1)
+            .ok_or(IrqEventError::Overflow)?;
+        let result = gate.signal_with_process(
+            queue, table, pending.token, pending.delivered_event, supervisor_cr3,
+        ).map_err(IrqEventError::Coordinated)?;
+        self.active = None;
+        self.delivered = delivered;
+        Ok(result)
     }
 
     /// An already acknowledged IRQ can be explicitly discarded if its wait
@@ -834,6 +864,84 @@ mod tests {
         assert_eq!(gate.signal_with_process(&mut queue, &mut table, token, 78, 0x9000),
             Err(CoordinatedError::Gate(Error::WrongEvent)));
         assert_eq!((gate, queue, table.snapshot(pid)), before);
+    }
+
+    #[test]
+    fn authorized_irq_eoi_can_wake_both_policy_and_process_table_once() {
+        let a_frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let b_frames = core::array::from_fn(|i| 0x10000 + i as u64 * 4096);
+        let mut table = ProcessTable::<2, 7>::new();
+        let a_pid = table.reserve(a_frames[0], a_frames).unwrap();
+        let b_pid = table.reserve(b_frames[0], b_frames).unwrap();
+        let mut queue = Ring3RunQueue::<2>::new();
+        let a = queue.admit(a_pid).unwrap();
+        let b = queue.admit(b_pid).unwrap();
+        queue.start_next().unwrap();
+        table.mark_running(a_pid, a_frames[0]).unwrap();
+        let mut gate = EventWaitGate::<2>::new();
+        let token = gate.arm(&queue, a, 97).unwrap();
+        assert_eq!(gate.commit_with_process(&mut queue, &mut table, token, a_frames[0]),
+            Ok(Commit::Parked(Some(b))));
+        table.mark_running(b_pid, b_frames[0]).unwrap();
+
+        let mut irq = BspIrqEventBridge::new();
+        let receipt = irq.capture(&gate, token, 0x55, 0x55, 97).unwrap();
+        assert_eq!(irq.deliver_after_eoi_with_process(
+            &mut gate, &mut queue, &mut table, receipt, 0x90000,
+        ), Err(IrqEventError::WrongPhase));
+        irq.acknowledge_physical_eoi(receipt).unwrap();
+
+        let before = (irq, gate, queue, table.snapshot(a_pid), table.snapshot(b_pid));
+        assert_eq!(irq.deliver_after_eoi_with_process(
+            &mut gate, &mut queue, &mut table, receipt, a_frames[0],
+        ), Err(IrqEventError::Coordinated(CoordinatedError::Process(
+            TableError::Process(
+                standalone_process_table::standalone_process::ProcessError::ActiveCr3
+            ),
+        ))));
+        assert_eq!((irq, gate, queue, table.snapshot(a_pid), table.snapshot(b_pid)), before);
+        assert_eq!(irq.verify_drained(), Err(IrqEventError::NotDrained));
+
+        assert_eq!(irq.deliver_after_eoi_with_process(
+            &mut gate, &mut queue, &mut table, receipt, 0x90000,
+        ), Ok(Delivery::Woken(a)));
+        assert_eq!(queue.running(), Some(b));
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(table.snapshot(a_pid).unwrap().state, ProcessState::Ready);
+        assert_eq!(table.snapshot(a_pid).unwrap().frames, a_frames);
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(irq.verify_drained(), Ok(IrqEventTotals {
+            entered: 1, acknowledged: 1, delivered: 1, discarded: 0,
+        }));
+        assert_eq!(irq.deliver_after_eoi_with_process(
+            &mut gate, &mut queue, &mut table, receipt, 0x90000,
+        ), Err(IrqEventError::Stale));
+    }
+
+    #[test]
+    fn eoi_acknowledged_before_park_only_latches_notification() {
+        let frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let mut table = ProcessTable::<1, 7>::new();
+        let pid = table.reserve(frames[0], frames).unwrap();
+        let mut queue = Ring3RunQueue::<1>::new();
+        let a = queue.admit(pid).unwrap();
+        queue.start_next().unwrap();
+        table.mark_running(pid, frames[0]).unwrap();
+        let mut gate = EventWaitGate::<1>::new();
+        let token = gate.arm(&queue, a, 11).unwrap();
+        let mut irq = BspIrqEventBridge::new();
+        let receipt = irq.capture(&gate, token, 0x54, 0x54, 11).unwrap();
+        irq.acknowledge_physical_eoi(receipt).unwrap();
+        assert_eq!(irq.deliver_after_eoi_with_process(
+            &mut gate, &mut queue, &mut table, receipt, 0,
+        ), Ok(Delivery::Latched));
+        assert_eq!(table.snapshot(pid).unwrap().state, ProcessState::Running);
+        assert_eq!(gate.commit_with_process(&mut queue, &mut table, token, frames[0]),
+            Ok(Commit::DeliveredBeforePark));
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(queue.running(), Some(a));
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(irq.verify_drained().unwrap().delivered, 1);
     }
 
     #[test]
