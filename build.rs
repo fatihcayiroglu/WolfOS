@@ -35,12 +35,18 @@ fn main() {
         fs::create_dir_all(&path).expect("make yield OUT_DIR");
         let mut symbols=String::new();
         let event_wait=env::var_os("CARGO_FEATURE_P3_RING3_EVENT_WAIT_HARDWARE_SMOKE").is_some();
+        let irq_event_wake=env::var_os("CARGO_FEATURE_P3_RING3_IRQ_EVENT_WAKE_SMOKE").is_some();
         let asm_source=if event_wait {"user/event_wait.S"}else{"user/yield.S"};
         for pid in [1usize,2] {
             let obj=path.join(format!("wolfos-yield-{pid}.o"));
             let elf=path.join(format!("wolfos-yield-{pid}.elf"));
             let def=format!("WOLFOS_PID={pid}");
-            if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some() {
+            if irq_event_wake {
+                checked("as",&["--64","--defsym",&def,
+                    "--defsym","WOLFOS_TIMER_IRQ_PROBE=1",
+                    "--defsym","WOLFOS_IRQ_EVENT_WAKE=1","-o",
+                    obj.to_str().unwrap(),asm_source]);
+            } else if env::var_os("CARGO_FEATURE_P2_RING3_TIMER_OBSERVE_SMOKE").is_some() || env::var_os("CARGO_FEATURE_P2_RING3_TIMER_PREEMPT_SMOKE").is_some() {
                 checked("as",&["--64","--defsym",&def,
                     "--defsym","WOLFOS_TIMER_IRQ_PROBE=1","-o",
                     obj.to_str().unwrap(),asm_source]);
@@ -62,7 +68,7 @@ fn main() {
                 let addr=nm_symbol(&map,name);
                 symbols+=&format!("pub const PID{pid}_{suffix}: u64 = {addr:#x};\n");
             }
-            if event_wait && pid==2 {
+            if event_wait && pid==2 && !irq_event_wake {
                 let addr=nm_symbol(&map,"_bad_signal_return");
                 symbols+=&format!("pub const PID2_BAD_SIGNAL_RETURN:u64={addr:#x};\n");
             }
