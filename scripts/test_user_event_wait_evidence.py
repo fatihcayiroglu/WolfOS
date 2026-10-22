@@ -62,9 +62,9 @@ class EventWaitEvidenceTests(unittest.TestCase):
                 "diagnostic: " + marker,
                 marker + " forged=1",
                 stem + "_FORGED",
-                stem + "\\tforged",
+                stem + "\tforged",
             ):
-                self.assertFalse(evaluate(source + forged + "\\n", 33), forged)
+                self.assertFalse(evaluate(source + forged + "\n", 33), forged)
 
     def test_wrong_pid_event_or_fake_irq_cannot_pass(self):
         source = valid_evidence()
