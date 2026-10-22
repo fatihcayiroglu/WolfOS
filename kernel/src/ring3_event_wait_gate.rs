@@ -1038,7 +1038,8 @@ mod tests {
             Err(CoordinatedError::Gate(Error::Stale)),
         );
         assert_eq!(table.snapshot(b_pid).unwrap().frames, b_frames);
-        assert_eq!(queue.reap(a), Ok(()));
+        // This unit test has no PMM to reclaim the returned lease; do not
+        // call runqueue.reap here. Hardware/PMM quiescence is a caller duty.
         assert_eq!(table.cancel_ready(b_pid, 0x90000),
             Err(TableError::Process(
                 standalone_process_table::standalone_process::ProcessError::WrongState,
