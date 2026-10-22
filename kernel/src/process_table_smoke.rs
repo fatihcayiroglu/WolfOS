@@ -55,6 +55,20 @@ pub fn verify() {
     { fail("allocated_frames_or_boot_root") }
 
     let mut table = ProcessTable::<RESIDENT, FRAMES>::new();
+    // Exercise a real-PMM physical alias BETWEEN members of one proposed
+    // transaction, not just aliases against previously published PIDs.
+    // Failure must preserve both the empty table and its starting PID.
+    let mut in_batch_alias = groups[1];
+    in_batch_alias[6] = groups[0][3];
+    if table.reserve_batch([
+        (groups[0][0], groups[0]),
+        (groups[1][0], in_batch_alias),
+    ]) != Err(TableError::PhysicalAlias)
+        || table.occupied() != 0
+        || table.running() != 0
+        || table.snapshot(1).is_some()
+    { fail("batch_cross_lease_alias_or_partial_pid") }
+
     // Admit three REAL 7-frame PMM leases atomically. A failed fourth
     // candidate must not publish an earlier member or mint partial PIDs.
     let residents = core::array::from_fn(|i| (groups[i][0], groups[i]));
