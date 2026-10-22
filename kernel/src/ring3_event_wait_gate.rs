@@ -1108,9 +1108,11 @@ mod tests {
         let fresh = queue.admit(fresh_pid).unwrap();
         assert_ne!(fresh, a);
         assert_eq!(gate.signal(&mut queue, a_ticket, 60), Err(Error::Stale));
+        // After cancellation the old PID is no longer a live owner. A
+        // replayed token must fail closed before touching the new owner.
         assert_eq!(gate.retire_parked_with_process(
             &mut queue, &mut table, &irq, a_ticket, 0x90000,
-        ), Err(CoordinatedError::Gate(Error::Stale)));
+        ), Err(CoordinatedError::WrongOwner));
         assert_eq!(table.snapshot(fresh_pid).unwrap().frames, a_frames);
         assert_eq!(table.snapshot(b_pid).unwrap().frames, b_frames);
         assert_eq!(queue.timer_switches(), 0);
