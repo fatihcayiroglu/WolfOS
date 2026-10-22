@@ -1048,6 +1048,75 @@ mod tests {
     }
 
     #[test]
+    fn cancel_one_of_two_blocked_owners_never_wakes_or_steals_the_other() {
+        let a_frames = core::array::from_fn(|i| 0x1000 + i as u64 * 4096);
+        let b_frames = core::array::from_fn(|i| 0x10000 + i as u64 * 4096);
+        let mut table = ProcessTable::<2, 7>::new();
+        let a_pid = table.reserve(a_frames[0], a_frames).unwrap();
+        let b_pid = table.reserve(b_frames[0], b_frames).unwrap();
+        let mut queue = Ring3RunQueue::<2>::new();
+        let a = queue.admit(a_pid).unwrap();
+        let b = queue.admit(b_pid).unwrap();
+        assert_eq!(queue.start_next(), Ok(a));
+        table.mark_running(a_pid, a_frames[0]).unwrap();
+        let mut gate = EventWaitGate::<2>::new();
+        let a_ticket = gate.arm(&queue, a, 60).unwrap();
+        assert_eq!(gate.commit_with_process(
+            &mut queue, &mut table, a_ticket, a_frames[0],
+        ), Ok(Commit::Parked(Some(b))));
+        table.mark_running(b_pid, b_frames[0]).unwrap();
+        let b_ticket = gate.arm(&queue, b, 61).unwrap();
+        assert_eq!(gate.commit_with_process(
+            &mut queue, &mut table, b_ticket, b_frames[0],
+        ), Ok(Commit::Parked(None)));
+        assert_eq!(queue.running(), None);
+        assert_eq!(table.running(), 0);
+        assert_eq!(gate.in_flight(), 2);
+
+        let irq = BspIrqEventBridge::new();
+        assert_eq!(gate.retire_parked_with_process(
+            &mut queue, &mut table, &irq, a_ticket, 0x90000,
+        ), Ok(a_frames));
+        assert_eq!(queue.slots()[0].state, State::Exited);
+        assert_eq!(queue.slots()[1].state, State::Blocked);
+        assert_eq!(queue.running(), None);
+        assert_eq!(table.snapshot(a_pid), None);
+        assert_eq!(table.snapshot(b_pid).unwrap().state, ProcessState::Blocked);
+        assert_eq!(table.snapshot(b_pid).unwrap().frames, b_frames);
+        assert_eq!(gate.in_flight(), 1);
+        assert_eq!(gate.signal(&mut queue, a_ticket, 60), Err(Error::Stale));
+        assert_eq!(queue.running(), None);
+
+        // The still-blocked independent owner may be notified without an
+        // unrelated cancellation fabricating any hardware timer switch.
+        assert_eq!(gate.signal_with_process(
+            &mut queue, &mut table, b_ticket, 61, 0x90000,
+        ), Ok(Delivery::Woken(b)));
+        assert_eq!(queue.running(), None);
+        assert_eq!(table.snapshot(b_pid).unwrap().state, ProcessState::Ready);
+        assert_eq!(gate.in_flight(), 0);
+        assert_eq!(queue.timer_switches(), 0);
+        assert_eq!(queue.start_next(), Ok(b));
+        table.mark_running(b_pid, b_frames[0]).unwrap();
+
+        // Model a trusted caller which has independently reclaimed the
+        // returned PMM frames and quiesced every saved CPU/FX reference.
+        // Reuse of the old slot and event ID must never revive the old ticket.
+        assert_eq!(queue.reap(a), Ok(()));
+        let fresh_pid = table.reserve(a_frames[0], a_frames).unwrap();
+        assert!(fresh_pid > b_pid);
+        let fresh = queue.admit(fresh_pid).unwrap();
+        assert_ne!(fresh, a);
+        assert_eq!(gate.signal(&mut queue, a_ticket, 60), Err(Error::Stale));
+        assert_eq!(gate.retire_parked_with_process(
+            &mut queue, &mut table, &irq, a_ticket, 0x90000,
+        ), Err(CoordinatedError::Gate(Error::Stale)));
+        assert_eq!(table.snapshot(fresh_pid).unwrap().frames, a_frames);
+        assert_eq!(table.snapshot(b_pid).unwrap().frames, b_frames);
+        assert_eq!(queue.timer_switches(), 0);
+    }
+
+    #[test]
     fn registry_capacity_is_bounded_and_no_lease_changes_on_refusal() {
         let mut q = Ring3RunQueue::<2>::new();
         let a = q.admit(1).unwrap();
