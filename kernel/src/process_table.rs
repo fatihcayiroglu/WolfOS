@@ -262,6 +262,62 @@ mod tests {
         assert_eq!(t.occupied(),0);
     }
     #[test]
+    fn four_resident_owners_survive_mixed_block_wake_exit_and_teardown() {
+        let mut t = ProcessTable::<4, 7>::new();
+        let owned = [
+            frames(0x1000), frames(0x10000),
+            frames(0x20000), frames(0x30000),
+        ];
+        let pid = core::array::from_fn::<_, 4, _>(|i| {
+            t.reserve(owned[i][0], owned[i]).unwrap()
+        });
+        assert_eq!(t.occupied(), 4);
+        assert_eq!(t.running(), 0);
+
+        t.mark_running(pid[0], owned[0][0]).unwrap();
+        assert_eq!(t.mark_running(pid[1], owned[1][0]), Err(TableError::AnotherRunning));
+        t.park_running(pid[0], owned[0][0]).unwrap();
+        t.mark_running(pid[1], owned[1][0]).unwrap();
+        t.block_running(pid[1], owned[1][0]).unwrap();
+        t.mark_running(pid[2], owned[2][0]).unwrap();
+        t.exit_zero(pid[2], owned[2][0]).unwrap();
+        t.mark_running(pid[3], owned[3][0]).unwrap();
+        t.park_running(pid[3], owned[3][0]).unwrap();
+        assert_eq!(t.running(), 0);
+
+        let snapshots = pid.map(|id| t.snapshot(id));
+        assert_eq!(snapshots[0].unwrap().state, ProcessState::Ready);
+        assert_eq!(snapshots[1].unwrap().state, ProcessState::Blocked);
+        assert_eq!(snapshots[2].unwrap().state, ProcessState::Exited);
+        assert_eq!(snapshots[3].unwrap().state, ProcessState::Ready);
+        for root in owned.map(|frames| frames[0]) {
+            assert_eq!(t.wake_blocked(pid[1], root),
+                Err(TableError::Process(ProcessError::ActiveCr3)));
+            assert_eq!(t.cancel_ready(pid[3], root),
+                Err(TableError::Process(ProcessError::ActiveCr3)));
+            assert_eq!(t.reap(pid[2], root),
+                Err(TableError::Process(ProcessError::ActiveCr3)));
+            assert_eq!(pid.map(|id| t.snapshot(id)), snapshots,
+                "a foreign user CR3 must never mutate any owner");
+        }
+
+        t.wake_blocked(pid[1], 0x90000).unwrap();
+        assert_eq!(t.snapshot(pid[1]).unwrap().state, ProcessState::Ready);
+        assert_eq!(t.reap(pid[2], 0x90000), Ok(owned[2]));
+        assert_eq!(t.snapshot(pid[2]), None);
+        assert_eq!(t.cancel_ready(pid[3], 0x90000), Ok(owned[3]));
+        assert_eq!(t.cancel_ready(pid[0], 0x90000), Ok(owned[0]));
+        assert_eq!(t.snapshot(pid[1]).unwrap().frames, owned[1]);
+        assert_eq!(t.cancel_ready(pid[1], 0x90000), Ok(owned[1]));
+        assert_eq!(t.occupied(), 0);
+        assert_eq!(t.running(), 0);
+        for (i, id) in pid.iter().enumerate() {
+            assert_eq!(t.snapshot(*id), None, "PID {i} must be retired");
+            assert_eq!(t.cancel_ready(*id, 0x90000), Err(TableError::UnknownPid));
+        }
+    }
+
+    #[test]
     fn reap_and_ready_cancel_reject_every_resident_foreign_cr3() {
         let mut t = ProcessTable::<3, 7>::new();
         let a = frames(0x1000);
