@@ -97,6 +97,8 @@ jobs:
         run: make p2-ring3-yield-smoke
       - name: P3 genuine two-ELF CPL3 WAIT SIGNAL resumed IRET with one-use event ticket and no PMM leaks
         run: make p3-ring3-event-wait-hardware-smoke
+      - name: P3 genuine BSP xAPIC IRQ wakes Blocked CPL3 WAIT, returns original IRET, strict EOI and 1/4-vCPU QEMU
+        run: make p3-ring3-irq-event-wake-smoke
       - name: P2 two actual native Ring3 ELF IF-enabled contexts with checked PID CR3 TSS FX and masked PIC (QEMU)
         run: make p2-ring3-irq-ready-smoke
       - name: P2 real xAPIC timer IRQ observed in two separate CPL3 ELF busy loops, guarded TSS.RSP0 and private CR3

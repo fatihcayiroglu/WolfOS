@@ -19,6 +19,27 @@ _start:
     // SYS_WAIT_EVENT: syscall and separate event must both be authenticated.
     mov eax, 10
 .else
+.ifdef WOLFOS_IRQ_EVENT_WAKE
+    // No voluntary SIGNAL or YIELD. PID2 is continuously RUNNING while
+    // PID1 remains BLOCKED. Only a genuine xAPIC IRQ is permitted to wake
+    // PID1. The IRQ dispatcher must switch away in this busy window.
+    mov ecx, 60000000
+.global _busy_begin
+.global _busy_end
+_busy_begin:
+    dec ecx
+    jnz _busy_begin
+_busy_end:
+    // Must not reach syscall EXIT before the verified IRQ woke PID1.
+    mov eax, 3
+    xor edi, edi
+    xor esi, esi
+    int 0x80
+    // Authenticate the genuine PID2 EXIT RIP exactly like PID1's EXIT;
+    // this path has no SIGNAL/YIELD and no earlier _yield_return.
+_exit_return:
+    jmp failed
+.else
     // Malicious or stale event delivered by real PID2 CPL3 code must
     // return an explicit error and never release PID1's blocked frame.
     // This intentionally exercises the syscall boundary, not a synthetic
@@ -42,6 +63,7 @@ _bad_signal_return:
     jne failed
     mov eax, 11
 .endif
+.endif
     mov edi, 77
     xor esi, esi
     int 0x80
@@ -63,9 +85,27 @@ _yield_return:
     xor edi, edi
     xor esi, esi
     int 0x80
+// PID2's isolated IRQ-wake workload already declared this symbol at
+// its no-SIGNAL EXIT above; all other flavors reach the normal exit RIP.
+.ifndef WOLFOS_IRQ_EVENT_WAKE
 _exit_return:
+.else
+.if WOLFOS_PID == 1
+_exit_return:
+.endif
+.endif
 failed:
     ud2
+
+// The IRQ wake build emits busy-window symbols for BOTH linked ELFs.
+.if WOLFOS_PID == 1
+.ifdef WOLFOS_IRQ_EVENT_WAKE
+.global _busy_begin
+.global _busy_end
+_busy_begin:
+_busy_end:
+.endif
+.endif
 
 .section .data
 .global progress

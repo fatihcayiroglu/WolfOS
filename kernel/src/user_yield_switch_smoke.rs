@@ -16,6 +16,8 @@ use crate::ring3_event_wait_gate::{
     Commit as EventCommit, Delivery as EventDelivery, Error as EventError,
     EventToken, EventWaitGate,
 };
+#[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+use crate::ring3_event_wait_gate::{BspIrqEventBridge, IrqEventTotals};
 #[cfg(feature="p3-ring3-four-elf-live-smoke")]
 use crate::ring3_irq_eoi_ledger::Ring3IrqEoiLedger;
 use x86_64::{VirtAddr,instructions::{interrupts as cpu_interrupts,tlb},
@@ -107,7 +109,8 @@ fn pic_write(port:u16,value:u8){
         options(nostack,nomem,preserves_flags));}
 }
 
-const TRAPS:usize=if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){5}
+const TRAPS:usize=if cfg!(feature="p3-ring3-irq-event-wake-smoke"){3}
+    else if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){5}
     else if cfg!(feature="p2-ring3-timer-nonyield-smoke"){COUNT}else{10};
 const ROUNDS:u64=if cfg!(feature="p3-ring3-event-wait-hardware-smoke"){1}
     else if cfg!(feature="p2-ring3-timer-nonyield-smoke"){16}else{4};
@@ -189,6 +192,10 @@ struct Runtime{
     event_wakes:u64,
     #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
     event_rejections:u64,
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    irq_event_bridge:BspIrqEventBridge,
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    irq_eoi_writes:u64,
 }
 struct BspRuntime(UnsafeCell<Option<Runtime>>);
 // SAFETY: only one BSP may access the runtime; IF=0 from admission until
@@ -293,6 +300,13 @@ pub extern "C" fn observe_timer_irq(
     }
     if s.timer_irqs[i]>100_000{
         fail("unexpected_interrupt_storm")
+    }
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    if i==1 && in_busy && s.event_wait.is_some() {
+        // Only reached via the real installed local xAPIC vector and a
+        // validated CPL3 hardware IRQ frame, NEVER a syscall or a policy
+        // test calling the event gate directly.
+        return irq_wake_blocked_user(s,raw);
     }
     // A REAL hardware timer IRQ may choose an independently mapped
     // OTHER PID's full hardware IRET frame, without a voluntary INT80.
@@ -402,18 +416,127 @@ pub extern "C" fn observe_timer_irq(
     }
     raw
 }
+/// P3 isolated hardware acceptance: an actual BSP xAPIC timer IRQ taken
+/// inside PID2's no-syscall Ring3 busy loop releases PID1's original parked
+/// INT80 wait frame, then resumes the saved IRET/GPR/FX image for PID1.
+///
+/// This handler runs on PID2's pinned supervisor RSP0 with IF=0, private
+/// CR3 and independently validated hardware frame. The APIC ISR register
+/// proves vector E0 is genuinely in-service before the single physical EOI.
+/// All process/event/queue bookkeeping is serialized under the same IRQ.
+#[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+fn irq_wake_blocked_user(
+    s:&mut Runtime, raw:*const UserSyscallFrame,
+)->*const UserSyscallFrame{
+    if cpu_interrupts::are_enabled()
+        || s.current!=1 || s.exits.iter().any(|done|*done)
+        || s.rr.running()!=Some(s.rr_handles[1])
+        || s.rr.slots()[0].state!=RrState::Blocked
+        || s.processes.running()!=1 || s.event_wakes!=0
+        || s.event_rejections!=0 || s.rr.timer_switches()!=0 {
+        fail("real_IRQ_wake_invalid_running_or_blocked_owner")
+    }
+    let ticket=s.event_wait.unwrap_or_else(||fail("real_IRQ_missing_wait_token"));
+    let saved=s.frames[0];
+    if saved!=s.stacks[0].top-user_syscall_abi::FRAME_BYTES as u64
+        || unsafe{(*(saved as *const UserSyscallFrame)).hardware.rip}!=after_yield(0)
+        || unsafe{(*(saved as *const UserSyscallFrame)).registers.rax}!=0
+        || unsafe{(*(saved as *const UserSyscallFrame)).registers.r12}!=1
+        || unsafe{(*(saved as *const UserSyscallFrame)).registers.r14}!=USER_ID[0] {
+        fail("real_IRQ_original_WAIT_frame_not_pinned")
+    }
+    // xAPIC ISR7 bit 0 corresponds exactly to the installed vector E0.
+    // Checking the hardware's in-service bit rejects a synthetic callback,
+    // EOI-after-the-fact replay and an unrelated interrupt vector.
+    let vector=crate::apic_timer_smoke::TIMER_VECTOR;
+    let isr_offset=0x100usize+usize::from(vector/32)*0x10;
+    let isr_mask=1u32<<(vector%32);
+    if vector!=0xe0 || isr_offset!=0x170
+        || unsafe{crate::user_xapic_high::read(isr_offset)}&isr_mask==0 {
+        fail("real_IRQ_wrong_vector_or_not_in_service")
+    }
+    let receipt=s.irq_event_bridge.capture(
+        &s.event_gate,ticket,vector,vector,EVENT_ID
+    ).unwrap_or_else(|_|fail("real_IRQ_duplicate_or_forged_receipt"));
+    // Exactly one physical write while E0 is still in service.
+    acknowledge_validated_timer_irq(s,1);
+    s.irq_event_bridge.acknowledge_physical_eoi(receipt)
+        .unwrap_or_else(|_|fail("real_IRQ_EOI_receipt_refused"));
+
+    // A wake may not alias PID2's currently executing USER CR3. The
+    // still-pinned high-half kernel stack is mapped in the trusted boot
+    // supervisor root; IF remains masked through the entire handoff.
+    let outgoing_root=s.leases[1][0];
+    unsafe{asm!("mov cr3, {}",in(reg)s.boot,
+                options(nostack,preserves_flags));}
+    if actual_cr3()!=s.boot {
+        fail("real_IRQ_supervisor_root_switch_failed")
+    }
+    let delivered=s.irq_event_bridge.deliver_after_eoi_with_process(
+        &mut s.event_gate,&mut s.rr,&mut s.processes,receipt,s.boot
+    );
+    unsafe{asm!("mov cr3, {}",in(reg)outgoing_root,
+                options(nostack,preserves_flags));}
+    if actual_cr3()!=outgoing_root
+        || delivered!=Ok(EventDelivery::Woken(s.rr_handles[0]))
+        || s.irq_event_bridge.verify_drained()!=Ok(IrqEventTotals{
+            entered:1,acknowledged:1,delivered:1,discarded:0,
+        }) {
+        fail("real_IRQ_after_EOI_wake_or_process_owner")
+    }
+    // This is an actual cross-PID timer IRQ decision, not a voluntary
+    // SIGNAL/YIELD syscall. Retain the source's complete hardware frame.
+    if s.rr.timer_tick(s.rr_handles[1])!=Ok(s.rr_handles[0])
+        || s.rr.timer_switches()!=1 {
+        fail("real_IRQ_round_robin_handoff")
+    }
+    s.frames[1]=raw as u64;
+    if s.processes.park_running(2,outgoing_root).is_err(){
+        fail("real_IRQ_source_process_not_parked")
+    }
+    if unsafe{s.fx.switch_to(s.fx_tokens[0])}.is_err()
+        || s.fx.image_xmm0(s.fx_tokens[1])!=Ok(USER_ID[1]){
+        fail("real_IRQ_fx_state_not_saved")
+    }
+    if !unsafe{interrupts::test_handoff_rsp0(s.stacks[0].top)}{
+        fail("real_IRQ_target_stack_not_mapped")
+    }
+    unsafe{asm!("mov cr3, {}",in(reg)s.leases[0][0],
+                options(nostack,preserves_flags));}
+    if actual_cr3()!=s.leases[0][0]
+        || s.processes.mark_running(1,s.leases[0][0]).is_err()
+        || s.processes.running()!=1 {
+        fail("real_IRQ_target_private_cr3_or_running_pid")
+    }
+    s.event_wait=None;
+    s.event_wakes=1;
+    s.current=0;
+    serial::write_line(
+        "WOLFOS_RING3_IRQ_WAKE_EOI_OK vector=224 source_pid=2 isr=1 physical_eoi=1 event_receipt=1"
+    );
+    serial::write_line(
+        "WOLFOS_RING3_IRQ_WAKE_HANDOFF_OK from=2 to=1 real_timer_switch=1 original_wait_iret=1 cr3_private=1 rsp0_guarded=1 fx_saved=1"
+    );
+    saved as *const UserSyscallFrame
+}
+
 /// Centralized exactly-once EOI callsite for a validated user timer IRQ.
 /// No serial I/O, locks, allocations or APIC reads on the successful path.
 #[cfg(any(feature="p2-ring3-timer-observe-smoke", feature="p2-ring3-timer-preempt-smoke"))]
 fn acknowledge_validated_timer_irq(s:&mut Runtime, i:usize){
     #[cfg(not(feature="p3-ring3-four-elf-live-smoke"))]
-    let _=(s,i);
+    let _=(&*s,i);
     // SAFETY: BSP IF=0, verified in-service xAPIC timer vector and
     // supervisor-only UC alias in the CURRENT trusted private CR3.
     unsafe{
         crate::user_xapic_high::write(
             crate::lapic_irq_layout::EOI_OFFSET,
             crate::lapic_irq_layout::EOI_VALUE);
+    }
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    {
+        s.irq_eoi_writes=s.irq_eoi_writes.checked_add(1)
+            .unwrap_or_else(||fail("real_IRQ_EOI_counter_overflow"));
     }
     #[cfg(feature="p3-ring3-four-elf-live-smoke")]
     if s.irq_eoi.acknowledge(i).is_err() {
@@ -483,8 +606,16 @@ fn prepare_elf(hhdm:u64,frames:[u64;7],source:*const [u64;512],
         after_exit(pid)>CODE && after_exit(pid)<DATA;
     #[cfg(not(feature="p2-ring3-timer-nonyield-smoke"))]
     let symbols_ok=entry(pid)==CODE && progress(pid)==DATA &&
-        after_yield(pid)>CODE && after_exit(pid)>after_yield(pid) &&
-        after_exit(pid)<DATA;
+        after_yield(pid)>CODE && after_yield(pid)<DATA &&
+        after_exit(pid)>CODE && after_exit(pid)<DATA &&
+        (if cfg!(feature="p3-ring3-irq-event-wake-smoke") && pid==1 {
+            // PID2's intentional no-SIGNAL EXIT is inside the busy
+            // section, before the unreachable legacy yield return.
+            // Both targets MUST still fall inside the real ELF RX page.
+            after_exit(pid)<after_yield(pid)
+        }else{
+            after_exit(pid)>after_yield(pid)
+        });
     if plan.entry!=CODE||plan.len!=2||!symbols_ok{
         fail("native_elf_symbols_or_layout")
     }
@@ -1055,6 +1186,10 @@ pub fn enter(hhdm:u64)->!{
         event_wakes:0,
         #[cfg(feature = "p3-ring3-event-wait-hardware-smoke")]
         event_rejections:0,
+        #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+        irq_event_bridge:BspIrqEventBridge::new(),
+        #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+        irq_eoi_writes:0,
     };
     unsafe{*RUNTIME.0.get()=Some(state);}
     let s=active();
@@ -1066,8 +1201,11 @@ pub fn enter(hhdm:u64)->!{
     }
     #[cfg(feature="p3-ring3-four-elf-live-smoke")]
     serial::write_line("WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=4");
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    serial::write_line("WOLFOS_RING3_IRQ_WAKE_START_OK native_elf=2 user_if=1 real_xapic=1 private_cr3=2 rsp0_guarded=2");
     #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),
-              not(feature="p3-ring3-four-elf-live-smoke")))]
+              not(feature="p3-ring3-four-elf-live-smoke"),
+              not(feature="p3-ring3-irq-event-wake-smoke")))]
     serial::write_line("WOLFOS_RING3_TIMER_ARMED_OK real_local_apic=1 user_if=1 no_yield_busy_loops=2");
     #[cfg(not(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
     serial::write_line(
@@ -1184,7 +1322,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     }
     let val=unsafe{(ptr(s.hhdm,s.leases[i][5]) as *const u64).read_volatile()};
     let n=f.registers.rax;
-    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    #[cfg(all(feature="p3-ring3-event-wait-hardware-smoke",
+              not(feature="p3-ring3-irq-event-wake-smoke")))]
     if i==1 && n==SYS_SIGNAL_EVENT
             && f.hardware.rip==sym::PID2_BAD_SIGNAL_RETURN {
         // The source is a genuine CPL3 syscall with a deliberately
@@ -1234,8 +1373,12 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     #[cfg(all(not(feature="p2-ring3-timer-nonyield-smoke"),
               not(feature="p3-ring3-event-wait-hardware-smoke")))]
     let is_yield=n==TEST_YIELD&&f.hardware.rip==after_yield(i);
-    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    #[cfg(all(feature="p3-ring3-event-wait-hardware-smoke",
+              not(feature="p3-ring3-irq-event-wake-smoke")))]
     let is_yield=(if i==0 {n==SYS_WAIT_EVENT}else{n==SYS_SIGNAL_EVENT})
+        && f.hardware.rip==after_yield(i);
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    let is_yield=i==0 && n==SYS_WAIT_EVENT
         && f.hardware.rip==after_yield(i);
     #[cfg(feature="p2-ring3-timer-nonyield-smoke")]
     let is_yield=false; // no syscall may act as a cooperative yield
@@ -1273,6 +1416,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 }
                 s.event_wait=Some(token);
             }else{
+                #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+                fail("IRQ_wake_mode_must_not_execute_user_signal");
                 // Only PID2's authenticated SIGNAL syscall can reach this
                 // branch. The trusted event and exact nonreused ticket must
                 // both match; this signal is not a timer IRQ and writes no EOI.
@@ -1325,7 +1470,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         f.registers.rax=0;
     }else{
         if val!=ROUNDS
-            ||s.yields[i]!=(if cfg!(feature="p2-ring3-timer-nonyield-smoke"){0}else{ROUNDS})
+            ||s.yields[i]!=(if cfg!(feature="p2-ring3-timer-nonyield-smoke")
+                ||(cfg!(feature="p3-ring3-irq-event-wake-smoke")&&i==1)
+                {0}else{ROUNDS})
             ||s.processes.exit_zero(pid,active_root).is_err(){
             fail("early_or_bad_exit")
         }
@@ -1333,7 +1480,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         {
             if i==0 && (s.event_wait.is_some() || s.event_wakes!=1
                 || s.rr.running()!=Some(s.rr_handles[0])
-                || s.rr.timer_switches()!=0){
+                || s.rr.timer_switches()!=(if cfg!(feature="p3-ring3-irq-event-wake-smoke"){1}else{0})){
                 fail("woken_pid_did_not_resume_own_cpl3_iret")
             }
             if s.rr.exit_current(s.rr_handles[i])
@@ -1403,10 +1550,14 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     if s.exits.iter().all(|done|*done) {
         if !s.exits[i] { fail("unexpected_finished_other") }
         if s.hardware_traps!=TRAPS ||
-            s.yields!=[if cfg!(feature="p2-ring3-timer-nonyield-smoke"){0}else{ROUNDS};COUNT] {
+            s.yields!=core::array::from_fn(|idx|
+                if cfg!(feature="p2-ring3-timer-nonyield-smoke")
+                    || (cfg!(feature="p3-ring3-irq-event-wake-smoke") && idx==1)
+                {0}else{ROUNDS}) {
             fail("incomplete_two_ELF_schedule")
         }
-        #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+        #[cfg(all(feature="p3-ring3-event-wait-hardware-smoke",
+                  not(feature="p3-ring3-irq-event-wake-smoke")))]
         {
             if s.event_wait.is_some() || s.event_wakes!=1
                 || s.event_rejections!=1 || s.event_gate.in_flight()!=0
@@ -1416,6 +1567,25 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             }
             serial::write_line(
                 "WOLFOS_RING3_EVENT_HARDWARE_OK user_wait=1 rejected_signal=1 trusted_signal=1 resumed_wait=1 exits=2 traps=5 timer_switches=0 real_int80_iret=1 independent_cr3=2 rsp0=2 fx=2");
+        }
+        #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+        {
+            let totals=s.irq_event_bridge.verify_drained()
+                .unwrap_or_else(|_|fail("IRQ_event_ledger_undrained"));
+            let total_irqs=s.timer_irqs.iter().sum::<u64>();
+            if s.event_wait.is_some()||s.event_wakes!=1
+                ||s.event_rejections!=0||s.event_gate.in_flight()!=0
+                ||s.rr.running().is_some()||s.rr.timer_switches()!=1
+                ||s.rr.slots().iter().any(|slot|slot.state!=RrState::Exited)
+                ||totals!=(IrqEventTotals{entered:1,acknowledged:1,delivered:1,discarded:0})
+                ||s.irq_eoi_writes!=total_irqs||s.timer_busy[1]==0
+                ||total_irqs==0 {
+                fail("IRQ_real_event_wake_accounting_or_EOI")
+            }
+            serial::write_fmt(format_args!(
+                "WOLFOS_RING3_IRQ_WAKE_HARDWARE_OK events=1 timer_switches=1 signal_syscalls=0 voluntary_yields=0 traps=3 physical_irqs={} physical_eois={} private_cr3=2 fx=2\n",
+                total_irqs,s.irq_eoi_writes
+            ));
         }
         if unsafe{s.fx.suspend(s.fx_tokens[i])}.is_err(){
             fail("capture_last_pid_fx")
@@ -1435,7 +1605,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=0"
         );
-        #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),not(feature="p2-ring3-timer-nonyield-smoke")))]
+        #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),
+                  not(feature="p2-ring3-timer-nonyield-smoke"),
+                  not(feature="p3-ring3-irq-event-wake-smoke")))]
         serial::write_line(
             "WOLFOS_RING3_IRQ_READY_OK actual_cpl3_if=1 hardware_int80_traps=10 pid_cr3_rsp0_fx_checks=10 pic_masked=1 timer_armed=1"
         );
@@ -1450,8 +1622,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         );
         #[cfg(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))]
         {
-            if s.timer_busy.iter().any(|&v|v==0)||
-                s.timer_irqs.iter().any(|&v|v==0){
+            let missing_timer=if cfg!(feature="p3-ring3-irq-event-wake-smoke"){
+                s.timer_busy[1]==0 || s.timer_irqs[1]==0
+            }else{
+                s.timer_busy.iter().any(|&v|v==0)||
+                s.timer_irqs.iter().any(|&v|v==0)
+            };
+            if missing_timer {
                 fail("missing_real_cpl3_busy_loop_timer_irq")
             }
             TIMER_LIVE.store(false,core::sync::atomic::Ordering::Release);
@@ -1553,7 +1730,8 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     switches,s.timer_preempts[0],s.timer_preempts[1]
                 ));
             }
-            #[cfg(not(feature = "p2-ring3-timer-preempt-smoke"))]
+            #[cfg(all(not(feature = "p2-ring3-timer-preempt-smoke"),
+                      not(feature="p3-ring3-irq-event-wake-smoke")))]
             serial::write_fmt(format_args!(
                 "WOLFOS_RING3_TIMER_HARDWARE_OK real_apic_irqs={} pid1_busy_irqs={} pid2_busy_irqs={} eoi_each=1 real_user_if=1 yield_free_busy_windows=8 same_pid_iret=1\n",
                 s.timer_irqs[0]+s.timer_irqs[1],
@@ -1738,11 +1916,16 @@ extern "C" fn finalize()->! {
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=25 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
-    #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
+    #[cfg(all(feature="p3-ring3-event-wait-hardware-smoke",
+              not(feature="p3-ring3-irq-event-wake-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_EVENT_CLEANUP_OK frames_freed=25 wait_ticket_drained=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
-    #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),not(feature="p2-ring3-timer-nonyield-smoke")))]
+    #[cfg(feature="p3-ring3-irq-event-wake-smoke")]
+    serial::write_line(
+        "WOLFOS_RING3_IRQ_WAKE_CLEANUP_OK frames_freed=28 wait_ticket_drained=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
+    );
+    #[cfg(all(any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"),not(feature="p2-ring3-timer-nonyield-smoke"),not(feature="p3-ring3-irq-event-wake-smoke")))]
     serial::write_line(
         "WOLFOS_RING3_YIELD_CLEANUP_OK frames_freed=28 both_ELF_exited=1 fx_wiped=2 tss_restored=1 cr3_restored=1 pmm_no_leak=1"
     );
