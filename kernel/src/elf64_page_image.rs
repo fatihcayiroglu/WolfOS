@@ -224,7 +224,7 @@ mod tests {
             [&mut a, &mut b, &mut c],
         ), Err(MaterializeError::DuplicateVirtualPage));
         let mut out_of_file = data;
-        out_of_file.file_offset = 0x800;
+        out_of_file.file_offset = 0x1180; // preserve VA/file page offset
         assert_eq!(materialize_batch(
             &image, [(&text, 0x401000), (&text, 0x402000),
                      (&out_of_file, 0x403000)],
