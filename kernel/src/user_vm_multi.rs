@@ -188,6 +188,29 @@ pub fn validate_elf_bindings(
     Ok(plan)
 }
 
+/// Strict post-install audit bound to the original ELF bytes, not merely
+/// to a caller-supplied page list. Fail closed if the byte-derived PT_LOAD
+/// layout, stack permissions, PTE flags, physical frame ownership or ANY
+/// hidden high-half/unused shadow entry differs.
+///
+/// This is an offline audit of a disconnected root. The hardware CR3,
+/// actual frame contents and loader-byte immutability remain caller-owned.
+pub fn audit_elf_bindings(
+    image: &[u8],
+    stack_page: u64,
+    pml4: &[u64; ENTRY_COUNT],
+    pdpt: &[u64; ENTRY_COUNT],
+    pd: &[u64; ENTRY_COUNT],
+    pt: &[u64; ENTRY_COUNT],
+    tables: [u64; TABLE_FRAMES],
+    pages: &[UserPage],
+) -> Result<ImagePlan, ElfBindingError> {
+    let plan = validate_elf_bindings(image, stack_page, tables, pages)?;
+    audit(pml4, pdpt, pd, pt, tables, pages)
+        .map_err(ElfBindingError::PhysicalOrRoot)?;
+    Ok(plan)
+}
+
 /// Install a fixed set of pages in an EMPTY 4-level shadow hierarchy.
 /// Parent W bit is set if any leaf needs write permission; individual
 /// RX code leaves remain read-only by their *leaf* PTE. No W+X allowed.
@@ -282,6 +305,50 @@ mod tests {
         bytes[168..176].copy_from_slice(&4096u64.to_le_bytes());
         bytes[0x100] = 0xc3;
         bytes
+    }
+
+    #[test]
+    fn exact_elf_and_real_pte_audit_rejects_permission_and_hidden_alias_corruption() {
+        let elf = elf_fixture();
+        let mut b = bank();
+        let [root, pdpt, pd, pt] = &mut b;
+        populate(root, pdpt, pd, pt, TABLES, &PAGES).unwrap();
+        let [root, pdpt, pd, pt] = &b;
+        let expected = validate_elf_bindings(&elf, 0x404000, TABLES, &PAGES).unwrap();
+        assert_eq!(
+            audit_elf_bindings(&elf, 0x404000, root, pdpt, pd, pt, TABLES, &PAGES),
+            Ok(expected)
+        );
+        // Even if the page list still passes the ELF preflight binding,
+        // actual shadow PTEs must not gain W on executable code, X on a
+        // data/stack leaf or a hidden kernel-half user alias.
+        for (table, slot, flag) in [
+            (3usize, 1usize, WRITABLE),
+            (3, 3, NX),
+            (3, 4, NX),
+            (0, 511, PRESENT | USER),
+        ] {
+            let mut broken = b;
+            broken[table][slot] ^= flag;
+            let [root, pdpt, pd, pt] = &broken;
+            assert_eq!(
+                audit_elf_bindings(&elf, 0x404000, root, pdpt, pd, pt, TABLES, &PAGES),
+                Err(ElfBindingError::PhysicalOrRoot(MultiError::MismatchedLayout)),
+            );
+            // The audit is a pure read-only operation.
+            assert_eq!(broken[table][slot], b[table][slot] ^ flag);
+        }
+        let mut altered_elf = elf;
+        altered_elf[124..128].copy_from_slice(&5u32.to_le_bytes()); // data becomes RX
+        let [root, pdpt, pd, pt] = &b;
+        assert_eq!(
+            audit_elf_bindings(&altered_elf, 0x404000, root, pdpt, pd, pt, TABLES, &PAGES),
+            Err(ElfBindingError::PermissionMismatch),
+        );
+        assert_eq!(
+            audit_elf_bindings(&elf, 0x403000, root, pdpt, pd, pt, TABLES, &PAGES),
+            Err(ElfBindingError::StackInvalid),
+        );
     }
 
     #[test]
