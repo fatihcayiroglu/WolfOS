@@ -32,6 +32,22 @@ use standalone_table::standalone_process::ProcessState;
 #[cfg(not(test))]
 use crate::process_lifecycle::ProcessState;
 
+// Reuse the strict allocation-free ET_EXEC validator directly so this
+// policy module remains independently rustc --test-able across QEMU flavors.
+#[path = "elf64_preflight.rs"]
+mod elf_preflight_for_admission;
+use elf_preflight_for_admission::{preflight as validate_elf, ElfError, PAGE_BYTES};
+
+/// No PID, PMM lease or saved IRET frame is published if the ELF-to-frame
+/// validation fails, even for a late member of a multi-process batch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElfAdmissionError {
+    Image { index: usize, reason: ElfError },
+    EntryMismatch { index: usize },
+    UnsafeUserStack { index: usize },
+    Registry(GuardedBatchError<ContextError>),
+}
+
 pub const KSTACK_BYTES: u64 = 16 * 1024;
 const USER_MIN: u64 = 0x10000;
 const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -234,6 +250,53 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
         // in this trusted single-threaded/IRQ-disabled metadata phase.
         *self = staged_bank;
         Ok(pids)
+    }
+
+    /// Validate each exact ELF64 ET_EXEC byte image BEFORE jointly
+    /// publishing fresh PID/PMM leases and saved bootstrap CPU contexts.
+    ///
+    /// Every RIP must match that image's strictly preflighted file-backed
+    /// executable entry. The proposed aligned user RSP must address a
+    /// separate lower-half stack page, not any PT_LOAD page of that ELF.
+    /// The trusted loader MUST independently allocate/map/pin those pages
+    /// and revalidate the bytes before making an actual hardware handoff.
+    /// No mapping, physical PMM free, ELF execution, FX save or IRET occurs.
+    ///
+    /// A bad later ELF/entry/stack leaves BOTH registries unmodified;
+    /// registry validation itself is performed by the same joint atomic
+    /// transaction used for arbitrary bootstrap admission.
+    pub fn admit_elf_batch<const N: usize, const COUNT: usize>(
+        &mut self,
+        table: &mut ProcessTable<SLOTS, N>,
+        requests: [(&[u8], [u64; N], KernelStack, UserSyscallFrame); COUNT],
+    ) -> Result<[u64; COUNT], ElfAdmissionError> {
+        for (index, (image, _, _, frame)) in requests.iter().enumerate() {
+            let plan = validate_elf(image).map_err(|reason|
+                ElfAdmissionError::Image { index, reason }
+            )?;
+            if frame.hardware.rip != plan.entry {
+                return Err(ElfAdmissionError::EntryMismatch { index });
+            }
+            // On x86-64 the first push touches RSP-1. Reject a stack in
+            // the mapped image, including BSS and shared text-page tails.
+            let Some(last_byte) = frame.hardware.rsp.checked_sub(1) else {
+                return Err(ElfAdmissionError::UnsafeUserStack { index });
+            };
+            let page = last_byte & !(PAGE_BYTES - 1);
+            if frame.hardware.rsp & 15 != 0
+                || page < USER_MIN || page >= USER_END
+                || plan.segments.iter().flatten().any(|seg|
+                    page < seg.page_end && seg.page_start < page + PAGE_BYTES
+                )
+            {
+                return Err(ElfAdmissionError::UnsafeUserStack { index });
+            }
+        }
+        let contexts = core::array::from_fn(|i| {
+            (requests[i].1, requests[i].2, requests[i].3)
+        });
+        self.admit_bootstrap_batch(table, contexts)
+            .map_err(ElfAdmissionError::Registry)
     }
 
     /// Snapshot the entire hardware trap, but only from a live PID whose
@@ -590,6 +653,115 @@ mod tests {
         assert_eq!(table.reserve_batch([(roots[0], owned[0])]), Ok([5]),
             "failed bootstrap must not resurrect stale PID generations");
         assert_eq!(table.cancel_ready(5, 0x90000), Ok(owned[0]));
+    }
+
+    fn staged_et_exec(entry: u64) -> [u8; 512] {
+        let mut data = [0u8; 512];
+        data[..4].copy_from_slice(b"\x7fELF");
+        data[4..7].copy_from_slice(&[2, 1, 1]);
+        data[16..18].copy_from_slice(&2u16.to_le_bytes());
+        data[18..20].copy_from_slice(&62u16.to_le_bytes());
+        data[20..24].copy_from_slice(&1u32.to_le_bytes());
+        data[24..32].copy_from_slice(&entry.to_le_bytes());
+        data[32..40].copy_from_slice(&64u64.to_le_bytes());
+        data[52..54].copy_from_slice(&64u16.to_le_bytes());
+        data[54..56].copy_from_slice(&56u16.to_le_bytes());
+        data[56..58].copy_from_slice(&1u16.to_le_bytes());
+        data[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+        data[68..72].copy_from_slice(&5u32.to_le_bytes()); // R|X
+        data[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+        data[80..88].copy_from_slice(&entry.to_le_bytes());
+        data[96..104].copy_from_slice(&8u64.to_le_bytes());
+        data[104..112].copy_from_slice(&0x900u64.to_le_bytes());
+        data[112..120].copy_from_slice(&4096u64.to_le_bytes());
+        data[0x100] = 0x90;
+        data
+    }
+
+    #[test]
+    fn elf64_gate_refuses_late_corrupt_image_entry_and_colliding_user_stack_atomically() {
+        let a = staged_et_exec(0x401100);
+        let b = staged_et_exec(0x501100);
+        let mut bad = staged_et_exec(0x601100);
+        let mut table = ProcessTable::<3, 7>::new();
+        let mut bank = UserContextBank::<3>::new();
+        let owned = [frames(0x10000), frames(0x20000), frames(0x30000)];
+        let stacks = [
+            stack(0xffff_8000_0d00_0000),
+            stack(0xffff_8000_0d01_0000),
+            stack(0xffff_8000_0d02_0000),
+        ];
+        let entries = [
+            frame(0x401100, 1), frame(0x501100, 2), frame(0x601100, 3),
+        ];
+        // Malformed late ET_EXEC is rejected before ANY process generation
+        // or saved bootstrap context can be published.
+        bad[68..72].copy_from_slice(&7u32.to_le_bytes()); // W+X
+        assert_eq!(bank.admit_elf_batch(&mut table, [
+            (&a, owned[0], stacks[0], entries[0]),
+            (&b, owned[1], stacks[1], entries[1]),
+            (&bad, owned[2], stacks[2], entries[2]),
+        ]), Err(ElfAdmissionError::Image {
+            index: 2, reason: ElfError::InvalidPermissions,
+        }));
+        assert_eq!((table.occupied(), bank.count()), (0, 0));
+
+        let mut wrong_entry = entries[1];
+        wrong_entry.hardware.rip += 1;
+        assert_eq!(bank.admit_elf_batch(&mut table, [
+            (&a, owned[0], stacks[0], entries[0]),
+            (&b, owned[1], stacks[1], wrong_entry),
+        ]), Err(ElfAdmissionError::EntryMismatch { index: 1 }));
+        assert_eq!((table.occupied(), bank.count()), (0, 0));
+
+        let mut stack_in_text = entries[1];
+        stack_in_text.hardware.rsp = 0x501180;
+        assert_eq!(bank.admit_elf_batch(&mut table, [
+            (&a, owned[0], stacks[0], entries[0]),
+            (&b, owned[1], stacks[1], stack_in_text),
+        ]), Err(ElfAdmissionError::UnsafeUserStack { index: 1 }));
+        assert_eq!((table.occupied(), bank.count()), (0, 0));
+
+        // ET_EXEC validation can succeed but late registry validation must
+        // still roll back BOTH ledgers, including all minted PID numbers.
+        let mut bad_flags = entries[1];
+        bad_flags.hardware.rflags = 0x202;
+        assert_eq!(bank.admit_elf_batch(&mut table, [
+            (&a, owned[0], stacks[0], entries[0]),
+            (&b, owned[1], stacks[1], bad_flags),
+        ]), Err(ElfAdmissionError::Registry(
+            GuardedBatchError::Validate(ContextError::BadFlags)
+        )));
+        assert_eq!((table.occupied(), bank.count()), (0, 0));
+
+        let minted = bank.admit_elf_batch(&mut table, [
+            (&a, owned[0], stacks[0], entries[0]),
+            (&b, owned[1], stacks[1], entries[1]),
+        ]).unwrap();
+        assert_eq!(minted, [1, 2]);
+        assert_eq!(table.occupied(), 2);
+        assert_eq!(bank.count(), 2);
+        for i in 0..2 {
+            assert_eq!(table.snapshot(minted[i]).unwrap().frames, owned[i]);
+            assert_eq!(bank.snapshot(minted[i]).unwrap().frame, entries[i]);
+        }
+        let frozen = (table.snapshot(1), table.snapshot(2),
+                      bank.snapshot(1), bank.snapshot(2));
+        let mut text_overwrite = entries[2];
+        text_overwrite.hardware.rsp = 0x601120;
+        assert_eq!(bank.admit_elf_batch(&mut table, [
+            (&bad, owned[2], stacks[2], text_overwrite),
+        ]), Err(ElfAdmissionError::Image {
+            index: 0, reason: ElfError::InvalidPermissions,
+        }));
+        assert_eq!((table.snapshot(1), table.snapshot(2),
+                    bank.snapshot(1), bank.snapshot(2)), frozen);
+        for i in [1usize, 0] {
+            assert_eq!(table.cancel_ready(minted[i], 0x90000), Ok(owned[i]));
+            bank.retire(&table, minted[i]).unwrap();
+        }
+        assert_eq!((table.occupied(), bank.count()), (0, 0));
+        assert_eq!(bank.admit_elf_batch::<7, 0>(&mut table, []), Ok([]));
     }
 
     #[test]
