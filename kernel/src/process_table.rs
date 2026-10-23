@@ -35,6 +35,13 @@ impl From<ProcessError> for TableError {
     fn from(err: ProcessError) -> Self { Self::Process(err) }
 }
 
+/// A joint metadata admission did not mutate the owning process table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardedBatchError<E> {
+    Table(TableError),
+    Validate(E),
+}
+
 pub struct ProcessTable<const SLOTS: usize, const FRAMES: usize> {
     slots: [ProcessRecord<FRAMES>; SLOTS],
     last_pid: u64,
@@ -135,6 +142,26 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         }
         *self = staged;
         Ok(minted)
+    }
+
+    /// Stage a batch without committing either PID ownership or generation
+    /// until a second trusted, read-only validation of the prospective table
+    /// succeeds. Callers must stage THEIR other metadata privately during
+    /// validation; never expose hardware state or publish external effects.
+    ///
+    /// On either error, this table is byte-for-byte unchanged, including
+    /// the monotonic PID allocator. No physical PMM pages are allocated,
+    /// mapped, activated or released by this policy-only helper.
+    pub fn reserve_batch_checked<const COUNT: usize, E>(
+        &mut self,
+        leases: [(u64, [u64; FRAMES]); COUNT],
+        validate: impl FnOnce(&Self, [u64; COUNT]) -> Result<(), E>,
+    ) -> Result<[u64; COUNT], GuardedBatchError<E>> {
+        let mut staged = Self { slots: self.slots, last_pid: self.last_pid };
+        let pids = staged.reserve_batch(leases).map_err(GuardedBatchError::Table)?;
+        validate(&staged, pids).map_err(GuardedBatchError::Validate)?;
+        *self = staged;
+        Ok(pids)
     }
 
     /// Current phase admits multiple READY entries but only ONE running
