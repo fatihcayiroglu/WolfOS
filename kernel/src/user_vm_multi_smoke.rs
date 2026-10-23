@@ -7,7 +7,7 @@
 use crate::{
     elf64_preflight::preflight,
     elf64_page_image::{materialize_batch, audit_materialized_batch, audit_zeroed_stack, PageAuditError, PAGE_SIZE},
-    kernel_half_shadow, pmm, serial,
+    kernel_half_shadow, pmm, serial, user_image_admission::{self, BackingPage},
     user_vm_layout::ENTRY_COUNT,
     user_vm_multi::{self, UserPage},
 };
@@ -212,6 +212,28 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
             loads, [&*first, &*second, &*third], fourth,
         ) != Ok(plan) { return false; }
 
+        // Stronger physical provenance: each byte borrow must point to its
+        // OWN HHDM-mapped PMM frame, not a swapped caller-owned buffer.
+        // The independent ready_image_gate above already verified the ELF
+        // plan and exact PTE flags; this gate binds frame identity to bytes.
+        let file_backings = [
+            BackingPage { virtual_address: TEXT,
+                physical_frame: frames[4], bytes: &*first },
+            BackingPage { virtual_address: TEXT_BSS,
+                physical_frame: frames[5], bytes: &*second },
+            BackingPage { virtual_address: DATA,
+                physical_frame: frames[6], bytes: &*third },
+        ];
+        let stack_backing = BackingPage { virtual_address: STACK,
+            physical_frame: frames[7], bytes: &*fourth };
+        if user_image_admission::audit_hhdm_backings(
+            hhdm, &file_backings, stack_backing,
+        ).is_err() || user_image_admission::audit_staged_image(
+            &file, STACK, [frames[0], frames[1], frames[2], frames[3]],
+            &pages, root, pdpt, pd, pt,
+            &file_backings, stack_backing,
+        ) != Ok(plan) { return false; }
+
         // Snapshot the actual live Limine PML4 via HHDM WITHOUT modifying it.
         // The new root's four page tables are private PMM frames, while the
         // kernel upper half intentionally shares the live boot paging trees.
@@ -292,7 +314,7 @@ pub fn verify(hhdm: u64) -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 hhdm_backing=1 staged_admission=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
     true
 }
