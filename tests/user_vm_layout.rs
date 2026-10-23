@@ -2,6 +2,8 @@
 //! layout under the host Rust test harness. Neither module executes images.
 #[path = "../kernel/src/elf64_preflight.rs"]
 mod elf64_preflight;
+#[path = "../kernel/src/elf64_page_image.rs"]
+mod elf64_page_image;
 #[path = "../kernel/src/user_vm_layout.rs"]
 mod user_vm_layout;
 #[path = "../kernel/src/user_vm_multi.rs"]
