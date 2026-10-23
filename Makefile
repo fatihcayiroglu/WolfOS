@@ -13,6 +13,8 @@ else ifeq ($(FLAVOR),exception)
 FEATURES := --features exception-smoke
 else ifeq ($(FLAVOR),address-space-retirement)
 FEATURES := --features address-space-retirement-smoke
+else ifeq ($(FLAVOR),smp-address-space-retirement)
+FEATURES := --features smp-address-space-retirement-smoke
 else ifeq ($(FLAVOR),paging-fault)
 FEATURES := --features paging-fault-smoke
 else ifeq ($(FLAVOR),timer)
@@ -151,6 +153,11 @@ smoke:
 address-space-retirement-smoke:
 	$(MAKE) iso FLAVOR=address-space-retirement
 	python3 scripts/address_space_retirement_smoke.py $(OUT)/wolfos-address-space-retirement.iso
+
+.PHONY: smp-address-space-retirement-smoke
+smp-address-space-retirement-smoke:
+	$(MAKE) iso FLAVOR=smp-address-space-retirement
+	python3 scripts/address_space_retirement_smoke.py $(OUT)/wolfos-smp-address-space-retirement.iso --smp
 
 exception-smoke:
 	$(MAKE) iso FLAVOR=exception

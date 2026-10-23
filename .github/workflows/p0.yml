@@ -56,6 +56,8 @@ jobs:
         run: make user-vm-shadow-smoke
       - name: BSP address-space retirement gate with real CR3 activation and inactive-root PMM cleanup (1/4 vCPUs)
         run: make address-space-retirement-smoke
+      - name: Four real CPU CR3 departures gate retirement, including deliberately withheld last AP
+        run: make smp-address-space-retirement-smoke
       - name: P2 user descriptor and TSS.RSP0 / TR preflight (CPL0-only QEMU)
         run: make user-ring-prep-smoke
       - name: P2 REAL CPL3 / INT80 / IRETQ roundtrip (single-vCPU QEMU)

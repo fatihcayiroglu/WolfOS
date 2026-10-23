@@ -16,6 +16,7 @@ On Ubuntu: `sudo apt install build-essential git make xorriso qemu-system-x86 ov
 - `make test`: Python source/config tests plus Rust host unit tests
 - `make smoke`: boot and serial assertions in QEMU
 - `make address-space-retirement-smoke`: BSP-only activation/retirement gate with real private CR3 loads, including a reservation racing retirement (1/4-vCPU QEMU; no Ring3 or SMP shootdown)
+- `make smp-address-space-retirement-smoke`: four real CPU CR3 departures, with the last AP deliberately held active before exact root-frame cleanup (CPL0 only; no IPI shootdown)
 - `make exception-smoke`: CPU exception dispatch
 - `make paging-fault-smoke`: mapping/unmapping and fault dispatch
 - `make topology-smoke`: ACPI/MADT plus 1/4-vCPU SMP and saved-context checks
