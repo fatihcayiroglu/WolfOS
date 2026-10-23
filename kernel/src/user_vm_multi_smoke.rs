@@ -8,6 +8,7 @@ use crate::{
     elf64_preflight::preflight,
     elf64_page_image::{materialize_batch, audit_materialized_batch, audit_zeroed_stack, PageAuditError, PAGE_SIZE},
     kernel_half_shadow, pmm, serial, user_image_admission::{self, BackingPage},
+    pmm_frame_batch::{FrameBatch, FrameSource, AcquireError, ReleaseReport},
     user_vm_layout::ENTRY_COUNT,
     user_vm_multi::{self, UserPage},
 };
@@ -19,6 +20,24 @@ const TEXT: u64 = 0x401000;
 const TEXT_BSS: u64 = 0x402000;
 const DATA: u64 = 0x403000;
 const STACK: u64 = 0x404000;
+
+struct RealPmm {
+    remaining: usize,
+}
+
+impl FrameSource for RealPmm {
+    fn allocate(&mut self) -> Option<u64> {
+        if self.remaining == 0 { return None; }
+        let frame = pmm::allocate_frame()?;
+        self.remaining -= 1;
+        Some(frame)
+    }
+
+    fn release(&mut self, frame: u64) -> bool {
+        pmm::free_frame(frame).is_ok()
+    }
+}
+
 
 fn put16(b: &mut [u8], pos: usize, val: u16) {
     b[pos..pos + 2].copy_from_slice(&val.to_le_bytes());
@@ -287,34 +306,56 @@ pub fn verify(hhdm: u64) -> bool {
     let before = pmm::statistics().allocated_frames;
     let (cr3, _) = Cr3::read();
     let cr3_before = cr3.start_address().as_u64();
-    let mut frames = [0u64; FRAME_TOTAL];
-    let mut acquired = 0usize;
-    for frame in frames.iter_mut() {
-        let Some(value) = pmm::allocate_frame() else { break; };
-        *frame = value;
-        acquired += 1;
+
+    // Real PMM fault injection: the fourth requested frame is unavailable.
+    // All three already-owned frames MUST be returned before the caller can
+    // proceed, and the PMM live-allocation counter must be unchanged.
+    let mut limited = RealPmm { remaining: 3 };
+    let rollback = matches!(
+        FrameBatch::<_, FRAME_TOTAL>::acquire(&mut limited),
+        Err(AcquireError::Exhausted {
+            acquired: 3,
+            rollback: ReleaseReport { released: 3, failed: 0 },
+        })
+    ) && pmm::statistics().allocated_frames == before;
+    if !rollback {
+        serial::write_line("WOLFOS_USER_MULTI_ERROR injected_rollback=0");
+        return false;
     }
-    let exclusive = acquired == FRAME_TOTAL
-        && frames.iter().enumerate().all(|(i, frame)|
-            *frame != 0 && *frame % 4096 == 0 && !frames[..i].contains(frame)
-        );
+
+    // Stage every real PMM frame under a single non-cloneable owner.
+    // Even an early return triggers cleanup; explicit close reports errors.
+    let mut source = RealPmm { remaining: FRAME_TOTAL };
+    let batch = match FrameBatch::<_, FRAME_TOTAL>::acquire(&mut source) {
+        Ok(batch) => batch,
+        Err(error) => {
+            serial::write_fmt(format_args!(
+                "WOLFOS_USER_MULTI_ERROR frame_batch_acquire={error:?}\n",
+            ));
+            return false;
+        }
+    };
+    let frames = *batch.frames();
+    let exclusive = frames.iter().enumerate().all(|(i, frame)|
+        *frame != 0 && *frame % 4096 == 0 && !frames[..i].contains(frame)
+    );
     let verified = exclusive && prove(hhdm, &frames);
-    let mut freed = 0usize;
-    for physical in frames[..acquired].iter().rev().copied() {
-        if pmm::free_frame(physical).is_ok() { freed += 1; }
-    }
+    let cleanup = batch.close();
+    let freed = cleanup.released;
     let (now, _) = Cr3::read();
     let cr3_unchanged = now.start_address().as_u64() == cr3_before;
     let no_leak = pmm::statistics().allocated_frames == before;
-    if !verified || freed != FRAME_TOTAL || !cr3_unchanged || !no_leak {
+    if !verified || freed != FRAME_TOTAL || cleanup.failed != 0
+        || !cr3_unchanged || !no_leak
+    {
         serial::write_fmt(format_args!(
-            "WOLFOS_USER_MULTI_ERROR allocated={} verified={} freed={} cr3={} accounting={}\n",
-            acquired, verified, freed, cr3_unchanged, no_leak,
+            "WOLFOS_USER_MULTI_ERROR allocated={} verified={} freed={} release_failed={} cr3={} accounting={}\n",
+            FRAME_TOTAL, verified, freed, cleanup.failed, cr3_unchanged, no_leak,
         ));
         return false;
     }
     serial::write_line(
-        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 hhdm_backing=1 staged_admission=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 hhdm_backing=1 staged_admission=1 frame_batch=1 injected_rollback=3 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
     true
 }
