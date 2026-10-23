@@ -6,7 +6,7 @@ use x86_64::registers::control::Cr3;
 use crate::{
     pmm, serial,
     process_table::{ProcessTable, TableError, GuardedBatchError},
-    user_context_bank::{UserContextBank, KernelStack, KSTACK_BYTES, ContextError},
+    user_context_bank::{UserContextBank, KernelStack, KSTACK_BYTES, ContextError, ElfAdmissionError},
     user_syscall_abi::UserSyscallFrame,
 };
 
@@ -56,13 +56,39 @@ fn context_stack(slot: usize) -> KernelStack {
 
 fn bootstrap_frame(slot: usize) -> UserSyscallFrame {
     let mut frame = UserSyscallFrame::default();
-    frame.hardware.rip = 0x401000 + slot as u64 * 0x1000;
+    frame.hardware.rip = 0x401100 + slot as u64 * 0x1000;
     frame.hardware.rsp = 0x405000;
     frame.hardware.cs = 0x2b;
     frame.hardware.ss = 0x23;
     frame.hardware.rflags = 0x2;
     frame.registers.rax = slot as u64 + 1;
     frame
+}
+
+/// Bounded kernel-resident ET_EXEC file bytes. These bytes are parsed
+/// in QEMU but NOT mapped or executed as user instructions in this flavor.
+fn elf_bytes(slot: usize) -> [u8; 512] {
+    let mut bytes = [0u8; 512];
+    let entry = 0x401100u64 + slot as u64 * 0x1000;
+    bytes[..4].copy_from_slice(b"\x7fELF");
+    bytes[4..7].copy_from_slice(&[2, 1, 1]);
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+    bytes[18..20].copy_from_slice(&62u16.to_le_bytes()); // AMD64
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&entry.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+    bytes[68..72].copy_from_slice(&5u32.to_le_bytes()); // R|X
+    bytes[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+    bytes[80..88].copy_from_slice(&entry.to_le_bytes());
+    bytes[96..104].copy_from_slice(&8u64.to_le_bytes());
+    bytes[104..112].copy_from_slice(&0x900u64.to_le_bytes());
+    bytes[112..120].copy_from_slice(&4096u64.to_le_bytes());
+    bytes[0x100] = 0x90;
+    bytes
 }
 
 pub fn verify() {
@@ -77,6 +103,23 @@ pub fn verify() {
 
     let mut table = ProcessTable::<RESIDENT, FRAMES>::new();
     let mut contexts = UserContextBank::<RESIDENT>::new();
+    let images = [elf_bytes(0), elf_bytes(1), elf_bytes(2)];
+    // A late W+X ELF cannot publish any earlier PID/context, despite
+    // already-owned REAL PMM candidate leases still held by the caller.
+    let mut invalid_elf = images[2];
+    invalid_elf[68..72].copy_from_slice(&7u32.to_le_bytes());
+    if contexts.admit_elf_batch(&mut table, [
+        (&images[0][..], groups[0], context_stack(0), bootstrap_frame(0)),
+        (&images[1][..], groups[1], context_stack(1), bootstrap_frame(1)),
+        (&invalid_elf[..], groups[2], context_stack(2), bootstrap_frame(2)),
+    ]) != Err(ElfAdmissionError::Image {
+        index: 2,
+        reason: crate::user_context_bank::elf_preflight_for_admission::ElfError::InvalidPermissions,
+    })
+        || table.occupied() != 0 || contexts.count() != 0
+        || pmm::statistics().allocated_frames != baseline + GROUPS * FRAMES
+    { fail("late_invalid_elf_rollback_real_pmm") }
+
     // Test a physical alias BETWEEN proposed real-PMM process leases.
     // Both new PIDs and bootstrap CPU context frames must stay invisible.
     let mut in_batch_alias = groups[1];
@@ -107,9 +150,9 @@ pub fn verify() {
     // Admit three REAL independent PMM leases and guarded *metadata*
     // contexts atomically; no bootstrap IRET or frame mapping is performed.
     let residents = core::array::from_fn(|i|
-        (groups[i], context_stack(i), bootstrap_frame(i))
+        (&images[i][..], groups[i], context_stack(i), bootstrap_frame(i))
     );
-    if contexts.admit_bootstrap_batch(&mut table, residents) != Ok([1, 2, 3])
+    if contexts.admit_elf_batch(&mut table, residents) != Ok([1, 2, 3])
         || contexts.count() != RESIDENT
         || (1..=3).any(|pid| contexts.snapshot(pid).is_none())
     { fail("three_resident_joint_batch_admissions") }
@@ -122,6 +165,9 @@ pub fn verify() {
 
     serial::write_line(
         "WOLFOS_PROCESS_TABLE_BOOTSTRAP_OK pids=3 context_frames=3 private_lease_roots=3 atomic_rollback=1 stack_mapped=0 cpl3_executed=0"
+    );
+    serial::write_line(
+        "WOLFOS_PROCESS_TABLE_ELF_PREFLIGHT_OK images=3 file_backed_entries=3 wx_denied=1 late_rollback=1 real_pmm=28 user_mapping=0"
     );
 
     // The actual hardware boot CR3 cannot be reclaimed as a PID root.
