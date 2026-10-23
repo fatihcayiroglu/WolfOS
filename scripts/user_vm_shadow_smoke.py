@@ -36,7 +36,7 @@ def main() -> int:
         print(output)
         multi_marker = (
             "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 "
-            "elf_segments=2 bss_zero=1 kernel_supervisor=1 high_half_copied=1 "
+            "elf_segments=2 bss_zero=1 elf_pte_contract=1 kernel_supervisor=1 high_half_copied=1 "
             "kernel_anchor=1 hhdm_anchor=1 freed=8 "
             "cr3_unchanged=1 ring3=0"
         )

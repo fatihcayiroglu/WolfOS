@@ -328,6 +328,9 @@ mod tests {
     fn elf_to_pte_binding_rejects_page_footprints_larger_than_bounded_root() {
         let mut elf = elf_fixture();
         elf[104..112].copy_from_slice(&0x4000u64.to_le_bytes());
+        // Shift the RW segment out of range so strict ELF preflight
+        // succeeds; the bounded four-PTE footprint still must refuse.
+        elf[136..144].copy_from_slice(&0x409180u64.to_le_bytes());
         assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES, &PAGES),
             Err(ElfBindingError::TooManyPages));
         assert_eq!(validate_elf_bindings(&elf_fixture(), 0, TABLES, &PAGES),

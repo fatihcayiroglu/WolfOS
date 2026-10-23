@@ -91,6 +91,25 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
         UserPage { virtual_address: STACK, physical_frame: frames[7],
             writable: true, executable: false },
     ];
+    // Authenticate the *exact* ELF PT_LOAD RX/BSS/RW pages and the
+    // proposed RW+NX user stack against every eventual shadow-root PTE
+    // BEFORE zeroing frame buffers or writing a table entry.
+    if user_vm_multi::validate_elf_bindings(
+        &file, STACK, [frames[0], frames[1], frames[2], frames[3]], &pages,
+    ) != Ok(plan) { return false; }
+    let mut bad = pages;
+    bad[1].writable = true; // RX/BSS cannot silently become RWX.
+    if user_vm_multi::validate_elf_bindings(
+        &file, STACK, [frames[0], frames[1], frames[2], frames[3]], &bad,
+    ).is_ok() { return false; }
+    bad = pages;
+    bad[2].virtual_address = TEXT_BSS; // duplicate RX virtual leaf.
+    if user_vm_multi::validate_elf_bindings(
+        &file, STACK, [frames[0], frames[1], frames[2], frames[3]], &bad,
+    ).is_ok() { return false; }
+    // All rejected PTE proposals leave the already allocated PMM frame
+    // counts and all candidate page-table/data buffers untouched.
+
     // SAFETY: eight separately owned and HHDM-mapped PMM physical frames.
     // These pointers are disjoint, never exposed to another CPU and stay
     // owned until this synchronous proof finishes and PMM frees them.
@@ -202,7 +221,7 @@ pub fn verify(hhdm: u64) -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 elf_pte_contract=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
     true
 }
