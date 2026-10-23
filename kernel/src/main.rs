@@ -14,6 +14,10 @@ mod serial;
 mod cpu;
 mod pmm;
 mod pmm_layout;
+#[cfg(feature = "address-space-retirement-smoke")]
+mod address_space_retirement;
+#[cfg(feature = "address-space-retirement-smoke")]
+mod address_space_retirement_smoke;
 mod interrupts;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke")), feature = "user-process-smoke")))))]
 mod user_ring_entry;
@@ -352,6 +356,12 @@ pub extern "C" fn kmain() -> ! {
     }
     #[cfg(feature = "paging-fault-smoke")]
     paging::trigger_unmapped_read();
+
+    #[cfg(feature = "address-space-retirement-smoke")]
+    if !address_space_retirement_smoke::verify(hhdm.offset) {
+        serial::write_line("WOLFOS_ADDRESS_SPACE_RETIRE_TEST_FAILED");
+        halt_forever();
+    }
 
 
 

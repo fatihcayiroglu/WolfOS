@@ -16,6 +16,7 @@ x86_64 = { version = "=0.15.5", features = ["abi_x86_interrupt"] }
 [features]
 default = []
 smoke-exit = []
+address-space-retirement-smoke = ["smoke-exit"]
 exception-smoke = ["smoke-exit"]
 paging-fault-smoke = ["smoke-exit"]
 timer-smoke = ["smoke-exit"]
