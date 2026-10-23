@@ -6,7 +6,7 @@
 
 use crate::{
     elf64_preflight::preflight,
-    elf64_page_image::{materialize, PAGE_SIZE},
+    elf64_page_image::{materialize_batch, PAGE_SIZE},
     kernel_half_shadow, pmm, serial,
     user_vm_layout::ENTRY_COUNT,
     user_vm_multi::{self, UserPage},
@@ -116,10 +116,13 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
         let second = &mut *pointers[5].cast::<[u8; PAGE_SIZE]>();
         let third = &mut *pointers[6].cast::<[u8; PAGE_SIZE]>();
         let fourth = &mut *pointers[7].cast::<[u8; PAGE_SIZE]>();
-        if materialize(&file, &text, TEXT, first).is_err()
-            || materialize(&file, &text, TEXT_BSS, second).is_err()
-            || materialize(&file, &data, DATA, third).is_err()
-        { return false; }
+        // Validate all three PT_LOAD pages before changing ANY HHDM
+        // buffer. The separate stack page stays zero-only and unexecutable.
+        if materialize_batch(
+            &file,
+            [(&text, TEXT), (&text, TEXT_BSS), (&data, DATA)],
+            [first, second, third],
+        ).is_err() { return false; }
         fourth.fill(0); // new zeroed stack, with no ELF file backing.
 
         // Snapshot the actual live Limine PML4 via HHDM WITHOUT modifying it.
@@ -202,7 +205,7 @@ pub fn verify(hhdm: u64) -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
     true
 }
