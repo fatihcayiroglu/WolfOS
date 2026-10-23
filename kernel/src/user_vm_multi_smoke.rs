@@ -6,7 +6,7 @@
 
 use crate::{
     elf64_preflight::preflight,
-    elf64_page_image::{materialize_batch, PAGE_SIZE},
+    elf64_page_image::{materialize_batch, audit_materialized_batch, audit_zeroed_stack, PageAuditError, PAGE_SIZE},
     kernel_half_shadow, pmm, serial,
     user_vm_layout::ENTRY_COUNT,
     user_vm_multi::{self, UserPage},
@@ -148,6 +148,59 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
         ).is_err() { return false; }
         fourth.fill(0); // new zeroed stack, with no ELF file backing.
 
+        // Observe the real four PMM data-frame buffers before any
+        // hardware CR3 load. All file bytes, zeroed BSS/tails and stack
+        // contents must match the validated ELF and zero-stack contract.
+        let loads = [(&text, TEXT), (&text, TEXT_BSS), (&data, DATA)];
+        if audit_materialized_batch(
+            &file, loads, [&*first, &*second, &*third],
+        ).is_err() || audit_zeroed_stack(fourth).is_err() {
+            return false;
+        }
+        let original_text = first[0x100];
+        first[0x100] ^= 1;
+        let text_rejected = matches!(
+            audit_materialized_batch(
+                &file, loads, [&*first, &*second, &*third],
+            ),
+            Err(PageAuditError::ContentMismatch {
+                index: 0, offset: 0x100,
+            }),
+        );
+        first[0x100] = original_text;
+        second[23] = 0xa5;
+        let bss_rejected = matches!(
+            audit_materialized_batch(
+                &file, loads, [&*first, &*second, &*third],
+            ),
+            Err(PageAuditError::ContentMismatch {
+                index: 1, offset: 23,
+            }),
+        );
+        second[23] = 0;
+        third[0x180] ^= 1;
+        let data_rejected = matches!(
+            audit_materialized_batch(
+                &file, loads, [&*first, &*second, &*third],
+            ),
+            Err(PageAuditError::ContentMismatch {
+                index: 2, offset: 0x180,
+            }),
+        );
+        third[0x180] ^= 1;
+        fourth[11] = 0x5a;
+        let stack_rejected = audit_zeroed_stack(fourth) == Err(11);
+        fourth[11] = 0;
+        if !text_rejected || !bss_rejected
+            || !data_rejected || !stack_rejected
+            || audit_materialized_batch(
+                &file, loads, [&*first, &*second, &*third],
+            ).is_err()
+            || audit_zeroed_stack(fourth).is_err()
+        {
+            return false;
+        }
+
         // Snapshot the actual live Limine PML4 via HHDM WITHOUT modifying it.
         // The new root's four page tables are private PMM frames, while the
         // kernel upper half intentionally shares the live boot paging trees.
@@ -228,7 +281,7 @@ pub fn verify(hhdm: u64) -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
     true
 }

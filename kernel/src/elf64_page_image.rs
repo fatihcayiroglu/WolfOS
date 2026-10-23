@@ -158,6 +158,70 @@ pub fn materialize_batch<const N: usize>(
     Ok(contents)
 }
 
+/// Failure after a completed batch cannot be ignored during admission:
+/// a PTE may have the correct flags while its PMM-backed *bytes* do not
+/// match the immutable ELF source, including the zeroed BSS and page tails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageAuditError {
+    InvalidRequest(MaterializeError),
+    ContentMismatch { index: usize, offset: usize },
+}
+
+/// Revalidate every bounded page request against its source ELF bytes and
+/// then read every byte of every already-populated backing page. Never
+/// mutate buffers or table entries. A first mismatch fails closed.
+///
+/// A trusted caller must keep image bytes and PMM pages stable throughout
+/// validation, and audit PTE physical ownership/permissions separately.
+/// This does not map or execute a userspace image or change hardware CR3.
+pub fn audit_materialized_batch<const N: usize>(
+    input: &[u8],
+    requests: [(&LoadSegment, u64); N],
+    pages: [&[u8; PAGE_SIZE]; N],
+) -> Result<[PageContents; N], PageAuditError> {
+    let mut checked: [Option<CheckedPage>; N] = [None; N];
+    // Validate ALL layouts before interpreting any page content.
+    for (i, (segment, va)) in requests.iter().copied().enumerate() {
+        if requests[..i].iter().any(|(_, old_va)| *old_va == va) {
+            return Err(PageAuditError::InvalidRequest(
+                MaterializeError::DuplicateVirtualPage,
+            ));
+        }
+        checked[i] = Some(
+            inspect(input, segment, va).map_err(PageAuditError::InvalidRequest)?
+        );
+    }
+    let mut summaries = [PageContents {
+        copied: 0, zeroed: PAGE_SIZE, writable: false, executable: false,
+    }; N];
+    for (index, backing) in pages.into_iter().enumerate() {
+        let check = checked[index].expect("each checked page is valid");
+        for (offset, actual) in backing.iter().copied().enumerate() {
+            let expected = if offset >= check.into
+                && offset - check.into < check.copied
+            {
+                input[check.from + (offset - check.into)]
+            } else {
+                0 // full zero BSS plus every unused first/last page byte
+            };
+            if actual != expected {
+                return Err(PageAuditError::ContentMismatch { index, offset });
+            }
+        }
+        summaries[index] = check.contents;
+    }
+    Ok(summaries)
+}
+
+/// A user stack is intentionally NOT an ELF PT_LOAD page. Check all 4 KiB,
+/// including bytes that would otherwise leak a previous PMM owner's data.
+pub fn audit_zeroed_stack(page: &[u8; PAGE_SIZE]) -> Result<(), usize> {
+    match page.iter().position(|byte| *byte != 0) {
+        Some(offset) => Err(offset),
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +243,117 @@ mod tests {
             writable: true, executable: false,
         };
         (image, text, data)
+    }
+
+    #[test]
+    fn post_copy_elf_byte_audit_checks_code_bss_data_and_stack() {
+        let (image, text, data) = samples();
+        let mut code = [0xa5; PAGE_SIZE];
+        let mut bss = [0x5a; PAGE_SIZE];
+        let mut rw = [0xc3; PAGE_SIZE];
+        let requests = [
+            (&text, 0x401000), (&text, 0x402000), (&data, 0x403000),
+        ];
+        let built = materialize_batch(
+            &image, requests, [&mut code, &mut bss, &mut rw],
+        ).unwrap();
+        assert_eq!(
+            audit_materialized_batch(&image, requests, [&code, &bss, &rw]),
+            Ok(built),
+        );
+        assert_eq!(audit_zeroed_stack(&[0u8; PAGE_SIZE]), Ok(()));
+
+        let old = code[0x100];
+        code[0x100] ^= 1;
+        assert_eq!(
+            audit_materialized_batch(&image, requests, [&code, &bss, &rw]),
+            Err(PageAuditError::ContentMismatch {
+                index: 0, offset: 0x100,
+            }),
+        );
+        code[0x100] = old;
+        bss[17] = 0x5a;
+        assert_eq!(
+            audit_materialized_batch(&image, requests, [&code, &bss, &rw]),
+            Err(PageAuditError::ContentMismatch {
+                index: 1, offset: 17,
+            }),
+        );
+        bss[17] = 0;
+        rw[0x180] ^= 1;
+        assert_eq!(
+            audit_materialized_batch(&image, requests, [&code, &bss, &rw]),
+            Err(PageAuditError::ContentMismatch {
+                index: 2, offset: 0x180,
+            }),
+        );
+        rw[0x180] ^= 1;
+        let mut stack = [0u8; PAGE_SIZE];
+        stack[PAGE_SIZE - 1] = 0xff;
+        assert_eq!(audit_zeroed_stack(&stack), Err(PAGE_SIZE - 1));
+        assert_eq!(
+            audit_materialized_batch(&image, requests, [&code, &bss, &rw]),
+            Ok(built),
+        );
+    }
+
+    #[test]
+    fn changed_elf_bytes_and_late_bad_layout_reject_without_any_writes() {
+        let (image, text, data) = samples();
+        let mut code = [0u8; PAGE_SIZE];
+        let mut bss = [0u8; PAGE_SIZE];
+        let mut rw = [0u8; PAGE_SIZE];
+        let requests = [
+            (&text, 0x401000), (&text, 0x402000), (&data, 0x403000),
+        ];
+        materialize_batch(&image, requests, [&mut code, &mut bss, &mut rw])
+            .unwrap();
+        let mut changed_source = image;
+        changed_source[0x100] ^= 1;
+        assert_eq!(
+            audit_materialized_batch(
+                &changed_source, requests, [&code, &bss, &rw],
+            ),
+            Err(PageAuditError::ContentMismatch {
+                index: 0, offset: 0x100,
+            }),
+        );
+        let mut invalid = data;
+        invalid.executable = true; // late W+X, no bytes inspected/written
+        assert_eq!(
+            audit_materialized_batch(
+                &image,
+                [(&text, 0x401000), (&text, 0x402000),
+                    (&invalid, 0x403000)],
+                [&code, &bss, &rw],
+            ),
+            Err(PageAuditError::InvalidRequest(
+                MaterializeError::InvalidPermissions,
+            )),
+        );
+        assert_eq!(
+            audit_materialized_batch(
+                &image,
+                [(&text, 0x401000), (&text, 0x402000),
+                    (&data, 0x401000)],
+                [&code, &bss, &rw],
+            ),
+            Err(PageAuditError::InvalidRequest(
+                MaterializeError::DuplicateVirtualPage,
+            )),
+        );
+        assert_eq!(
+            audit_materialized_batch(&image, requests, [&code, &bss, &rw]),
+            Ok([
+                PageContents { copied: 8, zeroed: PAGE_SIZE-8,
+                    writable: false, executable: true },
+                PageContents { copied: 0, zeroed: PAGE_SIZE,
+                    writable: false, executable: true },
+                PageContents { copied: 8, zeroed: PAGE_SIZE-8,
+                    writable: true, executable: false },
+            ]),
+        );
+        assert_eq!(audit_materialized_batch(&image, [], []), Ok([]));
     }
 
     #[test]
