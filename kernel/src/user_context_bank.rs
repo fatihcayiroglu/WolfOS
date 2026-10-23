@@ -224,7 +224,7 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             (owned.first().copied().unwrap_or(0), owned)
         });
         let pids = table.reserve_batch_checked(leases, |candidate, minted| {
-            let frames = core::array::from_fn(|i| {
+            let frames: [_; COUNT] = core::array::from_fn(|i| {
                 (minted[i], requests[i].0.first().copied().unwrap_or(0),
                  requests[i].1, requests[i].2)
             });
