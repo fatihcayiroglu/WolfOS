@@ -9,7 +9,7 @@
 //! ALL 2048 entries, including every unused PT leaf and the high half.
 //! This is not a general multi-PT VMM, a runnable CR3, or Ring 3 execution.
 
-use crate::elf64_preflight::PAGE_BYTES;
+use crate::elf64_preflight::{preflight, ElfError, ImagePlan, PAGE_BYTES, USER_MIN, USER_END};
 use crate::user_vm_layout::{
     indices, Indices, ENTRY_COUNT, NX, PRESENT, USER, WRITABLE,
 };
@@ -112,6 +112,82 @@ fn expected(table: usize, index: usize, indices: Indices,
     }
 }
 
+/// A bounded ELF-to-private-PTE contract. All PT_LOAD pages, including
+/// fully BSS-only ones, must have exactly one matching physical leaf; the
+/// additional user stack must be a distinct RW+NX page outside every LOAD.
+/// No extra user virtual pages, permission upgrades, frame/table aliases
+/// or cross-PT roots are accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElfBindingError {
+    Image(ElfError),
+    TooManyPages,
+    StackInvalid,
+    MissingOrExtraPage,
+    PermissionMismatch,
+    PhysicalOrRoot(MultiError),
+}
+
+/// Pure pre-installation validation: parse original immutable ELF bytes,
+/// derive exact 4KiB page requirements and compare to a proposed mapping.
+/// No table writes, PMM allocations, HHDM copies or CR3 changes.
+/// The caller must map/pin exactly the audited frames and recheck source
+/// bytes before hardware execution.
+pub fn validate_elf_bindings(
+    image: &[u8],
+    stack_page: u64,
+    tables: [u64; TABLE_FRAMES],
+    pages: &[UserPage],
+) -> Result<ImagePlan, ElfBindingError> {
+    let plan = preflight(image).map_err(ElfBindingError::Image)?;
+    let end = stack_page.checked_add(PAGE_BYTES)
+        .ok_or(ElfBindingError::StackInvalid)?;
+    if stack_page & (PAGE_BYTES - 1) != 0
+        || stack_page < USER_MIN || end > USER_END
+    {
+        return Err(ElfBindingError::StackInvalid);
+    }
+
+    // Reject a huge LOAD before walking its pages. All valid page counts
+    // fit the same fixed four-leaf PMM hierarchy as the stack.
+    let mut required: [Option<(u64, bool, bool)>; MAX_PAGES] = [None; MAX_PAGES];
+    let mut count = 0usize;
+    for seg in plan.segments[..plan.len].iter().flatten() {
+        let num = seg.page_end.checked_sub(seg.page_start)
+            .ok_or(ElfBindingError::TooManyPages)? / PAGE_BYTES;
+        if num == 0 || num > (MAX_PAGES - 1 - count) as u64 {
+            return Err(ElfBindingError::TooManyPages);
+        }
+        for k in 0..num {
+            required[count] = Some((
+                seg.page_start + k * PAGE_BYTES, seg.writable, seg.executable
+            ));
+            count += 1;
+        }
+    }
+    if required[..count].iter().flatten().any(|(va, _, _)| *va == stack_page) {
+        return Err(ElfBindingError::StackInvalid);
+    }
+    required[count] = Some((stack_page, true, false));
+    count += 1;
+    if pages.len() != count {
+        return Err(ElfBindingError::MissingOrExtraPage);
+    }
+    // Every virtual page must occur exactly once, with its RX/RW+NX
+    // permissions matching the verified PT_LOAD plan or the stack.
+    for page in pages {
+        let Some((_, writable, executable)) = required[..count].iter()
+            .flatten().find(|(va, _, _)| *va == page.virtual_address)
+        else { return Err(ElfBindingError::MissingOrExtraPage) };
+        if page.writable != *writable || page.executable != *executable {
+            return Err(ElfBindingError::PermissionMismatch);
+        }
+    }
+    // The bounded VMM independently validates physical-frame uniqueness,
+    // 4-KiB alignment, canonical user range and one 2-MiB PT scope.
+    validate(&tables, pages).map_err(ElfBindingError::PhysicalOrRoot)?;
+    Ok(plan)
+}
+
 /// Install a fixed set of pages in an EMPTY 4-level shadow hierarchy.
 /// Parent W bit is set if any leaf needs write permission; individual
 /// RX code leaves remain read-only by their *leaf* PTE. No W+X allowed.
@@ -175,6 +251,88 @@ mod tests {
     type Bank = [[u64; ENTRY_COUNT]; TABLE_FRAMES];
 
     fn bank() -> Bank { [[0; ENTRY_COUNT]; TABLE_FRAMES] }
+
+    fn elf_fixture() -> [u8; 512] {
+        let mut bytes = [0u8; 512];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4..7].copy_from_slice(&[2, 1, 1]);
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x401100u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+        // RX code, two pages including a BSS-only page.
+        bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+        bytes[72..80].copy_from_slice(&0x100u64.to_le_bytes());
+        bytes[80..88].copy_from_slice(&0x401100u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&8u64.to_le_bytes());
+        bytes[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+        bytes[112..120].copy_from_slice(&4096u64.to_le_bytes());
+        // Separate RW data in page 3.
+        bytes[120..124].copy_from_slice(&1u32.to_le_bytes());
+        bytes[124..128].copy_from_slice(&6u32.to_le_bytes());
+        bytes[128..136].copy_from_slice(&0x180u64.to_le_bytes());
+        bytes[136..144].copy_from_slice(&0x403180u64.to_le_bytes());
+        bytes[152..160].copy_from_slice(&8u64.to_le_bytes());
+        bytes[160..168].copy_from_slice(&0x600u64.to_le_bytes());
+        bytes[168..176].copy_from_slice(&4096u64.to_le_bytes());
+        bytes[0x100] = 0xc3;
+        bytes
+    }
+
+    #[test]
+    fn elf_to_pte_binding_covers_every_load_bss_and_nx_stack() {
+        let elf = elf_fixture();
+        let plan = validate_elf_bindings(&elf, 0x404000, TABLES, &PAGES).unwrap();
+        assert_eq!(plan.entry, 0x401100);
+        assert_eq!(plan.len, 2);
+        let shuffled = [PAGES[3], PAGES[1], PAGES[0], PAGES[2]];
+        assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES, &shuffled), Ok(plan));
+    }
+
+    #[test]
+    fn elf_to_pte_binding_refuses_missing_bss_extra_alias_and_permission_upgrades() {
+        let elf = elf_fixture();
+        assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES,
+            &[PAGES[0], PAGES[2], PAGES[3]]
+        ), Err(ElfBindingError::MissingOrExtraPage));
+        let mut wrong = PAGES;
+        wrong[1].virtual_address = 0x405000;
+        assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES, &wrong),
+            Err(ElfBindingError::MissingOrExtraPage));
+        let mut permission = PAGES;
+        permission[0].writable = true;
+        assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES, &permission),
+            Err(ElfBindingError::PermissionMismatch));
+        permission = PAGES;
+        permission[3].executable = true;
+        assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES, &permission),
+            Err(ElfBindingError::PermissionMismatch));
+        assert_eq!(validate_elf_bindings(&elf, 0x403000, TABLES, &PAGES),
+            Err(ElfBindingError::StackInvalid));
+        let mut aliased = PAGES;
+        aliased[3].physical_frame = PAGES[0].physical_frame;
+        assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES, &aliased),
+            Err(ElfBindingError::PhysicalOrRoot(MultiError::AliasedPhysicalFrame)));
+        let mut corrupt = elf;
+        corrupt[68..72].copy_from_slice(&7u32.to_le_bytes());
+        assert_eq!(validate_elf_bindings(&corrupt, 0x404000, TABLES, &PAGES),
+            Err(ElfBindingError::Image(ElfError::InvalidPermissions)));
+    }
+
+    #[test]
+    fn elf_to_pte_binding_rejects_page_footprints_larger_than_bounded_root() {
+        let mut elf = elf_fixture();
+        elf[104..112].copy_from_slice(&0x4000u64.to_le_bytes());
+        assert_eq!(validate_elf_bindings(&elf, 0x404000, TABLES, &PAGES),
+            Err(ElfBindingError::TooManyPages));
+        assert_eq!(validate_elf_bindings(&elf_fixture(), 0, TABLES, &PAGES),
+            Err(ElfBindingError::StackInvalid));
+    }
 
     #[test]
     fn mixed_pages_share_same_pml4_and_ancestors_but_not_permissions() {
