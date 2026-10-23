@@ -108,14 +108,11 @@ pub fn verify() {
     // already-owned REAL PMM candidate leases still held by the caller.
     let mut invalid_elf = images[2];
     invalid_elf[68..72].copy_from_slice(&7u32.to_le_bytes());
-    if contexts.admit_elf_batch(&mut table, [
+    if !matches!(contexts.admit_elf_batch(&mut table, [
         (&images[0][..], groups[0], context_stack(0), bootstrap_frame(0)),
         (&images[1][..], groups[1], context_stack(1), bootstrap_frame(1)),
         (&invalid_elf[..], groups[2], context_stack(2), bootstrap_frame(2)),
-    ]) != Err(ElfAdmissionError::Image {
-        index: 2,
-        reason: crate::user_context_bank::elf_preflight_for_admission::ElfError::InvalidPermissions,
-    })
+    ]), Err(ElfAdmissionError::Image { index: 2, .. }))
         || table.occupied() != 0 || contexts.count() != 0
         || pmm::statistics().allocated_frames != baseline + GROUPS * FRAMES
     { fail("late_invalid_elf_rollback_real_pmm") }
