@@ -21,7 +21,7 @@ mod user_ring_entry;
 mod user_ring3_smoke;
 #[cfg(feature = "user-ring3-isolation-smoke")]
 mod user_ring3_isolation_smoke;
-#[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))))]
+#[cfg(any(feature = "process-table-smoke", any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))))))]
 mod user_syscall_abi;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod user_syscall_entry;
@@ -39,7 +39,7 @@ mod user_file_io_smoke;
 mod process_lifecycle;
 #[cfg(any(feature = "p3-ring3-event-wait-hardware-smoke", any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "process-table-smoke", feature = "user-context-smoke")))))))]
 mod process_table;
-#[cfg(any(feature = "p3-ring3-four-elf-preflight-smoke", feature = "p2-handoff-preflight-smoke", any(feature = "kernel-stack-lease-smoke", feature = "user-context-smoke")))]
+#[cfg(any(feature = "process-table-smoke", any(feature = "p3-ring3-four-elf-preflight-smoke", feature = "p2-handoff-preflight-smoke", any(feature = "kernel-stack-lease-smoke", feature = "user-context-smoke"))))]
 mod user_context_bank;
 #[cfg(feature = "user-context-smoke")]
 mod user_context_smoke;
@@ -189,7 +189,8 @@ mod ring3_round_robin;
           feature = "p3-ring3-event-wait-hardware-smoke",
           feature = "p2-handoff-preflight-smoke",
           feature = "kernel-stack-lease-smoke",
-          feature = "user-context-smoke"))]
+          feature = "user-context-smoke",
+          feature = "process-table-smoke"))]
 mod ring3_runqueue;
 // A no-heap event registration/notification gate for the isolated real
 // two-ELF WAIT/SIGNAL QEMU feature. The caller must serialize it against
