@@ -10,6 +10,7 @@
 //! This is not a general multi-PT VMM, a runnable CR3, or Ring 3 execution.
 
 use crate::elf64_preflight::{preflight, ElfError, ImagePlan, PAGE_BYTES, USER_MIN, USER_END};
+use crate::elf64_page_image::{audit_materialized_batch, audit_zeroed_stack, PageAuditError, PAGE_SIZE};
 use crate::user_vm_layout::{
     indices, Indices, ENTRY_COUNT, NX, PRESENT, USER, WRITABLE,
 };
@@ -211,6 +212,66 @@ pub fn audit_elf_bindings(
     Ok(plan)
 }
 
+/// Fail closed on the FIRST missing proof in a prospective ELF image:
+/// actual shadow PTE bytes, exact source-derived LOAD page coverage, exact
+/// owned PMM page contents, and zeroed one-page user stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadyImageError {
+    Mappings(ElfBindingError),
+    MissingOrUnexpectedLoadPage,
+    Bytes(PageAuditError),
+    DirtyStack { offset: usize },
+}
+
+/// Single read-only pre-handoff verification for a bounded disconnected
+/// ELF64 user root. No heap, mappings, CR3 writes or code execution.
+///
+/// The trustworthy caller must serialize/pin original ELF bytes, all owned
+/// PMM frames and the four shadow tables during the audit. A successful
+/// result does NOT authorize a dynamic scheduler or hardware IRET by itself.
+pub fn audit_ready_elf_image<const N: usize>(
+    image: &[u8],
+    stack_page: u64,
+    tables: [u64; TABLE_FRAMES],
+    mapped_pages: &[UserPage],
+    pml4: &[u64; ENTRY_COUNT],
+    pdpt: &[u64; ENTRY_COUNT],
+    pd: &[u64; ENTRY_COUNT],
+    pt: &[u64; ENTRY_COUNT],
+    requests: [(&crate::elf64_preflight::LoadSegment, u64); N],
+    contents: [&[u8; PAGE_SIZE]; N],
+    stack_bytes: &[u8; PAGE_SIZE],
+) -> Result<ImagePlan, ReadyImageError> {
+    let plan = audit_elf_bindings(
+        image, stack_page, pml4, pdpt, pd, pt, tables, mapped_pages,
+    ).map_err(ReadyImageError::Mappings)?;
+
+    // Reject an incomplete/mismatched content audit. Exact PTE bindings
+    // alone do not prove that every file-backed leaf was initialized.
+    let mut expected_count = 0usize;
+    for segment in plan.segments[..plan.len].iter().flatten() {
+        let pages = (segment.page_end - segment.page_start) / PAGE_BYTES;
+        for index in 0..pages {
+            let va = segment.page_start + index * PAGE_BYTES;
+            if !requests.iter().any(|(requested_segment, requested_va)|
+                *requested_va == va && **requested_segment == *segment
+            ) {
+                return Err(ReadyImageError::MissingOrUnexpectedLoadPage);
+            }
+            expected_count += 1;
+        }
+    }
+    if expected_count != N {
+        return Err(ReadyImageError::MissingOrUnexpectedLoadPage);
+    }
+
+    audit_materialized_batch(image, requests, contents)
+        .map_err(ReadyImageError::Bytes)?;
+    audit_zeroed_stack(stack_bytes)
+        .map_err(|offset| ReadyImageError::DirtyStack { offset })?;
+    Ok(plan)
+}
+
 /// Install a fixed set of pages in an EMPTY 4-level shadow hierarchy.
 /// Parent W bit is set if any leaf needs write permission; individual
 /// RX code leaves remain read-only by their *leaf* PTE. No W+X allowed.
@@ -305,6 +366,73 @@ mod tests {
         bytes[168..176].copy_from_slice(&4096u64.to_le_bytes());
         bytes[0x100] = 0xc3;
         bytes
+    }
+
+    #[test]
+    fn unified_elf_image_gate_refuses_omitted_tampered_or_unzeroed_backing() {
+        use crate::elf64_page_image::{materialize_batch, PageAuditError};
+        let elf = elf_fixture();
+        let plan = preflight(&elf).unwrap();
+        let text = plan.segments[0].unwrap();
+        let data = plan.segments[1].unwrap();
+        let mut tables = bank();
+        let [r, a, d, t] = &mut tables;
+        populate(r, a, d, t, TABLES, &PAGES).unwrap();
+        let mut code = [0x55; PAGE_SIZE];
+        let mut bss = [0x66; PAGE_SIZE];
+        let mut rw = [0x77; PAGE_SIZE];
+        let mut stack = [0u8; PAGE_SIZE];
+        let requested = [
+            (&text, 0x401000), (&text, 0x402000), (&data, 0x403000),
+        ];
+        materialize_batch(&elf, requested, [&mut code, &mut bss, &mut rw]).unwrap();
+        let [r, a, d, t] = &tables;
+        assert_eq!(audit_ready_elf_image(
+            &elf, 0x404000, TABLES, &PAGES, r, a, d, t,
+            requested, [&code, &bss, &rw], &stack,
+        ), Ok(plan));
+
+        assert_eq!(audit_ready_elf_image(
+            &elf, 0x404000, TABLES, &PAGES, r, a, d, t,
+            requested[..2].try_into().unwrap(), [&code, &bss], &stack,
+        ), Err(ReadyImageError::MissingOrUnexpectedLoadPage));
+
+        let mut forged = data;
+        forged.file_size = 1; // plausible, but NOT the original ELF plan
+        assert_eq!(audit_ready_elf_image(
+            &elf, 0x404000, TABLES, &PAGES, r, a, d, t,
+            [(&text, 0x401000), (&text, 0x402000), (&forged, 0x403000)],
+            [&code, &bss, &rw], &stack,
+        ), Err(ReadyImageError::MissingOrUnexpectedLoadPage));
+
+        bss[14] = 0xaa;
+        assert_eq!(audit_ready_elf_image(
+            &elf, 0x404000, TABLES, &PAGES, r, a, d, t,
+            requested, [&code, &bss, &rw], &stack,
+        ), Err(ReadyImageError::Bytes(PageAuditError::ContentMismatch {
+            index: 1, offset: 14,
+        })));
+        bss[14] = 0;
+        stack[19] = 0xfa;
+        assert_eq!(audit_ready_elf_image(
+            &elf, 0x404000, TABLES, &PAGES, r, a, d, t,
+            requested, [&code, &bss, &rw], &stack,
+        ), Err(ReadyImageError::DirtyStack { offset: 19 }));
+        stack[19] = 0;
+        let mut altered = tables;
+        altered[3][1] |= WRITABLE; // executable text PTE may not gain W
+        let [r, a, d, t] = &altered;
+        assert_eq!(audit_ready_elf_image(
+            &elf, 0x404000, TABLES, &PAGES, r, a, d, t,
+            requested, [&code, &bss, &rw], &stack,
+        ), Err(ReadyImageError::Mappings(
+            ElfBindingError::PhysicalOrRoot(MultiError::MismatchedLayout)
+        )));
+        let [r, a, d, t] = &tables;
+        assert_eq!(audit_ready_elf_image(
+            &elf, 0x404000, TABLES, &PAGES, r, a, d, t,
+            requested, [&code, &bss, &rw], &stack,
+        ), Ok(plan));
     }
 
     #[test]
