@@ -1,9 +1,27 @@
 """Reject absent, forged, reordered and failed hardware-run evidence."""
 import unittest
-from scripts.address_space_retirement_smoke import PROOF, evaluate
+from scripts.address_space_retirement_smoke import PROOF, SMP_PROOF, evaluate
 
 
 class RetirementEvidenceTests(unittest.TestCase):
+    def test_smp_requires_its_own_complete_proof(self):
+        self.assertTrue(evaluate(SMP_PROOF + "\nWOLFOS_BOOT_OK", 33, smp=True))
+        self.assertFalse(evaluate(PROOF + "\nWOLFOS_BOOT_OK", 33, smp=True))
+        self.assertFalse(evaluate(SMP_PROOF + "\nWOLFOS_BOOT_OK", 33))
+
+    def test_smp_rejects_missing_cpu_or_unproven_last_ap(self):
+        for proof in [SMP_PROOF.replace("per_cpu_restored=4", "per_cpu_restored=3"),
+                      SMP_PROOF.replace("last_ap_rejected=1", "last_ap_rejected=0"),
+                      SMP_PROOF + "\n" + SMP_PROOF, "prefix " + SMP_PROOF]:
+            self.assertFalse(evaluate(proof + "\nWOLFOS_BOOT_OK", 33, smp=True))
+
+    def test_smp_fault_exit_and_order_are_required(self):
+        for output, code in [(SMP_PROOF + "\nWOLFOS_BOOT_OK", 35),
+                             ("WOLFOS_BOOT_OK\n" + SMP_PROOF, 33),
+                             (SMP_PROOF + "\nWOLFOS_SMP_RETIRE_ERROR\nWOLFOS_BOOT_OK", 33),
+                             (SMP_PROOF + "\nWOLFOS_SMP_RETIRE_TEST_FAILED\nWOLFOS_BOOT_OK", 33)]:
+            self.assertFalse(evaluate(output, code, smp=True))
+
     def test_complete_ordered_hardware_evidence(self):
         self.assertTrue(evaluate(PROOF + "\nWOLFOS_BOOT_OK\n", 33))
 
