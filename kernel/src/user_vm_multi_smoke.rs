@@ -201,6 +201,17 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
             return false;
         }
 
+
+        // Complete pre-handoff audit: actual shadow PTE byte layout,
+        // ALL PT_LOAD page coverage, exact PMM bytes, and zeroed user stack.
+        // Still disconnected, with no CR3 write or IRET execution.
+        if user_vm_multi::audit_ready_elf_image(
+            &file, STACK,
+            [frames[0], frames[1], frames[2], frames[3]],
+            &pages, root, pdpt, pd, pt,
+            loads, [&*first, &*second, &*third], fourth,
+        ) != Ok(plan) { return false; }
+
         // Snapshot the actual live Limine PML4 via HHDM WITHOUT modifying it.
         // The new root's four page tables are private PMM frames, while the
         // kernel upper half intentionally shares the live boot paging trees.
@@ -281,7 +292,7 @@ pub fn verify(hhdm: u64) -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
+        "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
     true
 }
