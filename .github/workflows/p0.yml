@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build-and-boot:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - name: Install VM build tools
@@ -27,10 +27,13 @@ jobs:
             -o Acquire::Retries=3 -o Acquire::http::Timeout=40 \
             -o Acquire::https::Timeout=40 update
           sudo env DEBIAN_FRONTEND=noninteractive timeout \
-            --signal=TERM --kill-after=15s 420s apt-get \
+            --signal=TERM --kill-after=15s 720s apt-get \
             -o Acquire::Retries=3 -o Acquire::http::Timeout=40 \
             -o Acquire::https::Timeout=40 install -y --no-install-recommends \
             xorriso qemu-system-x86 seabios make git binutils
+          # Package mirrors occasionally take 7+ minutes fetching QEMU 11MB.
+          # Bounded 12-minute install timeout preserves fail-closed behavior;
+          # 30-minute job still has headroom for EVERY mandatory QEMU smoke.
           # QEMU smoke runs from an ISO using PC BIOS, not GUI/audio backends.
           # Explicitly fail if the headless emulator or ISO builder is absent.
           command -v qemu-system-x86_64
