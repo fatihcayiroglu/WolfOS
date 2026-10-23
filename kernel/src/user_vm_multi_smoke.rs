@@ -126,9 +126,13 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
         if user_vm_multi::populate(root, pdpt, pd, pt,
             [frames[0], frames[1], frames[2], frames[3]], &pages).is_err()
         { return false; }
-        if user_vm_multi::audit(root, pdpt, pd, pt,
-            [frames[0], frames[1], frames[2], frames[3]], &pages).is_err()
-            || root[256..].iter().any(|p| *p != 0)
+        // Audit the physical shadow PTE bytes against fresh ELF byte
+        // preflight, including the actual RX, RW+NX and stack flags.
+        // This is still a disconnected root; hardware CR3 is unchanged.
+        if user_vm_multi::audit_elf_bindings(
+            &file, STACK, root, pdpt, pd, pt,
+            [frames[0], frames[1], frames[2], frames[3]], &pages,
+        ).is_err() || root[256..].iter().any(|p| *p != 0)
         { return false; }
 
         let first = &mut *pointers[4].cast::<[u8; PAGE_SIZE]>();
