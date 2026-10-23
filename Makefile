@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),exception)
 FEATURES := --features exception-smoke
+else ifeq ($(FLAVOR),address-space-retirement)
+FEATURES := --features address-space-retirement-smoke
 else ifeq ($(FLAVOR),paging-fault)
 FEATURES := --features paging-fault-smoke
 else ifeq ($(FLAVOR),timer)
@@ -144,6 +146,11 @@ run-uefi: iso
 smoke:
 	$(MAKE) iso FLAVOR=smoke
 	python3 scripts/smoke.py $(OUT)/wolfos-smoke.iso
+
+.PHONY: address-space-retirement-smoke
+address-space-retirement-smoke:
+	$(MAKE) iso FLAVOR=address-space-retirement
+	python3 scripts/address_space_retirement_smoke.py $(OUT)/wolfos-address-space-retirement.iso
 
 exception-smoke:
 	$(MAKE) iso FLAVOR=exception
@@ -347,6 +354,8 @@ test:
 	rustc --edition=2024 --test kernel/src/pmm_layout.rs -o $(OUT)/pmm_layout_tests
 	rustc --edition=2024 --test tests/pmm_frame_batch.rs -o $(OUT)/pmm_frame_batch_tests
 	$(OUT)/pmm_frame_batch_tests
+	rustc --edition=2024 --test kernel/src/address_space_retirement.rs -o $(OUT)/address_space_retirement_tests
+	$(OUT)/address_space_retirement_tests
 	rustc --edition=2024 --test kernel/src/acpi_layout.rs -o $(OUT)/acpi_layout_tests
 	$(OUT)/acpi_layout_tests
 	rustc --edition=2024 --test kernel/src/acpi_tables.rs -o $(OUT)/acpi_tables_tests
