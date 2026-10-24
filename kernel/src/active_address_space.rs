@@ -9,11 +9,21 @@ use core::mem::ManuallyDrop;
 use crate::{
     address_space_retirement::{Error, Phase, RetirementGate, Snapshot, Ticket},
     pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport},
+    saved_context_retirement::{
+        ContextTicket, Error as ContextError, SavedContextGate, Snapshot as ContextSnapshot,
+    },
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeError {
+    Context(ContextError),
+    Cpu(Error),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublishError {
     Gate(Error),
+    Context(ContextError),
     RootNotOwned,
     SupervisorOwned,
     InvalidFrames,
@@ -26,6 +36,7 @@ pub enum PublishError {
 pub struct ActiveAddressSpace<'a, S: FrameSource, const N: usize, const CPUS: usize> {
     batch: ManuallyDrop<FrameBatch<'a, S, N>>,
     gate: RetirementGate<CPUS>,
+    contexts: SavedContextGate<64>,
 }
 
 impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'a, S, N, CPUS> {
@@ -42,6 +53,10 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         let mut gate = match RetirementGate::new(generation, root, supervisor) {
             Ok(gate) => gate,
             Err(error) => return Err((batch, PublishError::Gate(error))),
+        };
+        let contexts = match SavedContextGate::<64>::new(generation) {
+            Ok(contexts) => contexts,
+            Err(error) => return Err((batch, PublishError::Context(error))),
         };
         let frames = batch.frames();
         let error = if !frames.contains(&root) {
@@ -64,6 +79,7 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         Ok(Self {
             batch: ManuallyDrop::new(batch),
             gate,
+            contexts,
         })
     }
 
@@ -75,8 +91,48 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         self.gate.snapshot()
     }
 
+    /// Only for a fresh entry that has no saved resumable context. A scheduler
+    /// must use reserve_saved_resume for every suspended/preempted user return.
     pub fn reserve_cpu(&mut self, cpu: usize) -> Result<Ticket, Error> {
         self.gate.reserve_cpu(cpu)
+    }
+
+    pub fn context_snapshot(&self) -> ContextSnapshot {
+        self.contexts.snapshot()
+    }
+
+    /// Metadata admission; register the actual resumable frame and queue entry
+    /// before publishing them to any dispatcher. One exclusive owner lock is
+    /// needed across scheduler admission, dispatch, and retirement.
+    pub fn register_saved_context(&mut self, slot: usize) -> Result<ContextTicket, ContextError> {
+        if self.gate.snapshot().phase != Phase::Live {
+            return Err(ContextError::WrongPhase);
+        }
+        self.contexts.admit(slot)
+    }
+
+    /// Validate the exact saved-context incarnation and reserve its CPU under
+    /// the same exclusive borrow. This does not load CR3 or dequeue a task.
+    pub fn reserve_saved_resume(
+        &mut self,
+        context: ContextTicket,
+        cpu: usize,
+    ) -> Result<Ticket, ResumeError> {
+        self.contexts
+            .validate_resume(context)
+            .map_err(ResumeError::Context)?;
+        self.gate.reserve_cpu(cpu).map_err(ResumeError::Cpu)
+    }
+
+    /// # Safety
+    /// The caller must first cancel the actual saved execution frame,
+    /// dispatch queue, wakeups and pending handoffs for this exact token.
+    /// Metadata revocation alone is not proof of cancellation.
+    pub unsafe fn revoke_saved_context(
+        &mut self,
+        context: ContextTicket,
+    ) -> Result<(), ContextError> {
+        unsafe { self.contexts.revoke(context) }
     }
 
     pub fn confirm_active(&mut self, ticket: Ticket, actual_cr3: u64) -> Result<(), Error> {
@@ -84,7 +140,10 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
     }
 
     pub fn begin_retirement(&mut self) -> Result<(), Error> {
-        self.gate.begin_retirement()
+        self.gate.begin_retirement()?;
+        // Both ledgers share this exclusive &mut owner. Closing after the CPU
+        // gate is monotone; context admission is now permanently disallowed.
+        self.contexts.close_admission().map_err(|_| Error::WrongPhase)
     }
 
     pub fn acknowledge_quiescent(&mut self, ticket: Ticket, actual_cr3: u64) -> Result<(), Error> {
@@ -93,6 +152,19 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
 
     /// Metadata only; does not reclaim or certify external references.
     pub fn finish_retirement(&mut self) -> Result<(), Error> {
+        let cpus = self.gate.snapshot();
+        if cpus.phase != Phase::Retiring {
+            return Err(Error::WrongPhase);
+        }
+        if cpus.reserved != 0 || cpus.active != 0 {
+            return Err(Error::OutstandingCpus);
+        }
+        if self.contexts.snapshot().pending != 0 {
+            return Err(Error::OutstandingContexts);
+        }
+        // All checks occur under the exclusive owner borrow. Neither gate
+        // can reopen. This still does not prove external hardware quiescence.
+        self.contexts.finish().map_err(|_| Error::WrongPhase)?;
         self.gate.finish_retirement()
     }
 
@@ -113,6 +185,12 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
     /// A retired snapshot or a coordinator CR3 observation alone is insufficient.
     pub unsafe fn reclaim(mut self) -> Result<ReleaseReport, (Self, Error)> {
         if self.gate.snapshot().phase != Phase::Retired {
+            return Err((self, Error::WrongPhase));
+        }
+        if self.contexts.snapshot().pending != 0 {
+            return Err((self, Error::OutstandingContexts));
+        }
+        if self.contexts.snapshot().phase != crate::saved_context_retirement::Phase::Closed {
             return Err((self, Error::WrongPhase));
         }
         // SAFETY: successful retirement plus the caller's external proof

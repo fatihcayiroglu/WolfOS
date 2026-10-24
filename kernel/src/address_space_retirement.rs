@@ -38,6 +38,7 @@ pub enum Error {
     WrongCr3,
     EpochExhausted,
     OutstandingCpus,
+    OutstandingContexts,
 }
 
 /// Opaque identity of one CPU reservation, not a hardware quiescence proof.

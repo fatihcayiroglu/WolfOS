@@ -1,12 +1,15 @@
 //! Exact production ownership/ledger code with observable allocator effects.
 #[path = "../kernel/src/active_address_space.rs"]
 mod active_address_space;
+#[path = "../kernel/src/saved_context_retirement.rs"]
+mod saved_context_retirement;
 #[path = "../kernel/src/address_space_retirement.rs"]
 mod address_space_retirement;
 #[path = "../kernel/src/pmm_frame_batch.rs"]
 mod pmm_frame_batch;
 
-use active_address_space::{ActiveAddressSpace, PublishError};
+use active_address_space::{ActiveAddressSpace, PublishError, ResumeError};
+use saved_context_retirement::{Error as ContextError, Phase as ContextPhase};
 use address_space_retirement::{Error, Phase};
 use pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport};
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
@@ -297,4 +300,96 @@ fn ownership_preserves_physical_addresses_above_64_gib() {
         })
     );
     assert_eq!(trace.borrow().releases, [root + 4096, root]);
+}
+
+#[test]
+fn saved_context_blocks_retirement_and_frame_reclamation_until_verified_revocation() {
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<2, 4>(&mut source, 0x1000);
+    let context = owner.register_saved_context(4).unwrap();
+    assert_eq!(owner.context_snapshot().pending, 1u64 << 4);
+    owner.begin_retirement().unwrap();
+    assert_eq!(owner.context_snapshot().phase, ContextPhase::Closing);
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingContexts));
+    assert_eq!(
+        owner.reserve_saved_resume(context, 2),
+        Err(ResumeError::Context(ContextError::WrongPhase))
+    );
+    assert_eq!(owner.snapshot().reserved, 0);
+    assert!(trace.borrow().releases.is_empty());
+    owner = match reclaim(owner) {
+        Err((owner, Error::WrongPhase)) => owner,
+        _ => panic!("saved context allowed premature frame release"),
+    };
+    // SAFETY: synthetic host test never actually publishes a user frame,
+    // dispatch queue, wakeup or CPU load; no external resumable users exist.
+    unsafe { owner.revoke_saved_context(context) }.unwrap();
+    assert_eq!(owner.context_snapshot().pending, 0);
+    owner.finish_retirement().unwrap();
+    assert_eq!(owner.context_snapshot().phase, ContextPhase::Closed);
+    assert_eq!(
+        reclaim(owner).ok(),
+        Some(ReleaseReport { released: 2, failed: 0 })
+    );
+    assert_eq!(trace.borrow().releases, [0x2000, 0x1000]);
+}
+
+#[test]
+fn stale_saved_slot_cannot_reserve_cpu_or_revoke_new_context() {
+    let mut source = Source::new(&[0x1000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<1, 2>(&mut source, 0x1000);
+    let stale = owner.register_saved_context(63).unwrap();
+    assert_eq!(owner.register_saved_context(63), Err(ContextError::Busy));
+    // SAFETY: host-only metadata, with no actual saved frame or queue users.
+    unsafe { owner.revoke_saved_context(stale) }.unwrap();
+    let fresh = owner.register_saved_context(63).unwrap();
+    assert_ne!(stale, fresh);
+    assert_eq!(
+        owner.reserve_saved_resume(stale, 1),
+        Err(ResumeError::Context(ContextError::StaleTicket))
+    );
+    assert_eq!(
+        unsafe { owner.revoke_saved_context(stale) },
+        Err(ContextError::StaleTicket)
+    );
+    assert_eq!(owner.snapshot().reserved, 0);
+    assert_eq!(owner.context_snapshot().pending, 1u64 << 63);
+    let cpu = owner.reserve_saved_resume(fresh, 1).unwrap();
+    owner.confirm_active(cpu, 0x1000).unwrap();
+    owner.begin_retirement().unwrap();
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingCpus));
+    owner.acknowledge_quiescent(cpu, 0x9000).unwrap();
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingContexts));
+    // SAFETY: host-only mock has no actual resumable scheduler context.
+    unsafe { owner.revoke_saved_context(fresh) }.unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(
+        reclaim(owner).ok(),
+        Some(ReleaseReport { released: 1, failed: 0 })
+    );
+    assert_eq!(trace.borrow().releases, [0x1000]);
+}
+
+#[test]
+fn retirement_closes_context_registration_and_cpu_resume_atomically() {
+    let mut source = Source::new(&[0x1000]);
+    let mut owner = publish::<1, 1>(&mut source, 0x1000);
+    let context = owner.register_saved_context(0).unwrap();
+    owner.begin_retirement().unwrap();
+    let cpu_before = owner.snapshot();
+    let context_before = owner.context_snapshot();
+    assert_eq!(owner.register_saved_context(1), Err(ContextError::WrongPhase));
+    assert_eq!(
+        owner.reserve_saved_resume(context, 0),
+        Err(ResumeError::Context(ContextError::WrongPhase))
+    );
+    assert_eq!(owner.snapshot(), cpu_before);
+    assert_eq!(owner.context_snapshot(), context_before);
+    assert_eq!(owner.begin_retirement(), Err(Error::WrongPhase));
+    // SAFETY: host-only context ledger has no external saved CPU frame or queue.
+    unsafe { owner.revoke_saved_context(context) }.unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
 }
