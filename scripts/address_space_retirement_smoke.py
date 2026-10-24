@@ -13,12 +13,12 @@ PROOF = (
 SMP_PROOF = (
     "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 "
     "bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 "
-    "pmm_no_leak=1 ring3=0 ipi_shootdown=0"
+    "pmm_no_leak=1 saved_context_pinned=1 ring3=0 ipi_shootdown=0"
 )
 OWNERSHIP_PROOF = (
     "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 "
     "cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 "
-    "pmm_no_leak=1 ring3=0 ipi_shootdown=0"
+    "pmm_no_leak=1 saved_context_pinned=1 ring3=0 ipi_shootdown=0"
 )
 
 
@@ -69,7 +69,7 @@ def main() -> int:
                 print(f"FAIL: retirement CR3 proof ({cpus} vCPUs, exit={run.returncode})")
                 print(run.stderr.decode(errors="replace"))
                 return 1
-            description = ("active Drop pins frames, all CPU departures required, last AP withheld, zero PMM leak"
+            description = ("active Drop and synthetic saved context pin frames, all CPU departures required, last AP withheld, zero PMM leak"
                            if smp else "BSP private CR3 blocks retirement until restored, zero PMM leak")
             print(f"PASS: {description} ({cpus} vCPUs)")
     return 0
