@@ -54,6 +54,17 @@ def main() -> int:
     try:
         await_marker(proc, output, b"WOLFOS_BOOT_OK")
         await_marker(proc, output, b"WOLFOS_SHELL_READY")
+        await_marker(proc, output, b"WOLFOS_BOOT_SELFTESTS_SKIPPED mode=non_smoke")
+        forbidden = (
+            b"WOLFOS_PMM_TEST_OK",
+            b"WOLFOS_PAGING_MAP_OK",
+            b"WOLFOS_CONTEXT_OK",
+            b"WOLFOS_KTHREAD_OK",
+            b"WOLFOS_CTX_BATCH_OK",
+        )
+        for marker in forbidden:
+            if marker in output:
+                raise RuntimeError(f"interactive boot unexpectedly ran stress check: {marker!r}")
         for typed, marker in [
             (b"help\r", b"WOLFOS_SHELL_HELP"),
             (b"mem\r", b"WOLFOS_SHELL_MEM"),
