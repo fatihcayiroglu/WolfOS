@@ -16,6 +16,7 @@ mod pmm;
 mod pmm_layout;
 #[cfg(any(feature = "address-space-retirement-smoke", feature = "smp-address-space-retirement-smoke"))]
 mod address_space_retirement;
+mod tlb_shootdown;
 #[cfg(feature = "smp-address-space-retirement-smoke")]
 mod active_address_space;
 #[cfg(feature = "address-space-retirement-smoke")]
