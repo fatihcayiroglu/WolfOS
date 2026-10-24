@@ -2,8 +2,8 @@
 //!
 //! Every successfully allocated frame is returned exactly once on explicit
 //! close, partial-allocation failure, or an early scope exit (Drop). A future
-//! runnable process needs a SEPARATE, quiescence-proven ownership transfer:
-//! never keep this guard alive while installing its frames as active CR3.
+//! runnable process must first consume this guard through the separate
+//! ActiveAddressSpace owner; never install frames while still staged.
 //!
 //! The provider guarantees unique, aligned, owned PMM frame addresses.
 //! This is a lifetime/rollback primitive, not a physical allocator, page
@@ -32,7 +32,8 @@ pub enum AcquireError {
 }
 
 /// Retains exclusive staged-frame ownership. No copy/clone or implicit
-/// disarm path exists: dropping it MUST return all remaining frames.
+/// disarm path exists: dropping it MUST return all remaining frames unless
+/// it has been consumed by the explicit ActiveAddressSpace transfer.
 #[must_use = "staged PMM frames are released when this owner is dropped"]
 pub struct FrameBatch<'a, S: FrameSource, const N: usize> {
     source: &'a mut S,

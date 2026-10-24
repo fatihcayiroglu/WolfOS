@@ -363,6 +363,8 @@ test:
 	$(OUT)/pmm_frame_batch_tests
 	rustc --edition=2024 --test kernel/src/address_space_retirement.rs -o $(OUT)/address_space_retirement_tests
 	$(OUT)/address_space_retirement_tests
+	rustc --edition=2024 --test tests/active_address_space.rs -o $(OUT)/active_address_space_tests
+	$(OUT)/active_address_space_tests
 	rustc --edition=2024 --test kernel/src/acpi_layout.rs -o $(OUT)/acpi_layout_tests
 	$(OUT)/acpi_layout_tests
 	rustc --edition=2024 --test kernel/src/acpi_tables.rs -o $(OUT)/acpi_tables_tests
