@@ -381,7 +381,7 @@ pub fn verify_bsp() -> bool {
     }
     // Synthetic-only escape hatch retained to exercise quiescence ledger;
     // production admission must use attach_from_context_bank above.
-    let Some(Ok(binding)) = with_gate(|gate| Ring3SavedBinding::attach(
+    let Some(Ok(binding)) = with_gate(|gate| Ring3SavedBinding::attach_synthetic_for_smoke(
         gate, &queue, handle, 0,
     )) else {
         return false;

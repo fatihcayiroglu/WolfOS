@@ -27,23 +27,25 @@ runtime lock.
   **not independent proof** that a genuine CPU trap occurred.
 - `attach_from_context_bank`: production-facing ordering first checks that
   saved-trap ledger, then verifies exact registry/root/full PMM lease via
-  `attach_from_process_table`, and registers the saved-context ticket only
+  an internal registry/PMM lease check, and registers the saved-context ticket only
   after both independent metadata checks pass. Four-vCPU CPL0 smoke proves
   empty bank/registry cannot create a saved ticket, but contains no CPL3
   return frame.
-- `attach_from_process_table`: require a real `ProcessTable` record whose
+- Test-only `attach_from_process_table` (production-internal checked helper): require a real `ProcessTable` record whose
   READY/BLOCKED state exactly matches the queue incarnation and whose
   minted PID generation, private CR3 root and **ordered full PMM frame
   lease** match the live `ActiveAddressSpace` owner. Reject unknown/stale
   queue handles, mismatched state, foreign frame sets or reused PID identity
   before registering any saved-context ticket. Production hardware callers
   must still verify the saved `UserContextBank` GPR/IRET/FX record and hold
-  a shared coordinator lock; the legacy unchecked `attach` remains solely
-  for isolated synthetic smoke/test scenarios until migrated.
-- `attach`: verify the exact queue incarnation is READY or BLOCKED and
-  register its saved-context pin in the owner. The external trusted caller
-  is responsible for authenticating the process PID, CR3 ownership and
-  actual saved GPR/IRET/FX state before making this binding visible.
+  a shared coordinator lock; unverified admission is no longer a public
+  production entry point: raw `attach` is `cfg(test)` only, and the distinct
+  `attach_synthetic_for_smoke` exists only behind the dedicated CPL0
+  `smp-address-space-retirement-smoke` build feature.
+- Test-only `attach` / smoke-only `attach_synthetic_for_smoke`: verify the
+  exact queue incarnation is READY or BLOCKED and register its saved pin.
+  These entry points bypass process/trap evidence deliberately and are
+  unavailable under those names in ordinary production compilation.
 - `unsafe park_for_event`: stage an exact RUNNING-to-BLOCKED event-bound
   wait on a copy of the queue; require a still-live saved-context pin and
   acknowledgement of the matching CPU reservation under the authenticated
@@ -69,9 +71,10 @@ runtime lock.
 
 These functions do not save registers, switch CR3/TSS/FX, issue IPIs,
 authenticate IRQ/event sources, allocate memory, cancel actual wakeup
-backends or implement scheduler synchronization. Bypassing the bridge via
-old unguarded APIs remains possible until every production dispatch and
-wake path is migrated. These limitations must not be hidden.
+backends or implement scheduler synchronization. Other legacy runtime paths outside this bridge still lack a shared
+hardware provenance/lock integration. The test/smoke feature explicitly
+retains an unchecked escape hatch; it must never be enabled in a real release.
+These limitations must not be hidden.
 
 ## Evidence
 
