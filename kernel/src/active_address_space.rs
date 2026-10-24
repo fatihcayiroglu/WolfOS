@@ -101,6 +101,15 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         self.contexts.snapshot()
     }
 
+    /// Inspect an exact saved context under the caller's shared coordinator
+    /// lock before exposing a queued wakeup or dispatch to another CPU.
+    pub fn validate_saved_context(&self, context: ContextTicket) -> Result<(), ContextError> {
+        if self.gate.snapshot().phase != Phase::Live {
+            return Err(ContextError::WrongPhase);
+        }
+        self.contexts.validate_resume(context)
+    }
+
     /// Metadata admission; register the actual resumable frame and queue entry
     /// before publishing them to any dispatcher. One exclusive owner lock is
     /// needed across scheduler admission, dispatch, and retirement.
@@ -118,9 +127,7 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         context: ContextTicket,
         cpu: usize,
     ) -> Result<Ticket, ResumeError> {
-        self.contexts
-            .validate_resume(context)
-            .map_err(ResumeError::Context)?;
+        self.validate_saved_context(context).map_err(ResumeError::Context)?;
         self.gate.reserve_cpu(cpu).map_err(ResumeError::Cpu)
     }
 

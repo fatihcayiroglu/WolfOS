@@ -20,6 +20,8 @@ mod tlb_shootdown;
 #[cfg(feature = "smp-address-space-retirement-smoke")]
 mod active_address_space;
 #[cfg(feature = "smp-address-space-retirement-smoke")]
+mod ring3_context_retirement;
+#[cfg(feature = "smp-address-space-retirement-smoke")]
 mod saved_context_retirement;
 #[cfg(feature = "address-space-retirement-smoke")]
 mod address_space_retirement_smoke;
@@ -207,7 +209,8 @@ mod ring3_round_robin;
           feature = "p2-handoff-preflight-smoke",
           feature = "kernel-stack-lease-smoke",
           feature = "user-context-smoke",
-          feature = "process-table-smoke"))]
+          feature = "process-table-smoke",
+          feature = "smp-address-space-retirement-smoke"))]
 mod ring3_runqueue;
 // A no-heap event registration/notification gate for the isolated real
 // two-ELF WAIT/SIGNAL QEMU feature. The caller must serialize it against

@@ -1,6 +1,10 @@
 //! Exact production ownership/ledger code with observable allocator effects.
 #[path = "../kernel/src/active_address_space.rs"]
 mod active_address_space;
+#[path = "../kernel/src/ring3_context_retirement.rs"]
+mod ring3_context_retirement;
+#[path = "../kernel/src/ring3_runqueue.rs"]
+mod ring3_runqueue;
 #[path = "../kernel/src/saved_context_retirement.rs"]
 mod saved_context_retirement;
 #[path = "../kernel/src/address_space_retirement.rs"]
@@ -10,6 +14,8 @@ mod pmm_frame_batch;
 
 use active_address_space::{ActiveAddressSpace, PublishError, ResumeError};
 use saved_context_retirement::{Error as ContextError, Phase as ContextPhase};
+use ring3_context_retirement::{Error as BindError, Ring3SavedBinding};
+use ring3_runqueue::{Error as QueueError, Ring3RunQueue, State as QueueState};
 use address_space_retirement::{Error, Phase};
 use pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport};
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
@@ -390,6 +396,96 @@ fn retirement_closes_context_registration_and_cpu_resume_atomically() {
     assert_eq!(owner.begin_retirement(), Err(Error::WrongPhase));
     // SAFETY: host-only context ledger has no external saved CPU frame or queue.
     unsafe { owner.revoke_saved_context(context) }.unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
+}
+
+#[test]
+fn bound_event_wake_cannot_resurrect_a_retiring_saved_process() {
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<2, 2>(&mut source, 0x1000);
+    let mut queue = Ring3RunQueue::<2>::new();
+    let blocked = queue.admit(41).unwrap();
+    let peer = queue.admit(42).unwrap();
+    assert_eq!(queue.start_next(), Ok(blocked));
+    let (next, wait) = queue.block_current_for_event(blocked, 0xabc).unwrap();
+    assert_eq!(next, Some(peer));
+    let binding = Ring3SavedBinding::attach(&mut owner, &queue, blocked, 3).unwrap();
+    assert_eq!(owner.context_snapshot().pending, 1 << 3);
+    owner.begin_retirement().unwrap();
+    let before = queue;
+    assert_eq!(
+        binding.wake_for_event(&mut queue, &owner, wait, 0xabc),
+        Err(BindError::Context(ContextError::WrongPhase))
+    );
+    assert_eq!(queue, before);
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingContexts));
+    assert!(trace.borrow().releases.is_empty());
+    // SAFETY: host simulation has no real Ring3 frame, timer, pending IPI,
+    // wakeup, or hardware load; only the queue metadata above exists.
+    unsafe { binding.cancel(&mut queue, &mut owner) }.unwrap();
+    assert!(queue.slots().iter().any(|s| s.handle == blocked && s.state == QueueState::Exited));
+    assert_eq!(queue.wake_for_event(wait, 0xabc), Err(QueueError::WrongState));
+    assert_eq!(owner.context_snapshot().pending, 0);
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 2, failed: 0 }));
+    assert_eq!(trace.borrow().releases, [0x2000, 0x1000]);
+}
+
+#[test]
+fn bound_dispatch_stages_queue_until_exact_selected_handle_is_authorized() {
+    let mut source = Source::new(&[0x1000]);
+    let mut owner = publish::<1, 2>(&mut source, 0x1000);
+    let mut queue = Ring3RunQueue::<2>::new();
+    let earlier = queue.admit(77).unwrap();
+    let selected = queue.admit(88).unwrap();
+    let binding = Ring3SavedBinding::attach(&mut owner, &queue, selected, 0).unwrap();
+    let before = queue;
+    assert_eq!(
+        binding.start_next(&mut queue, &mut owner, 1),
+        Err(BindError::WrongHandle)
+    );
+    assert_eq!(queue, before);
+    assert_eq!(owner.snapshot().reserved, 0);
+    queue.cancel(earlier).unwrap();
+    let cpu = binding.start_next(&mut queue, &mut owner, 1).unwrap();
+    assert_eq!(queue.running(), Some(selected));
+    assert_eq!(owner.snapshot().reserved, 0b10);
+    owner.confirm_active(cpu, 0x1000).unwrap();
+    owner.begin_retirement().unwrap();
+    owner.acknowledge_quiescent(cpu, 0x9000).unwrap();
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingContexts));
+    queue.exit_current(selected).unwrap();
+    // SAFETY: host mock has no actual saved user frame, queue reader,
+    // wakeup, in-flight CPU load, or DMA user. Owner CPU was acknowledged.
+    unsafe { binding.retire_exited(&queue, &mut owner) }.unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
+}
+
+#[test]
+fn busy_cpu_cannot_partially_commit_a_bound_queue_dispatch() {
+    let mut source = Source::new(&[0x1000]);
+    let mut owner = publish::<1, 1>(&mut source, 0x1000);
+    let mut queue = Ring3RunQueue::<1>::new();
+    let handle = queue.admit(17).unwrap();
+    let binding = Ring3SavedBinding::attach(&mut owner, &queue, handle, 1).unwrap();
+    let preexisting = owner.reserve_cpu(0).unwrap();
+    let original = queue;
+    assert_eq!(
+        binding.start_next(&mut queue, &mut owner, 0),
+        Err(BindError::Reserve(active_address_space::ResumeError::Cpu(Error::CpuBusy)))
+    );
+    assert_eq!(queue, original);
+    owner.acknowledge_quiescent(preexisting, 0x9000).unwrap();
+    let cpu = binding.start_next(&mut queue, &mut owner, 0).unwrap();
+    assert_eq!(queue.running(), Some(handle));
+    owner.begin_retirement().unwrap();
+    owner.acknowledge_quiescent(cpu, 0x9000).unwrap();
+    queue.exit_current(handle).unwrap();
+    // SAFETY: isolated mock has no real saved frame, wakeup or CPU load.
+    unsafe { binding.retire_exited(&queue, &mut owner) }.unwrap();
     owner.finish_retirement().unwrap();
     assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
 }

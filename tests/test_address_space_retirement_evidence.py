@@ -15,6 +15,8 @@ class RetirementEvidenceTests(unittest.TestCase):
         for proof in [SMP_PROOF.replace("per_cpu_restored=4", "per_cpu_restored=3"),
                       SMP_PROOF.replace("last_ap_rejected=1", "last_ap_rejected=0"),
                       SMP_PROOF.replace("saved_context_pinned=1", "saved_context_pinned=0"),
+                      SMP_PROOF.replace("runqueue_cancel=1", "runqueue_cancel=0"),
+                      SMP_PROOF.replace("late_wake_rejected=1", "late_wake_rejected=0"),
                       SMP_PROOF.replace("saved_context_pinned=1 ", ""),
                       SMP_PROOF + "\n" + SMP_PROOF, "prefix " + SMP_PROOF]:
             self.assertFalse(evaluate(OWNERSHIP_PROOF + "\n" + proof + "\nWOLFOS_BOOT_OK", 33, smp=True))
@@ -31,6 +33,8 @@ class RetirementEvidenceTests(unittest.TestCase):
                       OWNERSHIP_PROOF.replace("last_ap_pinned=1", "last_ap_pinned=0"),
                       OWNERSHIP_PROOF.replace("retired_owner_freed=1", "retired_owner_freed=0"),
                       OWNERSHIP_PROOF.replace("saved_context_pinned=1", "saved_context_pinned=0"),
+                      OWNERSHIP_PROOF.replace("runqueue_cancel=1", "runqueue_cancel=0"),
+                      OWNERSHIP_PROOF.replace("late_wake_rejected=1", "late_wake_rejected=0"),
                       "prefix " + OWNERSHIP_PROOF, OWNERSHIP_PROOF + " forged=1"]:
             self.assertFalse(evaluate(proof + "\n" + SMP_PROOF + "\nWOLFOS_BOOT_OK", 33, smp=True))
 
