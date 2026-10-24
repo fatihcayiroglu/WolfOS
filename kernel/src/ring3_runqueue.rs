@@ -11,6 +11,11 @@ pub struct Handle { pub pid: u64, pub generation: u64 }
 /// can authenticate a later wake. Caller still authenticates event origin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WaitTicket { handle: Handle, event: u64, sequence: u64 }
+impl WaitTicket {
+    /// Identifies the queue incarnation named by this ticket. It does NOT
+    /// authenticate event origin or authorize wakeup without queue validation.
+    pub fn handle(self) -> Handle { self.handle }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State { Empty, Ready, Running, Blocked, Exited }

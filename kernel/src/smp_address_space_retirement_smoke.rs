@@ -3,8 +3,10 @@
 //! their own observation. Explicit active ownership pins the root throughout.
 //! No Ring3, PCID, private globals or IPI shootdown.
 use crate::{
-    active_address_space::{ActiveAddressSpace, ResumeError},
+    active_address_space::ActiveAddressSpace,
     address_space_retirement::{Error, Phase},
+    ring3_context_retirement::{Error as BindError, Ring3SavedBinding},
+    ring3_runqueue::{Error as QueueError, Ring3RunQueue},
     saved_context_retirement::Error as ContextError,
     pmm,
     pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport},
@@ -352,10 +354,20 @@ pub fn verify_bsp() -> bool {
     if actual_root() != supervisor || !wait_for(&ACTIVE, aps) {
         return false;
     }
-    // Synthetic saved-return token, deliberately *not* a Ring3 frame.
-    // It is admitted before retirement under the exact same ledger lock
-    // used by all four real CPU CR3 reservations.
-    let Some(Ok(saved)) = with_gate(|gate| gate.register_saved_context(0)) else {
+    // Exercise the actual Ring3RunQueue policy with a synthetic BLOCKED
+    // wait. It never owns a real user frame/CR3, but its queue handle and
+    // one-use wait ticket are bound to the same ledger as all real CPU loads.
+    let mut queue = Ring3RunQueue::<1>::new();
+    let Ok(handle) = queue.admit(73) else { return false };
+    if queue.start_next() != Ok(handle) {
+        return false;
+    }
+    let Ok((None, wait)) = queue.block_current_for_event(handle, 0xa11) else {
+        return false;
+    };
+    let Some(Ok(binding)) = with_gate(|gate| Ring3SavedBinding::attach(
+        gate, &queue, handle, 0,
+    )) else {
         return false;
     };
     if with_gate(|gate| gate.context_snapshot().pending) != Some(1)
@@ -378,6 +390,7 @@ pub fn verify_bsp() -> bool {
         return false;
     }
     RELEASE.fetch_or(last_bit, Ordering::Release);
+    let before_late_wake = queue;
     if !wait_for(&ACKS, ALL)
         || BAD.load(Ordering::Acquire)
         || ENTERED
@@ -389,17 +402,19 @@ pub fn verify_bsp() -> bool {
         || with_gate(|gate| gate.snapshot().active) != Some(0)
         || with_gate(|gate| gate.context_snapshot().pending) != Some(1)
         || with_gate(|gate| gate.finish_retirement()) != Some(Err(Error::OutstandingContexts))
-        || with_gate(|gate| gate.reserve_saved_resume(saved, bsp))
-            != Some(Err(ResumeError::Context(ContextError::WrongPhase)))
+        || with_gate(|gate| binding.wake_for_event(&mut queue, gate, wait, 0xa11))
+            != Some(Err(BindError::Context(ContextError::WrongPhase)))
+        || queue != before_late_wake
         || actual_root() != supervisor
         || pmm::statistics().allocated_frames != resident
     {
         return false;
     }
-    // SAFETY: synthetic context token never referenced any actual Ring3
-    // trap frame, runqueue, event wakeup, timer, or future CR3 handoff.
+    // SAFETY: this synthetic runqueue entry never referenced an actual
+    // Ring3 trap frame, hardware timer, event backend or future CR3 handoff.
     // Real CPUs have all independently restored supervisor roots above.
-    if with_gate(|gate| unsafe { gate.revoke_saved_context(saved) }) != Some(Ok(()))
+    if with_gate(|gate| unsafe { binding.cancel(&mut queue, gate) }) != Some(Ok(()))
+        || queue.wake_for_event(wait, 0xa11) != Err(QueueError::WrongState)
         || with_gate(|gate| gate.context_snapshot().pending) != Some(0)
         || with_gate(|gate| gate.finish_retirement()) != Some(Ok(()))
         || with_gate(|gate| gate.snapshot().phase) != Some(Phase::Retired)
@@ -415,9 +430,10 @@ pub fn verify_bsp() -> bool {
             let owner = slot.take()?;
             // SAFETY: all four authenticated CPUs have restored their original
             // root with PCID off, invalidating non-global private translations.
-            // The synthetic saved token was explicitly revoked only after all
-            // actual CPU departures. No real Ring3 saved frame, future queued
-            // load, walker or device reference exists in this isolated flavor.
+            // The synthetic BLOCKED queue entry and its saved-context token
+            // were atomically canceled after all actual CPU departures. No
+            // real Ring3 saved frame, future queued load, walker or device
+            // reference exists in this isolated flavor.
             // Borrowed child tables stay resident.
             match unsafe { owner.reclaim() } {
                 Ok(report) => Some(report),
@@ -438,10 +454,10 @@ pub fn verify_bsp() -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 pmm_no_leak=1 saved_context_pinned=1 ring3=0 ipi_shootdown=0",
+        "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0",
     );
     serial::write_line(
-        "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 pmm_no_leak=1 saved_context_pinned=1 ring3=0 ipi_shootdown=0",
+        "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0",
     );
     true
 }
