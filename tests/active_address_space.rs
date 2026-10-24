@@ -592,7 +592,7 @@ fn registry_bound_admission_matches_exact_pid_root_and_pmm_lease() {
     let mut source = Source::new(&[0x1000, 0x2000]);
     let trace = source.trace.clone();
     let staged = FrameBatch::<_, 2>::acquire(&mut source).unwrap();
-    let mut owner = ActiveAddressSpace::<_, 2, 1>::publish(staged, 1, 0x1000, 0x9000).unwrap();
+    let mut owner = ActiveAddressSpace::<_, 2, 1>::publish(staged, 1, 0x1000, 0x9000).unwrap_or_else(|_| panic!("publish"));
     let mut registry = ProcessTable::<1, 2>::new();
     let pid = registry.reserve(0x1000, [0x1000, 0x2000]).unwrap();
     assert_eq!(pid, 1);
@@ -617,7 +617,7 @@ fn registry_bound_admission_matches_exact_pid_root_and_pmm_lease() {
 fn registry_bound_admission_rejects_wrong_state_stale_handle_and_wrong_owner() {
     let mut source = Source::new(&[0x1000, 0x2000]);
     let staged = FrameBatch::<_, 2>::acquire(&mut source).unwrap();
-    let mut owner = ActiveAddressSpace::<_, 2, 1>::publish(staged, 1, 0x1000, 0x9000).unwrap();
+    let mut owner = ActiveAddressSpace::<_, 2, 1>::publish(staged, 1, 0x1000, 0x9000).unwrap_or_else(|_| panic!("publish"));
     let mut registry = ProcessTable::<1, 2>::new();
     let pid = registry.reserve(0x1000, [0x1000, 0x2000]).unwrap();
     let mut queue = Ring3RunQueue::<1>::new();
@@ -659,7 +659,7 @@ fn registry_bound_admission_rejects_wrong_state_stale_handle_and_wrong_owner() {
         let batch = FrameBatch::<_, 2>::acquire(&mut other_source).unwrap();
         let mut other_owner = ActiveAddressSpace::<_, 2, 1>::publish(
             batch, generation, 0x1000, 0x9000
-        ).unwrap();
+        ).unwrap_or_else(|_| panic!("publish"));
         let mut other_registry = ProcessTable::<1, 2>::new();
         let other_pid = other_registry.reserve(0x1000, [0x1000, 0x2000]).unwrap();
         let mut other_queue = Ring3RunQueue::<1>::new();
