@@ -57,11 +57,10 @@ impl Ring3SavedBinding {
             .ok_or(Error::StaleHandle)
     }
 
-    /// Bind a *previously admitted* queue entry to an already authenticated,
-    /// saved user frame. Callers must first save the real interrupt/user
-    /// context, validate the PID/CR3 owner, and hold the shared scheduler lock.
-    /// The wrapper checks only queue identity and saved-context metadata.
-    pub fn attach<'a, S: FrameSource, const FRAMES: usize, const CPUS: usize,
+    /// Internal primitive: only queue identity and saved-slot availability.
+    /// Never expose this as a production entry point. Full admission must
+    /// validate saved trap, process registry and ordered PMM lease first.
+    fn attach_unchecked<'a, S: FrameSource, const FRAMES: usize, const CPUS: usize,
         const QUEUE: usize>(
         owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
         queue: &Ring3RunQueue<QUEUE>,
@@ -79,6 +78,32 @@ impl Ring3SavedBinding {
         Ok(Self { handle, context })
     }
 
+    /// Explicit legacy fixture API. The test harness has no real CPL3 trap
+    /// and deliberately exercises the queue/PMM retirement ledger alone.
+    #[cfg(test)]
+    pub fn attach<'a, S: FrameSource, const FRAMES: usize, const CPUS: usize,
+        const QUEUE: usize>(
+        owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        queue: &Ring3RunQueue<QUEUE>,
+        handle: Handle,
+        saved_slot: usize,
+    ) -> Result<Self, Error> {
+        Self::attach_unchecked(owner, queue, handle, saved_slot)
+    }
+
+    /// QEMU-only synthetic escape hatch. A real Ring3 trap must NEVER call
+    /// this routine: it bypasses context-bank and PMM lease authentication.
+    #[cfg(feature = "smp-address-space-retirement-smoke")]
+    pub fn attach_synthetic_for_smoke<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        queue: &Ring3RunQueue<QUEUE>,
+        handle: Handle,
+        saved_slot: usize,
+    ) -> Result<Self, Error> {
+        Self::attach_unchecked(owner, queue, handle, saved_slot)
+    }
+
     /// Admission against an actual generation-safe process registry and
     /// move-only PMM owner, not merely a caller-selected queue PID/slot.
     /// Requires registry state READY for a READY queue entry, or BLOCKED
@@ -92,7 +117,7 @@ impl Ring3SavedBinding {
     /// the same scheduler/registry/PMM-owner lock across this admission and
     /// every future dispatch/wake/cancel. Legacy attach exists only for
     /// isolated synthetic composition until the hardware path is migrated.
-    pub fn attach_from_process_table<'a, S: FrameSource, const FRAMES: usize,
+    fn attach_from_process_table_checked<'a, S: FrameSource, const FRAMES: usize,
         const CPUS: usize, const QUEUE: usize>(
         owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
         registry: &ProcessTable<QUEUE, FRAMES>,
@@ -111,7 +136,21 @@ impl Ring3SavedBinding {
         if !owner.matches_process_lease(handle.pid, root, &frames) {
             return Err(Error::OwnerMismatch);
         }
-        Self::attach(owner, queue, handle, saved_slot)
+        Self::attach_unchecked(owner, queue, handle, saved_slot)
+    }
+
+    /// Registry/PMM composition remains directly available only to host
+    /// tests; it has no stored-trap evidence and is not a production API.
+    #[cfg(test)]
+    pub fn attach_from_process_table<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        registry: &ProcessTable<QUEUE, FRAMES>,
+        queue: &Ring3RunQueue<QUEUE>,
+        handle: Handle,
+        saved_slot: usize,
+    ) -> Result<Self, Error> {
+        Self::attach_from_process_table_checked(owner, registry, queue, handle, saved_slot)
     }
 
     /// Production-path pre-admission check: the stored exact PID frame must
@@ -131,7 +170,7 @@ impl Ring3SavedBinding {
         saved_slot: usize,
     ) -> Result<Self, Error> {
         bank.verify_saved_binding(registry, queue, handle).map_err(Error::FrameEvidence)?;
-        Self::attach_from_process_table(owner, registry, queue, handle, saved_slot)
+        Self::attach_from_process_table_checked(owner, registry, queue, handle, saved_slot)
     }
 
     /// Stage an authenticated RUNNING -> BLOCKED event wait and publish it
