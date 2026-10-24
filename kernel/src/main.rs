@@ -324,12 +324,18 @@ pub extern "C" fn kmain() -> ! {
             halt_forever();
         }
     }
-    if !pmm::self_test() {
-        serial::write_line("WOLFOS_PMM_TEST_FAILED");
-        halt_forever();
+    // Every mandatory smoke flavor enables smoke-exit; normal/COM1 boots
+    // must not stress-allocate 128 frames and run 10,000 allocator probes
+    // before providing a useful interface. CI exercises this path exactly.
+    #[cfg(feature = "smoke-exit")]
+    {
+        if !pmm::self_test() {
+            serial::write_line("WOLFOS_PMM_TEST_FAILED");
+            halt_forever();
+        }
+        serial::write_line("WOLFOS_PMM_TEST_OK iterations=10000 unique=128");
+        serial::write_line("WOLFOS_PMM_DYNAMIC_OK");
     }
-    serial::write_line("WOLFOS_PMM_TEST_OK iterations=10000 unique=128");
-    serial::write_line("WOLFOS_PMM_DYNAMIC_OK");
     let pci_summary = pci::discover();
     if pci_summary.devices == 0 || pci_summary.displays == 0 {
         serial::write_line("WOLFOS_PCI_TEST_FAILED no supported QEMU VGA/PCI devices");
@@ -349,6 +355,9 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
 
+    // Real page-table exercise belongs to the isolated mandatory smoke
+    // flavors; ordinary boot does not map/unmap disposable test pages.
+    #[cfg(feature = "smoke-exit")]
     if !paging::mapping_roundtrip(hhdm.offset) {
         serial::write_line("WOLFOS_PAGING_TEST_FAILED");
         halt_forever();
@@ -491,17 +500,23 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_AP_IPI_TEST_FAILED");
         halt_forever();
     }
-    if !context_switch::verify_roundtrip() {
-        serial::write_line("WOLFOS_CONTEXT_TEST_FAILED");
-        halt_forever();
-    }
-    if !kernel_threads::verify() {
-        serial::write_line("WOLFOS_KTHREAD_TEST_FAILED");
-        halt_forever();
-    }
-    if !context_batch::verify() {
-        serial::write_line("WOLFOS_CTX_BATCH_TEST_FAILED");
-        halt_forever();
+    // These tests schedule hundreds of throwaway kernel contexts. Keep
+    // running them under every mandatory smoke flavor, never on a normal
+    // interactive boot path where no user requested a stress workload.
+    #[cfg(feature = "smoke-exit")]
+    {
+        if !context_switch::verify_roundtrip() {
+            serial::write_line("WOLFOS_CONTEXT_TEST_FAILED");
+            halt_forever();
+        }
+        if !kernel_threads::verify() {
+            serial::write_line("WOLFOS_KTHREAD_TEST_FAILED");
+            halt_forever();
+        }
+        if !context_batch::verify() {
+            serial::write_line("WOLFOS_CTX_BATCH_TEST_FAILED");
+            halt_forever();
+        }
     }
     #[cfg(feature = "timer-smoke")]
     if !timer::verify() {
@@ -514,6 +529,8 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_APIC_TIMER_TEST_FAILED");
         halt_forever();
     }
+    #[cfg(not(feature = "smoke-exit"))]
+    serial::write_line("WOLFOS_BOOT_SELFTESTS_SKIPPED mode=non_smoke");
     serial::write_line("WOLFOS_BOOT_OK");
 
     // Experimental interactive BSP-only COM1 diagnostics, separate from all

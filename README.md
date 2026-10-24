@@ -17,6 +17,7 @@ On Ubuntu: `sudo apt install build-essential git make xorriso qemu-system-x86 ov
 - `make smoke`: boot and serial assertions in QEMU
 - `make run-shell`: experimental **interactive COM1 kernel diagnostic console** in QEMU (type `help`, `about`, `mem`, `clear`, or `halt`; no physical-disk writes). This is not a Ring3 user shell or graphical desktop.
 - `make serial-shell-smoke`: automated QEMU serial-input roundtrip and command/output markers
+- `make run` and `make run-shell` skip disposable allocator/paging/context stress checks; all `smoke-exit` CI flavors still run and verify them. Core hardware detection and initialization remain mandatory.
 - `make address-space-retirement-smoke`: BSP-only activation/retirement gate with real private CR3 loads, including a reservation racing retirement (1/4-vCPU QEMU; no Ring3 or SMP shootdown)
 - `make smp-address-space-retirement-smoke`: explicit staged-to-active frame ownership, active Drop retention and four real CPU CR3 departures, with the last AP held active before exact root-frame cleanup (CPL0 only; no IPI shootdown)
 - `make exception-smoke`: CPU exception dispatch
