@@ -19,6 +19,18 @@ ticket. All operations require an **external exclusive lock across the
 actual queue and address-space owner**; this module does not implement that
 runtime lock.
 
+- `UserContextBank::verify_saved_binding`: validate an exact generation-tagged
+  READY/BLOCKED runqueue handle against its resident process and an IF-enabled
+  stored full hardware trap frame. Bootstrap-only frames, masked IF, missing
+  saved records, stale handles, and wrong registry state fail closed without
+  any publication. A recorded `FrameOrigin::HardwareTrap` is metadata,
+  **not independent proof** that a genuine CPU trap occurred.
+- `attach_from_context_bank`: production-facing ordering first checks that
+  saved-trap ledger, then verifies exact registry/root/full PMM lease via
+  `attach_from_process_table`, and registers the saved-context ticket only
+  after both independent metadata checks pass. Four-vCPU CPL0 smoke proves
+  empty bank/registry cannot create a saved ticket, but contains no CPL3
+  return frame.
 - `attach_from_process_table`: require a real `ProcessTable` record whose
   READY/BLOCKED state exactly matches the queue incarnation and whose
   minted PID generation, private CR3 root and **ordered full PMM frame
@@ -63,6 +75,9 @@ wake path is migrated. These limitations must not be hidden.
 
 ## Evidence
 
+- Standalone `UserContextBank` host tests accept only a correctly saved
+  IF-enabled hardware trap record after READY/BLOCKED registry agreement;
+  bootstrap-only, IF-masked, stale handle and state-split cases refuse.
 - Host-only registry/queue/PMM owner composition tests require exact
   PID-generation/private-root/frame-lease equality, reject wrong registry
   state and forged handles, and preserve allocator/queue state on failure.
@@ -87,8 +102,8 @@ wake path is migrated. These limitations must not be hidden.
 
 ## Next production step
 
-Connect the checked binding to actual Ring3 timer/syscall trap transitions and
-`UserContextBank` with a shared lock and authenticated saved frames;
+Wire the checked context-bank binding into actual Ring3 timer/syscall trap
+transitions and provide a shared lock plus real CPU/FX-provenance evidence;
 atomically close event/timer admission during exit, drain in-flight AP
 handoffs, enforce owner+queue generation equality, and prove late
 wakeups cannot reload a reclaimed CR3 on actual multi-CPU QEMU.
