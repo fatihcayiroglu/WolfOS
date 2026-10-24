@@ -24,6 +24,7 @@ pub enum Error {
     Queue(QueueError),
     Context(ContextError),
     Reserve(ResumeError),
+    Quiesce(crate::address_space_retirement::Error),
 }
 
 /// A process-generation-safe association. The queue may outlive the
@@ -68,6 +69,49 @@ impl Ring3SavedBinding {
         }
         let context = owner.register_saved_context(saved_slot).map_err(Error::Context)?;
         Ok(Self { handle, context })
+    }
+
+    /// Stage an authenticated RUNNING -> BLOCKED event wait and publish it
+    /// only after the CPU's exact address-space reservation has been drained.
+    /// The queue remains unchanged for any validation, wait-sequence, or
+    /// quiescence failure; a successful transition leaves the saved context
+    /// pinned until a subsequent authenticated wake/cancel/exit.
+    ///
+    /// The caller must hold the SAME external scheduler/owner lock through
+    /// this entire operation. It must not expose the staged peer as runnable
+    /// on hardware until that peer independently reserves its own address
+    /// space and completes all CR3/TSS/FX/IRET handoff checks.
+    ///
+    /// # Safety
+    /// The trusted CPU trap path must already have copied and authenticated
+    /// this exact PID's GPR/IRET/FX frame, registered the real event source,
+    /// canceled pending private-CR3 loads, switched to the authenticated
+    /// supervisor CR3, and completed required local invalidation. `cpu_ticket`
+    /// MUST belong to the suspended CPU and this owner; a caller-supplied
+    /// CR3 value is not hardware proof. This function performs no trap,
+    /// lock, TLB, event-source, or scheduler hardware operation.
+    pub unsafe fn park_for_event<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        &self,
+        queue: &mut Ring3RunQueue<QUEUE>,
+        owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        cpu_ticket: CpuTicket,
+        actual_supervisor_cr3: u64,
+        event: u64,
+    ) -> Result<(Option<Handle>, WaitTicket), Error> {
+        if self.state(queue)? != State::Running || queue.running() != Some(self.handle) {
+            return Err(Error::WrongState);
+        }
+        owner.validate_saved_context(self.context).map_err(Error::Context)?;
+        let mut staged = *queue;
+        let result = staged.block_current_for_event(self.handle, event).map_err(Error::Queue)?;
+        // SAFETY: the hardware and event-source obligations are required of
+        // the unsafe caller above. The exact CPU ticket must be acknowledged
+        // before the blocked policy record becomes visible.
+        owner.acknowledge_quiescent(cpu_ticket, actual_supervisor_cr3)
+            .map_err(Error::Quiesce)?;
+        *queue = staged;
+        Ok(result)
     }
 
     /// A delayed wait notification cannot make an address space runnable
