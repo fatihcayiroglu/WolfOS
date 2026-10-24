@@ -23,6 +23,14 @@ runtime lock.
   register its saved-context pin in the owner. The external trusted caller
   is responsible for authenticating the process PID, CR3 ownership and
   actual saved GPR/IRET/FX state before making this binding visible.
+- `unsafe park_for_event`: stage an exact RUNNING-to-BLOCKED event-bound
+  wait on a copy of the queue; require a still-live saved-context pin and
+  acknowledgement of the matching CPU reservation under the authenticated
+  supervisor CR3 **before** publishing the blocked queue snapshot. Failed
+  event sequence allocation, foreign/stale CPU token, wrong supervisor root,
+  or retiring owner cannot partially commit the queue. Actual hardware
+  frame saving, event-source registration, TLB invalidation and CPU-local
+  observation are caller obligations; this is not a real Ring3 trap handler.
 - `wake_for_event`: reject a wrong queue generation, wrong event ticket,
   closed owner admission, or stale context before changing blocked state.
   The queue's existing one-use wait sequence remains authoritative.
@@ -46,6 +54,10 @@ wake path is migrated. These limitations must not be hidden.
 
 ## Evidence
 
+- Host-only PMM owner/queue composition additionally validates a successful
+  event park after CPU quiescence, wrong-root/foreign-ticket rejections,
+  no zero-event partial commits, late close-admission rejection, and clean
+  resume/exit/frame release. These are **not** CPU hardware observations.
 - Exact real `Ring3RunQueue` host tests with PMM mock owner: late event
   wake after retirement leaves queue unchanged; cancellation prevents
   event resurrection; wrong selected handle and busy CPU cannot partially

@@ -489,3 +489,97 @@ fn busy_cpu_cannot_partially_commit_a_bound_queue_dispatch() {
     owner.finish_retirement().unwrap();
     assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
 }
+
+#[test]
+fn bound_running_event_park_publishes_only_after_exact_cpu_quiescence() {
+    let mut source = Source::new(&[0x1000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<1, 1>(&mut source, 0x1000);
+    let mut queue = Ring3RunQueue::<1>::new();
+    let handle = queue.admit(901).unwrap();
+    let binding = Ring3SavedBinding::attach(&mut owner, &queue, handle, 5).unwrap();
+    let cpu = binding.start_next(&mut queue, &mut owner, 0).unwrap();
+    owner.confirm_active(cpu, 0x1000).unwrap();
+
+    let original = queue;
+    assert_eq!(
+        unsafe { binding.park_for_event(&mut queue, &mut owner, cpu, 0x1000, 0xbad) },
+        Err(BindError::Quiesce(Error::WrongCr3))
+    );
+    assert_eq!(queue, original);
+    assert_eq!(owner.snapshot().active, 1);
+    assert_eq!(
+        unsafe { binding.park_for_event(&mut queue, &mut owner, cpu, 0x9000, 0) },
+        Err(BindError::Queue(QueueError::InvalidEvent))
+    );
+    assert_eq!(queue, original);
+    assert_eq!(owner.snapshot().active, 1);
+
+    // SAFETY: host-only simulation, without a real CPL3 frame, event
+    // registration or CR3 load. The synthetic token models completed
+    // authenticated trap save and supervisor-root restoration.
+    let (selected, wait) = unsafe {
+        binding.park_for_event(&mut queue, &mut owner, cpu, 0x9000, 0xbad)
+    }.unwrap();
+    assert_eq!(selected, None);
+    assert_eq!(owner.snapshot().active, 0);
+    assert_eq!(owner.context_snapshot().pending, 1u64 << 5);
+    assert_eq!(queue.running(), None);
+    assert!(queue.slots().iter().any(|s| s.handle == handle && s.state == QueueState::Blocked));
+    assert_eq!(queue.wake_for_event(wait, 0xbee), Err(QueueError::WrongEvent));
+    assert_eq!(binding.wake_for_event(&mut queue, &owner, wait, 0xbad), Ok(()));
+    let resumed = binding.start_next(&mut queue, &mut owner, 0).unwrap();
+    owner.confirm_active(resumed, 0x1000).unwrap();
+    owner.begin_retirement().unwrap();
+    owner.acknowledge_quiescent(resumed, 0x9000).unwrap();
+    queue.exit_current(handle).unwrap();
+    // SAFETY: isolated host metadata has no actual saved frame, IRQ,
+    // queued wakeup, external hardware load or DMA reference.
+    unsafe { binding.retire_exited(&queue, &mut owner) }.unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
+    assert_eq!(trace.borrow().releases, [0x1000]);
+}
+
+#[test]
+fn foreign_cpu_ticket_or_retiring_owner_never_commits_bound_block() {
+    let mut source = Source::new(&[0x1000]);
+    let mut owner = publish::<1, 1>(&mut source, 0x1000);
+    let mut foreign_source = Source::new(&[0x2000]);
+    let mut foreign_owner = publish::<1, 1>(&mut foreign_source, 0x2000);
+    let foreign_cpu = foreign_owner.reserve_cpu(0).unwrap();
+    let mut queue = Ring3RunQueue::<1>::new();
+    let handle = queue.admit(902).unwrap();
+    let binding = Ring3SavedBinding::attach(&mut owner, &queue, handle, 6).unwrap();
+    let cpu = binding.start_next(&mut queue, &mut owner, 0).unwrap();
+    owner.confirm_active(cpu, 0x1000).unwrap();
+    let before = queue;
+    assert_eq!(
+        unsafe { binding.park_for_event(&mut queue, &mut owner, foreign_cpu, 0x9000, 0xaaa) },
+        Err(BindError::Quiesce(Error::StaleTicket))
+    );
+    assert_eq!(queue, before);
+    assert_eq!(owner.snapshot().active, 1);
+    // A separate owner cannot use its ticket to quiesce this task.
+    assert_eq!(foreign_owner.snapshot().reserved, 1);
+
+    owner.begin_retirement().unwrap();
+    assert_eq!(
+        unsafe { binding.park_for_event(&mut queue, &mut owner, cpu, 0x9000, 0xaaa) },
+        Err(BindError::Context(ContextError::WrongPhase))
+    );
+    assert_eq!(queue, before);
+    assert_eq!(owner.snapshot().active, 1);
+    assert_eq!(owner.context_snapshot().pending, 1u64 << 6);
+    owner.acknowledge_quiescent(cpu, 0x9000).unwrap();
+    queue.exit_current(handle).unwrap();
+    // SAFETY: no Ring3 frame, event source, timer wake, in-flight CPU
+    // handoff, private CR3 load, or external frame users exist in this test.
+    unsafe { binding.retire_exited(&queue, &mut owner) }.unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
+    foreign_owner.acknowledge_quiescent(foreign_cpu, 0x9000).unwrap();
+    foreign_owner.begin_retirement().unwrap();
+    foreign_owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(foreign_owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
+}
