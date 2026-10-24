@@ -19,6 +19,15 @@ ticket. All operations require an **external exclusive lock across the
 actual queue and address-space owner**; this module does not implement that
 runtime lock.
 
+- `attach_from_process_table`: require a real `ProcessTable` record whose
+  READY/BLOCKED state exactly matches the queue incarnation and whose
+  minted PID generation, private CR3 root and **ordered full PMM frame
+  lease** match the live `ActiveAddressSpace` owner. Reject unknown/stale
+  queue handles, mismatched state, foreign frame sets or reused PID identity
+  before registering any saved-context ticket. Production hardware callers
+  must still verify the saved `UserContextBank` GPR/IRET/FX record and hold
+  a shared coordinator lock; the legacy unchecked `attach` remains solely
+  for isolated synthetic smoke/test scenarios until migrated.
 - `attach`: verify the exact queue incarnation is READY or BLOCKED and
   register its saved-context pin in the owner. The external trusted caller
   is responsible for authenticating the process PID, CR3 ownership and
@@ -54,6 +63,9 @@ wake path is migrated. These limitations must not be hidden.
 
 ## Evidence
 
+- Host-only registry/queue/PMM owner composition tests require exact
+  PID-generation/private-root/frame-lease equality, reject wrong registry
+  state and forged handles, and preserve allocator/queue state on failure.
 - Host-only PMM owner/queue composition additionally validates a successful
   event park after CPU quiescence, wrong-root/foreign-ticket rejections,
   no zero-event partial commits, late close-admission rejection, and clean
@@ -75,7 +87,7 @@ wake path is migrated. These limitations must not be hidden.
 
 ## Next production step
 
-Connect the binding to actual Ring3 timer/syscall trap transitions and
+Connect the checked binding to actual Ring3 timer/syscall trap transitions and
 `UserContextBank` with a shared lock and authenticated saved frames;
 atomically close event/timer admission during exit, drain in-flight AP
 handoffs, enforce owner+queue generation equality, and prove late

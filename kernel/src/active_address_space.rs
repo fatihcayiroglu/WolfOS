@@ -91,6 +91,16 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         self.gate.snapshot()
     }
 
+    /// Fail closed unless the live PMM owner corresponds to exactly one
+    /// process-table generation, CR3 root and ordered lease. ProcessTable
+    /// requires its root at index zero. This is only metadata corroboration:
+    /// caller must still prove real saved GPR/IRET/FX and CPU provenance.
+    pub fn matches_process_lease(&self, pid: u64, root: u64, frames: &[u64; N]) -> bool {
+        self.gate.snapshot().phase == Phase::Live
+            && self.gate.matches_process_identity(pid, root)
+            && self.batch.frames() == frames
+    }
+
     /// Only for a fresh entry that has no saved resumable context. A scheduler
     /// must use reserve_saved_resume for every suspended/preempted user return.
     pub fn reserve_cpu(&mut self, cpu: usize) -> Result<Ticket, Error> {

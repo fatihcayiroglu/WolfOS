@@ -61,6 +61,17 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
     pub fn running(&self) -> usize {
         self.slots.iter().filter(|p| p.state == ProcessState::Running).count()
     }
+    /// Return an exact live READY/BLOCKED private PMM lease for an owner
+    /// registration gate. The caller must independently authenticate this
+    /// registry, preserve the PID generation, and verify the PMM owner; a
+    /// snapshot is not hardware CR3 or saved trap-frame evidence.
+    pub fn saved_binding_lease(&self, pid: u64, blocked: bool) -> Option<(u64, [u64; FRAMES])> {
+        let record = self.snapshot(pid)?;
+        let expected = if blocked { ProcessState::Blocked } else { ProcessState::Ready };
+        if record.state != expected { return None; }
+        Some((record.cr3_root, record.frames))
+    }
+
     /// A supplied supervisor CR3 must not use ANY frame leased to a live
     /// userspace process, even a non-root page-table/data frame. Looking only
     /// at the process PML4 root could wrongly authorize a handoff/reap under

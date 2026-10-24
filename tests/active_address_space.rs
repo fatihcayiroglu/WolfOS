@@ -5,6 +5,8 @@ mod active_address_space;
 mod ring3_context_retirement;
 #[path = "../kernel/src/ring3_runqueue.rs"]
 mod ring3_runqueue;
+#[path = "../kernel/src/process_table.rs"]
+mod process_table;
 #[path = "../kernel/src/saved_context_retirement.rs"]
 mod saved_context_retirement;
 #[path = "../kernel/src/address_space_retirement.rs"]
@@ -18,6 +20,7 @@ use ring3_context_retirement::{Error as BindError, Ring3SavedBinding};
 use ring3_runqueue::{Error as QueueError, Ring3RunQueue, State as QueueState};
 use address_space_retirement::{Error, Phase};
 use pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport};
+use process_table::ProcessTable;
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 #[derive(Default)]
@@ -582,4 +585,96 @@ fn foreign_cpu_ticket_or_retiring_owner_never_commits_bound_block() {
     foreign_owner.begin_retirement().unwrap();
     foreign_owner.finish_retirement().unwrap();
     assert_eq!(reclaim(foreign_owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
+}
+
+#[test]
+fn registry_bound_admission_matches_exact_pid_root_and_pmm_lease() {
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let staged = FrameBatch::<_, 2>::acquire(&mut source).unwrap();
+    let mut owner = ActiveAddressSpace::<_, 2, 1>::publish(staged, 1, 0x1000, 0x9000).unwrap();
+    let mut registry = ProcessTable::<1, 2>::new();
+    let pid = registry.reserve(0x1000, [0x1000, 0x2000]).unwrap();
+    assert_eq!(pid, 1);
+    let mut queue = Ring3RunQueue::<1>::new();
+    let handle = queue.admit(pid).unwrap();
+    let bound = Ring3SavedBinding::attach_from_process_table(
+        &mut owner, &registry, &queue, handle, 9
+    ).unwrap();
+    assert_eq!(owner.context_snapshot().pending, 1 << 9);
+    assert_eq!(queue.running(), None);
+    // SAFETY: this host-only metadata fixture has no real user frame,
+    // registered event source, pending handoff, AP or CR3 hardware load.
+    unsafe { bound.cancel(&mut queue, &mut owner) }.unwrap();
+    assert_eq!(registry.cancel_ready(pid, 0x9000).unwrap(), [0x1000, 0x2000]);
+    owner.begin_retirement().unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 2, failed: 0 }));
+    assert_eq!(trace.borrow().releases, [0x2000, 0x1000]);
+}
+
+#[test]
+fn registry_bound_admission_rejects_wrong_state_stale_handle_and_wrong_owner() {
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let staged = FrameBatch::<_, 2>::acquire(&mut source).unwrap();
+    let mut owner = ActiveAddressSpace::<_, 2, 1>::publish(staged, 1, 0x1000, 0x9000).unwrap();
+    let mut registry = ProcessTable::<1, 2>::new();
+    let pid = registry.reserve(0x1000, [0x1000, 0x2000]).unwrap();
+    let mut queue = Ring3RunQueue::<1>::new();
+    let handle = queue.admit(pid).unwrap();
+
+    let forged = ring3_runqueue::Handle { pid, generation: handle.generation + 1 };
+    assert!(matches!(
+        Ring3SavedBinding::attach_from_process_table(&mut owner, &registry, &queue, forged, 0),
+        Err(BindError::StaleHandle)
+    ));
+    assert_eq!(owner.context_snapshot().pending, 0);
+    assert_eq!(queue.start_next(), Ok(handle));
+    assert_eq!(queue.block_current(handle), Ok(None));
+    assert_eq!(
+        Ring3SavedBinding::attach_from_process_table(&mut owner, &registry, &queue, handle, 0),
+        Err(BindError::RegistryMismatch)
+    );
+    assert_eq!(owner.context_snapshot().pending, 0);
+    registry.mark_running(pid, 0x1000).unwrap();
+    registry.block_running(pid, 0x1000).unwrap();
+    let valid = Ring3SavedBinding::attach_from_process_table(
+        &mut owner, &registry, &queue, handle, 0
+    ).unwrap();
+    assert_eq!(owner.context_snapshot().pending, 1);
+    // SAFETY: no real saved frames, IRQ wakeups or hardware users exist.
+    unsafe { valid.cancel(&mut queue, &mut owner) }.unwrap();
+    assert_eq!(registry.cancel_blocked(pid, 0x9000).unwrap(), [0x1000, 0x2000]);
+    owner.begin_retirement().unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 2, failed: 0 }));
+
+    // An exact process table cannot be paired with either a copied owner
+    // from a different PID generation or a different set of physical pages.
+    for (generation, frames) in [
+        (2, [0x1000, 0x2000]),
+        (1, [0x1000, 0x3000]),
+    ] {
+        let mut other_source = Source::new(&frames);
+        let batch = FrameBatch::<_, 2>::acquire(&mut other_source).unwrap();
+        let mut other_owner = ActiveAddressSpace::<_, 2, 1>::publish(
+            batch, generation, 0x1000, 0x9000
+        ).unwrap();
+        let mut other_registry = ProcessTable::<1, 2>::new();
+        let other_pid = other_registry.reserve(0x1000, [0x1000, 0x2000]).unwrap();
+        let mut other_queue = Ring3RunQueue::<1>::new();
+        let other_handle = other_queue.admit(other_pid).unwrap();
+        let snapshot = other_queue;
+        assert_eq!(
+            Ring3SavedBinding::attach_from_process_table(
+                &mut other_owner, &other_registry, &other_queue, other_handle, 63
+            ),
+            Err(BindError::OwnerMismatch)
+        );
+        assert_eq!(other_queue, snapshot);
+        assert_eq!(other_owner.context_snapshot().pending, 0);
+        other_owner.begin_retirement().unwrap();
+        other_owner.finish_retirement().unwrap();
+        assert_eq!(reclaim(other_owner).ok(), Some(ReleaseReport { released: 2, failed: 0 }));
+    }
 }
