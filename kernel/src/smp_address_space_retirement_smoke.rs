@@ -36,7 +36,25 @@ static LEFT: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
 struct PmmFrames;
 impl FrameSource for PmmFrames {
     fn allocate(&mut self) -> Option<u64> {
-        pmm::allocate_frame()
+        let first = pmm::allocate_frame()?;
+        if first != 0 {
+            return Some(first);
+        }
+        // UEFI may expose physical frame zero as usable RAM. The ledger
+        // deliberately reserves zero as an invalid CR3 identity. Hold that
+        // frame until the next allocation, then return it before publication;
+        // immediately freeing and retrying would select zero again forever.
+        let next = pmm::allocate_frame();
+        if pmm::free_frame(first).is_err() {
+            serial::write_line("WOLFOS_SMP_RETIRE_ERROR frame_zero_release");
+            if let Some(frame) = next {
+                if pmm::free_frame(frame).is_err() {
+                    serial::write_line("WOLFOS_SMP_RETIRE_ERROR nonzero_root_rollback");
+                }
+            }
+            return None;
+        }
+        next
     }
     fn release(&mut self, frame: u64) -> bool {
         pmm::free_frame(frame).is_ok()

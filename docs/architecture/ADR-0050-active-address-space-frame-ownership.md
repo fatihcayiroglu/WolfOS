@@ -51,6 +51,11 @@ all four authenticated CPUs have restored their original CR3 can BSP finish
 retirement and call unsafe reclaim, with an exact one-frame release report.
 Shared child tables and their unchanged global kernel mappings stay resident.
 Every failure after publication retains the active owner or leaks its frames.
+The proof's PMM adapter handles UEFI exposing usable physical frame zero:
+it holds zero while allocating a nonzero root, then returns zero before
+publication (also on allocation exhaustion). Freeing zero before retrying
+would continually select it again. The ledger's nonzero-root validation is
+preserved; this does not reserve frame zero globally or change PMM policy.
 
 Before AP release, an additional real BSP CR3 roundtrip deliberately drops a
 separate active owner. PMM usage must stay exactly one above baseline while
