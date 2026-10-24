@@ -19,6 +19,8 @@ mod address_space_retirement;
 mod tlb_shootdown;
 #[cfg(feature = "smp-address-space-retirement-smoke")]
 mod active_address_space;
+#[cfg(feature = "smp-address-space-retirement-smoke")]
+mod saved_context_retirement;
 #[cfg(feature = "address-space-retirement-smoke")]
 mod address_space_retirement_smoke;
 #[cfg(feature = "smp-address-space-retirement-smoke")]
