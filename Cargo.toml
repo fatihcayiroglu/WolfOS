@@ -16,6 +16,8 @@ x86_64 = { version = "=0.15.5", features = ["abi_x86_interrupt"] }
 [features]
 default = []
 smoke-exit = []
+# Opt-in BSP polling diagnostics; does not write disks or launch applications.
+serial-shell = []
 address-space-retirement-smoke = ["smoke-exit"]
 smp-address-space-retirement-smoke = ["smoke-exit"]
 exception-smoke = ["smoke-exit"]

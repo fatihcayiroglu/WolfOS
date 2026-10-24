@@ -15,6 +15,8 @@ On Ubuntu: `sudo apt install build-essential git make xorriso qemu-system-x86 ov
 - `make doctor`: list missing tools
 - `make test`: Python source/config tests plus Rust host unit tests
 - `make smoke`: boot and serial assertions in QEMU
+- `make run-shell`: experimental **interactive COM1 kernel diagnostic console** in QEMU (type `help`, `about`, `mem`, `clear`, or `halt`; no physical-disk writes). This is not a Ring3 user shell or graphical desktop.
+- `make serial-shell-smoke`: automated QEMU serial-input roundtrip and command/output markers
 - `make address-space-retirement-smoke`: BSP-only activation/retirement gate with real private CR3 loads, including a reservation racing retirement (1/4-vCPU QEMU; no Ring3 or SMP shootdown)
 - `make smp-address-space-retirement-smoke`: explicit staged-to-active frame ownership, active Drop retention and four real CPU CR3 departures, with the last AP held active before exact root-frame cleanup (CPL0 only; no IPI shootdown)
 - `make exception-smoke`: CPU exception dispatch
@@ -34,7 +36,7 @@ All smoke targets build CD ISO files under `out/`. They do not write physical di
 
 The verified scope remains an experimental Rust-owned kernel: boot execution, frame allocation, CPU tables/exceptions, paging, ACPI topology, saved-context kernel threads, **four-process** Ring 3 ELF execution, address-space isolation, and timer-origin preemptive handoff in isolated QEMU scenarios. A genuine hardware IRQ → blocked WAIT wake → saved IRET resume **has been demonstrated for two fixed ELF processes**; generalized dynamic process creation, device-event registration, scheduling, and arbitrary workload-safe Block → Wake → Resume integration remain incomplete. Host-only queue, process/PMM lease and context-bank policy regressions are not substitutes for physical CPU/IRQ proof. The reference-clock calibration is a QEMU test variant, not a validated general scheduling or wall-clock source.
 
-WolfOS does **not** yet have a shell, a consumer-ready filesystem, production drivers, network, GPU acceleration, a general-purpose preemptive scheduler, or support for Windows programs, Steam and GTA V. Its Ring 3/ELF support and VFS/RamFS experiments are currently bounded development milestones, not mature general-purpose services. Windows compatibility is a long-term goal, not a present feature. Physical-machine driver safety and cross-platform application compatibility require separate engineering and test gates.
+WolfOS has an opt-in interactive **kernel diagnostic console over QEMU COM1**, not a Ring3 user shell or terminal application. It still does **not** have a consumer-ready shell, filesystem, production drivers, network, GPU acceleration, a general-purpose preemptive scheduler, or support for Windows programs, Steam and GTA V. Its Ring 3/ELF support and VFS/RamFS experiments are currently bounded development milestones, not mature general-purpose services. Windows compatibility is a long-term goal, not a present feature. Physical-machine driver safety and cross-platform application compatibility require separate engineering and test gates.
 
 See [the roadmap](docs/ROADMAP.md), [security guidance](docs/SECURITY.md) and [Turkish getting-started guide](docs/BASLANGIC_TR.md).
 

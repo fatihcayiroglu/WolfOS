@@ -46,6 +46,8 @@ jobs:
         run: make test
       - name: Build and smoke test in QEMU
         run: make smoke
+      - name: First interactive COM1 shell commands in QEMU (BSP-only)
+        run: make serial-shell-smoke
       - name: CPU invalid-opcode exception smoke test
         run: make exception-smoke
       - name: Paging map/unmap and page-fault smoke test

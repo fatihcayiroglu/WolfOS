@@ -17,6 +17,17 @@ unsafe fn port_in(port: u16) -> u8 {
     out
 }
 
+/// Read at most one waiting COM1 byte. BSP polling only: no IRQ, DMA or heap.
+pub fn read_byte_nonblocking() -> Option<u8> {
+    // SAFETY: COM1 line-status register advertises a ready receiver byte.
+    if unsafe { port_in(COM1 + 5) } & 1 == 0 {
+        None
+    } else {
+        // SAFETY: the 16550 UART reports receive-data-ready above.
+        Some(unsafe { port_in(COM1) })
+    }
+}
+
 pub fn init() {
     // SAFETY: 16550-compatible COM1 on QEMU target.
     unsafe {

@@ -9,6 +9,8 @@ LIMINE_BRANCH := v10.x-binary
 
 ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
+else ifeq ($(FLAVOR),serial-shell)
+FEATURES := --features serial-shell
 else ifeq ($(FLAVOR),exception)
 FEATURES := --features exception-smoke
 else ifeq ($(FLAVOR),address-space-retirement)
@@ -113,7 +115,7 @@ else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: tlb-shootdown-hardware-smoke all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p3-ring3-event-wait-hardware-smoke p3-ring3-irq-event-wake-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke p2-ring3-timer-observe-smoke p2-ring3-timer-preempt-smoke p2-ring3-timer-nonyield-smoke p3-ring3-four-elf-preflight-smoke p3-ring3-four-live-smoke check clean test doctor
+.PHONY: serial-shell-smoke run-shell tlb-shootdown-hardware-smoke all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p3-ring3-event-wait-hardware-smoke p3-ring3-irq-event-wake-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke p2-ring3-timer-observe-smoke p2-ring3-timer-preempt-smoke p2-ring3-timer-nonyield-smoke p3-ring3-four-elf-preflight-smoke p3-ring3-four-live-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -138,6 +140,14 @@ iso: limine/limine kernel
 
 run: iso
 	qemu-system-x86_64 -M q35 -m 512M -cdrom $(OUT)/wolfos-normal.iso -boot d -serial stdio -display none -no-reboot
+
+run-shell:
+	$(MAKE) iso FLAVOR=serial-shell
+	qemu-system-x86_64 -M q35 -m 512M -cdrom $(OUT)/wolfos-serial-shell.iso -boot d -serial stdio -monitor none -display none -no-reboot
+
+serial-shell-smoke:
+	$(MAKE) iso FLAVOR=serial-shell
+	python3 scripts/serial_shell_smoke.py $(OUT)/wolfos-serial-shell.iso
 
 run-graphics: iso
 	qemu-system-x86_64 -M q35 -m 512M -cdrom $(OUT)/wolfos-normal.iso -boot d -serial stdio -display default -no-reboot
@@ -354,6 +364,9 @@ p3-ring3-four-live-smoke:
 	python3 scripts/user_timer_four_live_smoke.py $(OUT)/wolfos-p3-ring3-four-live.iso
 
 test:
+	mkdir -p $(OUT)
+	rustc --edition=2024 --test kernel/src/serial_shell.rs -o $(OUT)/serial_shell_tests
+	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_four_live_evidence.py' -v

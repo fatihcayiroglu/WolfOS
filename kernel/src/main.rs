@@ -11,6 +11,8 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest};
 
 mod serial;
+#[cfg(feature = "serial-shell")]
+mod serial_shell;
 mod cpu;
 mod pmm;
 mod pmm_layout;
@@ -513,6 +515,11 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_line("WOLFOS_BOOT_OK");
+
+    // Experimental interactive BSP-only COM1 diagnostics, separate from all
+    // hardware smoke flavors and deliberately without disk or user processes.
+    #[cfg(feature = "serial-shell")]
+    serial_shell::run();
 
     #[cfg(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"))]
     user_yield_switch_smoke::enter(hhdm.offset);
