@@ -16,6 +16,8 @@ mod pmm;
 mod pmm_layout;
 #[cfg(any(feature = "address-space-retirement-smoke", feature = "smp-address-space-retirement-smoke"))]
 mod address_space_retirement;
+#[cfg(feature = "smp-address-space-retirement-smoke")]
+mod active_address_space;
 #[cfg(feature = "address-space-retirement-smoke")]
 mod address_space_retirement_smoke;
 #[cfg(feature = "smp-address-space-retirement-smoke")]
@@ -85,7 +87,7 @@ mod user_vm_layout;
 mod user_vm_shadow_smoke;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi;
-#[cfg(feature = "user-vm-shadow-smoke")]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "smp-address-space-retirement-smoke"))]
 mod pmm_frame_batch;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_image_admission;

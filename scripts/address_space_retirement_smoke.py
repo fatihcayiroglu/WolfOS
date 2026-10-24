@@ -15,6 +15,11 @@ SMP_PROOF = (
     "bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 "
     "pmm_no_leak=1 ring3=0 ipi_shootdown=0"
 )
+OWNERSHIP_PROOF = (
+    "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 "
+    "cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 "
+    "pmm_no_leak=1 ring3=0 ipi_shootdown=0"
+)
 
 
 def evaluate(output: str, returncode: int, *, smp: bool = False) -> bool:
@@ -23,6 +28,10 @@ def evaluate(output: str, returncode: int, *, smp: bool = False) -> bool:
     proofs = [row for row in rows if proof.split()[0] in row]
     if returncode != 33 or proofs != [proof] or rows.count("WOLFOS_BOOT_OK") != 1:
         return False
+    if smp:
+        ownership = [row for row in rows if OWNERSHIP_PROOF.split()[0] in row]
+        if ownership != [OWNERSHIP_PROOF] or rows.index(OWNERSHIP_PROOF) >= rows.index(proof):
+            return False
     if any(bad in output for bad in (
         "WOLFOS_ADDRESS_SPACE_RETIRE_ERROR", "WOLFOS_ADDRESS_SPACE_RETIRE_TEST_FAILED",
         "WOLFOS_SMP_RETIRE_ERROR", "WOLFOS_SMP_RETIRE_TEST_FAILED",
@@ -60,7 +69,7 @@ def main() -> int:
                 print(f"FAIL: retirement CR3 proof ({cpus} vCPUs, exit={run.returncode})")
                 print(run.stderr.decode(errors="replace"))
                 return 1
-            description = ("all real CPU CR3 departures required, last AP withheld, zero PMM leak"
+            description = ("active Drop pins frames, all CPU departures required, last AP withheld, zero PMM leak"
                            if smp else "BSP private CR3 blocks retirement until restored, zero PMM leak")
             print(f"PASS: {description} ({cpus} vCPUs)")
     return 0

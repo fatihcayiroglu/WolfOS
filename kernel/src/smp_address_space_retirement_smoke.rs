@@ -1,9 +1,13 @@
 //! Isolated four-CPU CPL0 quiescence proof. All CPUs borrow one cloned
 //! kernel PML4, restore the registered supervisor root, then acknowledge
-//! their own observation. No Ring3, PCID, private globals or IPI shootdown.
+//! their own observation. Explicit active ownership pins the root throughout.
+//! No Ring3, PCID, private globals or IPI shootdown.
 use crate::{
-    address_space_retirement::{Error, Phase, RetirementGate},
-    pmm, serial,
+    active_address_space::ActiveAddressSpace,
+    address_space_retirement::{Error, Phase},
+    pmm,
+    pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport},
+    serial,
 };
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -18,6 +22,7 @@ const CPUS: usize = 4;
 const ALL: u64 = 15;
 const SPINS: usize = 200_000_000;
 static PREPARED: AtomicBool = AtomicBool::new(false);
+static STARTED: AtomicBool = AtomicBool::new(false);
 static ROOT: AtomicU64 = AtomicU64::new(0);
 static SUPERVISOR: AtomicU64 = AtomicU64::new(0);
 static BSP: AtomicUsize = AtomicUsize::new(CPUS);
@@ -28,9 +33,23 @@ static BAD: AtomicBool = AtomicBool::new(false);
 static ENTERED: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
 static LEFT: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
 
+struct PmmFrames;
+impl FrameSource for PmmFrames {
+    fn allocate(&mut self) -> Option<u64> {
+        pmm::allocate_frame()
+    }
+    fn release(&mut self, frame: u64) -> bool {
+        pmm::free_frame(frame).is_ok()
+    }
+}
+type Owner = ActiveAddressSpace<'static, PmmFrames, 1, CPUS>;
+// A single mutable borrow is created by the BSP after STARTED's one-shot CAS,
+// before AP startup. Thereafter only the locked Owner can use this provider.
+static mut FRAME_SOURCE: PmmFrames = PmmFrames;
+
 struct Ledger {
     held: AtomicBool,
-    value: UnsafeCell<Option<RetirementGate<CPUS>>>,
+    value: UnsafeCell<Option<Owner>>,
 }
 // SAFETY: initialization and every access hold held exclusively. No borrowed
 // ledger reference escapes with(); the guard unlocks on every ordinary exit.
@@ -46,7 +65,7 @@ impl Drop for Unlock<'_> {
     }
 }
 impl Ledger {
-    fn with<R>(&self, operation: impl FnOnce(&mut Option<RetirementGate<CPUS>>) -> R) -> Option<R> {
+    fn with<R>(&self, operation: impl FnOnce(&mut Option<Owner>) -> R) -> Option<R> {
         for _ in 0..SPINS {
             if self
                 .held
@@ -62,7 +81,7 @@ impl Ledger {
         None
     }
 }
-fn with_gate<R>(operation: impl FnOnce(&mut RetirementGate<CPUS>) -> R) -> Option<R> {
+fn with_gate<R>(operation: impl FnOnce(&mut Owner) -> R) -> Option<R> {
     LEDGER.with(|slot| slot.as_mut().map(operation)).flatten()
 }
 fn actual_root() -> u64 {
@@ -84,30 +103,7 @@ fn wait_for(value: &AtomicU64, mask: u64) -> bool {
     false
 }
 
-// Only before publication/bootstrap: no CPU can have loaded this root.
-fn reject_unpublished_root(root: u64) -> bool {
-    if pmm::free_frame(root).is_err() {
-        serial::write_line("WOLFOS_SMP_RETIRE_ERROR staged_root_release");
-    }
-    false
-}
-
-/// BSP only, after its MMIO probe and before any AP is released. Only the
-/// newly allocated PML4 is owned; all child tables remain borrowed/pinned.
-pub fn prepare_bsp(bsp_id: u32, cpus: &[&MpInfo], hhdm: u64) -> bool {
-    if !supported() || cpus.len() != CPUS || PREPARED.load(Ordering::Acquire) || hhdm & 4095 != 0 {
-        return false;
-    }
-    let Some(bsp) = cpus.iter().position(|cpu| cpu.lapic_id == bsp_id) else {
-        return false;
-    };
-    let supervisor = actual_root();
-    let Some(root) = pmm::allocate_frame() else {
-        return false;
-    };
-    if root == supervisor {
-        return false;
-    }
+fn copy_root(hhdm: u64, supervisor: u64, root: u64) -> bool {
     let pointers = hhdm
         .checked_add(supervisor)
         .and_then(|old| hhdm.checked_add(root).map(|new| (old, new)))
@@ -118,7 +114,7 @@ pub fn prepare_bsp(bsp_id: u32, cpus: &[&MpInfo], hhdm: u64) -> bool {
             ))
         });
     let Some((old, new)) = pointers else {
-        return reject_unpublished_root(root);
+        return false;
     };
     // SAFETY: distinct aligned resident PML4 frames via trusted HHDM, before
     // AP startup. Shared children, kernel mappings and stack mappings do not
@@ -128,12 +124,90 @@ pub fn prepare_bsp(bsp_id: u32, cpus: &[&MpInfo], hhdm: u64) -> bool {
             new.add(i).write_volatile(old.add(i).read_volatile());
         }
     }
-    let Ok(mut gate) = RetirementGate::new(3, root, supervisor) else {
-        return reject_unpublished_root(root);
+    true
+}
+
+/// Before AP release, deliberately lose an owner while its real CR3 is active.
+/// The test alone can recover this intentional leak after independently
+/// restoring the sole CPU; general lost-owner recovery is not implemented.
+fn verify_active_drop(hhdm: u64) -> bool {
+    let before = pmm::statistics().allocated_frames;
+    let supervisor = actual_root();
+    let mut source = PmmFrames;
+    let Ok(batch) = FrameBatch::<_, 1>::acquire(&mut source) else {
+        return false;
     };
-    if gate.publish().is_err() {
-        return reject_unpublished_root(root);
+    let root = batch.frames()[0];
+    if root == supervisor {
+        core::mem::forget(batch); // A corrupt PMM must never free the live root.
+        return false;
     }
+    if !copy_root(hhdm, supervisor, root) {
+        return false;
+    }
+    let Ok(mut owner) = ActiveAddressSpace::<_, 1, 1>::publish(batch, 4, root, supervisor) else {
+        return false;
+    };
+    let Ok(ticket) = owner.reserve_cpu(0) else {
+        return false;
+    };
+    let (original, flags) = Cr3::read();
+    // SAFETY: IF=0, PCID=0, before AP release; cloned immutable kernel
+    // mappings and their borrowed children remain resident throughout.
+    unsafe {
+        Cr3::write(PhysFrame::containing_address(PhysAddr::new(root)), flags);
+    }
+    let confirmed = owner.confirm_active(ticket, actual_root()).is_ok();
+    drop(owner);
+    let retained = pmm::statistics().allocated_frames == before + 1 && actual_root() == root;
+    // SAFETY: unconditional restore before any return after private load.
+    unsafe {
+        Cr3::write(original, flags);
+    }
+    if !confirmed || !retained || actual_root() != supervisor || !supported() {
+        return false;
+    }
+    // Sole BSP, no saved context/queue/device/walker or future root load.
+    // Shared child tables stay pinned. This is isolated test-leak recovery.
+    pmm::free_frame(root).is_ok() && pmm::statistics().allocated_frames == before
+}
+
+/// BSP only, after its MMIO probe and before any AP is released. Only the
+/// newly allocated PML4 is owned; all child tables remain borrowed/pinned.
+pub fn prepare_bsp(bsp_id: u32, cpus: &[&MpInfo], hhdm: u64) -> bool {
+    if !supported()
+        || cpus.len() != CPUS
+        || hhdm & 4095 != 0
+        || STARTED
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return false;
+    }
+    let Some(bsp) = cpus.iter().position(|cpu| cpu.lapic_id == bsp_id) else {
+        return false;
+    };
+    if !verify_active_drop(hhdm) {
+        return false;
+    }
+    let supervisor = actual_root();
+    // SAFETY: STARTED admits exactly one BSP borrower before any AP starts.
+    // This static provider is used only through the locked active owner later.
+    let source = unsafe { &mut *core::ptr::addr_of_mut!(FRAME_SOURCE) };
+    let Ok(batch) = FrameBatch::<_, 1>::acquire(source) else {
+        return false;
+    };
+    let root = batch.frames()[0];
+    if root == supervisor {
+        core::mem::forget(batch);
+        return false;
+    }
+    if !copy_root(hhdm, supervisor, root) {
+        return false;
+    }
+    let Ok(gate) = ActiveAddressSpace::publish(batch, 3, root, supervisor) else {
+        return false;
+    };
     if LEDGER.with(|slot| {
         if slot.is_some() {
             return false;
@@ -142,7 +216,7 @@ pub fn prepare_bsp(bsp_id: u32, cpus: &[&MpInfo], hhdm: u64) -> bool {
         true
     }) != Some(true)
     {
-        return reject_unpublished_root(root);
+        return false; // Active Drop retains the root on publication failure.
     }
     ROOT.store(root, Ordering::Relaxed);
     SUPERVISOR.store(supervisor, Ordering::Relaxed);
@@ -295,11 +369,34 @@ pub fn verify_bsp() -> bool {
     // Independently established on all four CPUs: original root restored,
     // PCID off, no private/global mappings or pending future loads. Only the
     // PML4 is owned; none of its borrowed child tables are released.
-    if pmm::free_frame(root).is_err()
+    let released = LEDGER
+        .with(|slot| {
+            let owner = slot.take()?;
+            // SAFETY: all four authenticated CPUs have restored their original
+            // root with PCID off, invalidating non-global private translations.
+            // No saved user contexts, queued loads, walkers or device references
+            // exist in this isolated flavor. Borrowed child tables stay resident.
+            match unsafe { owner.reclaim() } {
+                Ok(report) => Some(report),
+                Err((owner, _)) => {
+                    *slot = Some(owner);
+                    None
+                }
+            }
+        })
+        .flatten();
+    if released
+        != Some(ReleaseReport {
+            released: 1,
+            failed: 0,
+        })
         || pmm::statistics().allocated_frames.checked_add(1) != Some(resident)
     {
         return false;
     }
+    serial::write_line(
+        "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 pmm_no_leak=1 ring3=0 ipi_shootdown=0",
+    );
     serial::write_line(
         "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 pmm_no_leak=1 ring3=0 ipi_shootdown=0",
     );
