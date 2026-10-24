@@ -7,6 +7,8 @@ use crate::{
     address_space_retirement::{Error, Phase},
     ring3_context_retirement::{Error as BindError, Ring3SavedBinding},
     ring3_runqueue::{Error as QueueError, Ring3RunQueue},
+    process_table::ProcessTable,
+    user_context_bank::{ContextError as FrameError, UserContextBank},
     saved_context_retirement::Error as ContextError,
     pmm,
     pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport},
@@ -365,6 +367,20 @@ pub fn verify_bsp() -> bool {
     let Ok((None, wait)) = queue.block_current_for_event(handle, 0xa11) else {
         return false;
     };
+    // An empty real process registry/context bank cannot authorize any
+    // saved-frame binding. This is still CPL0-only QEMU smoke: no actual
+    // CPL3 trap or UserContextBank frame is fabricated for the test.
+    let registry = ProcessTable::<1, 1>::new();
+    let bank = UserContextBank::<1>::new();
+    if with_gate(|gate| Ring3SavedBinding::attach_from_context_bank(
+        gate, &registry, &bank, &queue, handle, 0,
+    )) != Some(Err(BindError::FrameEvidence(FrameError::NotResident)))
+        || with_gate(|gate| gate.context_snapshot().pending) != Some(0)
+    {
+        return false;
+    }
+    // Synthetic-only escape hatch retained to exercise quiescence ledger;
+    // production admission must use attach_from_context_bank above.
     let Some(Ok(binding)) = with_gate(|gate| Ring3SavedBinding::attach(
         gate, &queue, handle, 0,
     )) else {

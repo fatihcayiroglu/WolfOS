@@ -17,6 +17,9 @@ use crate::{
     saved_context_retirement::{ContextTicket, Error as ContextError},
 };
 
+#[cfg(not(test))]
+use crate::user_context_bank::{ContextError as FrameEvidenceError, UserContextBank};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     StaleHandle,
@@ -28,6 +31,8 @@ pub enum Error {
     Quiesce(crate::address_space_retirement::Error),
     RegistryMismatch,
     OwnerMismatch,
+    #[cfg(not(test))]
+    FrameEvidence(FrameEvidenceError),
 }
 
 /// A process-generation-safe association. The queue may outlive the
@@ -107,6 +112,26 @@ impl Ring3SavedBinding {
             return Err(Error::OwnerMismatch);
         }
         Self::attach(owner, queue, handle, saved_slot)
+    }
+
+    /// Production-path pre-admission check: the stored exact PID frame must
+    /// be a verified IF-enabled hardware trap record, not a bootstrap frame,
+    /// before cross-checking its queue/registry/PMM owner. Both read-only
+    /// validation stages complete BEFORE admitting the saved context token.
+    /// The caller still authenticates actual CPU/FX/trap provenance and holds
+    /// the single external scheduler lock across all these ledgers.
+    #[cfg(not(test))]
+    pub fn attach_from_context_bank<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        registry: &ProcessTable<QUEUE, FRAMES>,
+        bank: &UserContextBank<QUEUE>,
+        queue: &Ring3RunQueue<QUEUE>,
+        handle: Handle,
+        saved_slot: usize,
+    ) -> Result<Self, Error> {
+        bank.verify_saved_binding(registry, queue, handle).map_err(Error::FrameEvidence)?;
+        Self::attach_from_process_table(owner, registry, queue, handle, saved_slot)
     }
 
     /// Stage an authenticated RUNNING -> BLOCKED event wait and publish it

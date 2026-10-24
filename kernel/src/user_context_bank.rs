@@ -60,7 +60,7 @@ pub enum ContextError {
     BadUserPointer, BadSelectors, BadFlags,
     BadKernelStack, KernelStackOverlap, FrameOutsideKernelStack,
     AlreadyPrepared, Full, NotPrepared, OnlyOnePrepared, ActiveUserCr3,
-    StaleProcess, NotRetired, SchedulerMismatch,
+    StaleProcess, NotRetired, SchedulerMismatch, NotHardwareTrap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -471,6 +471,46 @@ impl<const SLOTS: usize> UserContextBank<SLOTS> {
             Self::validate_frame(&stored.frame, stored.origin)?;
         }
         Ok(())
+    }
+
+    /// Audit one exact generation-tagged READY/BLOCKED runqueue entry
+    /// against the matching live process registry and a previously saved
+    /// genuine CPL3 trap *record*. Bootstrap-only frames cannot be treated
+    /// as suspended contexts. No frame, registry or queue state is changed.
+    ///
+    /// This validates stored metadata, including safe IF-enabled IRET flags,
+    /// but cannot itself prove CPU-local trap provenance, FXSAVE ownership,
+    /// locked scheduling, mapped user pages, or that the caller really saved
+    /// the frame from Ring3. Those proofs belong to the trusted trap path.
+    pub fn verify_saved_binding<const N: usize>(
+        &self,
+        table: &ProcessTable<SLOTS, N>,
+        queue: &Ring3RunQueue<SLOTS>,
+        handle: RunHandle,
+    ) -> Result<(), ContextError> {
+        if handle.pid == 0 { return Err(ContextError::InvalidPid) }
+        let state = queue.slots().iter()
+            .find(|slot| slot.state != RunState::Empty && slot.handle == handle)
+            .map(|slot| slot.state).ok_or(ContextError::SchedulerMismatch)?;
+        let expected = match state {
+            RunState::Ready => ProcessState::Ready,
+            RunState::Blocked => ProcessState::Blocked,
+            _ => return Err(ContextError::WrongState),
+        };
+        let process = table.snapshot(handle.pid).ok_or(ContextError::NotResident)?;
+        if process.state != expected { return Err(ContextError::WrongState) }
+        let saved = self.snapshot(handle.pid).ok_or(ContextError::NotPrepared)?;
+        if saved.pid != handle.pid || saved.cr3_root != process.cr3_root {
+            return Err(ContextError::StaleProcess);
+        }
+        if !saved.kernel_stack.valid() { return Err(ContextError::BadKernelStack) }
+        if saved.origin != FrameOrigin::HardwareTrap {
+            return Err(ContextError::NotHardwareTrap);
+        }
+        if saved.frame.hardware.rflags & (1 << 9) == 0 {
+            return Err(ContextError::BadFlags);
+        }
+        Self::validate_frame(&saved.frame, FrameOrigin::HardwareTrap)
     }
 
     /// Validate a scheduler-selected post-park handoff before any hardware
@@ -1981,5 +2021,70 @@ mod tests {
         assert_eq!(bank.prepare_bootstrap(&t,1,0x1000,stack(0xffff_8000_0012_0000),
             frame(0x401000,1)),Err(ContextError::AlreadyPrepared));
         assert_eq!(bank.count(),1);
+    }
+
+    #[test]
+    fn saved_binding_requires_previously_captured_if_enabled_trap_and_exact_registry_state() {
+        let mut table = ProcessTable::<1, 7>::new();
+        let pid = table.reserve(0x1000, frames(0x1000)).unwrap();
+        let mut bank = UserContextBank::<1>::new();
+        let mut queue = Ring3RunQueue::<1>::new();
+        let handle = queue.admit(pid).unwrap();
+        let kstack = stack(0xffff_8000_0d50_0000);
+        bank.prepare_bootstrap(&table, pid, 0x1000, kstack, frame(0x401000, pid)).unwrap();
+        assert_eq!(bank.verify_saved_binding(&table, &queue, handle),
+                   Err(ContextError::NotHardwareTrap));
+        assert_eq!(queue.start_next(), Ok(handle));
+        table.mark_running(pid, 0x1000).unwrap();
+        let mut trap = frame(0x401200, 0x7711);
+        trap.hardware.rflags = 0x202;
+        trap.registers.r15 = 0x44;
+        bank.refresh_authenticated_trap(
+            &table, pid, 0x1000, kstack, kstack.top - FRAME_BYTES as u64, trap
+        ).unwrap();
+        table.block_running(pid, 0x1000).unwrap();
+        assert_eq!(queue.block_current(handle), Ok(None));
+        let saved_before = bank.snapshot(pid);
+        let queue_before = queue;
+        assert_eq!(bank.verify_saved_binding(&table, &queue, handle), Ok(()));
+        let stale = RunHandle { pid, generation: handle.generation + 1 };
+        assert_eq!(bank.verify_saved_binding(&table, &queue, stale),
+                   Err(ContextError::SchedulerMismatch));
+        assert_eq!(bank.snapshot(pid), saved_before);
+        assert_eq!(queue, queue_before);
+        table.wake_blocked(pid, 0x9000).unwrap();
+        assert_eq!(bank.verify_saved_binding(&table, &queue, handle),
+                   Err(ContextError::WrongState));
+        queue.wake(handle).unwrap();
+        assert_eq!(bank.verify_saved_binding(&table, &queue, handle), Ok(()));
+        assert_eq!(bank.snapshot(pid).unwrap().frame, trap);
+    }
+
+    #[test]
+    fn saved_binding_rejects_if_masked_hardware_trap_and_missing_record() {
+        let mut table = ProcessTable::<1, 7>::new();
+        let pid = table.reserve(0x1000, frames(0x1000)).unwrap();
+        let mut bank = UserContextBank::<1>::new();
+        let mut queue = Ring3RunQueue::<1>::new();
+        let handle = queue.admit(pid).unwrap();
+        assert_eq!(bank.verify_saved_binding(&table, &queue, handle),
+                   Err(ContextError::NotPrepared));
+        assert_eq!(queue.start_next(), Ok(handle));
+        table.mark_running(pid, 0x1000).unwrap();
+        let kstack = stack(0xffff_8000_0d60_0000);
+        let mut masked = frame(0x401320, 0x55);
+        masked.hardware.rflags = 0x2;
+        // Older capture_trap admits a copied CPL3 trap with IF masked.
+        // Such a record may exist but is NOT an IF-enabled scheduler resume.
+        bank.capture_trap(
+            &table, pid, 0x1000, kstack, kstack.top - FRAME_BYTES as u64, masked
+        ).unwrap();
+        table.block_running(pid, 0x1000).unwrap();
+        assert_eq!(queue.block_current(handle), Ok(None));
+        let saved_before = bank.snapshot(pid);
+        assert_eq!(bank.verify_saved_binding(&table, &queue, handle),
+                   Err(ContextError::BadFlags));
+        assert_eq!(bank.snapshot(pid), saved_before);
+        assert_eq!(queue.running(), None);
     }
 }
