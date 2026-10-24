@@ -413,8 +413,9 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
     }
 }
 
-/// Two real four-CPU, fixed-xAPIC IPI rounds. Unlike the original AP IPI
-/// flavor, every acknowledgement must follow recipient-local INVLPG.
+/// Three genuine four-CPU IPI epochs. The last AP is deliberately withheld
+/// in epoch 3 to prove the barrier cannot complete or begin a new epoch.
+/// Every actual acknowledgement follows recipient-local INVLPG.
 #[cfg(feature = "tlb-shootdown-hardware-smoke")]
 pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
     use x86_64::registers::control::{Cr4, Cr4Flags};
@@ -451,11 +452,41 @@ pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
     unsafe { write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, enabled); }
     let mut good = true;
     let mut sends = 0u64;
-    'rounds: for round in 1..=2u64 {
+    let mut withheld_verified = false;
+    'rounds: for round in 1..=3u64 {
         if hw::completed() { good = false; break; }
         let mut sent_this_round = 0u64;
         for (i, cpu) in cpus.iter().enumerate() {
             if cpu.lapic_id == bsp_id { continue; }
+            if round == 3 && sent_this_round == 2 {
+                // No IPI has been sent to this final AP yet. A missing
+                // hardware ack must leave its exact target bit pending and
+                // prevent the coordinator from beginning another epoch.
+                let Some(before) = hw::evidence() else {
+                    good = false;
+                    break 'rounds;
+                };
+                let missing = 1u64 << i;
+                if before.epoch != 3 || before.pending != missing
+                    || before.completed || before.acks != 8
+                    || before.invlpg != 8 || before.per_cpu[i] != 2
+                    || hw::begin_next() || hw::completed()
+                {
+                    good = false;
+                    break 'rounds;
+                }
+                let Some(after) = hw::evidence() else {
+                    good = false;
+                    break 'rounds;
+                };
+                if after.epoch != before.epoch || after.pending != missing
+                    || after.acks != before.acks || after.invlpg != before.invlpg
+                {
+                    good = false;
+                    break 'rounds;
+                }
+                withheld_verified = true;
+            }
             if !send(bsp_id, cpu.lapic_id) {
                 good = false;
                 break 'rounds;
@@ -472,7 +503,7 @@ pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
             }
         }
         if !hw::completed() { good = false; break; }
-        if round == 1 && !hw::begin_next() { good = false; break; }
+        if round < 3 && !hw::begin_next() { good = false; break; }
     }
     unsafe { write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr); }
     STOP.store(true, Ordering::Release);
@@ -486,30 +517,30 @@ pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
         if cpu.lapic_id == bsp_id { continue; }
         received += SEEN[i].load(Ordering::Acquire);
         eois += EOIS[i].load(Ordering::Acquire);
-        if SEEN[i].load(Ordering::Acquire) != 2
-            || EOIS[i].load(Ordering::Acquire) != 2
+        if SEEN[i].load(Ordering::Acquire) != 3
+            || EOIS[i].load(Ordering::Acquire) != 3
         { per_ap_ok = false; }
     }
     let bad = BAD.load(Ordering::Acquire);
     let spurious = SPURIOUS_COUNT.load(Ordering::Acquire);
     let Some(e) = hw::evidence() else { return false; };
     let flush_ok = cpus.iter().enumerate().all(|(i,cpu)|
-        e.per_cpu[i] == if cpu.lapic_id == bsp_id { 0 } else { 2 }
+        e.per_cpu[i] == if cpu.lapic_id == bsp_id { 0 } else { 3 }
     );
-    if good && offline && per_ap_ok && flush_ok
-        && sends == 6 && received == 6 && eois == 6
-        && e.acks == 6 && e.invlpg == 6
-        && e.epoch == 2 && e.targets == targets && e.pending == 0
+    if good && offline && per_ap_ok && flush_ok && withheld_verified
+        && sends == 9 && received == 9 && eois == 9
+        && e.acks == 9 && e.invlpg == 9
+        && e.epoch == 3 && e.targets == targets && e.pending == 0
         && e.completed && !e.bad && bad == 0 && spurious == 0
     {
         serial::write_fmt(format_args!(
-            "WOLFOS_TLB_SHOOTDOWN_HW_OK cpus=4 aps=3 rounds=2 sends=6 invlpg=6 acks=6 eois=6 bad=0 spurious=0 offline=3 epoch=2 pending=0 pcid=0 freed=0\n"
+            "WOLFOS_TLB_SHOOTDOWN_HW_OK cpus=4 aps=3 rounds=3 sends=9 invlpg=9 acks=9 eois=9 bad=0 spurious=0 offline=3 epoch=3 pending=0 withheld=1 blocked=1 pcid=0 freed=0\n"
         ));
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_TLB_SHOOTDOWN_HW_ERROR good={} offline={} per_ap={} flush_ok={} sends={} seen={} eois={} acks={} invlpg={} epoch={} pending={} completed={} bad={} gate_bad={} spurious={}\n",
-            good, offline, per_ap_ok, flush_ok, sends, received, eois,
+            "WOLFOS_TLB_SHOOTDOWN_HW_ERROR good={} offline={} per_ap={} flush_ok={} withheld={} sends={} seen={} eois={} acks={} invlpg={} epoch={} pending={} completed={} bad={} gate_bad={} spurious={}\n",
+            good, offline, per_ap_ok, flush_ok, withheld_verified, sends, received, eois,
             e.acks, e.invlpg, e.epoch, e.pending, e.completed, bad, e.bad,
             spurious,
         ));

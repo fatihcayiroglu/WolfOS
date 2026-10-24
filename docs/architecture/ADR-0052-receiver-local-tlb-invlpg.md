@@ -29,10 +29,20 @@ interrupt handler on each recipient:
 
 The BSP does not hold that lock while awaiting APs, waits for each EOI,
 checks the barrier cannot complete while any AP is missing, then requires
-completion by the last AP. A second epoch repeats all three IPIs for
-six actual IPI/invalidation/acknowledgement events. The check also requires
-three APs parked with interrupts disabled, no unexpected interrupts, and
-no panic. A failure never authorizes frame reuse.
+completion by the last AP. Two initial epochs each complete normally.
+
+In a **third** epoch the BSP intentionally withholds the final recipient's
+IPI after the first two real recipient-local invalidations/acknowledgements.
+It verifies that exactly that CPU's bit remains pending, that a new epoch
+cannot begin, and that the attempted premature begin changes no state.
+Only after these negative observations does the BSP send the withheld
+IPI and require the third epoch to complete. This is a deliberately
+unsent IPI, **not evidence that hardware dropped an IPI** or that
+production timeout/retry handling exists. Altogether nine hardware
+IPIs, nine local INVLPG instructions and nine acknowledgements are
+required. The check also requires three APs parked with interrupts
+disabled, no unexpected interrupts, and no panic. A failure never
+authorizes frame reuse.
 
 `make tlb-shootdown-hardware-smoke` enforces a strict serial signature
 and QEMU ISA debug-exit status. P0 CI runs this in addition to the

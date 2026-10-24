@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed unless two real 4-vCPU IPI -> local INVLPG -> ack rounds pass."""
+"""Require three four-vCPU TLB rounds including one withheld final IPI."""
 from pathlib import Path
 import re
 import subprocess
@@ -10,10 +10,10 @@ PROOF = re.compile(
     r"^WOLFOS_TLB_SHOOTDOWN_HW_OK cpus=(\d+) aps=(\d+) rounds=(\d+) "
     r"sends=(\d+) invlpg=(\d+) acks=(\d+) eois=(\d+) bad=(\d+) "
     r"spurious=(\d+) offline=(\d+) epoch=(\d+) pending=(\d+) "
-    r"pcid=(\d+) freed=(\d+)$",
+    r"withheld=(\d+) blocked=(\d+) pcid=(\d+) freed=(\d+)$",
     re.MULTILINE,
 )
-EXPECTED = (4, 3, 2, 6, 6, 6, 6, 0, 0, 3, 2, 0, 0, 0)
+EXPECTED = (4, 3, 3, 9, 9, 9, 9, 0, 0, 3, 3, 0, 1, 1, 0, 0)
 FAILURES = (
     "WOLFOS_TLB_SHOOTDOWN_HW_ERROR",
     "WOLFOS_TLB_SHOOTDOWN_HW_TEST_FAILED",
@@ -70,9 +70,10 @@ def main() -> int:
         if not validate(output, result.returncode):
             print(result.stderr.decode(errors="replace"))
             return 1
-        print("PASS: 4 genuine CPUs, 2 epochs, 6 hardware IPIs, "
-              "6 recipient-local INVLPG instructions, 6 serialized acks; "
-              "zero early reclamation")
+        print("PASS: 4 genuine CPUs, 3 epochs, 9 hardware IPIs, "
+              "9 recipient-local INVLPG instructions and serialized acks; "
+              "withheld last IPI left barrier pending, blocked a new epoch, "
+              "then recovered; zero early reclamation")
         return 0
 
 
