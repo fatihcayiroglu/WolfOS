@@ -122,6 +122,8 @@ jobs:
         run: make p3-ring3-four-live-smoke
       - name: BSP directed fixed xAPIC IPIs to three APs (4 vCPUs)
         run: make ap-ipi-smoke
+      - name: Real 4-vCPU IPI local INVLPG and generation-tagged TLB acknowledgements
+        run: make tlb-shootdown-hardware-smoke
       - name: Directed IPIs wake three AP-owned remote work mailboxes (4 vCPUs)
         run: make ap-remote-work-smoke
       - name: Per-AP bounded four-slot FIFO, backpressure and overlapping IPI-woken work (4 vCPUs)
