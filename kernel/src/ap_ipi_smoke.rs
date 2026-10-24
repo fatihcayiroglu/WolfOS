@@ -18,7 +18,7 @@ use crate::{ipi_layout, lapic_irq_layout, lapic_mmio, lapic_probe, pmm, serial,
 
 pub const VECTOR: u8 = ipi_layout::AP_IPI_VECTOR;
 pub const SPURIOUS: u8 = ipi_layout::SPURIOUS_VECTOR;
-const VA: u64 = 0x0000_4000_0000_3000;
+pub(crate) const VA: u64 = 0x0000_4000_0000_3000;
 const TIMER_LVT: usize = 0x320;
 const TIMER_MASK: u32 = 1 << 16;
 const PER_AP: u64 = 3;
@@ -105,6 +105,8 @@ pub(crate) fn bad_count() -> u64 { BAD.load(Ordering::Acquire) }
 pub extern "x86-interrupt" fn irq(_frame: InterruptStackFrame) {
     let slot = ap_slot(local_id());
     if let Some(i) = slot {
+        #[cfg(feature = "tlb-shootdown-hardware-smoke")]
+        crate::tlb_shootdown_hardware_smoke::on_ipi(i);
         #[cfg(feature = "ap-remote-work-smoke")]
         crate::ap_remote_work_smoke::on_ipi(i);
         #[cfg(feature = "ap-handoff-smoke")]
@@ -406,6 +408,110 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
         serial::write_fmt(format_args!(
             "WOLFOS_AP_IPI_ERROR cpus={} aps={} sends={} received={} eois={} bad={} spurious={} offline={} good={}\n",
             cpus.len(), aps, sends, received, eois, bad, spurious, offline, good,
+        ));
+        false
+    }
+}
+
+/// Two real four-CPU, fixed-xAPIC IPI rounds. Unlike the original AP IPI
+/// flavor, every acknowledgement must follow recipient-local INVLPG.
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
+    use x86_64::registers::control::{Cr4, Cr4Flags};
+    use crate::tlb_shootdown_hardware_smoke as hw;
+
+    if !PREPARED.load(Ordering::Acquire)
+        || x86_64::instructions::interrupts::are_enabled()
+        || COUNT.load(Ordering::Acquire) != 4 || cpus.len() != 4
+        || local_id() != bsp_id || Cr4::read().contains(Cr4Flags::PCID)
+    { return false; }
+    if !wait(|| cpus.iter().enumerate().all(|(i, cpu)|
+        cpu.lapic_id == bsp_id || READY[i].load(Ordering::Acquire)
+    ), WAIT_SPINS) {
+        STOP.store(true, Ordering::Release);
+        return false;
+    }
+
+    let mut targets = 0u64;
+    for (i, cpu) in cpus.iter().enumerate() {
+        if cpu.lapic_id != bsp_id { targets |= 1u64 << i; }
+    }
+    let (root, _) = Cr3::read();
+    if !hw::arm(targets, root.start_address().as_u64()) {
+        STOP.store(true, Ordering::Release);
+        return false;
+    }
+
+    let old_svr = unsafe { read(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET) };
+    let Ok(enabled) = lapic_irq_layout::enabled_svr(old_svr, SPURIOUS, VECTOR)
+    else {
+        STOP.store(true, Ordering::Release);
+        return false;
+    };
+    unsafe { write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, enabled); }
+    let mut good = true;
+    let mut sends = 0u64;
+    'rounds: for round in 1..=2u64 {
+        if hw::completed() { good = false; break; }
+        let mut sent_this_round = 0u64;
+        for (i, cpu) in cpus.iter().enumerate() {
+            if cpu.lapic_id == bsp_id { continue; }
+            if !send(bsp_id, cpu.lapic_id) {
+                good = false;
+                break 'rounds;
+            }
+            sends += 1;
+            sent_this_round += 1;
+            if !wait(|| EOIS[i].load(Ordering::Acquire) >= round, WAIT_SPINS)
+                || SEEN[i].load(Ordering::Acquire) != round
+                || EOIS[i].load(Ordering::Acquire) != round
+                || hw::completed() != (sent_this_round == 3)
+            {
+                good = false;
+                break 'rounds;
+            }
+        }
+        if !hw::completed() { good = false; break; }
+        if round == 1 && !hw::begin_next() { good = false; break; }
+    }
+    unsafe { write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr); }
+    STOP.store(true, Ordering::Release);
+    let offline = wait(|| cpus.iter().enumerate().all(|(i, cpu)|
+        cpu.lapic_id == bsp_id || OFFLINE[i].load(Ordering::Acquire)
+    ), WAIT_SPINS);
+    let mut received = 0u64;
+    let mut eois = 0u64;
+    let mut per_ap_ok = true;
+    for (i, cpu) in cpus.iter().enumerate() {
+        if cpu.lapic_id == bsp_id { continue; }
+        received += SEEN[i].load(Ordering::Acquire);
+        eois += EOIS[i].load(Ordering::Acquire);
+        if SEEN[i].load(Ordering::Acquire) != 2
+            || EOIS[i].load(Ordering::Acquire) != 2
+        { per_ap_ok = false; }
+    }
+    let bad = BAD.load(Ordering::Acquire);
+    let spurious = SPURIOUS_COUNT.load(Ordering::Acquire);
+    let Some(e) = hw::evidence() else { return false; };
+    let flush_ok = cpus.iter().enumerate().all(|(i,cpu)|
+        e.per_cpu[i] == if cpu.lapic_id == bsp_id { 0 } else { 2 }
+    );
+    if good && offline && per_ap_ok && flush_ok
+        && sends == 6 && received == 6 && eois == 6
+        && e.acks == 6 && e.invlpg == 6
+        && e.epoch == 2 && e.targets == targets && e.pending == 0
+        && e.completed && !e.bad && bad == 0 && spurious == 0
+    {
+        serial::write_fmt(format_args!(
+            "WOLFOS_TLB_SHOOTDOWN_HW_OK cpus=4 aps=3 rounds=2 sends=6 invlpg=6 acks=6 eois=6 bad=0 spurious=0 offline=3 epoch=2 pending=0 pcid=0 freed=0\n"
+        ));
+        true
+    } else {
+        serial::write_fmt(format_args!(
+            "WOLFOS_TLB_SHOOTDOWN_HW_ERROR good={} offline={} per_ap={} flush_ok={} sends={} seen={} eois={} acks={} invlpg={} epoch={} pending={} completed={} bad={} gate_bad={} spurious={}\n",
+            good, offline, per_ap_ok, flush_ok, sends, received, eois,
+            e.acks, e.invlpg, e.epoch, e.pending, e.completed, bad, e.bad,
+            spurious,
         ));
         false
     }

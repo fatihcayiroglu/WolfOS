@@ -101,14 +101,16 @@ mod acpi_layout;
 mod acpi_tables;
 mod acpi_walk;
 mod smp;
-#[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
+#[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke",
            feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
            feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod ipi_layout;
-#[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
+#[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke",
            feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
            feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod ap_ipi_smoke;
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+mod tlb_shootdown_hardware_smoke;
 #[cfg(any(feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke",
            feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod task_handoff;
@@ -416,7 +418,7 @@ pub extern "C" fn kmain() -> ! {
     }
     // Feature-isolated BSP mapping exists BEFORE AP startup: APs inherit
     // a writable UC local-APIC alias for private IRQ acknowledgement.
-    #[cfg(any(feature = "ap-ipi-smoke", feature = "ap-local-timer-smoke",
+    #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
                feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
     if !ap_ipi_smoke::prepare_bsp(mp.bsp_lapic_id, hhdm.offset, entries, mp.cpus()) {
@@ -470,6 +472,11 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "ap-local-timer-smoke")]
     if !ap_local_timer_smoke::verify_bsp(mp.bsp_lapic_id, mp.cpus()) {
         serial::write_line("WOLFOS_AP_LOCAL_TIMER_TEST_FAILED");
+        halt_forever();
+    }
+    #[cfg(feature = "tlb-shootdown-hardware-smoke")]
+    if !ap_ipi_smoke::verify_tlb_shootdown_bsp(mp.bsp_lapic_id, mp.cpus()) {
+        serial::write_line("WOLFOS_TLB_SHOOTDOWN_HW_TEST_FAILED");
         halt_forever();
     }
     #[cfg(feature = "ap-ipi-smoke")]

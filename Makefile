@@ -27,6 +27,8 @@ else ifeq ($(FLAVOR),apic-preempt)
 FEATURES := --features apic-preempt-smoke
 else ifeq ($(FLAVOR),ap-ipi)
 FEATURES := --features ap-ipi-smoke
+else ifeq ($(FLAVOR),tlb-shootdown-hardware)
+FEATURES := --features tlb-shootdown-hardware-smoke
 else ifeq ($(FLAVOR),ap-local-timer)
 FEATURES := --features ap-local-timer-smoke
 else ifeq ($(FLAVOR),ap-smp-preempt)
@@ -111,7 +113,7 @@ else
 $(error FLAVOR must be normal or smoke)
 endif
 
-.PHONY: all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p3-ring3-event-wait-hardware-smoke p3-ring3-irq-event-wake-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke p2-ring3-timer-observe-smoke p2-ring3-timer-preempt-smoke p2-ring3-timer-nonyield-smoke p3-ring3-four-elf-preflight-smoke p3-ring3-four-live-smoke check clean test doctor
+.PHONY: tlb-shootdown-hardware-smoke all iso kernel run run-graphics run-uefi smoke exception-smoke paging-fault-smoke topology-smoke timer-smoke apic-timer-smoke apic-calibration-smoke apic-preempt-smoke ap-ipi-smoke ap-local-timer-smoke ap-smp-preempt-smoke ap-remote-work-smoke ap-handoff-smoke ap-stack-migrate-smoke ap-irq-migrate-smoke ap-runqueue-smoke elf64-preflight-smoke user-vm-shadow-smoke user-ring-prep-smoke user-ring3-smoke user-ring3-isolation-smoke user-syscall-smoke user-elf-run-smoke user-process-smoke user-ramfs-smoke user-vfs-smoke user-copy-smoke user-file-io-smoke process-table-smoke user-context-smoke kernel-stack-lease-smoke kernel-stack-guard-smoke kernel-stack-guard-fault-smoke kernel-stack-guard-upper-fault-smoke high-half-stack-arena-smoke high-half-stack-arena-lower-fault-smoke high-half-stack-arena-upper-fault-smoke user-fx-smoke p2-handoff-preflight-smoke p3-ring3-event-wait-hardware-smoke p3-ring3-irq-event-wake-smoke p2-ring3-yield-smoke p2-ring3-irq-ready-smoke p2-ring3-timer-observe-smoke p2-ring3-timer-preempt-smoke p2-ring3-timer-nonyield-smoke p3-ring3-four-elf-preflight-smoke p3-ring3-four-live-smoke check clean test doctor
 all: iso
 
 limine/limine:
@@ -190,6 +192,10 @@ apic-preempt-smoke:
 ap-ipi-smoke:
 	$(MAKE) iso FLAVOR=ap-ipi
 	python3 scripts/ap_ipi_smoke.py $(OUT)/wolfos-ap-ipi.iso
+
+tlb-shootdown-hardware-smoke:
+	$(MAKE) iso FLAVOR=tlb-shootdown-hardware
+	python3 scripts/tlb_shootdown_hardware_smoke.py $(OUT)/wolfos-tlb-shootdown-hardware.iso
 
 ap-local-timer-smoke:
 	$(MAKE) iso FLAVOR=ap-local-timer
