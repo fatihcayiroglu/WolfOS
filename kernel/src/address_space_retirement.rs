@@ -120,6 +120,12 @@ impl<const CPUS: usize> RetirementGate<CPUS> {
         result
     }
 
+    /// Compare the registry-minted process generation and private CR3 root
+    /// against this specific retirement gate. Does not authorize hardware.
+    pub fn matches_process_identity(&self, pid: u64, root: u64) -> bool {
+        self.generation == pid && self.root == root
+    }
+
     /// Publish only after disconnected image/ownership admission succeeds.
     pub fn publish(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Staged {

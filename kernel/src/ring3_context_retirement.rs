@@ -12,6 +12,7 @@ use crate::{
     active_address_space::{ActiveAddressSpace, ResumeError},
     address_space_retirement::Ticket as CpuTicket,
     pmm_frame_batch::FrameSource,
+    process_table::ProcessTable,
     ring3_runqueue::{Error as QueueError, Handle, Ring3RunQueue, State, WaitTicket},
     saved_context_retirement::{ContextTicket, Error as ContextError},
 };
@@ -25,6 +26,8 @@ pub enum Error {
     Context(ContextError),
     Reserve(ResumeError),
     Quiesce(crate::address_space_retirement::Error),
+    RegistryMismatch,
+    OwnerMismatch,
 }
 
 /// A process-generation-safe association. The queue may outlive the
@@ -69,6 +72,41 @@ impl Ring3SavedBinding {
         }
         let context = owner.register_saved_context(saved_slot).map_err(Error::Context)?;
         Ok(Self { handle, context })
+    }
+
+    /// Admission against an actual generation-safe process registry and
+    /// move-only PMM owner, not merely a caller-selected queue PID/slot.
+    /// Requires registry state READY for a READY queue entry, or BLOCKED
+    /// for a BLOCKED one; root, ordered leased frames, and PID generation
+    /// must all match the SAME live address-space owner before a saved token
+    /// is registered. A mismatch has no owner/queue effects.
+    ///
+    /// This is stronger metadata identity validation, but cannot establish
+    /// that UserContextBank contains the authentic GPR/IRET/FX trap frame.
+    /// The trusted coordinator still must authenticate that frame and hold
+    /// the same scheduler/registry/PMM-owner lock across this admission and
+    /// every future dispatch/wake/cancel. Legacy attach exists only for
+    /// isolated synthetic composition until the hardware path is migrated.
+    pub fn attach_from_process_table<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        registry: &ProcessTable<QUEUE, FRAMES>,
+        queue: &Ring3RunQueue<QUEUE>,
+        handle: Handle,
+        saved_slot: usize,
+    ) -> Result<Self, Error> {
+        let state = queue.slots().iter()
+            .find(|slot| slot.state != State::Empty && slot.handle == handle)
+            .map(|slot| slot.state).ok_or(Error::StaleHandle)?;
+        if !matches!(state, State::Ready | State::Blocked) {
+            return Err(Error::WrongState);
+        }
+        let (root, frames) = registry.saved_binding_lease(handle.pid, state == State::Blocked)
+            .ok_or(Error::RegistryMismatch)?;
+        if !owner.matches_process_lease(handle.pid, root, &frames) {
+            return Err(Error::OwnerMismatch);
+        }
+        Self::attach(owner, queue, handle, saved_slot)
     }
 
     /// Stage an authenticated RUNNING -> BLOCKED event wait and publish it
