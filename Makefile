@@ -189,6 +189,11 @@ ps2-graphics-irq-smoke:
 	$(MAKE) iso FLAVOR=ps2-graphics-irq
 	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-irq.iso --irq-mode
 
+.PHONY: ps2-graphics-overflow-smoke
+ps2-graphics-overflow-smoke:
+	$(MAKE) iso FLAVOR=ps2-graphics-overflow
+	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-overflow.iso --overflow-mode
+
 .PHONY: framebuffer-console-smoke
 framebuffer-console-smoke:
 	$(MAKE) iso FLAVOR=framebuffer-console
