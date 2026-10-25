@@ -55,6 +55,7 @@ def main() -> int:
     try:
         await_marker(proc, output, b"WOLFOS_BOOT_OK")
         await_marker(proc, output, b"WOLFOS_SHELL_READY")
+        await_marker(proc, output, b"WOLFOS_FB_TEXT_OK glyph_pixels=")
         await_marker(proc, output, b"WOLFOS_BOOT_SELFTESTS_SKIPPED mode=non_smoke")
         forbidden = (
             b"WOLFOS_PMM_TEST_OK",
