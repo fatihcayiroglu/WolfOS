@@ -95,6 +95,7 @@ def main() -> int:
                     kind = sys.argv[3]
                     if kind == "pci":
                         wait_for(proc, output, b"WOLFOS_PS2_PCI_OK ")
+                        wait_for(proc, output, b"pixels=verified\r\n")
                         boot = re.search(
                             rb"WOLFOS_PCI_OK devices=(\d+) displays=(\d+) networks=(\d+) storage=(\d+)", output
                         )
@@ -106,6 +107,7 @@ def main() -> int:
                         print("PASS: PS/2 PCI matches boot PCI counts and real framebuffer pixels")
                     else:
                         wait_for(proc, output, b"WOLFOS_PS2_MEM_OK ")
+                        wait_for(proc, output, b"pixels=verified\r\n")
                         boot = re.search(
                             rb"WOLFOS_PMM_OK [^\r\n]*free_frames=(\d+)", output
                         )
