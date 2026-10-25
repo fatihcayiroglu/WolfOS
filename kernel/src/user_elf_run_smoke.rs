@@ -15,6 +15,8 @@
 //! Kernel high-half descendant page tables remain borrowed from Limine.
 
 use core::arch::asm;
+#[cfg(feature = "user-invalid-opcode-retire-smoke")]
+use x86_64::structures::idt::InterruptStackFrame;
 use core::sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering};
 use x86_64::{
     instructions::segmentation::{CS, Segment},
@@ -370,6 +372,127 @@ pub fn enter(hhdm: u64) -> ! {
     }
 }
 
+
+/// A real CPU #UD caused by fixed user ELF UD2, not by the supervisor.
+/// No IRETQ is possible: restore the boot root before freeing user CR3.
+/// Failure of ANY provenance check stays a hard kernel-test failure.
+#[cfg(feature = "user-invalid-opcode-retire-smoke")]
+pub(crate) fn retire_user_invalid_opcode(frame: &InterruptStackFrame) -> ! {
+    let stage = STAGE.load(Ordering::Acquire);
+    let active = CR3_PHYS.load(Ordering::Acquire);
+    let entry = ENTRY.load(Ordering::Acquire);
+    let user_top = STACK_TOP.load(Ordering::Acquire);
+    let (user_cs, user_ss, rsp0) = interrupts::ring3_cpu_state();
+    let (root, _) = Cr3::read();
+    let kernel_rsp: u64;
+    unsafe {
+        asm!("mov {}, rsp", out(reg) kernel_rsp,
+            options(nomem, nostack, preserves_flags));
+    }
+    let base = entry.checked_sub(symbols::ENTRY)
+        .unwrap_or_else(|| fail("ud_invalid_user_entry"));
+    let fault_rip = base.checked_add(symbols::FAULT_UD)
+        .unwrap_or_else(|| fail("ud_invalid_user_rip"));
+    if stage != RETURN_COUNT || RUN_INDEX.load(Ordering::Acquire) != 0
+        || active == 0 || entry == 0 || user_top == 0
+        || root.start_address().as_u64() != active
+        || CS::get_reg().0 != 8
+        || frame.code_segment.0 != user_cs
+        || frame.stack_segment.0 != user_ss
+        || frame.instruction_pointer.as_u64() != fault_rip
+        || frame.stack_pointer.as_u64() != user_top
+        || rsp0 < 16 * 1024
+        || kernel_rsp < rsp0 - (16 * 1024) || kernel_rsp >= rsp0
+    { fail("ud_fault_provenance_or_stage") }
+    let data = DATA_HHDM.load(Ordering::Acquire);
+    if data == 0 { fail("ud_missing_owned_elf_data") }
+    let actual = unsafe { &*(data as *const [u8; 65]) };
+    if actual[0] != 0x5a || actual[1..].iter().any(|b| *b != 0)
+    { fail("ud_guest_data_or_bss_corrupted") }
+    const USER_SIGILL_STATUS: u32 = 128 + 4;
+    if !matches!(PROCESS.with(|p| p.exit_with_status(1, active, USER_SIGILL_STATUS)), Ok(Ok(()))) {
+        fail("ud_process_exit_transition")
+    }
+    serial::write_line("WOLFOS_ELF_USER_UD_OK vector=6 cpl3=1 status=132 int80_calls=21 user_rip_verified=1");
+    finish_exited(1, USER_SIGILL_STATUS, active)
+}
+
+/// Shared single-owner retirement: applies to EXIT(0), EXIT(42) and the
+/// authenticated #UD path, after the PID has entered Exited state.
+/// Never dereference the former user root after restoring supervisor CR3.
+fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
+    // Hardware restoration before FREE: the boot CR3 has all needed
+    // kernel, HHDM, TSS and serial mappings. Never release an ACTIVE
+    // PML4; interrupt return will NOT be executed after this exit.
+    let boot = BOOT_CR3.load(Ordering::Acquire);
+    if boot == 0 || boot == active { fail("invalid_boot_root_ownership") }
+    unsafe {
+        asm!("mov cr3, {}", in(reg) boot,
+            options(nostack, preserves_flags));
+    }
+    let (now, _) = Cr3::read();
+    if now.start_address().as_u64() != boot { fail("boot_cr3_not_restored") }
+    // The audited PID ledger authorizes release ONLY after CR3
+    // restoration, only for this exact owning PID, exactly once.
+    let owned_by_pid = match PROCESS.with(|p| p.reap_with_status(pid, boot)) {
+        Ok(Ok((code, frames))) if code == exit_status => frames,
+        _ => fail("process_reap_or_exit_status"),
+    };
+    if cfg!(feature = "user-invalid-opcode-retire-smoke") {
+        serial::write_line("WOLFOS_ELF_USER_UD_REAP_OK pid=1 status=132 active_cr3_restored=1 lease=7");
+    } else if cfg!(feature = "user-exit-status-smoke") {
+        serial::write_line("WOLFOS_ELF_STATUS_REAP_OK pid=1 code=42 active_cr3_restored=1 lease=7");
+    }
+    for i in (0..FRAMES).rev() {
+        let owned = OWNED[i].swap(0, Ordering::AcqRel);
+        if owned == 0 || owned != owned_by_pid[i]
+            || pmm::free_frame(owned).is_err()
+        {
+            fail("owned_user_frame_free_failed")
+        }
+    }
+    if !matches!(PROCESS.with(|p| p.state), Ok(ProcessState::Reaped)) {
+        fail("process_not_reaped")
+    }
+    if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
+    { fail("pmm_frame_leak") }
+    serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
+    if cfg!(feature = "user-invalid-opcode-retire-smoke") {
+        serial::write_line("WOLFOS_ELF_USER_UD_RUN_OK linked_elf=1 hardware_cpl3=1 ud_vector=6 status=132 int80_calls=21 frames_freed=7 pmm_no_leak=1");
+    } else if cfg!(feature = "user-exit-status-smoke") {
+        serial::write_line("WOLFOS_ELF_STATUS_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=42 resources_released=1 real_process_manager=0");
+    } else if cfg!(feature = "user-file-io-smoke") {
+        serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=10 exit=0 resources_released=1 persistent=0 production=0");
+    } else if cfg!(feature = "user-copy-smoke") {
+        serial::write_line("WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 int80_calls=4 exit=0 resources_released=1 production_user_copy=0");
+    } else {
+        serial::write_line("WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=0 resources_released=1 real_process_manager=0");
+    }
+    #[cfg(feature = "user-process-smoke")]
+    {
+        serial::write_fmt(format_args!(
+            "WOLFOS_PROCESS_REAP_OK pid={} exited=1 restored_cr3=1 freed_frames=7 no_leak=1\n",
+            pid,
+        ));
+        if pid == 1 {
+            RUN_INDEX.store(1, Ordering::Release);
+            serial::write_line("WOLFOS_PROCESS_RELAUNCH pid=2 generation=2 first_reaped=1");
+            // No return to user kernel-stack frames from PID 1:
+            // only start a new independent root after full CR3
+            // restoration and prior PMM resources were reclaimed.
+            enter(HHDM_OFFSET.load(Ordering::Acquire));
+        }
+        if pid != 2 { fail("invalid_second_process_pid") }
+        RUN_INDEX.store(2, Ordering::Release);
+        serial::write_line("WOLFOS_PROCESS_LIFECYCLE_OK launched=2 exited=2 reaped=2 total_int80=44 restored_cr3=1 per_pid_owner=1 pmm_no_leak=1 concurrent=0");
+    }
+    #[cfg(feature = "user-ramfs-smoke")]
+    crate::ramfs_smoke::report_elf_exit();
+    #[cfg(feature = "user-vfs-smoke")]
+    crate::vfs_smoke::report_exit();
+    serial::qemu_exit_success()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wolfos_int80_syscall_dispatch(
     raw: *mut UserSyscallFrame,
@@ -600,72 +723,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 serial::write_line("WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22");
             }
 
-            // Hardware restoration before FREE: the boot CR3 has all needed
-            // kernel, HHDM, TSS and serial mappings. Never release an ACTIVE
-            // PML4; interrupt return will NOT be executed after this exit.
-            let boot = BOOT_CR3.load(Ordering::Acquire);
-            if boot == 0 || boot == active { fail("invalid_boot_root_ownership") }
-            unsafe {
-                asm!("mov cr3, {}", in(reg) boot,
-                    options(nostack, preserves_flags));
-            }
-            let (now, _) = Cr3::read();
-            if now.start_address().as_u64() != boot { fail("boot_cr3_not_restored") }
-            // The audited PID ledger authorizes release ONLY after CR3
-            // restoration, only for this exact owning PID, exactly once.
-            let owned_by_pid = match PROCESS.with(|p| p.reap_with_status(pid, boot)) {
-                Ok(Ok((code, frames))) if code == expected_status => frames,
-                _ => fail("process_reap_or_exit_status"),
-            };
-            if cfg!(feature = "user-exit-status-smoke") {
-                serial::write_line("WOLFOS_ELF_STATUS_REAP_OK pid=1 code=42 active_cr3_restored=1 lease=7");
-            }
-            for i in (0..FRAMES).rev() {
-                let owned = OWNED[i].swap(0, Ordering::AcqRel);
-                if owned == 0 || owned != owned_by_pid[i]
-                    || pmm::free_frame(owned).is_err()
-                {
-                    fail("owned_user_frame_free_failed")
-                }
-            }
-            if !matches!(PROCESS.with(|p| p.state), Ok(ProcessState::Reaped)) {
-                fail("process_not_reaped")
-            }
-            if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
-            { fail("pmm_frame_leak") }
-            serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
-            if cfg!(feature = "user-exit-status-smoke") {
-                serial::write_line("WOLFOS_ELF_STATUS_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=42 resources_released=1 real_process_manager=0");
-            } else if cfg!(feature = "user-file-io-smoke") {
-                serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=10 exit=0 resources_released=1 persistent=0 production=0");
-            } else if cfg!(feature = "user-copy-smoke") {
-                serial::write_line("WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 int80_calls=4 exit=0 resources_released=1 production_user_copy=0");
-            } else {
-                serial::write_line("WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=0 resources_released=1 real_process_manager=0");
-            }
-            #[cfg(feature = "user-process-smoke")]
-            {
-                serial::write_fmt(format_args!(
-                    "WOLFOS_PROCESS_REAP_OK pid={} exited=1 restored_cr3=1 freed_frames=7 no_leak=1\n",
-                    pid,
-                ));
-                if pid == 1 {
-                    RUN_INDEX.store(1, Ordering::Release);
-                    serial::write_line("WOLFOS_PROCESS_RELAUNCH pid=2 generation=2 first_reaped=1");
-                    // No return to user kernel-stack frames from PID 1:
-                    // only start a new independent root after full CR3
-                    // restoration and prior PMM resources were reclaimed.
-                    enter(HHDM_OFFSET.load(Ordering::Acquire));
-                }
-                if pid != 2 { fail("invalid_second_process_pid") }
-                RUN_INDEX.store(2, Ordering::Release);
-                serial::write_line("WOLFOS_PROCESS_LIFECYCLE_OK launched=2 exited=2 reaped=2 total_int80=44 restored_cr3=1 per_pid_owner=1 pmm_no_leak=1 concurrent=0");
-            }
-            #[cfg(feature = "user-ramfs-smoke")]
-            crate::ramfs_smoke::report_elf_exit();
-            #[cfg(feature = "user-vfs-smoke")]
-            crate::vfs_smoke::report_exit();
-            serial::qemu_exit_success()
+            finish_exited(pid, exit_status, active)
         }
     }
 }

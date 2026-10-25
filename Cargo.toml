@@ -58,6 +58,8 @@ user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
 # Real Ring3 EXIT(42) through INT80, status-aware reap and exact PMM release.
 user-exit-status-smoke = ["user-elf-run-smoke"]
+# Fixed real user UD2 recovery: authenticated CPL3 exception, status 132, PMM retirement.
+user-invalid-opcode-retire-smoke = ["user-elf-run-smoke"]
 user-process-smoke = ["smoke-exit"]
 user-ramfs-smoke = ["smoke-exit"]
 user-vfs-smoke = ["smoke-exit"]
