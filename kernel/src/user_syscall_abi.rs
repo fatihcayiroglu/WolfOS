@@ -21,6 +21,9 @@ pub const SYS_EXIT_ZERO: u64 = 3;
 /// Minimal single-byte ASCII console output; RDI=byte, RSI=0.
 /// This is intentionally not a user-pointer or POSIX write syscall.
 pub const SYS_PUTC: u64 = 4;
+/// RDI=u32 exit status, RSI=0. Nonzero status is process data,
+/// not a successful syscall return or a QEMU failure.
+pub const SYS_EXIT_STATUS: u64 = 9;
 pub const WOLFOS_ID: u64 = 0x574f_4c46;
 pub const ENOSYS: u64 = (-38i64) as u64;
 pub const EINVAL: u64 = (-22i64) as u64;
@@ -81,6 +84,7 @@ pub struct UserSyscallFrame {
 pub enum Outcome {
     Return(u64),
     ExitZero,
+    ExitStatus(u32),
     WriteByte(u8),
 }
 
@@ -114,6 +118,15 @@ pub fn dispatch(number: u64, arg0: u64, arg1: u64) -> Outcome {
         SYS_EXIT_ZERO => {
             if arg0 == 0 && arg1 == 0 {
                 Outcome::ExitZero
+            } else {
+                Outcome::Return(EINVAL)
+            }
+        },
+        SYS_EXIT_STATUS => {
+            if arg1 != 0 {
+                Outcome::Return(EINVAL)
+            } else if let Ok(code) = u32::try_from(arg0) {
+                Outcome::ExitStatus(code)
             } else {
                 Outcome::Return(EINVAL)
             }
@@ -176,6 +189,16 @@ mod tests {
         assert_eq!(dispatch(3, 0, 0), Outcome::ExitZero);
         assert_eq!(dispatch(3, 1, 0), Outcome::Return(EINVAL));
         assert_eq!(dispatch(3, 0, 1), Outcome::Return(EINVAL));
+    }
+
+    #[test]
+    fn exit_status_preserves_full_u32_and_rejects_invalid_arguments() {
+        for code in [0u32, 1, 42, 128, u32::MAX] {
+            assert_eq!(dispatch(SYS_EXIT_STATUS, u64::from(code), 0), Outcome::ExitStatus(code));
+        }
+        assert_eq!(dispatch(SYS_EXIT_STATUS, u32::MAX as u64 + 1, 0), Outcome::Return(EINVAL));
+        assert_eq!(dispatch(SYS_EXIT_STATUS, u64::MAX, 0), Outcome::Return(EINVAL));
+        assert_eq!(dispatch(SYS_EXIT_STATUS, 42, 1), Outcome::Return(EINVAL));
     }
 
     #[test]
