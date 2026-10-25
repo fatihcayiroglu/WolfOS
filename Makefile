@@ -178,6 +178,7 @@ ps2-graphics-info-smoke:
 	$(MAKE) iso FLAVOR=ps2-graphics-info
 	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-info.iso --info-mode mem
 	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-info.iso --info-mode pci
+	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-info.iso --info-mode cpu
 
 .PHONY: ps2-graphics-edit-smoke
 ps2-graphics-edit-smoke:
