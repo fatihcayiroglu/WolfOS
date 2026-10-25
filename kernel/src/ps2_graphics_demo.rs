@@ -24,11 +24,19 @@ pub fn run(layout: Layout, address: *mut u8, white: u32) -> ! {
     });
     let mut decoder = Set1Decoder::new();
     let mut accepted = 0usize;
-    let mut stage = 0u8;
+    let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") { 1u8 } else { 0u8 };
     let mut line = [0u8; 12];
     let mut line_len = 0usize;
     let mut overflow = false;
     serial::write_line("WOLFOS_PS2_READY mode=polling keyboard=set1 graphical=1");
+    if stage == 1 {
+        console.write("> ");
+        console.render(white, 0, |offset, color| {
+            // SAFETY: bounded mapped framebuffer from validated Layout.
+            unsafe { address.add(offset).cast::<u32>().write_volatile(color); }
+        });
+        serial::write_line("WOLFOS_PS2_PROMPT_READY");
+    }
     loop {
         if let Some(scancode) = read_scancode() {
             if let Some(key) = decoder.feed(scancode) {
