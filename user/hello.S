@@ -148,8 +148,15 @@ _after_write:
 .endif
 .endif
 
+.ifdef WOLFOS_EXIT_STATUS_SMOKE
+    // A real CPL3 task requests EXIT(42) from its saved RDI, not a
+    // kernel-synthesized status. INT80 must not return after cleanup.
+    mov eax, 9
+    mov edi, 42
+.else
     mov eax, 3
     xor edi, edi
+.endif
     xor esi, esi
     int 0x80
 _after_exit:

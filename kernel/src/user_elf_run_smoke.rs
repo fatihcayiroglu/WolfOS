@@ -464,12 +464,15 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         else if stage == 1 { user_syscall_abi::SYS_U32_ADD }
         else if cfg!(feature = "user-copy-smoke") && stage == 2 { 5 }
         else if stage < RETURN_COUNT { user_syscall_abi::SYS_PUTC }
+        else if cfg!(feature = "user-exit-status-smoke") { user_syscall_abi::SYS_EXIT_STATUS }
         else { user_syscall_abi::SYS_EXIT_ZERO };
     let arg0 = if stage == 1 { 7 }
         else if cfg!(feature = "user-copy-smoke") && stage == 2 {
             base + symbols::HELLO_TEXT
         } else if stage < RETURN_COUNT && stage >= 2 {
             u64::from(HELLO[stage - 2])
+        } else if cfg!(feature = "user-exit-status-smoke") && stage == RETURN_COUNT {
+            42
         } else { 0 };
     let arg1 = if stage == 1 { 35 }
         else if cfg!(feature = "user-copy-smoke") && stage == 2 {
@@ -564,7 +567,14 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             }
             raw
         }
-        Outcome::ExitZero => {
+        Outcome::ExitZero | Outcome::ExitStatus(_) => {
+            let exit_status = match outcome {
+                Outcome::ExitZero => 0,
+                Outcome::ExitStatus(code) => code,
+                _ => fail("wrong_exit_outcome"),
+            };
+            let expected_status = if cfg!(feature = "user-exit-status-smoke") { 42 } else { 0 };
+            if exit_status != expected_status { fail("guest_exit_status_mismatch") }
             let pid = RUN_INDEX.load(Ordering::Acquire) as u64 + 1;
             if stage != RETURN_COUNT || STAGE.load(Ordering::Acquire) != TOTAL_CALLS
             { fail("unexpected_exit_stage") }
@@ -575,12 +585,14 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             let actual = unsafe { &*(data as *const [u8; 65]) };
             if actual[0] != 0x5a || actual[1..].iter().any(|b| *b != 0)
             { fail("guest_elf_data_or_bss_corrupted") }
-            if !matches!(PROCESS.with(|p| p.exit_zero(pid, active)), Ok(Ok(()))) {
+            if !matches!(PROCESS.with(|p| p.exit_with_status(pid, active, exit_status)), Ok(Ok(()))) {
                 fail("process_exit_transition")
             }
             #[cfg(feature = "user-file-io-smoke")]
             crate::user_file_io_smoke::verify_exit(pid);
-            if cfg!(feature = "user-file-io-smoke") {
+            if cfg!(feature = "user-exit-status-smoke") {
+                serial::write_line("WOLFOS_ELF_EXIT_STATUS_OK code=42 cpl3=1 calls=22 saved_rdi=42");
+            } else if cfg!(feature = "user-file-io-smoke") {
                 serial::write_line("WOLFOS_FILE_IO_EXIT_OK code=0 cpl3=1 calls=10");
             } else if cfg!(feature = "user-copy-smoke") {
                 serial::write_line("WOLFOS_USERCOPY_EXIT_OK code=0 cpl3=1 calls=4");
@@ -601,10 +613,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             if now.start_address().as_u64() != boot { fail("boot_cr3_not_restored") }
             // The audited PID ledger authorizes release ONLY after CR3
             // restoration, only for this exact owning PID, exactly once.
-            let owned_by_pid = match PROCESS.with(|p| p.reap(pid, boot)) {
-                Ok(Ok(frames)) => frames,
-                _ => fail("process_reap_or_active_cr3"),
+            let owned_by_pid = match PROCESS.with(|p| p.reap_with_status(pid, boot)) {
+                Ok(Ok((code, frames))) if code == expected_status => frames,
+                _ => fail("process_reap_or_exit_status"),
             };
+            if cfg!(feature = "user-exit-status-smoke") {
+                serial::write_line("WOLFOS_ELF_STATUS_REAP_OK pid=1 code=42 active_cr3_restored=1 lease=7");
+            }
             for i in (0..FRAMES).rev() {
                 let owned = OWNED[i].swap(0, Ordering::AcqRel);
                 if owned == 0 || owned != owned_by_pid[i]
@@ -619,7 +634,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
             { fail("pmm_frame_leak") }
             serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
-            if cfg!(feature = "user-file-io-smoke") {
+            if cfg!(feature = "user-exit-status-smoke") {
+                serial::write_line("WOLFOS_ELF_STATUS_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=42 resources_released=1 real_process_manager=0");
+            } else if cfg!(feature = "user-file-io-smoke") {
                 serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=10 exit=0 resources_released=1 persistent=0 production=0");
             } else if cfg!(feature = "user-copy-smoke") {
                 serial::write_line("WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 int80_calls=4 exit=0 resources_released=1 production_user_copy=0");
