@@ -280,6 +280,9 @@ pub fn initialize() {
     }
     #[cfg(feature = "timer-smoke")]
     idt[crate::timer::TIMER_VECTOR].set_handler_fn(crate::timer::irq0);
+    // Only the dedicated QEMU BSP PS/2 IRQ experiment owns PIC IRQ1.
+    #[cfg(feature = "ps2-graphics-irq-smoke")]
+    idt[crate::ps2_irq::VECTOR].set_handler_fn(crate::ps2_irq::irq1);
     #[cfg(any(any(feature = "apic-timer-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")), feature = "apic-calibration-smoke",
                feature = "apic-preempt-smoke"))]
     // SAFETY: custom x86-64 long-mode interrupt-gate entry saves all GPRs
