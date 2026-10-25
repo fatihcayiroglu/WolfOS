@@ -32,10 +32,14 @@ fn wait_io() { outb(0x80, 0); }
 
 pub extern "x86-interrupt" fn irq1(_frame: InterruptStackFrame) {
     IRQS.fetch_add(1, Ordering::Relaxed);
-    if let Some(scan) = crate::ps2_keyboard::read_scancode() {
-        // Losing even a break code can corrupt modifier state. The queue
-        // poisons the foreground session instead of silently dropping it.
-        SCANCODES.push(scan);
+    match crate::ps2_keyboard::read_scancode_checked() {
+        Ok(Some(scan)) => {
+            // Losing even a break code can corrupt modifier state. The queue
+            // poisons the foreground session instead of silently dropping it.
+            SCANCODES.push(scan);
+        }
+        Ok(None) => {} // no data or unrelated AUX controller traffic
+        Err(()) => SCANCODES.poison(), // keyboard parity/timeout: lost byte
     }
     // Acknowledge the master PIC even if OBF is empty or the queue is full;
     // otherwise the IRQ line could remain blocked indefinitely.
