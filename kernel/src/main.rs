@@ -20,6 +20,8 @@ mod ps2_keyboard;
 mod ps2_graphics_demo;
 #[cfg(feature = "ps2-graphics-demo")]
 mod graphical_diagnostics;
+#[cfg(feature = "ps2-graphics-demo")]
+mod graphical_line_editor;
 #[cfg(feature = "serial-shell")]
 mod serial_shell;
 mod cpu;
