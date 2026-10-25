@@ -50,6 +50,8 @@ jobs:
         run: make serial-shell-smoke
       - name: Real PS/2 keyboard input to Rust framebuffer text (QEMU HMP sendkey)
         run: make ps2-graphics-smoke
+      - name: Real keyboard input overflow refusal and next command recovery on same QEMU boot
+        run: make ps2-graphics-edit-smoke
       - name: Read-only graphical MEM and cached PCI, two real keyboard QEMU boots
         run: make ps2-graphics-info-smoke
       - name: Fresh QEMU boot edits keyboard help and verifies actual framebuffer pixels
