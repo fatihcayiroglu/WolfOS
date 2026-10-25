@@ -22,6 +22,10 @@ mod ps2_graphics_demo;
 mod graphical_diagnostics;
 #[cfg(feature = "ps2-graphics-demo")]
 mod graphical_line_editor;
+#[cfg(feature = "ps2-graphics-irq-smoke")]
+mod ps2_scancode_queue;
+#[cfg(feature = "ps2-graphics-irq-smoke")]
+mod ps2_irq;
 #[cfg(feature = "serial-shell")]
 mod serial_shell;
 mod cpu;
