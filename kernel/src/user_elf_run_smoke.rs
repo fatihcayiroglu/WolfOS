@@ -29,7 +29,8 @@ use crate::{
     elf64_page_image::{materialize, PAGE_SIZE},
     elf64_preflight::preflight,
     interrupts, kernel_half_shadow, pmm, serial,
-    process_lifecycle::{ProcessCell, ProcessState},
+    process_lifecycle::ProcessState,
+    process_table::{ProcessTableCell, TableError},
     user_ring_entry::{self, Ring3Entry},
     user_syscall_abi::{self, Outcome, UserSyscallFrame},
 };
@@ -63,9 +64,10 @@ static STAGE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "user-file-io-smoke")]
 static FILE_FD: AtomicU64 = AtomicU64::new(0);
 static OWNED: [AtomicU64; FRAMES] = [const { AtomicU64::new(0) }; FRAMES];
-/// Common audited ownership record for the original ELF smoke and the
-/// two-process lifecycle feature, with monotonic process generations.
-static PROCESS: ProcessCell<FRAMES> = ProcessCell::new();
+/// The same bounded multi-PID ownership table tested with real PMM leases
+/// now owns the hardware Ring3 ELF path. Slots can be reused after reap,
+/// while PID generations increase monotonically.
+static PROCESS_TABLE: ProcessTableCell<2, FRAMES> = ProcessTableCell::new();
 static RUN_INDEX: AtomicUsize = AtomicUsize::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 const MAX_RUNS: usize = if cfg!(feature = "user-process-smoke") { 2 } else { 1 };
@@ -172,8 +174,8 @@ pub fn enter(hhdm: u64) -> ! {
             // fully reaped and no PMM pages remain owned. CPU SS=0 is valid
             // here because the kernel arrived via a real CPL3 INT80 trap.
             let safely_reaped = matches!(
-                PROCESS.with(|p| (p.pid, p.state, p.frames)),
-                Ok((1, ProcessState::Reaped, frames)) if frames.iter().all(|f| *f == 0),
+                PROCESS_TABLE.with(|t| (t.snapshot(1), t.occupied(), t.running())),
+                Ok((None, 0, 0)),
             );
             if !safely_reaped || OWNED.iter().any(|p| p.load(Ordering::Acquire) != 0)
                 || !interrupts::verify_ring3_reentry_preconditions()
@@ -344,17 +346,27 @@ pub fn enter(hhdm: u64) -> ! {
         for (at, phys) in frames.iter().copied().enumerate() {
             OWNED[at].store(phys, Ordering::Release);
         }
-        if !matches!(PROCESS.with(|p| p.admit(pid, frames[0], frames)), Ok(Ok(()))) {
-            fail("process_admission_or_frame_ownership")
-        }
+        if !matches!(PROCESS_TABLE.with(|t| t.reserve(frames[0], frames)),
+            Ok(Ok(issued)) if issued == pid
+        ) { fail("process_table_admission_or_pid_generation") }
         compiler_fence(Ordering::SeqCst);
         asm!("mov cr3, {}", in(reg) frames[0],
             options(nostack, preserves_flags));
         let (now, _) = Cr3::read();
         if now.start_address().as_u64() != frames[0] { fail("new_cr3_not_active") }
-        if !matches!(PROCESS.with(|p| p.mark_running(pid, frames[0])), Ok(Ok(()))) {
-            fail("process_running_transition")
+        if !matches!(PROCESS_TABLE.with(|t| t.mark_running(pid, frames[0])), Ok(Ok(()))) {
+            fail("process_table_running_transition")
         }
+        // Read the actual hardware CR3 above; this table check must reject
+        // freeing a RUNNING user root or any of its own PMM frames.
+        if !matches!(PROCESS_TABLE.with(|t| (
+            t.snapshot(pid), t.occupied(), t.running(),
+            t.reap_with_status(pid, frames[0]),
+        )), Ok((Some(record), 1, 1, Err(TableError::Process(
+            crate::process_lifecycle::ProcessError::ActiveCr3
+        )))) if record.state == ProcessState::Running
+            && record.cr3_root == frames[0] && record.frames == frames
+        ) { fail("process_table_active_cr3_guard") }
         #[cfg(feature = "user-process-smoke")]
         serial::write_fmt(format_args!(
             "WOLFOS_PROCESS_START pid={} state=running private_cr3=1 owned_frames=7\n",
@@ -423,7 +435,7 @@ fn checked_user_fault_owner(frame: &InterruptStackFrame, symbol_offset: u64) -> 
 pub(crate) fn retire_user_invalid_opcode(frame: &InterruptStackFrame) -> ! {
     let active = checked_user_fault_owner(frame, symbols::FAULT_UD);
     const USER_SIGILL_STATUS: u32 = 128 + 4;
-    if !matches!(PROCESS.with(|p| p.exit_with_status(1, active, USER_SIGILL_STATUS)), Ok(Ok(()))) {
+    if !matches!(PROCESS_TABLE.with(|t| t.exit_with_status(1, active, USER_SIGILL_STATUS)), Ok(Ok(()))) {
         fail("ud_process_exit_transition")
     }
     serial::write_line("WOLFOS_ELF_USER_UD_OK vector=6 cpl3=1 status=132 int80_calls=21 user_rip_verified=1");
@@ -443,7 +455,7 @@ pub(crate) fn retire_user_page_fault(frame: &InterruptStackFrame, code: PageFaul
     { fail("pf_wrong_cr2_or_fault_bits") }
     let active = checked_user_fault_owner(frame, symbols::FAULT_PF);
     const USER_SIGSEGV_STATUS: u32 = 128 + 11;
-    if !matches!(PROCESS.with(|p| p.exit_with_status(1, active, USER_SIGSEGV_STATUS)), Ok(Ok(()))) {
+    if !matches!(PROCESS_TABLE.with(|t| t.exit_with_status(1, active, USER_SIGSEGV_STATUS)), Ok(Ok(()))) {
         fail("pf_process_exit_transition")
     }
     serial::write_line("WOLFOS_ELF_USER_PF_OK vector=14 cpl3=1 status=139 address=0xffff800000000000 read_denied=1 user_rip_verified=1");
@@ -467,7 +479,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     if now.start_address().as_u64() != boot { fail("boot_cr3_not_restored") }
     // The audited PID ledger authorizes release ONLY after CR3
     // restoration, only for this exact owning PID, exactly once.
-    let owned_by_pid = match PROCESS.with(|p| p.reap_with_status(pid, boot)) {
+    let owned_by_pid = match PROCESS_TABLE.with(|t| t.reap_with_status(pid, boot)) {
         Ok(Ok((code, frames))) if code == exit_status => frames,
         _ => fail("process_reap_or_exit_status"),
     };
@@ -488,12 +500,21 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
             fail("owned_user_frame_free_failed")
         }
     }
-    if !matches!(PROCESS.with(|p| p.state), Ok(ProcessState::Reaped)) {
-        fail("process_not_reaped")
+    // The exact former PID must be absent, its slot free, and an attempted
+    // second reap must fail. No other live table entry may remain.
+    if !matches!(PROCESS_TABLE.with(|t| (
+        t.snapshot(pid), t.occupied(), t.running(),
+        t.reap_with_status(pid, boot),
+    )), Ok((None, 0, 0, Err(TableError::UnknownPid)))) {
+        fail("process_table_stale_pid_or_double_reap")
     }
     if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
     { fail("pmm_frame_leak") }
     serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
+    serial::write_fmt(format_args!(
+        "WOLFOS_PROCESS_TABLE_REAP_OK pid={} slots=2 occupied=0 running=0 stale_denied=1 double_reap_denied=1 real_cpl3=1\n",
+        pid,
+    ));
     if cfg!(feature = "user-page-fault-retire-smoke")
         && (!cfg!(feature = "user-process-fault-recovery-smoke") || pid == 1)
     {
@@ -756,7 +777,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             let actual = unsafe { &*(data as *const [u8; 65]) };
             if actual[0] != 0x5a || actual[1..].iter().any(|b| *b != 0)
             { fail("guest_elf_data_or_bss_corrupted") }
-            if !matches!(PROCESS.with(|p| p.exit_with_status(pid, active, exit_status)), Ok(Ok(()))) {
+            if !matches!(PROCESS_TABLE.with(|t| t.exit_with_status(pid, active, exit_status)), Ok(Ok(()))) {
                 fail("process_exit_transition")
             }
             #[cfg(feature = "user-file-io-smoke")]
