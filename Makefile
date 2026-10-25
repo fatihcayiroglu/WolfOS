@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),ps2-graphics-edit)
+FEATURES := --features ps2-graphics-edit-smoke
 else ifeq ($(FLAVOR),ps2-graphics-info)
 FEATURES := --features ps2-graphics-info-smoke
 else ifeq ($(FLAVOR),ps2-graphics-help)
@@ -400,6 +402,8 @@ test:
 	$(OUT)/framebuffer_text_tests
 	rustc --edition=2024 --test tests/framebuffer_console.rs -o $(OUT)/framebuffer_console_tests
 	$(OUT)/framebuffer_console_tests
+	rustc --edition=2024 --test tests/graphical_line_editor.rs -o $(OUT)/graphical_line_editor_tests
+	$(OUT)/graphical_line_editor_tests
 	rustc --edition=2024 --test tests/graphical_diagnostics.rs -o $(OUT)/graphical_diagnostics_tests
 	$(OUT)/graphical_diagnostics_tests
 	rustc --edition=2024 --test tests/serial_shell.rs -o $(OUT)/serial_shell_tests
