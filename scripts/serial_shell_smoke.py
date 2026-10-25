@@ -79,6 +79,18 @@ def main() -> int:
         if prompts != 3:
             raise RuntimeError(f"CRLF caused duplicate/missing prompts: {prompts} (expected 3)")
         print("PASS: CRLF produced one command and one prompt")
+        # CPUID already appears during boot. Require a NEW, command-scoped
+        # identity record rather than accepting that earlier boot marker.
+        proc.stdin.write(b"cpu\r")
+        proc.stdin.flush()
+        await_marker(proc, output, b"WOLFOS_SHELL_CPU_END")
+        scoped = output.split(b"WOLFOS_SHELL_CPU_BEGIN", 1)
+        if len(scoped) != 2:
+            raise RuntimeError("CPU command never began")
+        cpu_record = scoped[1].split(b"WOLFOS_SHELL_CPU_END", 1)[0]
+        if b"WOLFOS_CPU_OK vendor=" not in cpu_record:
+            raise RuntimeError(f"CPU command did not report CPUID: {cpu_record!r}")
+        print("PASS: real COM1 cpu command reports live read-only CPUID")
         for typed, marker in [
             (b"clear\r", b"WOLFOS_SHELL_CLEAR"),
             (b"somethingelse\r", b"WOLFOS_SHELL_UNKNOWN"),
