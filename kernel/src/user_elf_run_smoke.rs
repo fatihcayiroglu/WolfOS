@@ -38,6 +38,8 @@ mod symbols {
     include!(concat!(env!("OUT_DIR"), "/wolfos_elf_symbols.rs"));
 }
 const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wolfos-user-hello.elf"));
+#[cfg(feature = "user-process-fault-recovery-smoke")]
+const RECOVERY_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wolfos-user-recovery.elf"));
 const HELLO: &[u8; 19] = b"Hello from WolfOS!\n";
 const PAGE: u64 = 4096;
 const PRESENT: u64 = 1;
@@ -157,8 +159,10 @@ pub fn enter(hhdm: u64) -> ! {
     let elf: &[u8] = crate::vfs_smoke::elf_file();
     #[cfg(feature = "user-ramfs-smoke")]
     let elf: &[u8] = crate::ramfs_smoke::elf_file();
-    #[cfg(not(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")))]
+    #[cfg(not(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-process-fault-recovery-smoke")))]
     let elf: &[u8] = ELF;
+    #[cfg(feature = "user-process-fault-recovery-smoke")]
+    let elf: &[u8] = if index == 1 { RECOVERY_ELF } else { ELF };
     if index == 0 {
         if !interrupts::verify_ring3_preconditions() { fail("gdt_tss") }
     } else {
@@ -467,7 +471,9 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
         Ok(Ok((code, frames))) if code == exit_status => frames,
         _ => fail("process_reap_or_exit_status"),
     };
-    if cfg!(feature = "user-page-fault-retire-smoke") {
+    if cfg!(feature = "user-page-fault-retire-smoke")
+        && (!cfg!(feature = "user-process-fault-recovery-smoke") || pid == 1)
+    {
         serial::write_line("WOLFOS_ELF_USER_PF_REAP_OK pid=1 status=139 active_cr3_restored=1 lease=7");
     } else if cfg!(feature = "user-invalid-opcode-retire-smoke") {
         serial::write_line("WOLFOS_ELF_USER_UD_REAP_OK pid=1 status=132 active_cr3_restored=1 lease=7");
@@ -488,7 +494,9 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
     { fail("pmm_frame_leak") }
     serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
-    if cfg!(feature = "user-page-fault-retire-smoke") {
+    if cfg!(feature = "user-page-fault-retire-smoke")
+        && (!cfg!(feature = "user-process-fault-recovery-smoke") || pid == 1)
+    {
         serial::write_line("WOLFOS_ELF_USER_PF_RUN_OK linked_elf=1 hardware_cpl3=1 pf_vector=14 status=139 int80_calls=21 frames_freed=7 pmm_no_leak=1");
     } else if cfg!(feature = "user-invalid-opcode-retire-smoke") {
         serial::write_line("WOLFOS_ELF_USER_UD_RUN_OK linked_elf=1 hardware_cpl3=1 ud_vector=6 status=132 int80_calls=21 frames_freed=7 pmm_no_leak=1");
@@ -508,6 +516,8 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
             pid,
         ));
         if pid == 1 {
+            #[cfg(feature = "user-process-fault-recovery-smoke")]
+            if exit_status != 139 { fail("recovery_pid1_expected_sigsegv") }
             RUN_INDEX.store(1, Ordering::Release);
             serial::write_line("WOLFOS_PROCESS_RELAUNCH pid=2 generation=2 first_reaped=1");
             // No return to user kernel-stack frames from PID 1:
@@ -517,7 +527,12 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
         }
         if pid != 2 { fail("invalid_second_process_pid") }
         RUN_INDEX.store(2, Ordering::Release);
-        serial::write_line("WOLFOS_PROCESS_LIFECYCLE_OK launched=2 exited=2 reaped=2 total_int80=44 restored_cr3=1 per_pid_owner=1 pmm_no_leak=1 concurrent=0");
+        if cfg!(feature = "user-process-fault-recovery-smoke") {
+            if exit_status != 0 { fail("recovery_pid2_expected_exit_zero") }
+            serial::write_line("WOLFOS_PROCESS_FAULT_RECOVERY_OK first_pid=1 first_status=139 second_pid=2 second_status=0 total_int80=43 restored_cr3=2 frames_freed=14 pmm_no_leak=1");
+        } else {
+            serial::write_line("WOLFOS_PROCESS_LIFECYCLE_OK launched=2 exited=2 reaped=2 total_int80=44 restored_cr3=1 per_pid_owner=1 pmm_no_leak=1 concurrent=0");
+        }
     }
     #[cfg(feature = "user-ramfs-smoke")]
     crate::ramfs_smoke::report_elf_exit();

@@ -169,6 +169,13 @@ _user_fault_ud:
     mov eax, 9
     mov edi, 42
 .else
+    // Recovery PID2 is a separately linked healthy ELF. Two NOPs
+    // match the 13-byte faulting PF instruction pair in PID1 so the
+    // independently audited symbol offsets remain exactly identical.
+.ifdef WOLFOS_USER_PROCESS_RECOVERY_SECOND
+    nop
+    nop
+.endif
     mov eax, 3
     xor edi, edi
 .endif

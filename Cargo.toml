@@ -62,6 +62,8 @@ user-exit-status-smoke = ["user-elf-run-smoke"]
 user-invalid-opcode-retire-smoke = ["user-elf-run-smoke"]
 # Fixed real user #PF recovery: authenticated fault address, status 139, PMM retirement.
 user-page-fault-retire-smoke = ["user-elf-run-smoke"]
+# Faulted PID1 -> fully reaped -> separately linked healthy PID2 on real CPL3.
+user-process-fault-recovery-smoke = ["user-page-fault-retire-smoke", "user-process-smoke"]
 user-process-smoke = ["smoke-exit"]
 user-ramfs-smoke = ["smoke-exit"]
 user-vfs-smoke = ["smoke-exit"]
