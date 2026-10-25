@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),ps2-graphics-overflow)
+FEATURES := --features ps2-graphics-overflow-smoke
 else ifeq ($(FLAVOR),ps2-graphics-irq)
 FEATURES := --features ps2-graphics-irq-smoke
 else ifeq ($(FLAVOR),ps2-graphics-edit)
