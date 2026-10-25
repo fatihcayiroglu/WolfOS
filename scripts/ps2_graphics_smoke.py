@@ -47,9 +47,10 @@ def connect_monitor(path: pathlib.Path) -> socket.socket:
 
 def main() -> int:
     help_mode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
+    edit_mode = len(sys.argv) == 3 and sys.argv[2] == "--edit-mode"
     info_mode = len(sys.argv) == 4 and sys.argv[2] == "--info-mode" and sys.argv[3] in ("mem", "pci")
-    if not (len(sys.argv) == 2 or help_mode or info_mode):
-        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --info-mode mem|pci]")
+    if not (len(sys.argv) == 2 or help_mode or info_mode or edit_mode):
+        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --edit-mode | --info-mode mem|pci]")
         return 2
     iso = pathlib.Path(sys.argv[1]).resolve()
     if not iso.is_file():
@@ -79,9 +80,11 @@ def main() -> int:
             monitor = connect_monitor(monitor_path)
             try:
                 # Real emulated i8042 scan codes, never serial input.
-                if help_mode or info_mode:
+                if help_mode or info_mode or edit_mode:
                     wait_for(proc, output, b"WOLFOS_PS2_PROMPT_READY")
-                if help_mode:
+                if edit_mode:
+                    keys = ("h",) * 12 + ("x", "ret")
+                elif help_mode:
                     keys = ("h", "e", "l", "x", "backspace", "p", "ret")
                 elif info_mode:
                     keys = tuple(sys.argv[3]) + ("ret",)
@@ -91,7 +94,15 @@ def main() -> int:
                     monitor.sendall(f"sendkey {key}\n".encode("ascii"))
                     wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\r\n".encode())
                     print(f"PASS: emulated keyboard key={key} accepted={i}")
-                if info_mode:
+                if edit_mode:
+                    wait_for(proc, output, b"WOLFOS_PS2_EDIT_REJECT_OK poisoned=1 pixels=verified")
+                    wait_for(proc, output, b"WOLFOS_PS2_EDIT_PROMPT_READY")
+                    for i, key in enumerate(("h", "e", "l", "p", "ret"), len(keys) + 1):
+                        monitor.sendall(f"sendkey {key}\n".encode("ascii"))
+                        wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\r\n".encode())
+                    wait_for(proc, output, b"WOLFOS_PS2_EDIT_RECOVERY_OK next=HELP pixels=verified")
+                    print("PASS: overlong PS/2 line rejected and next HELP rendered in same QEMU boot")
+                elif info_mode:
                     kind = sys.argv[3]
                     if kind == "pci":
                         wait_for(proc, output, b"WOLFOS_PS2_PCI_OK ")
