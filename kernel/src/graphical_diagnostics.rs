@@ -53,6 +53,20 @@ pub fn pci(displays: usize, networks: usize, storage: usize) -> Option<Line> {
     Some(line)
 }
 
+/// Bounded read-only CPUID vendor and family/model; no device probing.
+pub fn cpu(vendor: &str, family: Option<u32>, model: Option<u32>) -> Option<Line> {
+    if !vendor.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return None;
+    }
+    let mut line = Line::new();
+    match (family, model) {
+        (Some(family), Some(model)) =>
+            write!(&mut line, "CPU {} {}/{}", vendor, family, model).ok()?,
+        _ => write!(&mut line, "CPU {} NO LEAF1", vendor).ok()?,
+    };
+    Some(line)
+}
+
 pub fn diagnostic(
     command: Command, free_frames: usize,
     displays: usize, networks: usize, storage: usize,
@@ -79,6 +93,18 @@ mod tests {
     fn pci_summary_is_exact_and_not_truncated() {
         assert_eq!(pci(1, 2, 3).unwrap().as_str(), "PCI D1 N2 S3");
         assert_eq!(pci(usize::MAX, usize::MAX, usize::MAX), None);
+    }
+
+    #[test]
+    fn cpu_summary_is_exact_bounded_and_printable() {
+        assert_eq!(cpu("GenuineIntel", Some(6), Some(85)).unwrap().as_str(),
+                   "CPU GenuineIntel 6/85");
+        assert_eq!(cpu("AuthenticAMD", Some(271), Some(255)).unwrap().as_str(),
+                   "CPU AuthenticAMD 271/255");
+        assert_eq!(cpu("unknown", None, None).unwrap().as_str(),
+                   "CPU unknown NO LEAF1");
+        assert_eq!(cpu("vendor\n", Some(6), Some(85)), None);
+        assert_eq!(cpu("extra-long-vendor-name", Some(271), Some(255)), None);
     }
 
     #[test]

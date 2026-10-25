@@ -50,9 +50,9 @@ def main() -> int:
     irq_mode = len(sys.argv) == 3 and sys.argv[2] == "--irq-mode"
     overflow_mode = len(sys.argv) == 3 and sys.argv[2] == "--overflow-mode"
     edit_mode = len(sys.argv) == 3 and sys.argv[2] == "--edit-mode"
-    info_mode = len(sys.argv) == 4 and sys.argv[2] == "--info-mode" and sys.argv[3] in ("mem", "pci")
+    info_mode = len(sys.argv) == 4 and sys.argv[2] == "--info-mode" and sys.argv[3] in ("mem", "pci", "cpu")
     if not (len(sys.argv) == 2 or help_mode or info_mode or edit_mode or irq_mode or overflow_mode):
-        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --edit-mode | --irq-mode | --overflow-mode | --info-mode mem|pci]")
+        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --edit-mode | --irq-mode | --overflow-mode | --info-mode mem|pci|cpu]")
         return 2
     iso = pathlib.Path(sys.argv[1]).resolve()
     if not iso.is_file():
@@ -142,7 +142,7 @@ def main() -> int:
                         if not boot or not live or live.groups() != boot.groups()[1:]:
                             raise RuntimeError("graphical PCI counts do not equal early immutable discovery")
                         print("PASS: PS/2 PCI matches boot PCI counts and real framebuffer pixels")
-                    else:
+                    elif kind == "mem":
                         wait_for(proc, output, b"WOLFOS_PS2_MEM_OK ")
                         wait_for(proc, output, b"pixels=verified\r\n")
                         boot = re.search(
@@ -159,6 +159,20 @@ def main() -> int:
                         if free <= 0 or free > boot_free or mib != free // 256:
                             raise RuntimeError(f"bad graphical memory data: boot={boot_free} free={free} MiB={mib}")
                         print("PASS: PS/2 MEM reports live free MiB with framebuffer pixels")
+                    else:
+                        wait_for(proc, output, b"WOLFOS_PS2_CPU_OK ")
+                        wait_for(proc, output, b"pixels=verified\r\n")
+                        boot = re.search(
+                            rb"WOLFOS_CPU_OK vendor=(\S+) family=(\d+) model=(\d+) sse2=",
+                            output,
+                        )
+                        live = re.search(
+                            rb"WOLFOS_PS2_CPU_OK vendor=(\S+) family=(\d+) model=(\d+) pixels=verified",
+                            output,
+                        )
+                        if not boot or not live or boot.groups() != live.groups():
+                            raise RuntimeError("graphical CPU identity differs from genuine boot CPUID")
+                        print("PASS: PS/2 CPU matches boot CPUID and actual C glyph framebuffer pixels")
                 elif help_mode or irq_mode:
                     wait_for(
                         proc, output,

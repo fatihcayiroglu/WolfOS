@@ -162,17 +162,24 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                     // read-only diagnostics are granted in this graphical
                     // prototype: PMM snapshot and cached early PCI discovery.
                     let stats = crate::pmm::statistics();
-                    let report = graphical_diagnostics::diagnostic(
-                        command, stats.free_frames(),
-                        pci_summary.displays, pci_summary.networks, pci_summary.storage,
-                    );
+                    let report = if command == Command::Cpu {
+                        let identity = crate::cpu::identify();
+                        graphical_diagnostics::cpu(
+                            identity.vendor_name(), identity.family, identity.model,
+                        )
+                    } else {
+                        graphical_diagnostics::diagnostic(
+                            command, stats.free_frames(),
+                            pci_summary.displays, pci_summary.networks, pci_summary.storage,
+                        )
+                    };
                     let answer = match command {
                         Command::Help => "HELP ABOUT",
                         Command::About => "WOLFOS RUST",
                         Command::TooLong => "TOO LONG",
                         Command::Empty => "",
                         Command::Unknown => "UNKNOWN",
-                        Command::Memory | Command::Pci =>
+                        Command::Memory | Command::Pci | Command::Cpu =>
                             report.as_ref().map(|line| line.as_str()).unwrap_or("DATA TOO LONG"),
                         // Privileged COM1-only actions remain unavailable.
                         _ => "NOT AVAILABLE",
@@ -266,10 +273,15 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                             graphical_diagnostics::pci(
                                 pci_summary.displays, pci_summary.networks, pci_summary.storage,
                             )
+                        } else if command == Command::Cpu {
+                            let identity = crate::cpu::identify();
+                            graphical_diagnostics::cpu(
+                                identity.vendor_name(), identity.family, identity.model,
+                            )
                         } else { None };
                         let text_matches = expected.as_ref().map(|line| {
                             line.as_str().bytes().enumerate().all(|(i, c)| {
-                                console.cell(i, 1) == Some(c)
+                                console.cell(i, 1) == Some(c.to_ascii_uppercase())
                             })
                         }).unwrap_or(false);
                         let pixels_match = match command {
@@ -280,6 +292,11 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                             // pixels, followed by a dark pixel.
                             Command::Pci => pixel(20, 88) == Some(white)
                                 && pixel(21, 88) == Some(white)
+                                && pixel(24, 88) == Some(0),
+                            // C top row is 0b01110: dark, three white, dark.
+                            Command::Cpu => pixel(20, 88) == Some(0)
+                                && pixel(21, 88) == Some(white)
+                                && pixel(23, 88) == Some(white)
                                 && pixel(24, 88) == Some(0),
                             _ => false,
                         };
@@ -296,6 +313,17 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                                 "WOLFOS_PS2_PCI_OK displays={} networks={} storage={} pixels=verified\n",
                                 pci_summary.displays, pci_summary.networks, pci_summary.storage,
                             )),
+                            Command::Cpu => {
+                                let identity = crate::cpu::identify();
+                                let (Some(family), Some(model)) = (identity.family, identity.model) else {
+                                    serial::write_line("WOLFOS_PS2_CPU_FAILED missing_feature_leaf");
+                                    crate::halt_forever();
+                                };
+                                serial::write_fmt(format_args!(
+                                    "WOLFOS_PS2_CPU_OK vendor={} family={} model={} pixels=verified\n",
+                                    identity.vendor_name(), family, model,
+                                ));
+                            }
                             _ => unreachable!(),
                         }
                         crate::halt_forever();

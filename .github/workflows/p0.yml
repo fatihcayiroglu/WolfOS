@@ -56,7 +56,7 @@ jobs:
         run: make ps2-graphics-irq-smoke
       - name: Real keyboard input overflow refusal and next command recovery on same QEMU boot
         run: make ps2-graphics-edit-smoke
-      - name: Read-only graphical MEM and cached PCI, two real keyboard QEMU boots
+      - name: Read-only graphical MEM, CPU and cached PCI, three real keyboard QEMU boots
         run: make ps2-graphics-info-smoke
       - name: Fresh QEMU boot edits keyboard help and verifies actual framebuffer pixels
         run: make ps2-graphics-help-smoke
