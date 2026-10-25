@@ -85,6 +85,19 @@ impl Set1Decoder {
     }
 }
 
+/// Classify a drained i8042 byte. AUX traffic is not keyboard input; a
+/// keyboard parity/timeout error is different: a make or break code may have
+/// been lost, so IRQ consumers must stop decoding the entire input session.
+fn classify_scancode(status: u8, byte: u8) -> Result<Option<u8>, ()> {
+    if status & 0x01 == 0 || status & 0x20 != 0 {
+        return Ok(None);
+    }
+    if status & 0xc0 != 0 {
+        return Err(());
+    }
+    Ok(Some(byte))
+}
+
 #[cfg(not(test))]
 mod hardware {
     use core::arch::asm;
@@ -101,27 +114,41 @@ mod hardware {
     /// Fetch at most one valid keyboard scan code from the 8042 output buffer.
     /// Even error and AUX bytes are consumed to prevent stuck output-buffer
     /// status, but never interpreted as a key.
-    pub fn read_scancode() -> Option<u8> {
+    pub fn read_scancode_checked() -> Result<Option<u8>, ()> {
         // SAFETY: status port read is non-mutating.
         let status = unsafe { read_port(0x64) };
         if status & 0x01 == 0 {
-            return None;
+            return Ok(None);
         }
         // SAFETY: status indicated a buffered byte, which must be drained.
         let byte = unsafe { read_port(0x60) };
-        if status & 0xe0 != 0 {
-            return None;
-        }
-        Some(byte)
+        super::classify_scancode(status, byte)
+    }
+
+    // Preserve the original polling-demo interface; the IRQ path uses the
+    // checked variant so corrupted keyboard bytes cannot be ignored.
+    pub fn read_scancode() -> Option<u8> {
+        read_scancode_checked().ok().flatten()
     }
 }
 
 #[cfg(not(test))]
-pub use hardware::read_scancode;
+pub use hardware::{read_scancode, read_scancode_checked};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_error_classification_never_converts_corruption_to_keys() {
+        assert_eq!(classify_scancode(0x00, 0x1c), Ok(None)); // no OBF
+        assert_eq!(classify_scancode(0x01, 0x1c), Ok(Some(0x1c)));
+        assert_eq!(classify_scancode(0x21, 0x1c), Ok(None)); // AUX
+        assert_eq!(classify_scancode(0x61, 0x1c), Ok(None)); // errored AUX
+        assert_eq!(classify_scancode(0x41, 0xaa), Err(())); // timeout, Shift break
+        assert_eq!(classify_scancode(0x81, 0x9e), Err(())); // parity, A break
+        assert_eq!(classify_scancode(0xc1, 0x1c), Err(())); // both, Enter
+    }
 
     #[test]
     fn qemu_set1_make_break_enter_and_backspace() {
