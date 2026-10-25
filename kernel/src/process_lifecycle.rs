@@ -29,7 +29,7 @@ pub enum ProcessState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessError {
     InvalidPid, StalePid, InvalidFrame, DuplicateFrame, InvalidRoot,
-    AlreadyOwned, WrongState, WrongAddressSpace, ExitNotZero,
+    AlreadyOwned, WrongState, WrongAddressSpace,
     ActiveCr3, LockBusy,
 }
 
@@ -144,8 +144,11 @@ impl<const N: usize> ProcessRecord<N> {
         Ok(())
     }
 
-    /// Called in kernel mode on a REAL user EXIT(0) trap.
-    pub fn exit_zero(&mut self, pid: u64, active_cr3: u64)
+    /// Record a trusted, actual RUNNING user exit status while its own CR3
+    /// remains active. This is ownership metadata only: the caller must
+    /// authenticate the trap, quiesce saved contexts and switch back to a
+    /// distinct supervisor CR3 before releasing physical pages.
+    pub fn exit_with_status(&mut self, pid: u64, active_cr3: u64, status: u32)
         -> Result<(), ProcessError>
     {
         self.identity(pid)?;
@@ -156,8 +159,15 @@ impl<const N: usize> ProcessRecord<N> {
             return Err(ProcessError::WrongAddressSpace)
         }
         self.state = ProcessState::Exited;
-        self.exit_status = 0;
+        self.exit_status = status;
         Ok(())
+    }
+
+    /// Compatibility path for the existing hardware EXIT(0) syscall.
+    pub fn exit_zero(&mut self, pid: u64, active_cr3: u64)
+        -> Result<(), ProcessError>
+    {
+        self.exit_with_status(pid, active_cr3, 0)
     }
 
     /// Roll back a RESERVED/READY process before any user execution.
@@ -204,12 +214,12 @@ impl<const N: usize> ProcessRecord<N> {
         Ok(owned)
     }
 
-    /// Release authorization requires: correct PID, exited state and
-    /// restored CR3 not equal to the private root. A successful reap
-    /// marks ownership relinquished exactly once before any caller frees
-    /// physical pages. The process generation remains to reject stale IDs.
-    pub fn reap(&mut self, pid: u64, active_cr3: u64)
-        -> Result<[u64; N], ProcessError>
+    /// Release authorization requires correct PID, EXITED state and
+    /// restored, distinct supervisor CR3. Nonzero exit codes must not pin
+    /// frames forever: report the status while relinquishing the exact lease.
+    /// The caller independently proves CPU quiescence and frees PMM pages.
+    pub fn reap_with_status(&mut self, pid: u64, active_cr3: u64)
+        -> Result<(u32, [u64; N]), ProcessError>
     {
         self.identity(pid)?;
         if self.state != ProcessState::Exited {
@@ -218,12 +228,20 @@ impl<const N: usize> ProcessRecord<N> {
         if active_cr3 == 0 || active_cr3 & (PAGE - 1) != 0
             || active_cr3 >= MAX_PHYSICAL || active_cr3 == self.cr3_root
         { return Err(ProcessError::ActiveCr3) }
-        if self.exit_status != 0 { return Err(ProcessError::ExitNotZero) }
+        let status = self.exit_status;
         let owned = self.frames;
         self.frames = [0; N];
         self.cr3_root = 0;
         self.state = ProcessState::Reaped;
-        Ok(owned)
+        Ok((status, owned))
+    }
+
+    /// Existing callers only require their exact PMM lease. Exit status
+    /// remains observable through the explicit reap_with_status() variant.
+    pub fn reap(&mut self, pid: u64, active_cr3: u64)
+        -> Result<[u64; N], ProcessError>
+    {
+        self.reap_with_status(pid, active_cr3).map(|(_, frames)| frames)
     }
 
     fn identity(&self, pid: u64) -> Result<(), ProcessError> {
@@ -305,6 +323,34 @@ mod tests {
         assert_eq!(p.admit(2, 0x1000, owned()), Err(ProcessError::StalePid));
         assert_eq!(p.admit(1, 0x1000, owned()), Err(ProcessError::StalePid));
     }
+    #[test]
+    fn nonzero_exit_records_status_and_releases_once_after_cr3_departure() {
+        let mut p = ProcessRecord::<7>::empty();
+        p.admit(41, owned()[0], owned()).unwrap();
+        assert_eq!(p.exit_with_status(41, owned()[0], 42),
+                   Err(ProcessError::WrongState));
+        p.mark_running(41, owned()[0]).unwrap();
+        let before = p;
+        assert_eq!(p.exit_with_status(42, owned()[0], 42),
+                   Err(ProcessError::StalePid));
+        assert_eq!(p.exit_with_status(41, 0x9000, 42),
+                   Err(ProcessError::WrongAddressSpace));
+        assert_eq!(p, before); // no partial state or spurious status
+        p.exit_with_status(41, owned()[0], 0x8000_002a).unwrap();
+        assert_eq!(p.state, ProcessState::Exited);
+        assert_eq!(p.exit_status, 0x8000_002a);
+        assert_eq!(p.reap_with_status(41, owned()[0]),
+                   Err(ProcessError::ActiveCr3));
+        assert_eq!(p.reap_with_status(41, 0x9000),
+                   Ok((0x8000_002a, owned())));
+        assert_eq!(p.state, ProcessState::Reaped);
+        assert_eq!(p.frames, [0; 7]);
+        assert_eq!(p.reap(41, 0x9000), Err(ProcessError::WrongState));
+        p.admit(42, owned()[0], owned()).unwrap();
+        assert_eq!(p.exit_status, 0);
+        assert_eq!(p.reap_with_status(41, 0x9000), Err(ProcessError::StalePid));
+    }
+
     #[test]
     fn rejected_tentative_resources_do_not_modify_the_ledger() {
         let mut p = ProcessRecord::<7>::empty();

@@ -237,22 +237,39 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
             .map_err(TableError::from)
     }
 
+    /// Record a trusted RUNNING owner's exit code. Status does not release
+    /// pages: a later reap requires a separate verified supervisor CR3.
+    pub fn exit_with_status(&mut self, pid: u64, actual_cr3: u64, status: u32)
+        -> Result<(), TableError>
+    {
+        self.record_mut(pid)?.exit_with_status(pid, actual_cr3, status)
+            .map_err(TableError::from)
+    }
+
     pub fn exit_zero(&mut self, pid: u64, actual_cr3: u64)
         -> Result<(), TableError>
     {
-        self.record_mut(pid)?.exit_zero(pid, actual_cr3).map_err(TableError::from)
+        self.exit_with_status(pid, actual_cr3, 0)
     }
 
     /// Only AFTER independently verifying supervisor CR3 is not ANY live
-    /// user's address space: relinquish exact PMM frame ownership once.
+    /// user's address space: relinquish exact PMM frame ownership once,
+    /// returning the original (possibly nonzero) exit status as well.
     /// The caller separately proves hardware quiescence and releases PMM.
-    pub fn reap(&mut self, pid: u64, actual_cr3: u64)
-        -> Result<[u64; FRAMES], TableError>
+    pub fn reap_with_status(&mut self, pid: u64, actual_cr3: u64)
+        -> Result<(u32, [u64; FRAMES]), TableError>
     {
         if actual_cr3 == 0 || actual_cr3 & (PAGE - 1) != 0
             || actual_cr3 >= (1 << 52) || self.owns_live_cr3(actual_cr3)
         { return Err(TableError::Process(ProcessError::ActiveCr3)) }
-        self.record_mut(pid)?.reap(pid, actual_cr3).map_err(TableError::from)
+        self.record_mut(pid)?.reap_with_status(pid, actual_cr3).map_err(TableError::from)
+    }
+
+    /// Compatibility with the existing EXIT(0) path and PMM lease callers.
+    pub fn reap(&mut self, pid: u64, actual_cr3: u64)
+        -> Result<[u64; FRAMES], TableError>
+    {
+        self.reap_with_status(pid, actual_cr3).map(|(_, frames)| frames)
     }
 
     /// Failure/rollback path for a never-running READY process. Reject an
@@ -303,6 +320,34 @@ mod tests {
     use super::*;
     fn frames(start: u64) -> [u64; 7] {
         core::array::from_fn(|i| start + i as u64 * 4096)
+    }
+
+    #[test]
+    fn nonzero_exit_retains_code_and_reaps_only_the_exact_pid_lease() {
+        let mut table = ProcessTable::<2, 7>::new();
+        let first = frames(0x1000);
+        let second = frames(0x10000);
+        let pid1 = table.reserve(first[0], first).unwrap();
+        let pid2 = table.reserve(second[0], second).unwrap();
+        table.mark_running(pid1, first[0]).unwrap();
+        assert_eq!(table.exit_with_status(pid1, second[0], 42),
+                   Err(TableError::Process(ProcessError::WrongAddressSpace)));
+        table.exit_with_status(pid1, first[0], 42).unwrap();
+        assert_eq!(table.snapshot(pid1).unwrap().exit_status, 42);
+        assert_eq!(table.reap_with_status(pid1, first[0]),
+                   Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!(table.reap_with_status(pid1, second[3]),
+                   Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!(table.occupied(), 2);
+        assert_eq!(table.reap_with_status(pid1, 0x9000), Ok((42, first)));
+        assert_eq!(table.occupied(), 1);
+        assert!(table.snapshot(pid1).is_none());
+        assert_eq!(table.snapshot(pid2).unwrap().frames, second);
+        assert_eq!(table.reap(pid1, 0x9000), Err(TableError::UnknownPid));
+        assert_eq!(table.cancel_ready(pid2, 0x9000), Ok(second));
+        assert_eq!(table.occupied(), 0);
+        let pid3 = table.reserve(first[0], first).unwrap();
+        assert!(pid3 > pid2 && pid3 > pid1);
     }
 
     #[test]
