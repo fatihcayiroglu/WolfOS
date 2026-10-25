@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),ps2-graphics)
+FEATURES := --features ps2-graphics-demo
 else ifeq ($(FLAVOR),framebuffer-console)
 FEATURES := --features framebuffer-console-smoke
 else ifeq ($(FLAVOR),exception)
@@ -150,6 +152,11 @@ run-shell:
 serial-shell-smoke:
 	$(MAKE) iso FLAVOR=serial-shell
 	python3 scripts/serial_shell_smoke.py $(OUT)/wolfos-serial-shell.iso
+
+.PHONY: ps2-graphics-smoke
+ps2-graphics-smoke:
+	$(MAKE) iso FLAVOR=ps2-graphics
+	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics.iso
 
 .PHONY: framebuffer-console-smoke
 framebuffer-console-smoke:
@@ -372,6 +379,8 @@ p3-ring3-four-live-smoke:
 
 test:
 	mkdir -p $(OUT)
+	rustc --edition=2024 --test kernel/src/ps2_keyboard.rs -o $(OUT)/ps2_keyboard_tests
+	$(OUT)/ps2_keyboard_tests
 	rustc --edition=2024 --test kernel/src/framebuffer_text.rs -o $(OUT)/framebuffer_text_tests
 	$(OUT)/framebuffer_text_tests
 	rustc --edition=2024 --test tests/framebuffer_console.rs -o $(OUT)/framebuffer_console_tests
