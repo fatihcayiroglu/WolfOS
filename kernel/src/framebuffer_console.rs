@@ -180,6 +180,23 @@ mod tests {
     }
 
     #[test]
+    fn input_backspace_clears_last_cell_but_never_crosses_line_start() {
+        let layout = Layout::new(24, 16, 112).unwrap();
+        let mut c = TextConsole::new(layout, 0, 0, 4, 2).unwrap();
+        assert!(!c.backspace());
+        c.write("abc");
+        assert_eq!(c.cursor(), (3, 0));
+        assert!(c.backspace());
+        assert_eq!(c.cursor(), (2, 0));
+        assert_eq!(c.cell(2, 0), Some(b' '));
+        c.write("d\n");
+        assert_eq!(c.cell(2, 0), Some(b'D'));
+        assert_eq!(c.cursor(), (0, 1));
+        assert!(!c.backspace());
+        assert_eq!(c.cell(2, 0), Some(b'D'));
+    }
+
+    #[test]
     fn overflow_input_is_display_data_not_an_executable_command() {
         let layout = Layout::new(6, 8, 32).unwrap();
         let mut t = TextConsole::new(layout,0,0,1,1).unwrap();
