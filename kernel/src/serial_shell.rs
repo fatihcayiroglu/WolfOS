@@ -7,7 +7,7 @@ const CAP: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
-    Empty, Help, About, Cpu, Memory, Clear, Halt, Unknown, TooLong,
+    Empty, Help, About, Cpu, Pci, Memory, Clear, Halt, Unknown, TooLong,
 }
 
 struct Input {
@@ -41,6 +41,7 @@ impl Input {
                         b"about" => Command::About,
                         b"mem" => Command::Memory,
                         b"cpu" => Command::Cpu,
+                        b"pci" => Command::Pci,
                         b"clear" => Command::Clear,
                         b"halt" => Command::Halt,
                         _ => Command::Unknown,
@@ -71,12 +72,12 @@ impl Input {
 }
 
 #[cfg(not(test))]
-fn execute(command: Command) {
+fn execute(command: Command, pci_summary: crate::pci::PciSummary) {
     use crate::{pmm, serial};
     match command {
         Command::Empty => {}
         Command::Help =>
-            serial::write_line("WOLFOS_SHELL_HELP commands: help about cpu mem clear halt"),
+            serial::write_line("WOLFOS_SHELL_HELP commands: help about cpu pci mem clear halt"),
         Command::About =>
             serial::write_line("WOLFOS_SHELL_ABOUT experimental Rust kernel; QEMU COM1, no userspace shell"),
         Command::Cpu => {
@@ -85,6 +86,17 @@ fn execute(command: Command) {
             serial::write_line("WOLFOS_SHELL_CPU_BEGIN");
             crate::cpu::log_identity();
             serial::write_line("WOLFOS_SHELL_CPU_END");
+        }
+        Command::Pci => {
+            // Do not rescan shared CF8/CFC ports after SMP startup. Show
+            // only the immutable discovery snapshot from early BSP boot.
+            serial::write_line("WOLFOS_SHELL_PCI_BEGIN");
+            serial::write_fmt(format_args!(
+                "WOLFOS_SHELL_PCI devices={} displays={} networks={} storage={}\n",
+                pci_summary.devices, pci_summary.displays,
+                pci_summary.networks, pci_summary.storage,
+            ));
+            serial::write_line("WOLFOS_SHELL_PCI_END");
         }
         Command::Memory => {
             let stats = pmm::statistics();
@@ -107,7 +119,7 @@ fn execute(command: Command) {
 }
 
 #[cfg(not(test))]
-pub fn run() -> ! {
+pub fn run(pci_summary: crate::pci::PciSummary) -> ! {
     use crate::serial;
     let mut input = Input::new();
     serial::write_line("WOLFOS_SHELL_READY serial=COM1 input=ASCII");
@@ -118,7 +130,7 @@ pub fn run() -> ! {
                 b'\r' | b'\n' => {
                     if let Some(command) = input.push(byte) {
                         serial::write_line("");
-                        execute(command);
+                        execute(command, pci_summary);
                         serial::write_fmt(format_args!("wolfos> "));
                     }
                 }
@@ -159,6 +171,9 @@ mod tests {
             (b"about", Command::About),
             (b"mem", Command::Memory),
             (b"cpu", Command::Cpu),
+            (b"pci", Command::Pci),
+            (b"PCI", Command::Unknown),
+            (b"pci scan", Command::Unknown),
             (b"CPU", Command::Unknown),
             (b"cpu 1", Command::Unknown),
             (b"clear", Command::Clear),

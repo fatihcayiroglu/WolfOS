@@ -15,7 +15,7 @@ On Ubuntu: `sudo apt install build-essential git make xorriso qemu-system-x86 ov
 - `make doctor`: list missing tools
 - `make test`: Python source/config tests plus Rust host unit tests
 - `make smoke`: boot and serial assertions in QEMU
-- `make run-shell`: experimental **interactive COM1 kernel diagnostic console** in QEMU (type `help`, `about`, `cpu`, `mem`, `clear`, or `halt`; no physical-disk writes). This is not a Ring3 user shell or graphical desktop.
+- `make run-shell`: experimental **interactive COM1 kernel diagnostic console** in QEMU (type `help`, `about`, `cpu`, `pci`, `mem`, `clear`, or `halt`; no physical-disk writes). This is not a Ring3 user shell or graphical desktop. The `pci` command reports the **cached boot-time** device counts (display/network/storage) and does not rescan PCI configuration ports or install drivers.
 - `make serial-shell-smoke`: automated QEMU serial-input roundtrip and command/output markers
 - `make run` and `make run-shell` skip disposable allocator/paging/context stress checks; all `smoke-exit` CI flavors still run and verify them. Core hardware detection and initialization remain mandatory.
 - `make address-space-retirement-smoke`: BSP-only activation/retirement gate with real private CR3 loads, including a reservation racing retirement (1/4-vCPU QEMU; no Ring3 or SMP shootdown)
