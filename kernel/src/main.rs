@@ -11,6 +11,7 @@ use limine::{BaseRevision, RequestsEndMarker, RequestsStartMarker};
 use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest, RsdpRequest};
 
 mod serial;
+mod framebuffer_text;
 #[cfg(feature = "serial-shell")]
 mod serial_shell;
 mod cpu;
@@ -423,6 +424,45 @@ pub extern "C" fn kmain() -> ! {
             unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().write_volatile(value); }
         }
     }
+    // Allocation-free original Rust glyphs are written through volatile stores.
+    // Validate stride and pointer arithmetic before calculating raw offsets.
+    let Some(layout) = framebuffer_text::Layout::new(fb.width, fb.height, fb.pitch) else {
+        serial::write_line("WOLFOS_FB_TEXT_FAILED invalid_geometry");
+        halt_forever();
+    };
+    if (fb.address() as usize) % 4 != 0
+        || fb.red_mask_shift > 24
+        || fb.green_mask_shift > 24
+        || fb.blue_mask_shift > 24
+    {
+        serial::write_line("WOLFOS_FB_TEXT_FAILED unaligned_or_invalid_shifts");
+        halt_forever();
+    }
+    let white = (255u32 << fb.red_mask_shift)
+        | (255u32 << fb.green_mask_shift)
+        | (255u32 << fb.blue_mask_shift);
+    let first_line = layout.draw_text(20, 20, "WOLFOS", white, |offset, color| {
+        // SAFETY: layout checked offset+4 against pitch*height (<=isize::MAX).
+        // Limine supplies an accessible mapped framebuffer; aligned 32-bpp
+        // pixel writes are required by the validated pixel layout above.
+        unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().write_volatile(color); }
+    });
+    let _second_line = layout.draw_text(20, 36, "RUST KERNEL", white, |offset, color| {
+        // SAFETY: same validated framebuffer layout and volatile pixel writes.
+        unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().write_volatile(color); }
+    });
+    let witness = layout.pixel_offset(20, 20);
+    let readback_ok = if let Some(offset) = witness {
+        // SAFETY: checked in-range aligned 32-bit pixel offset into Limine FB.
+        unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().read_volatile() == white }
+    } else {
+        false
+    };
+    if first_line < 10 || !readback_ok {
+        serial::write_line("WOLFOS_FB_TEXT_FAILED missing_pixel_readback");
+        halt_forever();
+    }
+    serial::write_fmt(format_args!("WOLFOS_FB_TEXT_OK glyph_pixels={} first_pixel=verified\n", first_line));
     serial::write_fmt(format_args!("WOLFOS_FRAMEBUFFER_OK {}x{}\n", fb.width, fb.height));
     let Some(mp) = MP_REQUEST.response() else {
         serial::write_line("WOLFOS_SMP_ERROR no Limine MP response");
