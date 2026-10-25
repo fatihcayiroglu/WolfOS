@@ -42,6 +42,17 @@ _after_add:
     // Isolated genuine CPL3 file I/O guest, deliberately NOT a POSIX API.
     // Every path and destination pointer is read from real user registers.
 .ifdef WOLFOS_FILE_IO_SMOKE
+    // Default-deny: a legitimate user path cannot OPEN until trusted
+    // kernel policy explicitly grants FileRead to this PID.
+    lea rdi, [rip + file_path]
+    mov esi, file_path_end - file_path
+    xor edx, edx
+    mov eax, 6
+    int 0x80
+_after_file_policy_denied_open:
+    cmp rax, -13
+    jne fail
+
     // Negative: a supervisor pointer may NEVER be followed.
     movabs rdi, 0xffff800000000000
     mov esi, file_path_end - file_path
@@ -87,7 +98,17 @@ _after_file_read:
     cmp dword ptr [rsp - 28], 0x0a4b4f5f # _OK newline
     jne fail
 
-    // EOF and clean release, then reject stale handle.
+    // A live revocation must deny READ even through this still-open FD.
+    mov rdi, r12
+    lea rsi, [rsp - 32]
+    mov edx, 8
+    mov eax, 7
+    int 0x80
+_after_file_policy_revoked_read:
+    cmp rax, -13
+    jne fail
+
+    // Trusted test policy re-grants FileRead; now EOF and clean release.
     mov rdi, r12
     lea rsi, [rsp - 32]
     mov edx, 8

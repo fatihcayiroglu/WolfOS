@@ -14,18 +14,24 @@ PROOFS = [
     "WOLFOS_FILE_IO_READY tmp_mount=1 sealed_file=1 pid_owner=1",
     "WOLFOS_ELF_ID_OK cpl3=1 return_rax=0x574f4c46",
     "WOLFOS_ELF_ADD_OK cpl3=1 return_rax=42",
+    "WOLFOS_SHIELD_FILE_DENIED_OK pid=1 fd_open=0 policy_default_deny=1",
+    "WOLFOS_SHIELD_FILE_GRANT_OK pid=1 handles=0",
     "WOLFOS_FILE_IO_BAD_OPEN_OK supervisor_denied=1",
     "WOLFOS_FILE_IO_OPEN_OK path_user_rx=1 fd=256",
     "WOLFOS_FILE_IO_BAD_READ_OK rx_write_denied=1 cursor_rollback=1",
     "WOLFOS_FILE_IO_READ_OK bytes=8 user_stack=1 payload=FILE_OK",
+    "WOLFOS_SHIELD_FILE_REVOKE_OK pid=1 handles=1",
+    "WOLFOS_SHIELD_READ_DENIED_OK pid=1 retained_fd=1",
+    "WOLFOS_SHIELD_FILE_REGRANT_OK pid=1 handles=1",
     "WOLFOS_FILE_IO_EOF_OK read=0",
     "WOLFOS_FILE_IO_CLOSE_OK released=1",
     "WOLFOS_FILE_IO_STALE_OK ebadf=1",
+    "WOLFOS_SHIELD_RETIRED_OK pid=1 grants=0 stale_denied=1",
     "WOLFOS_FILE_IO_FDS_OK open=0 stale_denied=1 pid_cleanup=1",
-    "WOLFOS_FILE_IO_EXIT_OK code=0 cpl3=1 calls=10",
+    "WOLFOS_FILE_IO_EXIT_OK code=0 cpl3=1 calls=12",
     "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1",
     "WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 "
-    "real_file_syscalls=3 int80_calls=10 exit=0 resources_released=1 "
+    "real_file_syscalls=3 int80_calls=12 exit=0 resources_released=1 "
     "persistent=0 production=0",
 ]
 
@@ -84,7 +90,7 @@ def main():
             print("FAIL: QEMU debug-exit expected 33, got", run.returncode)
             print(run.stderr.decode(errors="replace"))
             return 1
-        print("PASS: genuine CPL3 file syscalls, pointer denials, EOF/stale FD and seven-frame cleanup")
+        print("PASS: genuine CPL3 Shield deny/grant/revoke/retire, checked file syscalls and seven-frame cleanup")
         return 0
 
 if __name__ == "__main__":

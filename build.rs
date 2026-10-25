@@ -172,10 +172,12 @@ fn main() {
     ];
     if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
         symbols.extend_from_slice(&[
+            ("_after_file_policy_denied_open", "FILE_POLICY_DENIED_OPEN"),
             ("_after_file_bad_open", "FILE_BAD_OPEN"),
             ("_after_file_open", "FILE_OPEN"),
             ("_after_file_bad_read", "FILE_BAD_READ"),
             ("_after_file_read", "FILE_READ"),
+            ("_after_file_policy_revoked_read", "FILE_POLICY_REVOKED_READ"),
             ("_after_file_eof", "FILE_EOF"),
             ("_after_file_close", "FILE_CLOSE"),
             ("_after_file_stale_close", "FILE_STALE_CLOSE"),

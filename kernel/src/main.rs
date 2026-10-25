@@ -65,6 +65,8 @@ mod user_copy;
 mod user_file_io;
 #[cfg(feature = "user-file-io-smoke")]
 mod user_file_io_smoke;
+#[cfg(feature = "user-file-io-smoke")]
+mod app_permissions;
 #[cfg(any(feature = "smp-address-space-retirement-smoke", feature = "p3-ring3-event-wait-hardware-smoke", any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "user-context-smoke", any(feature = "process-table-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))))))]
 mod process_lifecycle;
 #[cfg(any(feature = "user-elf-run-smoke", feature = "user-process-smoke", feature = "user-copy-smoke", feature = "user-file-io-smoke", feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "smp-address-space-retirement-smoke", feature = "p3-ring3-event-wait-hardware-smoke", any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-fx-smoke", any(feature = "kernel-stack-lease-smoke", any(feature = "process-table-smoke", feature = "user-context-smoke")))))))]
