@@ -7,7 +7,7 @@ const CAP: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
-    Empty, Help, About, Memory, Clear, Halt, Unknown, TooLong,
+    Empty, Help, About, Cpu, Memory, Clear, Halt, Unknown, TooLong,
 }
 
 struct Input {
@@ -40,6 +40,7 @@ impl Input {
                         b"help" => Command::Help,
                         b"about" => Command::About,
                         b"mem" => Command::Memory,
+                        b"cpu" => Command::Cpu,
                         b"clear" => Command::Clear,
                         b"halt" => Command::Halt,
                         _ => Command::Unknown,
@@ -75,9 +76,16 @@ fn execute(command: Command) {
     match command {
         Command::Empty => {}
         Command::Help =>
-            serial::write_line("WOLFOS_SHELL_HELP commands: help about mem clear halt"),
+            serial::write_line("WOLFOS_SHELL_HELP commands: help about cpu mem clear halt"),
         Command::About =>
             serial::write_line("WOLFOS_SHELL_ABOUT experimental Rust kernel; QEMU COM1, no userspace shell"),
+        Command::Cpu => {
+            // CPUID is read-only, already used during boot, and does not
+            // probe mutable PCI/ACPI configuration or install a driver.
+            serial::write_line("WOLFOS_SHELL_CPU_BEGIN");
+            crate::cpu::log_identity();
+            serial::write_line("WOLFOS_SHELL_CPU_END");
+        }
         Command::Memory => {
             let stats = pmm::statistics();
             serial::write_fmt(format_args!(
@@ -150,6 +158,9 @@ mod tests {
             (b"help".as_slice(), Command::Help),
             (b"about", Command::About),
             (b"mem", Command::Memory),
+            (b"cpu", Command::Cpu),
+            (b"CPU", Command::Unknown),
+            (b"cpu 1", Command::Unknown),
             (b"clear", Command::Clear),
             (b"halt", Command::Halt),
             (b"HELP", Command::Unknown),
