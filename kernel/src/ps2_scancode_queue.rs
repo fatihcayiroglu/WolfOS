@@ -104,6 +104,20 @@ mod tests {
     }
 
     #[test]
+    fn lost_modifier_break_poison_blocks_all_later_input() {
+        let queue = ScancodeQueue::<2>::new();
+        // A lost Shift release would leave the decoder falsely shifted.
+        assert!(queue.push(0x2a)); // Shift make
+        assert!(queue.push(0x1e)); // A make
+        assert!(!queue.push(0xaa)); // Shift release cannot fit
+        assert!(queue.poisoned());
+        assert_eq!(queue.pop(), Err(())); // do not replay incomplete input
+        assert!(!queue.push(0x1c)); // Enter is not dispatched either
+        assert_eq!(queue.dropped(), 2);
+        assert_eq!(queue.pop(), Err(()));
+    }
+
+    #[test]
     fn zero_capacity_fails_without_modulo_by_zero() {
         let q = ScancodeQueue::<0>::new();
         assert_eq!(q.pop(), Ok(None));
