@@ -13,6 +13,7 @@ use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest,
 mod serial;
 mod framebuffer_text;
 mod framebuffer_console;
+mod shell_command;
 #[cfg(feature = "ps2-graphics-demo")]
 mod ps2_keyboard;
 #[cfg(feature = "ps2-graphics-demo")]

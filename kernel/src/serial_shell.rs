@@ -5,10 +5,7 @@
 //! This is an experimental kernel diagnostic console, not a user shell.
 const CAP: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Command {
-    Empty, Help, About, Cpu, Pci, Memory, Clear, Halt, Unknown, TooLong,
-}
+use crate::shell_command::Command;
 
 struct Input {
     bytes: [u8; CAP],
@@ -35,17 +32,7 @@ impl Input {
                 let command = if self.overflow {
                     Command::TooLong
                 } else {
-                    match &self.bytes[..self.len] {
-                        b"" => Command::Empty,
-                        b"help" => Command::Help,
-                        b"about" => Command::About,
-                        b"mem" => Command::Memory,
-                        b"cpu" => Command::Cpu,
-                        b"pci" => Command::Pci,
-                        b"clear" => Command::Clear,
-                        b"halt" => Command::Halt,
-                        _ => Command::Unknown,
-                    }
+                    Command::parse(&self.bytes[..self.len])
                 };
                 self.len = 0;
                 self.overflow = false;

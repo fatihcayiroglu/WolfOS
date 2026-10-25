@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),ps2-graphics-help)
+FEATURES := --features ps2-graphics-help-smoke
 else ifeq ($(FLAVOR),ps2-graphics)
 FEATURES := --features ps2-graphics-demo
 else ifeq ($(FLAVOR),framebuffer-console)
@@ -157,6 +159,11 @@ serial-shell-smoke:
 ps2-graphics-smoke:
 	$(MAKE) iso FLAVOR=ps2-graphics
 	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics.iso
+
+.PHONY: ps2-graphics-help-smoke
+ps2-graphics-help-smoke:
+	$(MAKE) iso FLAVOR=ps2-graphics-help
+	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-help.iso --help-mode
 
 .PHONY: framebuffer-console-smoke
 framebuffer-console-smoke:
@@ -385,7 +392,7 @@ test:
 	$(OUT)/framebuffer_text_tests
 	rustc --edition=2024 --test tests/framebuffer_console.rs -o $(OUT)/framebuffer_console_tests
 	$(OUT)/framebuffer_console_tests
-	rustc --edition=2024 --test kernel/src/serial_shell.rs -o $(OUT)/serial_shell_tests
+	rustc --edition=2024 --test tests/serial_shell.rs -o $(OUT)/serial_shell_tests
 	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
