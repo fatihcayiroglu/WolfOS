@@ -536,7 +536,7 @@ pub extern "C" fn kmain() -> ! {
     // Experimental interactive BSP-only COM1 diagnostics, separate from all
     // hardware smoke flavors and deliberately without disk or user processes.
     #[cfg(feature = "serial-shell")]
-    serial_shell::run();
+    serial_shell::run(pci_summary);
 
     #[cfg(any(feature = "p2-ring3-yield-smoke", feature = "p2-ring3-irq-ready-smoke"))]
     user_yield_switch_smoke::enter(hhdm.offset);
