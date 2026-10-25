@@ -50,6 +50,8 @@ jobs:
         run: make serial-shell-smoke
       - name: Real PS/2 keyboard input to Rust framebuffer text (QEMU HMP sendkey)
         run: make ps2-graphics-smoke
+      - name: Real IRQ1 overflow poisons keyboard input, EOIs PIC and blocks execution
+        run: make ps2-graphics-overflow-smoke
       - name: Real PIC IRQ1 keyboard interrupts queued for foreground framebuffer HELP (QEMU)
         run: make ps2-graphics-irq-smoke
       - name: Real keyboard input overflow refusal and next command recovery on same QEMU boot

@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),ps2-graphics-overflow)
+FEATURES := --features ps2-graphics-overflow-smoke
 else ifeq ($(FLAVOR),ps2-graphics-irq)
 FEATURES := --features ps2-graphics-irq-smoke
 else ifeq ($(FLAVOR),ps2-graphics-edit)
@@ -186,6 +188,11 @@ ps2-graphics-edit-smoke:
 ps2-graphics-irq-smoke:
 	$(MAKE) iso FLAVOR=ps2-graphics-irq
 	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-irq.iso --irq-mode
+
+.PHONY: ps2-graphics-overflow-smoke
+ps2-graphics-overflow-smoke:
+	$(MAKE) iso FLAVOR=ps2-graphics-overflow
+	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-overflow.iso --overflow-mode
 
 .PHONY: framebuffer-console-smoke
 framebuffer-console-smoke:

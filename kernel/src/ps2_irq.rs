@@ -14,6 +14,10 @@ const MASTER_DATA: u16 = 0x21;
 const SLAVE_COMMAND: u16 = 0xa0;
 const SLAVE_DATA: u16 = 0xa1;
 
+// The adversarial QEMU flavor alone uses eight slots to force backpressure.
+#[cfg(feature = "ps2-graphics-overflow-smoke")]
+static SCANCODES: ScancodeQueue<8> = ScancodeQueue::new();
+#[cfg(not(feature = "ps2-graphics-overflow-smoke"))]
 static SCANCODES: ScancodeQueue<64> = ScancodeQueue::new();
 static IRQS: AtomicUsize = AtomicUsize::new(0);
 static EOIS: AtomicUsize = AtomicUsize::new(0);
