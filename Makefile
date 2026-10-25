@@ -561,6 +561,8 @@ test:
 	$(OUT)/user_copy_tests
 	rustc --edition=2024 --test tests/user_file_io_contract.rs -o $(OUT)/user_file_io_contract_tests
 	$(OUT)/user_file_io_contract_tests
+	rustc --edition=2024 --test kernel/src/app_permissions.rs -o $(OUT)/app_permissions_tests
+	$(OUT)/app_permissions_tests
 	rustc --edition=2024 --test kernel/src/user_syscall_abi.rs -o $(OUT)/user_syscall_abi_tests
 	$(OUT)/user_syscall_abi_tests
 	rustc --edition=2024 --test tests/elf64_page_image.rs -o $(OUT)/elf64_page_image_tests
