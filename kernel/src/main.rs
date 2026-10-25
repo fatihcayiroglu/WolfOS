@@ -18,6 +18,8 @@ mod shell_command;
 mod ps2_keyboard;
 #[cfg(feature = "ps2-graphics-demo")]
 mod ps2_graphics_demo;
+#[cfg(feature = "ps2-graphics-demo")]
+mod graphical_diagnostics;
 #[cfg(feature = "serial-shell")]
 mod serial_shell;
 mod cpu;
@@ -649,7 +651,7 @@ pub extern "C" fn kmain() -> ! {
     // Experimental interactive BSP-only COM1 diagnostics, separate from all
     // hardware smoke flavors and deliberately without disk or user processes.
     #[cfg(feature = "ps2-graphics-demo")]
-    ps2_graphics_demo::run(layout, fb.address().cast::<u8>(), white);
+    ps2_graphics_demo::run(layout, fb.address().cast::<u8>(), white, pci_summary);
 
     #[cfg(feature = "serial-shell")]
     serial_shell::run(pci_summary);

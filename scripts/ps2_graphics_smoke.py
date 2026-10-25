@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import select
 import socket
 import subprocess
@@ -45,10 +46,11 @@ def connect_monitor(path: pathlib.Path) -> socket.socket:
 
 
 def main() -> int:
-    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--help-mode"):
-        print("usage: ps2_graphics_smoke.py image.iso [--help-mode]")
+    help_mode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
+    info_mode = len(sys.argv) == 4 and sys.argv[2] == "--info-mode" and sys.argv[3] in ("mem", "pci")
+    if not (len(sys.argv) == 2 or help_mode or info_mode):
+        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --info-mode mem|pci]")
         return 2
-    help_mode = len(sys.argv) == 3
     iso = pathlib.Path(sys.argv[1]).resolve()
     if not iso.is_file():
         print(f"missing ISO: {iso}")
@@ -77,16 +79,50 @@ def main() -> int:
             monitor = connect_monitor(monitor_path)
             try:
                 # Real emulated i8042 scan codes, never serial input.
-                if help_mode:
+                if help_mode or info_mode:
                     wait_for(proc, output, b"WOLFOS_PS2_PROMPT_READY")
+                if help_mode:
                     keys = ("h", "e", "l", "x", "backspace", "p", "ret")
+                elif info_mode:
+                    keys = tuple(sys.argv[3]) + ("ret",)
                 else:
                     keys = ("a", "b", "c", "backspace", "d", "ret")
                 for i, key in enumerate(keys, 1):
                     monitor.sendall(f"sendkey {key}\n".encode("ascii"))
                     wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\r\n".encode())
                     print(f"PASS: emulated keyboard key={key} accepted={i}")
-                if help_mode:
+                if info_mode:
+                    kind = sys.argv[3]
+                    if kind == "pci":
+                        wait_for(proc, output, b"WOLFOS_PS2_PCI_OK ")
+                        wait_for(proc, output, b"pixels=verified\r\n")
+                        boot = re.search(
+                            rb"WOLFOS_PCI_OK devices=(\d+) displays=(\d+) networks=(\d+) storage=(\d+)", output
+                        )
+                        live = re.search(
+                            rb"WOLFOS_PS2_PCI_OK displays=(\d+) networks=(\d+) storage=(\d+) pixels=verified", output
+                        )
+                        if not boot or not live or live.groups() != boot.groups()[1:]:
+                            raise RuntimeError("graphical PCI counts do not equal early immutable discovery")
+                        print("PASS: PS/2 PCI matches boot PCI counts and real framebuffer pixels")
+                    else:
+                        wait_for(proc, output, b"WOLFOS_PS2_MEM_OK ")
+                        wait_for(proc, output, b"pixels=verified\r\n")
+                        boot = re.search(
+                            rb"WOLFOS_PMM_OK [^\r\n]*free_frames=(\d+)", output
+                        )
+                        live = re.search(
+                            rb"WOLFOS_PS2_MEM_OK free_frames=(\d+) mib=(\d+) pixels=verified", output
+                        )
+                        if not boot or not live:
+                            raise RuntimeError("missing boot PMM or graphical memory measurement")
+                        boot_free = int(boot.group(1))
+                        free = int(live.group(1))
+                        mib = int(live.group(2))
+                        if free <= 0 or free > boot_free or mib != free // 256:
+                            raise RuntimeError(f"bad graphical memory data: boot={boot_free} free={free} MiB={mib}")
+                        print("PASS: PS/2 MEM reports live free MiB with framebuffer pixels")
+                elif help_mode:
                     wait_for(
                         proc, output,
                         b"WOLFOS_PS2_HELP_OK source=keyboard edit=backspace output=framebuffer pixels=verified",
