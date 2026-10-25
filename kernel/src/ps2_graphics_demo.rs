@@ -204,7 +204,7 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                                     crate::halt_forever();
                                 }
                                 serial::write_fmt(format_args!(
-                                    "WOLFOS_PS2_IRQ_OK keys={} irqs={} eois={} drops={} pixels=verified\\n",
+                                    "WOLFOS_PS2_IRQ_OK keys={} irqs={} eois={} drops={} pixels=verified\n",
                                     accepted, irqs, eois, dropped,
                                 ));
                                 crate::halt_forever();
