@@ -86,6 +86,8 @@ jobs:
         run: make user-elf-run-smoke
       - name: P2 real CPL3 EXIT(42) status-preserving reap and exact 7-frame cleanup
         run: make user-exit-status-smoke
+      - name: P2 CPL3 invalid opcode fault safely retires only its process and frees PMM frames
+        run: make user-invalid-opcode-retire-smoke
       - name: P2 two real sequential Ring3 ELF processes with PID generation and verified full cleanup
         run: make user-process-smoke
       - name: P2 original RamFS staged ELF64 native Hello executes as real Ring3 process and reaps

@@ -449,11 +449,16 @@ extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-    serial::write_fmt(format_args!("WOLFOS_EXCEPTION_UD vector=6 rip={:?}\n", frame.instruction_pointer));
-    #[cfg(feature = "exception-smoke")]
-    serial::qemu_exit_success();
-    #[cfg(not(feature = "exception-smoke"))]
-    crate::halt_forever();
+    #[cfg(feature = "user-invalid-opcode-retire-smoke")]
+    crate::user_elf_run_smoke::retire_user_invalid_opcode(&frame);
+    #[cfg(not(feature = "user-invalid-opcode-retire-smoke"))]
+    {
+        serial::write_fmt(format_args!("WOLFOS_EXCEPTION_UD vector=6 rip={:?}\n", frame.instruction_pointer));
+        #[cfg(feature = "exception-smoke")]
+        serial::qemu_exit_success();
+        #[cfg(not(feature = "exception-smoke"))]
+        crate::halt_forever();
+    }
 }
 
 extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, code: u64) {
