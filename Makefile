@@ -385,7 +385,7 @@ test:
 	$(OUT)/framebuffer_text_tests
 	rustc --edition=2024 --test tests/framebuffer_console.rs -o $(OUT)/framebuffer_console_tests
 	$(OUT)/framebuffer_console_tests
-	rustc --edition=2024 --test kernel/src/serial_shell.rs -o $(OUT)/serial_shell_tests
+	rustc --edition=2024 --test tests/serial_shell.rs -o $(OUT)/serial_shell_tests
 	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
