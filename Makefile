@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),ps2-graphics-help)
+FEATURES := --features ps2-graphics-help-smoke
 else ifeq ($(FLAVOR),ps2-graphics)
 FEATURES := --features ps2-graphics-demo
 else ifeq ($(FLAVOR),framebuffer-console)
@@ -157,6 +159,11 @@ serial-shell-smoke:
 ps2-graphics-smoke:
 	$(MAKE) iso FLAVOR=ps2-graphics
 	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics.iso
+
+.PHONY: ps2-graphics-help-smoke
+ps2-graphics-help-smoke:
+	$(MAKE) iso FLAVOR=ps2-graphics-help
+	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-help.iso --help-mode
 
 .PHONY: framebuffer-console-smoke
 framebuffer-console-smoke:
