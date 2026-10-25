@@ -365,6 +365,8 @@ p3-ring3-four-live-smoke:
 
 test:
 	mkdir -p $(OUT)
+	rustc --edition=2024 --test kernel/src/framebuffer_text.rs -o $(OUT)/framebuffer_text_tests
+	$(OUT)/framebuffer_text_tests
 	rustc --edition=2024 --test kernel/src/serial_shell.rs -o $(OUT)/serial_shell_tests
 	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v
