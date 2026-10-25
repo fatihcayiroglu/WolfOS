@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),ps2-graphics-irq)
+FEATURES := --features ps2-graphics-irq-smoke
 else ifeq ($(FLAVOR),ps2-graphics-edit)
 FEATURES := --features ps2-graphics-edit-smoke
 else ifeq ($(FLAVOR),ps2-graphics-info)
@@ -179,6 +181,11 @@ ps2-graphics-info-smoke:
 ps2-graphics-edit-smoke:
 	$(MAKE) iso FLAVOR=ps2-graphics-edit
 	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-edit.iso --edit-mode
+
+.PHONY: ps2-graphics-irq-smoke
+ps2-graphics-irq-smoke:
+	$(MAKE) iso FLAVOR=ps2-graphics-irq
+	python3 scripts/ps2_graphics_smoke.py $(OUT)/wolfos-ps2-graphics-irq.iso --irq-mode
 
 .PHONY: framebuffer-console-smoke
 framebuffer-console-smoke:
@@ -401,6 +408,8 @@ p3-ring3-four-live-smoke:
 
 test:
 	mkdir -p $(OUT)
+	rustc --edition=2024 --test kernel/src/ps2_scancode_queue.rs -o $(OUT)/ps2_scancode_queue_tests
+	$(OUT)/ps2_scancode_queue_tests
 	rustc --edition=2024 --test kernel/src/ps2_keyboard.rs -o $(OUT)/ps2_keyboard_tests
 	$(OUT)/ps2_keyboard_tests
 	rustc --edition=2024 --test kernel/src/framebuffer_text.rs -o $(OUT)/framebuffer_text_tests
