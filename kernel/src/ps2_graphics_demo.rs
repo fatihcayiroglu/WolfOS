@@ -6,6 +6,7 @@ use crate::{
     framebuffer_console::TextConsole,
     framebuffer_text::Layout,
     graphical_diagnostics,
+    graphical_line_editor::LineEditor,
     pci::PciSummary,
     ps2_keyboard::{Key, Set1Decoder, read_scancode},
     serial,
@@ -14,6 +15,7 @@ use crate::{
 
 pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary) -> ! {
     let info_mode = cfg!(feature = "ps2-graphics-info-smoke");
+    let edit_mode = cfg!(feature = "ps2-graphics-edit-smoke");
     let columns = if info_mode { 26 } else { 16 };
     let Some(mut console) = TextConsole::new(layout, 20, 80, columns, 2) else {
         serial::write_line("WOLFOS_PS2_FAILED insufficient_framebuffer");
@@ -28,10 +30,9 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
     });
     let mut decoder = Set1Decoder::new();
     let mut accepted = 0usize;
-    let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") || info_mode { 1u8 } else { 0u8 };
-    let mut line = [0u8; 12];
-    let mut line_len = 0usize;
-    let mut overflow = false;
+    let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") || info_mode || edit_mode { 1u8 } else { 0u8 };
+    let mut editor = LineEditor::<12>::new();
+    let mut rejected_overlong = false;
     serial::write_line("WOLFOS_PS2_READY mode=polling keyboard=set1 graphical=1");
     if stage == 1 {
         console.write("> ");
@@ -51,22 +52,14 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                 }
                 match key {
                     Key::Character(c) => {
-                        if stage == 0 || (!overflow && line_len < line.len()) {
-                            if stage != 0 {
-                                line[line_len] = c;
-                                line_len += 1;
-                            }
+                        if stage == 0 || editor.push(c) {
                             console.write(core::str::from_utf8(&[c]).unwrap_or("?"));
-                        } else {
-                            // Fail closed: never dispatch a truncated command.
-                            overflow = true;
                         }
                     }
                     Key::Backspace => {
                         if stage == 0 {
                             console.backspace();
-                        } else if !overflow && line_len != 0 {
-                            line_len -= 1;
+                        } else if editor.backspace() {
                             console.backspace();
                         }
                     }
@@ -107,9 +100,7 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                         crate::halt_forever();
                     }
                 } else if stage != 0 && matches!(key, Key::Enter) {
-                    let command = if overflow { Command::TooLong } else { Command::parse(&line[..line_len]) };
-                    line_len = 0;
-                    overflow = false;
+                    let command = editor.submit();
                     // The shared parser classifies input. Only explicit
                     // read-only diagnostics are granted in this graphical
                     // prototype: PMM snapshot and cached early PCI discovery.
@@ -134,6 +125,44 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                         // SAFETY: the validated layout clips each 32-bpp pixel.
                         unsafe { address.add(offset).cast::<u32>().write_volatile(color); }
                     });
+                    if edit_mode {
+                        // Check actual post-Enter framebuffer bytes before any
+                        // subsequent prompt erases the response or scrolls.
+                        let pixel = |x, y| layout.pixel_offset(x, y).map(|offset| {
+                            // SAFETY: Layout checked the mapped 32-bit pixel.
+                            unsafe { address.add(offset).cast::<u32>().read_volatile() }
+                        });
+                        let expected = if rejected_overlong {
+                            b"HELP ABOUT".as_slice()
+                        } else {
+                            b"TOO LONG".as_slice()
+                        };
+                        let text_matches = expected.iter().enumerate().all(|(i, c)| {
+                            console.cell(i, 1) == Some(*c)
+                        });
+                        let pixels_match = if rejected_overlong {
+                            // H top row begins lit, then dark.
+                            pixel(20, 88) == Some(white) && pixel(21, 88) == Some(0)
+                        } else {
+                            // T has five lit pixels on top, then dark spacer.
+                            pixel(20, 88) == Some(white) && pixel(24, 88) == Some(white)
+                                && pixel(25, 88) == Some(0)
+                        };
+                        if !text_matches || !pixels_match {
+                            serial::write_line("WOLFOS_PS2_EDIT_FAILED incorrect_text_or_pixels");
+                            crate::halt_forever();
+                        }
+                        if !rejected_overlong && command == Command::TooLong {
+                            rejected_overlong = true;
+                            serial::write_line("WOLFOS_PS2_EDIT_REJECT_OK poisoned=1 pixels=verified");
+                        } else if rejected_overlong && command == Command::Help {
+                            serial::write_line("WOLFOS_PS2_EDIT_RECOVERY_OK next=HELP pixels=verified");
+                            crate::halt_forever();
+                        } else {
+                            serial::write_line("WOLFOS_PS2_EDIT_FAILED unexpected_command");
+                            crate::halt_forever();
+                        }
+                    }
                     if stage == 1 && command == Command::Help {
                         let pixel = |x, y| layout.pixel_offset(x, y).map(|offset| {
                             // SAFETY: Layout validated this pixel byte offset.
@@ -203,6 +232,9 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                         // SAFETY: same validated mapped framebuffer.
                         unsafe { address.add(offset).cast::<u32>().write_volatile(color); }
                     });
+                    if edit_mode && rejected_overlong {
+                        serial::write_line("WOLFOS_PS2_EDIT_PROMPT_READY");
+                    }
                 }
             }
         } else {
