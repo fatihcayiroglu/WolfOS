@@ -49,6 +49,44 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
         });
         serial::write_line("WOLFOS_PS2_PROMPT_READY");
     }
+    #[cfg(feature = "ps2-graphics-overflow-smoke")]
+    {
+        // After the prompt is fully drawn, leave IF enabled and deliberately
+        // pause the foreground consumer. Only actual i8042 IRQ1 bytes may
+        // fill the eight-slot hardware ring.
+        serial::write_line("WOLFOS_PS2_OVERFLOW_READY capacity=8 foreground=held");
+        loop {
+            if crate::ps2_irq::evidence().3 {
+                x86_64::instructions::interrupts::disable();
+                let (irqs, eois, dropped, poisoned) = crate::ps2_irq::evidence();
+                if !poisoned || irqs < 9 || eois != irqs || dropped == 0
+                    || !matches!(crate::ps2_irq::take(), Err(()))
+                {
+                    serial::write_line("WOLFOS_PS2_OVERFLOW_FAILED counters_or_poison");
+                    crate::halt_forever();
+                }
+                let first = layout.pixel_offset(20, 80).map(|offset| {
+                    // SAFETY: validated mapped framebuffer pixel of '>'.
+                    unsafe { address.add(offset).cast::<u32>().read_volatile() }
+                });
+                let second = layout.pixel_offset(21, 80).map(|offset| {
+                    // SAFETY: validated mapped framebuffer pixel of '>'.
+                    unsafe { address.add(offset).cast::<u32>().read_volatile() }
+                });
+                if accepted != 0 || first != Some(white) || second != Some(0) {
+                    serial::write_line("WOLFOS_PS2_OVERFLOW_FAILED foreground_or_display");
+                    crate::halt_forever();
+                }
+                serial::write_fmt(format_args!(
+                    "WOLFOS_PS2_OVERFLOW_OK capacity=8 irqs={} eois={} dropped={} poison=1 decoded=0 pixels=verified\n",
+                    irqs, eois, dropped,
+                ));
+                crate::halt_forever();
+            }
+            core::hint::spin_loop();
+        }
+    }
+    #[cfg(not(feature = "ps2-graphics-overflow-smoke"))]
     loop {
         // Foreground input consumer. In the IRQ flavor all hardware 0x60/0x64
         // reads occur exclusively inside IRQ1; the consumer only pops bytes.
