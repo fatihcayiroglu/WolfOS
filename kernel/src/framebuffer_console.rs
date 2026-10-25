@@ -64,6 +64,13 @@ impl TextConsole {
         self.scrolls = self.scrolls.saturating_add(1);
     }
 
+    pub fn backspace(&mut self) -> bool {
+        if self.cursor_col == 0 { return false; }
+        self.cursor_col -= 1;
+        self.cells[self.cursor_row * MAX_COLS + self.cursor_col] = b' ';
+        true
+    }
+
     pub fn write(&mut self, text: &str) {
         for byte in text.bytes() {
             match byte {
