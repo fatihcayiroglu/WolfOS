@@ -25,6 +25,13 @@ impl<const CAP: usize> ScancodeQueue<CAP> {
         }
     }
 
+    /// IRQ producer: flag a missing or corrupted keyboard byte. The queue
+    /// must never replay earlier events once a make/break byte was lost.
+    pub fn poison(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.poisoned.store(true, Ordering::Release);
+    }
+
     /// IRQ producer; false permanently poisons this isolated input session.
     pub fn push(&self, scan: u8) -> bool {
         if self.poisoned.load(Ordering::Acquire) {
@@ -34,8 +41,7 @@ impl<const CAP: usize> ScancodeQueue<CAP> {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
         if CAP == 0 || tail.wrapping_sub(head) >= CAP {
-            self.poisoned.store(true, Ordering::Release);
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            self.poison();
             return false;
         }
         self.slots[tail % CAP].store(scan, Ordering::Relaxed);
@@ -101,6 +107,17 @@ mod tests {
         assert_eq!(q.pop(), Err(()));
         assert!(!q.push(4));
         assert_eq!(q.dropped(), 2);
+    }
+
+    #[test]
+    fn corrupt_controller_release_poison_discards_queued_keys_and_enter() {
+        let queue = ScancodeQueue::<4>::new();
+        assert!(queue.push(0x2a)); // Shift make previously queued
+        queue.poison();             // parity error lost its Shift break
+        assert_eq!(queue.pop(), Err(())); // stale Shift never reaches decoder
+        assert!(!queue.push(0x1c)); // later Enter cannot submit a command
+        assert_eq!(queue.dropped(), 2);
+        assert!(queue.poisoned());
     }
 
     #[test]
