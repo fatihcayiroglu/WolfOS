@@ -87,6 +87,9 @@ def main() -> int:
                     b"WOLFOS_PS2_GRAPHICS_OK keys=6 text=ABD backspace=1 enter=1 pixels=verified",
                 )
                 print("PASS: actual PS/2 input -> Rust console -> framebuffer pixels")
+                # The first evidence marker may be emitted before the
+                # next prompt is rendered; never race an unpolled PS/2 key.
+                wait_for(proc, output, b"WOLFOS_PS2_PROMPT_READY")
                 # Follow the preserved six-key hardware proof with a genuine
                 # edited graphical help command: helx, Backspace, p, Enter.
                 # Each event must come from emulated i8042, not COM1 input.
