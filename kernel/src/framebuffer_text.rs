@@ -38,6 +38,30 @@ impl Layout {
         usize::try_from(offset).ok()
     }
 
+    /// Paint one opaque 6x8 cell. Including the background is essential when
+    /// a console row scrolls or overwrites previously drawn characters.
+    /// Every offset is checked against the original validated pitch/height.
+    pub fn draw_cell<F: FnMut(usize, u32)>(
+        self, x: u64, y: u64, character: u8, foreground: u32,
+        background: u32, mut pixel: F,
+    ) -> usize {
+        let rows = glyph(character);
+        let mut written = 0;
+        for row in 0..8u64 {
+            let Some(py) = y.checked_add(row) else { break };
+            for col in 0..6u64 {
+                let Some(px) = x.checked_add(col) else { break };
+                let lit = row < 7 && col < 5
+                    && (rows[row as usize] & (0b1_0000u8 >> col)) != 0;
+                if let Some(offset) = self.pixel_offset(px, py) {
+                    pixel(offset, if lit { foreground } else { background });
+                    written += 1;
+                }
+            }
+        }
+        written
+    }
+
     /// Emits foreground pixels through a caller-provided safe/volatile writer.
     /// Unsupported bytes render '?' and lines do not wrap automatically.
     pub fn draw_text<F: FnMut(usize, u32)>(
