@@ -174,9 +174,11 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                             // M starts with a lit pixel followed by a dark one.
                             Command::Memory => pixel(20, 88) == Some(white)
                                 && pixel(21, 88) == Some(0),
-                            // P starts with a dark pixel followed by a lit one.
-                            Command::Pci => pixel(20, 88) == Some(0)
-                                && pixel(21, 88) == Some(white),
+                            // P's top glyph row is 0b11110: four lit
+                            // pixels, followed by a dark pixel.
+                            Command::Pci => pixel(20, 88) == Some(white)
+                                && pixel(21, 88) == Some(white)
+                                && pixel(24, 88) == Some(0),
                             _ => false,
                         };
                         if !text_matches || !pixels_match {
