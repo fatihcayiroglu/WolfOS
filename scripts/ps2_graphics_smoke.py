@@ -48,10 +48,11 @@ def connect_monitor(path: pathlib.Path) -> socket.socket:
 def main() -> int:
     help_mode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
     irq_mode = len(sys.argv) == 3 and sys.argv[2] == "--irq-mode"
+    overflow_mode = len(sys.argv) == 3 and sys.argv[2] == "--overflow-mode"
     edit_mode = len(sys.argv) == 3 and sys.argv[2] == "--edit-mode"
     info_mode = len(sys.argv) == 4 and sys.argv[2] == "--info-mode" and sys.argv[3] in ("mem", "pci")
-    if not (len(sys.argv) == 2 or help_mode or info_mode or edit_mode or irq_mode):
-        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --edit-mode | --irq-mode | --info-mode mem|pci]")
+    if not (len(sys.argv) == 2 or help_mode or info_mode or edit_mode or irq_mode or overflow_mode):
+        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --edit-mode | --irq-mode | --overflow-mode | --info-mode mem|pci]")
         return 2
     iso = pathlib.Path(sys.argv[1]).resolve()
     if not iso.is_file():
@@ -83,8 +84,30 @@ def main() -> int:
                 # Real emulated i8042 scan codes, never serial input.
                 if irq_mode:
                     wait_for(proc, output, b"WOLFOS_PS2_IRQ_READY vector=33 queue=64")
-                if help_mode or info_mode or edit_mode or irq_mode:
+                if overflow_mode:
+                    wait_for(proc, output, b"WOLFOS_PS2_OVERFLOW_READY capacity=8 foreground=held")
+                if help_mode or info_mode or edit_mode or irq_mode or overflow_mode:
                     wait_for(proc, output, b"WOLFOS_PS2_PROMPT_READY")
+                if overflow_mode:
+                    # Trigger only via genuine QEMU i8042 make/break events.
+                    # The guest BSP deliberately does not consume its 8-slot
+                    # queue. No synthetic queue writes or test-only IRQ calls.
+                    for _ in range(32):
+                        monitor.sendall(b"sendkey a 1\n")
+                        time.sleep(0.025)
+                    wait_for(proc, output, b"WOLFOS_PS2_OVERFLOW_OK capacity=8 ")
+                    wait_for(proc, output, b"poison=1 decoded=0 pixels=verified\r\n")
+                    proof = re.search(
+                        rb"WOLFOS_PS2_OVERFLOW_OK capacity=8 irqs=(\d+) eois=(\d+) dropped=(\d+) poison=1 decoded=0 pixels=verified",
+                        output,
+                    )
+                    if not proof:
+                        raise RuntimeError("no complete hardware IRQ1 overflow evidence")
+                    irqs, eois, dropped = (int(n) for n in proof.groups())
+                    if irqs < 9 or irqs != eois or dropped < 1:
+                        raise RuntimeError("IRQ1 overflow did not fail closed or PIC EOI mismatched")
+                    print(f"PASS: real IRQ1 overflow irqs={irqs} eois={eois} dropped={dropped}, no foreground execution")
+                    return 0
                 if edit_mode:
                     keys = ("h",) * 12 + ("x", "ret")
                 elif help_mode or irq_mode:
