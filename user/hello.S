@@ -148,6 +148,14 @@ _after_write:
 .endif
 .endif
 
+.ifdef WOLFOS_USER_PF_FAULT_SMOKE
+    // Genuine faulting CPL3 supervisor-address read: the CPU must raise
+    // #PF rather than permit a user process to read this high-half page.
+    movabs rax, 0xffff800000000000
+.global _user_fault_pf
+_user_fault_pf:
+    mov rax, qword ptr [rax]
+.else
 .ifdef WOLFOS_USER_UD_FAULT_SMOKE
     // Deliberate genuine user-mode #UD; the OS must retire THIS process,
     // never pretend the kernel exception handler or INT80 returned normally.
@@ -166,6 +174,7 @@ _user_fault_ud:
 .endif
     xor esi, esi
     int 0x80
+.endif
 .endif
 _after_exit:
     ud2                    # EXIT must never return

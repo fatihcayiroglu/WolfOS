@@ -60,6 +60,8 @@ user-elf-run-smoke = ["smoke-exit"]
 user-exit-status-smoke = ["user-elf-run-smoke"]
 # Fixed real user UD2 recovery: authenticated CPL3 exception, status 132, PMM retirement.
 user-invalid-opcode-retire-smoke = ["user-elf-run-smoke"]
+# Fixed real user #PF recovery: authenticated fault address, status 139, PMM retirement.
+user-page-fault-retire-smoke = ["user-elf-run-smoke"]
 user-process-smoke = ["smoke-exit"]
 user-ramfs-smoke = ["smoke-exit"]
 user-vfs-smoke = ["smoke-exit"]
