@@ -26,10 +26,21 @@ MARKERS = (
     "int80_calls=22 exit=0 resources_released=1 real_process_manager=0",
 )
 
+STATUS_MARKERS = (
+    *MARKERS[:4],
+    "WOLFOS_ELF_EXIT_STATUS_OK code=42 cpl3=1 calls=22 saved_rdi=42",
+    "WOLFOS_ELF_STATUS_REAP_OK pid=1 code=42 active_cr3_restored=1 lease=7",
+    MARKERS[5],
+    "WOLFOS_ELF_STATUS_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 "
+    "int80_calls=22 exit=42 resources_released=1 real_process_manager=0",
+)
+
 def main() -> int:
-    if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
-        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso")
+    status_mode = len(sys.argv) == 3 and sys.argv[2] == "--exit-status"
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and not status_mode) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--exit-status]")
         return 2
+    markers = STATUS_MARKERS if status_mode else MARKERS
     with tempfile.TemporaryDirectory(prefix="wolfos-real-elf-run-") as tmp:
         serial = Path(tmp) / "serial.log"
         command = [
@@ -57,11 +68,11 @@ def main() -> int:
             print("FAIL: genuine ELF64 independent sanitized CR3 entry missing")
             return 1
         positions = [output.find("WOLFOS_BOOT_OK"), entry.start()]
-        positions += [output.find(m) for m in MARKERS]
+        positions += [output.find(m) for m in markers]
         if any(i < 0 for i in positions) or positions != sorted(positions):
             print("FAIL: ELF64 ELF/PT_LOAD/IRet/Hello/Exit/CR3 cleanup order wrong")
             return 1
-        for marker in MARKERS:
+        for marker in markers:
             if output.count(marker) != 1:
                 print("FAIL: missing/duplicate native ELF proof: " + marker)
                 return 1
@@ -74,11 +85,18 @@ def main() -> int:
             if bad in output:
                 print("FAIL: ELF kernel trap rejected: " + bad)
                 return 1
+        unexpected = MARKERS[4] if status_mode else STATUS_MARKERS[4]
+        if unexpected in output:
+            print("FAIL: wrong guest EXIT syscall contract was accepted")
+            return 1
         if result.returncode != 33:
             print(f"FAIL: expected clean QEMU debug-exit 33, got {result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        print("PASS: linked ELF64 -> validated RX+RW/BSS -> real CPL3 Hello -> EXIT -> CR3 restore + 7 PMM free")
+        if status_mode:
+            print("PASS: linked ELF64 -> real CPL3 EXIT(42) -> exact status reap -> CR3 restore + 7 PMM free")
+        else:
+            print("PASS: linked ELF64 -> validated RX+RW/BSS -> real CPL3 Hello -> EXIT -> CR3 restore + 7 PMM free")
         return 0
 
 if __name__ == "__main__":
