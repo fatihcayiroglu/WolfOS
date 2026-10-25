@@ -14,14 +14,22 @@ struct Input {
     bytes: [u8; CAP],
     len: usize,
     overflow: bool,
+    skip_lf_after_cr: bool,
 }
 
 impl Input {
     const fn new() -> Self {
-        Self { bytes: [0; CAP], len: 0, overflow: false }
+        Self { bytes: [0; CAP], len: 0, overflow: false, skip_lf_after_cr: false }
     }
 
     fn push(&mut self, byte: u8) -> Option<Command> {
+        // A terminal may send CRLF for one Enter key. The LF belongs to
+        // that CR, while standalone LF remains a valid command terminator.
+        if byte == b'\n' && self.skip_lf_after_cr {
+            self.skip_lf_after_cr = false;
+            return None;
+        }
+        self.skip_lf_after_cr = byte == b'\r';
         match byte {
             b'\r' | b'\n' => {
                 let command = if self.overflow {
@@ -100,11 +108,11 @@ pub fn run() -> ! {
         if let Some(byte) = serial::read_byte_nonblocking() {
             match byte {
                 b'\r' | b'\n' => {
-                    serial::write_line("");
                     if let Some(command) = input.push(byte) {
+                        serial::write_line("");
                         execute(command);
+                        serial::write_fmt(format_args!("wolfos> "));
                     }
-                    serial::write_fmt(format_args!("wolfos> "));
                 }
                 b'\x08' | 0x7f => {
                     let len = input.len;
@@ -159,6 +167,20 @@ mod tests {
         assert_eq!(enter(&mut i, b"m\0em"), Command::Memory);
         assert_eq!(i.push(0x7f), None);
         assert_eq!(enter(&mut i, b""), Command::Empty);
+    }
+
+    #[test]
+    fn crlf_is_one_submission_but_standalone_lf_still_works() {
+        let mut i = Input::new();
+        for &byte in b"help" { assert_eq!(i.push(byte), None); }
+        assert_eq!(i.push(b'\r'), Some(Command::Help));
+        assert_eq!(i.push(b'\n'), None, "CRLF must not create an empty command");
+        for &byte in b"mem" { assert_eq!(i.push(byte), None); }
+        assert_eq!(i.push(b'\n'), Some(Command::Memory));
+        assert_eq!(i.push(b'\n'), Some(Command::Empty));
+        assert_eq!(i.push(b'\r'), Some(Command::Empty));
+        assert_eq!(i.push(b'x'), None, "non-LF after CR cancels suppression");
+        assert_eq!(i.push(b'\n'), Some(Command::Unknown));
     }
 
     #[test]
