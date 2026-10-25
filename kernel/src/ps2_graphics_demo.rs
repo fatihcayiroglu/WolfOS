@@ -5,13 +5,17 @@
 use crate::{
     framebuffer_console::TextConsole,
     framebuffer_text::Layout,
+    graphical_diagnostics,
+    pci::PciSummary,
     ps2_keyboard::{Key, Set1Decoder, read_scancode},
     serial,
     shell_command::Command,
 };
 
-pub fn run(layout: Layout, address: *mut u8, white: u32) -> ! {
-    let Some(mut console) = TextConsole::new(layout, 20, 80, 16, 2) else {
+pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary) -> ! {
+    let info_mode = cfg!(feature = "ps2-graphics-info-smoke");
+    let columns = if info_mode { 26 } else { 16 };
+    let Some(mut console) = TextConsole::new(layout, 20, 80, columns, 2) else {
         serial::write_line("WOLFOS_PS2_FAILED insufficient_framebuffer");
         crate::halt_forever();
     };
@@ -24,7 +28,7 @@ pub fn run(layout: Layout, address: *mut u8, white: u32) -> ! {
     });
     let mut decoder = Set1Decoder::new();
     let mut accepted = 0usize;
-    let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") { 1u8 } else { 0u8 };
+    let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") || info_mode { 1u8 } else { 0u8 };
     let mut line = [0u8; 12];
     let mut line_len = 0usize;
     let mut overflow = false;
@@ -106,14 +110,23 @@ pub fn run(layout: Layout, address: *mut u8, white: u32) -> ! {
                     let command = if overflow { Command::TooLong } else { Command::parse(&line[..line_len]) };
                     line_len = 0;
                     overflow = false;
+                    // The shared parser classifies input. Only explicit
+                    // read-only diagnostics are granted in this graphical
+                    // prototype: PMM snapshot and cached early PCI discovery.
+                    let stats = crate::pmm::statistics();
+                    let report = graphical_diagnostics::diagnostic(
+                        command, stats.free_frames(),
+                        pci_summary.displays, pci_summary.networks, pci_summary.storage,
+                    );
                     let answer = match command {
                         Command::Help => "HELP ABOUT",
                         Command::About => "WOLFOS RUST",
                         Command::TooLong => "TOO LONG",
                         Command::Empty => "",
                         Command::Unknown => "UNKNOWN",
-                        // Privileged COM1-only actions are never run via
-                        // the experimental graphical input path.
+                        Command::Memory | Command::Pci =>
+                            report.as_ref().map(|line| line.as_str()).unwrap_or("DATA TOO LONG"),
+                        // Privileged COM1-only actions remain unavailable.
                         _ => "NOT AVAILABLE",
                     };
                     console.write(answer);
@@ -137,6 +150,51 @@ pub fn run(layout: Layout, address: *mut u8, white: u32) -> ! {
                             serial::write_line("WOLFOS_PS2_FAILED help_render");
                             crate::halt_forever();
                         }
+                    }
+                    if info_mode {
+                        // Use real framebuffer readback and exact buffered
+                        // diagnostic content, not just a successful log marker.
+                        let pixel = |x, y| layout.pixel_offset(x, y).map(|offset| {
+                            // SAFETY: Layout validated this mapped 32-bpp pixel.
+                            unsafe { address.add(offset).cast::<u32>().read_volatile() }
+                        });
+                        let expected = if command == Command::Memory {
+                            graphical_diagnostics::memory(stats.free_frames())
+                        } else if command == Command::Pci {
+                            graphical_diagnostics::pci(
+                                pci_summary.displays, pci_summary.networks, pci_summary.storage,
+                            )
+                        } else { None };
+                        let text_matches = expected.as_ref().map(|line| {
+                            line.as_str().bytes().enumerate().all(|(i, c)| {
+                                console.cell(i, 1) == Some(c)
+                            })
+                        }).unwrap_or(false);
+                        let pixels_match = match command {
+                            // M starts with a lit pixel followed by a dark one.
+                            Command::Memory => pixel(20, 88) == Some(white)
+                                && pixel(21, 88) == Some(0),
+                            // P starts with a dark pixel followed by a lit one.
+                            Command::Pci => pixel(20, 88) == Some(0)
+                                && pixel(21, 88) == Some(white),
+                            _ => false,
+                        };
+                        if !text_matches || !pixels_match {
+                            serial::write_line("WOLFOS_PS2_INFO_FAILED bad_data_or_pixels");
+                            crate::halt_forever();
+                        }
+                        match command {
+                            Command::Memory => serial::write_fmt(format_args!(
+                                "WOLFOS_PS2_MEM_OK free_frames={} mib={} pixels=verified\n",
+                                stats.free_frames(), stats.free_frames() / 256,
+                            )),
+                            Command::Pci => serial::write_fmt(format_args!(
+                                "WOLFOS_PS2_PCI_OK displays={} networks={} storage={} pixels=verified\n",
+                                pci_summary.displays, pci_summary.networks, pci_summary.storage,
+                            )),
+                            _ => unreachable!(),
+                        }
+                        crate::halt_forever();
                     }
                     console.write("\n> ");
                     console.render(white, 0, |offset, color| {
