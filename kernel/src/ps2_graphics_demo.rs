@@ -6,6 +6,7 @@ use crate::{
     framebuffer_console::TextConsole,
     framebuffer_text::Layout,
     graphical_diagnostics,
+    graphical_line_editor::LineEditor,
     pci::PciSummary,
     ps2_keyboard::{Key, Set1Decoder, read_scancode},
     serial,
@@ -14,6 +15,7 @@ use crate::{
 
 pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary) -> ! {
     let info_mode = cfg!(feature = "ps2-graphics-info-smoke");
+    let edit_mode = cfg!(feature = "ps2-graphics-edit-smoke");
     let columns = if info_mode { 26 } else { 16 };
     let Some(mut console) = TextConsole::new(layout, 20, 80, columns, 2) else {
         serial::write_line("WOLFOS_PS2_FAILED insufficient_framebuffer");
@@ -28,10 +30,9 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
     });
     let mut decoder = Set1Decoder::new();
     let mut accepted = 0usize;
-    let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") || info_mode { 1u8 } else { 0u8 };
-    let mut line = [0u8; 12];
-    let mut line_len = 0usize;
-    let mut overflow = false;
+    let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") || info_mode || edit_mode { 1u8 } else { 0u8 };
+    let mut editor = LineEditor::<12>::new();
+    let mut rejected_overlong = false;
     serial::write_line("WOLFOS_PS2_READY mode=polling keyboard=set1 graphical=1");
     if stage == 1 {
         console.write("> ");
@@ -51,22 +52,14 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                 }
                 match key {
                     Key::Character(c) => {
-                        if stage == 0 || (!overflow && line_len < line.len()) {
-                            if stage != 0 {
-                                line[line_len] = c;
-                                line_len += 1;
-                            }
+                        if stage == 0 || editor.push(c) {
                             console.write(core::str::from_utf8(&[c]).unwrap_or("?"));
-                        } else {
-                            // Fail closed: never dispatch a truncated command.
-                            overflow = true;
                         }
                     }
                     Key::Backspace => {
                         if stage == 0 {
                             console.backspace();
-                        } else if !overflow && line_len != 0 {
-                            line_len -= 1;
+                        } else if editor.backspace() {
                             console.backspace();
                         }
                     }
@@ -107,9 +100,7 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                         crate::halt_forever();
                     }
                 } else if stage != 0 && matches!(key, Key::Enter) {
-                    let command = if overflow { Command::TooLong } else { Command::parse(&line[..line_len]) };
-                    line_len = 0;
-                    overflow = false;
+                    let command = editor.submit();
                     // The shared parser classifies input. Only explicit
                     // read-only diagnostics are granted in this graphical
                     // prototype: PMM snapshot and cached early PCI discovery.
