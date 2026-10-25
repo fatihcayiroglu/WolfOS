@@ -125,6 +125,44 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                         // SAFETY: the validated layout clips each 32-bpp pixel.
                         unsafe { address.add(offset).cast::<u32>().write_volatile(color); }
                     });
+                    if edit_mode {
+                        // Check actual post-Enter framebuffer bytes before any
+                        // subsequent prompt erases the response or scrolls.
+                        let pixel = |x, y| layout.pixel_offset(x, y).map(|offset| {
+                            // SAFETY: Layout checked the mapped 32-bit pixel.
+                            unsafe { address.add(offset).cast::<u32>().read_volatile() }
+                        });
+                        let expected = if rejected_overlong {
+                            b"HELP ABOUT".as_slice()
+                        } else {
+                            b"TOO LONG".as_slice()
+                        };
+                        let text_matches = expected.iter().enumerate().all(|(i, c)| {
+                            console.cell(i, 1) == Some(*c)
+                        });
+                        let pixels_match = if rejected_overlong {
+                            // H top row begins lit, then dark.
+                            pixel(20, 88) == Some(white) && pixel(21, 88) == Some(0)
+                        } else {
+                            // T has five lit pixels on top, then dark spacer.
+                            pixel(20, 88) == Some(white) && pixel(24, 88) == Some(white)
+                                && pixel(25, 88) == Some(0)
+                        };
+                        if !text_matches || !pixels_match {
+                            serial::write_line("WOLFOS_PS2_EDIT_FAILED incorrect_text_or_pixels");
+                            crate::halt_forever();
+                        }
+                        if !rejected_overlong && command == Command::TooLong {
+                            rejected_overlong = true;
+                            serial::write_line("WOLFOS_PS2_EDIT_REJECT_OK poisoned=1 pixels=verified");
+                        } else if rejected_overlong && command == Command::Help {
+                            serial::write_line("WOLFOS_PS2_EDIT_RECOVERY_OK next=HELP pixels=verified");
+                            crate::halt_forever();
+                        } else {
+                            serial::write_line("WOLFOS_PS2_EDIT_FAILED unexpected_command");
+                            crate::halt_forever();
+                        }
+                    }
                     if stage == 1 && command == Command::Help {
                         let pixel = |x, y| layout.pixel_offset(x, y).map(|offset| {
                             // SAFETY: Layout validated this pixel byte offset.
@@ -194,6 +232,9 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                         // SAFETY: same validated mapped framebuffer.
                         unsafe { address.add(offset).cast::<u32>().write_volatile(color); }
                     });
+                    if edit_mode && rejected_overlong {
+                        serial::write_line("WOLFOS_PS2_EDIT_PROMPT_READY");
+                    }
                 }
             }
         } else {
