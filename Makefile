@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
+else ifeq ($(FLAVOR),framebuffer-console)
+FEATURES := --features framebuffer-console-smoke
 else ifeq ($(FLAVOR),exception)
 FEATURES := --features exception-smoke
 else ifeq ($(FLAVOR),address-space-retirement)
@@ -148,6 +150,11 @@ run-shell:
 serial-shell-smoke:
 	$(MAKE) iso FLAVOR=serial-shell
 	python3 scripts/serial_shell_smoke.py $(OUT)/wolfos-serial-shell.iso
+
+.PHONY: framebuffer-console-smoke
+framebuffer-console-smoke:
+	$(MAKE) iso FLAVOR=framebuffer-console
+	python3 scripts/smoke.py $(OUT)/wolfos-framebuffer-console.iso --console-scroll
 
 run-graphics: iso
 	qemu-system-x86_64 -M q35 -m 512M -cdrom $(OUT)/wolfos-normal.iso -boot d -serial stdio -display default -no-reboot
@@ -367,6 +374,8 @@ test:
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/framebuffer_text.rs -o $(OUT)/framebuffer_text_tests
 	$(OUT)/framebuffer_text_tests
+	rustc --edition=2024 --test tests/framebuffer_console.rs -o $(OUT)/framebuffer_console_tests
+	$(OUT)/framebuffer_console_tests
 	rustc --edition=2024 --test kernel/src/serial_shell.rs -o $(OUT)/serial_shell_tests
 	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v

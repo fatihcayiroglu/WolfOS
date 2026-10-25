@@ -12,6 +12,7 @@ use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, MpRequest,
 
 mod serial;
 mod framebuffer_text;
+mod framebuffer_console;
 #[cfg(feature = "serial-shell")]
 mod serial_shell;
 mod cpu;
@@ -463,6 +464,73 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_fmt(format_args!("WOLFOS_FB_TEXT_OK glyph_pixels={} first_pixel=verified\n", first_line));
+
+    // This is an early static graphical console preview, not a user shell.
+    // It uses bounded RAM text cells with no heap and BSP-only volatile writes.
+    let console_cols = (fb.width.saturating_sub(20) / 6).min(40) as usize;
+    let console_rows = (fb.height.saturating_sub(80) / 8).min(5) as usize;
+    if let Some(mut console) = framebuffer_console::TextConsole::new(
+        layout, 20, 80, console_cols, console_rows,
+    ) {
+        console.write("WOLFOS READY\nTEXT CONSOLE PREVIEW\nNO KEYBOARD YET");
+        let pixels = console.render(white, 0, |offset, color| {
+            // SAFETY: constructor validates every full cell in the mapped
+            // 32bpp framebuffer and Layout checks individual byte offsets.
+            unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().write_volatile(color); }
+        });
+        let expected = console_cols * console_rows * 6 * 8;
+        let present = layout.pixel_offset(20, 80)
+            .map(|offset| {
+                // SAFETY: Layout validated a full aligned in-range pixel.
+                unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().read_volatile() == white }
+            }).unwrap_or(false);
+        if pixels != expected || !present {
+            serial::write_line("WOLFOS_FB_CONSOLE_FAILED bad_first_cell");
+            halt_forever();
+        }
+        serial::write_fmt(format_args!(
+            "WOLFOS_FB_CONSOLE_OK cols={} rows={} pixels={} cursor={:?}\n",
+            console_cols, console_rows, pixels, console.cursor(),
+        ));
+    } else {
+        serial::write_line("WOLFOS_FB_CONSOLE_SKIPPED small_framebuffer");
+    }
+
+    #[cfg(feature = "framebuffer-console-smoke")]
+    {
+        let Some(mut probe) = framebuffer_console::TextConsole::new(layout, 20, 80, 8, 2) else {
+            serial::write_line("WOLFOS_FB_CONSOLE_SCROLL_FAILED bad_geometry");
+            halt_forever();
+        };
+        // At two rows, A must scroll out: B moves to first row, C to second.
+        probe.write("A\nB\nC");
+        if probe.scroll_count() != 1
+            || probe.cell(0, 0) != Some(b'B')
+            || probe.cell(0, 1) != Some(b'C')
+        {
+            serial::write_line("WOLFOS_FB_CONSOLE_SCROLL_FAILED bad_text_cells");
+            halt_forever();
+        }
+        probe.render(white, 0, |offset, color| {
+            // SAFETY: checked complete 8x2 cells within mapped framebuffer.
+            unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().write_volatile(color); }
+        });
+        let check = |x, y| {
+            layout.pixel_offset(x, y).map(|offset| {
+                // SAFETY: Layout validated the aligned 32bpp pixel read.
+                unsafe { fb.address().cast::<u8>().add(offset).cast::<u32>().read_volatile() }
+            })
+        };
+        if check(20, 80) != Some(white)
+            || check(20, 88) != Some(0)
+            || check(21, 88) != Some(white)
+        {
+            serial::write_line("WOLFOS_FB_CONSOLE_SCROLL_FAILED bad_pixel_readback");
+            halt_forever();
+        }
+        serial::write_line("WOLFOS_FB_CONSOLE_SCROLL_OK rows=2 scrolls=1 pixels=verified");
+    }
+
     serial::write_fmt(format_args!("WOLFOS_FRAMEBUFFER_OK {}x{}\n", fb.width, fb.height));
     let Some(mp) = MP_REQUEST.response() else {
         serial::write_line("WOLFOS_SMP_ERROR no Limine MP response");

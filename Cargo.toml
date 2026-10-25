@@ -18,6 +18,8 @@ default = []
 smoke-exit = []
 # Opt-in BSP polling diagnostics; does not write disks or launch applications.
 serial-shell = []
+# Isolated two-row QEMU framebuffer scroll and pixel-readback proof.
+framebuffer-console-smoke = ["smoke-exit"]
 address-space-retirement-smoke = ["smoke-exit"]
 smp-address-space-retirement-smoke = ["smoke-exit"]
 exception-smoke = ["smoke-exit"]
