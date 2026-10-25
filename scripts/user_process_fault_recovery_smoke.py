@@ -39,6 +39,8 @@ SUCCESS0 = (
 )
 REAP1 = "WOLFOS_PROCESS_REAP_OK pid=1 exited=1 restored_cr3=1 freed_frames=7 no_leak=1"
 REAP2 = "WOLFOS_PROCESS_REAP_OK pid=2 exited=1 restored_cr3=1 freed_frames=7 no_leak=1"
+TABLE1 = "WOLFOS_PROCESS_TABLE_REAP_OK pid=1 slots=2 occupied=0 running=0 stale_denied=1 double_reap_denied=1 real_cpl3=1"
+TABLE2 = "WOLFOS_PROCESS_TABLE_REAP_OK pid=2 slots=2 occupied=0 running=0 stale_denied=1 double_reap_denied=1 real_cpl3=1"
 RELAUNCH = "WOLFOS_PROCESS_RELAUNCH pid=2 generation=2 first_reaped=1"
 FINAL = (
     "WOLFOS_PROCESS_FAULT_RECOVERY_OK first_pid=1 first_status=139 "
@@ -76,9 +78,9 @@ def main() -> int:
             return 1
         ordered = [
             "WOLFOS_BOOT_OK", START1, entries[0].group(0),
-            ID, ADD, HELLO, HELLO_OK, PF, PF_REAP, CLEAN, PF_RESULT,
+            ID, ADD, HELLO, HELLO_OK, PF, PF_REAP, CLEAN, TABLE1, PF_RESULT,
             REAP1, RELAUNCH, START2, entries[1].group(0),
-            ID, ADD, HELLO, HELLO_OK, EXIT0, CLEAN, SUCCESS0, REAP2, FINAL,
+            ID, ADD, HELLO, HELLO_OK, EXIT0, CLEAN, TABLE2, SUCCESS0, REAP2, FINAL,
         ]
         cursor = 0
         for token in ordered:
@@ -92,7 +94,7 @@ def main() -> int:
                 print("FAIL: missing or duplicated per-PID syscall/cleanup: " + token)
                 return 1
         for token in [START1, START2, PF, PF_REAP, PF_RESULT,
-                      EXIT0, SUCCESS0, REAP1, REAP2, RELAUNCH, FINAL]:
+                      EXIT0, SUCCESS0, REAP1, REAP2, TABLE1, TABLE2, RELAUNCH, FINAL]:
             if output.count(token) != 1:
                 print("FAIL: missing or duplicated unique recovery marker: " + token)
                 return 1

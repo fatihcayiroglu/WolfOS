@@ -25,6 +25,10 @@ REAP = [
     "WOLFOS_PROCESS_REAP_OK pid=1 exited=1 restored_cr3=1 freed_frames=7 no_leak=1",
     "WOLFOS_PROCESS_REAP_OK pid=2 exited=1 restored_cr3=1 freed_frames=7 no_leak=1",
 ]
+TABLE = [
+    f"WOLFOS_PROCESS_TABLE_REAP_OK pid={pid} slots=2 occupied=0 running=0 stale_denied=1 double_reap_denied=1 real_cpl3=1"
+    for pid in (1, 2)
+]
 RELAUNCH = "WOLFOS_PROCESS_RELAUNCH pid=2 generation=2 first_reaped=1"
 FINAL = (
     "WOLFOS_PROCESS_LIFECYCLE_OK launched=2 exited=2 reaped=2 "
@@ -94,6 +98,11 @@ def main() -> int:
                 first.append(output.find(token))
                 second.append(output.find(token, first[-1] + 1) if token == SUCCESS
                               else output.find(token, entries[1].start()))
+            # Each hardware run must go through the shared ProcessTable,
+            # not only the old single-owner record. It must be empty after
+            # each exact-PID reap; the next admission reuses a vacant slot.
+            first.insert(-1, one(output, TABLE[0]))
+            second.insert(-1, one(output, TABLE[1]))
             first.append(one(output, REAP[0]))
             second.append(one(output, REAP[1]))
             restart = one(output, RELAUNCH)
