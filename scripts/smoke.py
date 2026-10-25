@@ -27,6 +27,7 @@ MARKERS = (
     "WOLFOS_PAGING_MAP_OK",
     "WOLFOS_PAGING_UNMAP_OK",
     "WOLFOS_FB_TEXT_OK glyph_pixels=",
+    "WOLFOS_FB_CONSOLE_OK cols=",
     "WOLFOS_FRAMEBUFFER_OK",
     "WOLFOS_SMP_APS_OK total=1",
     "WOLFOS_LAPIC_MMIO_OK",
@@ -45,8 +46,8 @@ MARKERS = (
 )
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: smoke.py path/to/wolfos-smoke.iso")
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--console-scroll"):
+        print("usage: smoke.py path/to/wolfos-smoke.iso [--console-scroll]")
         return 2
     iso = pathlib.Path(sys.argv[1]).resolve()
     if not iso.is_file():
@@ -72,7 +73,8 @@ def main() -> int:
             return 2
         output = log.read_text(errors="replace") if log.exists() else ""
         print(output)
-        missing = [marker for marker in MARKERS if marker not in output]
+        markers = MARKERS + (("WOLFOS_FB_CONSOLE_SCROLL_OK rows=2 scrolls=1 pixels=verified",) if len(sys.argv) == 3 else ())
+        missing = [marker for marker in markers if marker not in output]
         if missing:
             print(f"FAIL: missing boot markers: {missing}")
             print(run.stderr.decode(errors="replace"))
