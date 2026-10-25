@@ -44,14 +44,24 @@ UD_FAULT_MARKERS = (
     "status=132 int80_calls=21 frames_freed=7 pmm_no_leak=1",
 )
 
+PF_FAULT_MARKERS = (
+    *MARKERS[:4],
+    "WOLFOS_ELF_USER_PF_OK vector=14 cpl3=1 status=139 address=0xffff800000000000 read_denied=1 user_rip_verified=1",
+    "WOLFOS_ELF_USER_PF_REAP_OK pid=1 status=139 active_cr3_restored=1 lease=7",
+    MARKERS[5],
+    "WOLFOS_ELF_USER_PF_RUN_OK linked_elf=1 hardware_cpl3=1 pf_vector=14 "
+    "status=139 int80_calls=21 frames_freed=7 pmm_no_leak=1",
+)
+
 def main() -> int:
     mode = sys.argv[2] if len(sys.argv) == 3 else None
     status_mode = mode == "--exit-status"
     fault_mode = mode == "--user-ud-fault"
-    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode)) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--exit-status|--user-ud-fault]")
+    pf_mode = mode == "--user-pf-fault"
+    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode)) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--exit-status|--user-ud-fault|--user-pf-fault]")
         return 2
-    markers = UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
+    markers = PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
     with tempfile.TemporaryDirectory(prefix="wolfos-real-elf-run-") as tmp:
         serial = Path(tmp) / "serial.log"
         command = [
@@ -96,12 +106,14 @@ def main() -> int:
             if bad in output:
                 print("FAIL: ELF kernel trap rejected: " + bad)
                 return 1
-        if fault_mode:
-            unexpected = (MARKERS[4], STATUS_MARKERS[4])
+        if pf_mode:
+            unexpected = (MARKERS[4], STATUS_MARKERS[4], UD_FAULT_MARKERS[4])
+        elif fault_mode:
+            unexpected = (MARKERS[4], STATUS_MARKERS[4], PF_FAULT_MARKERS[4])
         elif status_mode:
-            unexpected = (MARKERS[4], UD_FAULT_MARKERS[4])
+            unexpected = (MARKERS[4], UD_FAULT_MARKERS[4], PF_FAULT_MARKERS[4])
         else:
-            unexpected = (STATUS_MARKERS[4], UD_FAULT_MARKERS[4])
+            unexpected = (STATUS_MARKERS[4], UD_FAULT_MARKERS[4], PF_FAULT_MARKERS[4])
         if any(marker in output for marker in unexpected):
             print("FAIL: wrong guest exit/fault contract was accepted")
             return 1
@@ -109,7 +121,9 @@ def main() -> int:
             print(f"FAIL: expected clean QEMU debug-exit 33, got {result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if fault_mode:
+        if pf_mode:
+            print("PASS: linked ELF64 -> genuine CPL3 denied supervisor read #PF -> status 139 -> 7 PMM free")
+        elif fault_mode:
             print("PASS: linked ELF64 -> genuine CPL3 #UD -> status 132 -> CR3 restore + 7 PMM free")
         elif status_mode:
             print("PASS: linked ELF64 -> real CPL3 EXIT(42) -> exact status reap -> CR3 restore + 7 PMM free")

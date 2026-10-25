@@ -15,8 +15,10 @@
 //! Kernel high-half descendant page tables remain borrowed from Limine.
 
 use core::arch::asm;
-#[cfg(feature = "user-invalid-opcode-retire-smoke")]
+#[cfg(any(feature = "user-invalid-opcode-retire-smoke", feature = "user-page-fault-retire-smoke"))]
 use x86_64::structures::idt::InterruptStackFrame;
+#[cfg(feature = "user-page-fault-retire-smoke")]
+use x86_64::{registers::control::Cr2, structures::idt::PageFaultErrorCode};
 use core::sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering};
 use x86_64::{
     instructions::segmentation::{CS, Segment},
@@ -373,11 +375,10 @@ pub fn enter(hhdm: u64) -> ! {
 }
 
 
-/// A real CPU #UD caused by fixed user ELF UD2, not by the supervisor.
-/// No IRETQ is possible: restore the boot root before freeing user CR3.
-/// Failure of ANY provenance check stays a hard kernel-test failure.
-#[cfg(feature = "user-invalid-opcode-retire-smoke")]
-pub(crate) fn retire_user_invalid_opcode(frame: &InterruptStackFrame) -> ! {
+/// Authenticate the CPU's user-fault frame and the exact live process.
+/// Unexpected supervisor faults, wrong RIP/stage, or a swapped CR3 are fatal.
+#[cfg(any(feature = "user-invalid-opcode-retire-smoke", feature = "user-page-fault-retire-smoke"))]
+fn checked_user_fault_owner(frame: &InterruptStackFrame, symbol_offset: u64) -> u64 {
     let stage = STAGE.load(Ordering::Acquire);
     let active = CR3_PHYS.load(Ordering::Acquire);
     let entry = ENTRY.load(Ordering::Acquire);
@@ -390,9 +391,9 @@ pub(crate) fn retire_user_invalid_opcode(frame: &InterruptStackFrame) -> ! {
             options(nomem, nostack, preserves_flags));
     }
     let base = entry.checked_sub(symbols::ENTRY)
-        .unwrap_or_else(|| fail("ud_invalid_user_entry"));
-    let fault_rip = base.checked_add(symbols::FAULT_UD)
-        .unwrap_or_else(|| fail("ud_invalid_user_rip"));
+        .unwrap_or_else(|| fail("fault_invalid_user_entry"));
+    let fault_rip = base.checked_add(symbol_offset)
+        .unwrap_or_else(|| fail("fault_invalid_user_rip"));
     if stage != RETURN_COUNT || RUN_INDEX.load(Ordering::Acquire) != 0
         || active == 0 || entry == 0 || user_top == 0
         || root.start_address().as_u64() != active
@@ -403,12 +404,20 @@ pub(crate) fn retire_user_invalid_opcode(frame: &InterruptStackFrame) -> ! {
         || frame.stack_pointer.as_u64() != user_top
         || rsp0 < 16 * 1024
         || kernel_rsp < rsp0 - (16 * 1024) || kernel_rsp >= rsp0
-    { fail("ud_fault_provenance_or_stage") }
+    { fail("fault_provenance_or_stage") }
     let data = DATA_HHDM.load(Ordering::Acquire);
-    if data == 0 { fail("ud_missing_owned_elf_data") }
+    if data == 0 { fail("fault_missing_owned_elf_data") }
     let actual = unsafe { &*(data as *const [u8; 65]) };
     if actual[0] != 0x5a || actual[1..].iter().any(|b| *b != 0)
-    { fail("ud_guest_data_or_bss_corrupted") }
+    { fail("fault_guest_data_or_bss_corrupted") }
+    active
+}
+
+/// Genuine hardware #UD originating at the fixed USER RIP.
+/// Other #UD faults remain hard errors; never classify kernel defects as user exits.
+#[cfg(feature = "user-invalid-opcode-retire-smoke")]
+pub(crate) fn retire_user_invalid_opcode(frame: &InterruptStackFrame) -> ! {
+    let active = checked_user_fault_owner(frame, symbols::FAULT_UD);
     const USER_SIGILL_STATUS: u32 = 128 + 4;
     if !matches!(PROCESS.with(|p| p.exit_with_status(1, active, USER_SIGILL_STATUS)), Ok(Ok(()))) {
         fail("ud_process_exit_transition")
@@ -417,8 +426,28 @@ pub(crate) fn retire_user_invalid_opcode(frame: &InterruptStackFrame) -> ! {
     finish_exited(1, USER_SIGILL_STATUS, active)
 }
 
-/// Shared single-owner retirement: applies to EXIT(0), EXIT(42) and the
-/// authenticated #UD path, after the PID has entered Exited state.
+/// Real CPU #PF on a fixed high-half read from CPL3, never a synthetic
+/// kernel failure. The address and fault bits are independently validated.
+/// No IRETQ after process exit: restore boot CR3 before releasing PMM.
+#[cfg(feature = "user-page-fault-retire-smoke")]
+pub(crate) fn retire_user_page_fault(frame: &InterruptStackFrame, code: PageFaultErrorCode) -> ! {
+    const DENIED_SUPERVISOR_ADDR: u64 = 0xffff_8000_0000_0000;
+    if !matches!(Cr2::read(), Ok(addr) if addr.as_u64() == DENIED_SUPERVISOR_ADDR)
+        || !code.contains(PageFaultErrorCode::USER_MODE)
+        || code.contains(PageFaultErrorCode::CAUSED_BY_WRITE)
+        || code.contains(PageFaultErrorCode::INSTRUCTION_FETCH)
+    { fail("pf_wrong_cr2_or_fault_bits") }
+    let active = checked_user_fault_owner(frame, symbols::FAULT_PF);
+    const USER_SIGSEGV_STATUS: u32 = 128 + 11;
+    if !matches!(PROCESS.with(|p| p.exit_with_status(1, active, USER_SIGSEGV_STATUS)), Ok(Ok(()))) {
+        fail("pf_process_exit_transition")
+    }
+    serial::write_line("WOLFOS_ELF_USER_PF_OK vector=14 cpl3=1 status=139 address=0xffff800000000000 read_denied=1 user_rip_verified=1");
+    finish_exited(1, USER_SIGSEGV_STATUS, active)
+}
+
+/// Shared single-owner retirement for EXIT(0), EXIT(42), authenticated
+/// #UD and #PF paths, after the PID has entered Exited state.
 /// Never dereference the former user root after restoring supervisor CR3.
 fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     // Hardware restoration before FREE: the boot CR3 has all needed
@@ -438,7 +467,9 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
         Ok(Ok((code, frames))) if code == exit_status => frames,
         _ => fail("process_reap_or_exit_status"),
     };
-    if cfg!(feature = "user-invalid-opcode-retire-smoke") {
+    if cfg!(feature = "user-page-fault-retire-smoke") {
+        serial::write_line("WOLFOS_ELF_USER_PF_REAP_OK pid=1 status=139 active_cr3_restored=1 lease=7");
+    } else if cfg!(feature = "user-invalid-opcode-retire-smoke") {
         serial::write_line("WOLFOS_ELF_USER_UD_REAP_OK pid=1 status=132 active_cr3_restored=1 lease=7");
     } else if cfg!(feature = "user-exit-status-smoke") {
         serial::write_line("WOLFOS_ELF_STATUS_REAP_OK pid=1 code=42 active_cr3_restored=1 lease=7");
@@ -457,7 +488,9 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
     { fail("pmm_frame_leak") }
     serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
-    if cfg!(feature = "user-invalid-opcode-retire-smoke") {
+    if cfg!(feature = "user-page-fault-retire-smoke") {
+        serial::write_line("WOLFOS_ELF_USER_PF_RUN_OK linked_elf=1 hardware_cpl3=1 pf_vector=14 status=139 int80_calls=21 frames_freed=7 pmm_no_leak=1");
+    } else if cfg!(feature = "user-invalid-opcode-retire-smoke") {
         serial::write_line("WOLFOS_ELF_USER_UD_RUN_OK linked_elf=1 hardware_cpl3=1 ud_vector=6 status=132 int80_calls=21 frames_freed=7 pmm_no_leak=1");
     } else if cfg!(feature = "user-exit-status-smoke") {
         serial::write_line("WOLFOS_ELF_STATUS_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=42 resources_released=1 real_process_manager=0");

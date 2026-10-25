@@ -140,6 +140,9 @@ fn main() {
     } else if env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_some() {
         checked("as", &["--64", "--defsym", "WOLFOS_USERCOPY_SMOKE=1",
             "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    } else if env::var_os("CARGO_FEATURE_USER_PAGE_FAULT_RETIRE_SMOKE").is_some() {
+        checked("as", &["--64", "--defsym", "WOLFOS_USER_PF_FAULT_SMOKE=1",
+            "-o", obj.to_str().unwrap(), "user/hello.S"]);
     } else if env::var_os("CARGO_FEATURE_USER_INVALID_OPCODE_RETIRE_SMOKE").is_some() {
         checked("as", &["--64", "--defsym", "WOLFOS_USER_UD_FAULT_SMOKE=1",
             "-o", obj.to_str().unwrap(), "user/hello.S"]);
@@ -182,6 +185,9 @@ fn main() {
     }
     if env::var_os("CARGO_FEATURE_USER_INVALID_OPCODE_RETIRE_SMOKE").is_some() {
         symbols.push(("_user_fault_ud", "FAULT_UD"));
+    }
+    if env::var_os("CARGO_FEATURE_USER_PAGE_FAULT_RETIRE_SMOKE").is_some() {
+        symbols.push(("_user_fault_pf", "FAULT_PF"));
     }
     let mut generated = String::new();
     for (symbol, var) in symbols {

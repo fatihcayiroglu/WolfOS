@@ -470,46 +470,51 @@ extern "x86-interrupt" fn general_protection_fault(frame: InterruptStackFrame, c
 }
 
 extern "x86-interrupt" fn page_fault(frame: InterruptStackFrame, code: PageFaultErrorCode) {
-    let address = Cr2::read();
-    serial::write_fmt(format_args!(
-        "WOLFOS_EXCEPTION_PF vector=14 address={:?} flags={:?} rip={:?}\n",
-        address, code, frame.instruction_pointer
-    ));
-    #[cfg(any(feature = "kernel-stack-guard-fault-smoke",
-              feature = "kernel-stack-guard-upper-fault-smoke"))]
-    if matches!(address, Ok(address) if
-        crate::kernel_stack_guard_smoke::expected_fault(
-            address.as_u64(), code.bits(), frame.instruction_pointer.as_u64())
-    ) {
-        serial::write_fmt(format_args!(
-            "WOLFOS_STACK_GUARD_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\n",
-            if cfg!(feature="kernel-stack-guard-upper-fault-smoke") { "upper" }
-            else { "lower" }
-        ));
-        serial::qemu_exit_success();
-    }
-    #[cfg(any(feature = "high-half-stack-arena-lower-fault-smoke",
-              feature = "high-half-stack-arena-upper-fault-smoke"))]
-    if matches!(address, Ok(v) if
-        crate::high_half_stack_arena_smoke::expected_fault(
-            v.as_u64(), code.bits(), frame.instruction_pointer.as_u64())
-    ) {
-        serial::write_fmt(format_args!(
-            "WOLFOS_HIGH_STACK_ARENA_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\n",
-            if cfg!(feature="high-half-stack-arena-upper-fault-smoke") {
-                "pid2_upper"
-            } else { "pid1_lower" }
-        ));
-        serial::qemu_exit_success();
-    }
-    #[cfg(feature = "paging-fault-smoke")]
-    if matches!(address, Ok(fault_address) if fault_address.as_u64() == crate::paging::TEST_VIRTUAL_ADDRESS)
-        && !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+    #[cfg(feature = "user-page-fault-retire-smoke")]
+    crate::user_elf_run_smoke::retire_user_page_fault(&frame, code);
+    #[cfg(not(feature = "user-page-fault-retire-smoke"))]
     {
-        serial::write_line("WOLFOS_PAGING_FAULT_OK");
-        serial::qemu_exit_success();
+        let address = Cr2::read();
+        serial::write_fmt(format_args!(
+            "WOLFOS_EXCEPTION_PF vector=14 address={:?} flags={:?} rip={:?}\n",
+            address, code, frame.instruction_pointer
+        ));
+        #[cfg(any(feature = "kernel-stack-guard-fault-smoke",
+                  feature = "kernel-stack-guard-upper-fault-smoke"))]
+        if matches!(address, Ok(address) if
+            crate::kernel_stack_guard_smoke::expected_fault(
+                address.as_u64(), code.bits(), frame.instruction_pointer.as_u64())
+        ) {
+            serial::write_fmt(format_args!(
+                "WOLFOS_STACK_GUARD_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\n",
+                if cfg!(feature="kernel-stack-guard-upper-fault-smoke") { "upper" }
+                else { "lower" }
+            ));
+            serial::qemu_exit_success();
+        }
+        #[cfg(any(feature = "high-half-stack-arena-lower-fault-smoke",
+                  feature = "high-half-stack-arena-upper-fault-smoke"))]
+        if matches!(address, Ok(v) if
+            crate::high_half_stack_arena_smoke::expected_fault(
+                v.as_u64(), code.bits(), frame.instruction_pointer.as_u64())
+        ) {
+            serial::write_fmt(format_args!(
+                "WOLFOS_HIGH_STACK_ARENA_HARDWARE_OK side={} nonpresent=1 supervisor=1 read=1\n",
+                if cfg!(feature="high-half-stack-arena-upper-fault-smoke") {
+                    "pid2_upper"
+                } else { "pid1_lower" }
+            ));
+            serial::qemu_exit_success();
+        }
+        #[cfg(feature = "paging-fault-smoke")]
+        if matches!(address, Ok(fault_address) if fault_address.as_u64() == crate::paging::TEST_VIRTUAL_ADDRESS)
+            && !code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+        {
+            serial::write_line("WOLFOS_PAGING_FAULT_OK");
+            serial::qemu_exit_success();
+        }
+        crate::halt_forever();
     }
-    crate::halt_forever();
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, code: u64) -> ! {
