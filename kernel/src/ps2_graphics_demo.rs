@@ -89,6 +89,7 @@ pub fn run(layout: Layout, address: *mut u8, white: u32) -> ! {
                             // SAFETY: same bounded, verified 32-bpp framebuffer.
                             unsafe { address.add(offset).cast::<u32>().write_volatile(color); }
                         });
+                        serial::write_line("WOLFOS_PS2_PROMPT_READY");
                     } else {
                         serial::write_line("WOLFOS_PS2_FAILED keyboard_or_framebuffer_mismatch");
                         crate::halt_forever();
