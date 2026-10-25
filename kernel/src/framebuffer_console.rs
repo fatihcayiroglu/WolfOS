@@ -151,11 +151,10 @@ mod tests {
         let mut t = TextConsole::new(layout, 0, 0, 2, 2).unwrap();
         let mut surface = [0x5au8; 16 * 64];
         t.write("B\nC");
-        let mut apply = |offset: usize, color: u32| {
+        let count = t.render(0x0000ffff, 0, |offset, color| {
             assert!(offset + 4 <= surface.len());
             surface[offset..offset+4].copy_from_slice(&color.to_le_bytes());
-        };
-        let count = t.render(0x0000ffff, 0, &mut apply);
+        });
         assert_eq!(count, 2 * 2 * 6 * 8);
         assert_eq!(&surface[0..4], &0x0000ffffu32.to_le_bytes());
         assert_eq!(&surface[64 * 8..64 * 8 + 4], &0u32.to_le_bytes());
@@ -164,8 +163,13 @@ mod tests {
             assert!(surface[row * 64 + 48..(row + 1) * 64].iter().all(|v| *v == 0x5a));
         }
         t.write("\r ");
-        t.render(0x0000ffff, 0, &mut apply);
-        assert_eq!(&surface[64 * 8..64 * 8 + 4], &0u32.to_le_bytes());
+        t.render(0x0000ffff, 0, |offset, color| {
+            assert!(offset + 4 <= surface.len());
+            surface[offset..offset+4].copy_from_slice(&color.to_le_bytes());
+        });
+        // C top-row second pixel had been lit; replacing C with a space
+        // must clear it as well as the glyph foreground.
+        assert_eq!(&surface[64 * 8 + 4..64 * 8 + 8], &0u32.to_le_bytes());
     }
 
     #[test]
