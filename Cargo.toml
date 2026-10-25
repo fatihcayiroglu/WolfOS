@@ -24,6 +24,8 @@ ps2-graphics-demo = []
 ps2-graphics-help-smoke = ["ps2-graphics-demo"]
 # Read-only memory and boot-cached PCI diagnostics, two fresh QEMU boots.
 ps2-graphics-info-smoke = ["ps2-graphics-demo"]
+# Two consecutive commands in the same actual PS/2 QEMU boot.
+ps2-graphics-edit-smoke = ["ps2-graphics-demo"]
 # Isolated two-row QEMU framebuffer scroll and pixel-readback proof.
 framebuffer-console-smoke = ["smoke-exit"]
 address-space-retirement-smoke = ["smoke-exit"]
