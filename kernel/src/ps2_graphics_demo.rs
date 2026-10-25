@@ -281,7 +281,7 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                         } else { None };
                         let text_matches = expected.as_ref().map(|line| {
                             line.as_str().bytes().enumerate().all(|(i, c)| {
-                                console.cell(i, 1) == Some(c)
+                                console.cell(i, 1) == Some(c.to_ascii_uppercase())
                             })
                         }).unwrap_or(false);
                         let pixels_match = match command {
