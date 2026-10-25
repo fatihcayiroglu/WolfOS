@@ -87,6 +87,17 @@ def main() -> int:
                     b"WOLFOS_PS2_GRAPHICS_OK keys=6 text=ABD backspace=1 enter=1 pixels=verified",
                 )
                 print("PASS: actual PS/2 input -> Rust console -> framebuffer pixels")
+                # Follow the preserved six-key hardware proof with a genuine
+                # edited graphical help command: helx, Backspace, p, Enter.
+                # Each event must come from emulated i8042, not COM1 input.
+                for i, key in enumerate(("h", "e", "l", "x", "backspace", "p", "ret"), 7):
+                    monitor.sendall(f"sendkey {key}\\n".encode("ascii"))
+                    wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\\r\\n".encode())
+                wait_for(
+                    proc, output,
+                    b"WOLFOS_PS2_HELP_OK source=keyboard edit=backspace output=framebuffer pixels=verified",
+                )
+                print("PASS: edited graphical HELP rendered to QEMU framebuffer")
                 return 0
             finally:
                 monitor.close()
