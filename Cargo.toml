@@ -18,6 +18,8 @@ default = []
 smoke-exit = []
 # Opt-in BSP polling diagnostics; does not write disks or launch applications.
 serial-shell = []
+# QEMU-only polling of PS/2 set-1 keyboard into bounded framebuffer cells.
+ps2-graphics-demo = []
 # Isolated two-row QEMU framebuffer scroll and pixel-readback proof.
 framebuffer-console-smoke = ["smoke-exit"]
 address-space-retirement-smoke = ["smoke-exit"]
