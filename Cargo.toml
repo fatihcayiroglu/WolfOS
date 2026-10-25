@@ -26,6 +26,8 @@ ps2-graphics-help-smoke = ["ps2-graphics-demo"]
 ps2-graphics-info-smoke = ["ps2-graphics-demo"]
 # Two consecutive commands in the same actual PS/2 QEMU boot.
 ps2-graphics-edit-smoke = ["ps2-graphics-demo"]
+# Isolated true PIC IRQ1 PS/2 queue, retaining the graphical help test.
+ps2-graphics-irq-smoke = ["ps2-graphics-help-smoke"]
 # Isolated two-row QEMU framebuffer scroll and pixel-readback proof.
 framebuffer-console-smoke = ["smoke-exit"]
 address-space-retirement-smoke = ["smoke-exit"]
