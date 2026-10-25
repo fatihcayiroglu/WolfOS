@@ -65,10 +65,21 @@ def main() -> int:
         for marker in forbidden:
             if marker in output:
                 raise RuntimeError(f"interactive boot unexpectedly ran stress check: {marker!r}")
+        # Deliver a real CRLF, followed by two more commands in the same
+        # serial stream. By the ABOUT output, all prior prompts are emitted.
+        # One extra prompt would prove that LF was treated as another Enter.
+        proc.stdin.write(b"help\r\nmem\rabout\r")
+        proc.stdin.flush()
+        await_marker(proc, output, b"WOLFOS_SHELL_ABOUT")
+        before_about = output.split(b"WOLFOS_SHELL_ABOUT", 1)[0]
+        for marker in (b"WOLFOS_SHELL_HELP", b"WOLFOS_SHELL_MEM"):
+            if marker not in before_about:
+                raise RuntimeError(f"missing earlier command output: {marker!r}")
+        prompts = before_about.count(b"wolfos> ")
+        if prompts != 3:
+            raise RuntimeError(f"CRLF caused duplicate/missing prompts: {prompts} (expected 3)")
+        print("PASS: CRLF produced one command and one prompt")
         for typed, marker in [
-            (b"help\r", b"WOLFOS_SHELL_HELP"),
-            (b"mem\r", b"WOLFOS_SHELL_MEM"),
-            (b"about\r", b"WOLFOS_SHELL_ABOUT"),
             (b"clear\r", b"WOLFOS_SHELL_CLEAR"),
             (b"somethingelse\r", b"WOLFOS_SHELL_UNKNOWN"),
             (b"halt\r", b"WOLFOS_SHELL_HALT"),
