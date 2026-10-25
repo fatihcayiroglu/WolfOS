@@ -80,7 +80,7 @@ def main() -> int:
                 # accepted only from real 0x60/0x64 PS/2 port reads.
                 for i, key in enumerate(("a", "b", "c", "backspace", "d", "ret"), 1):
                     monitor.sendall(f"sendkey {key}\n".encode("ascii"))
-                    wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\n".encode())
+                    wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\r\n".encode())
                     print(f"PASS: emulated keyboard key={key} accepted={i}")
                 wait_for(
                     proc, output,
