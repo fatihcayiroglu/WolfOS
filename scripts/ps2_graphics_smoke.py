@@ -47,10 +47,11 @@ def connect_monitor(path: pathlib.Path) -> socket.socket:
 
 def main() -> int:
     help_mode = len(sys.argv) == 3 and sys.argv[2] == "--help-mode"
+    irq_mode = len(sys.argv) == 3 and sys.argv[2] == "--irq-mode"
     edit_mode = len(sys.argv) == 3 and sys.argv[2] == "--edit-mode"
     info_mode = len(sys.argv) == 4 and sys.argv[2] == "--info-mode" and sys.argv[3] in ("mem", "pci")
-    if not (len(sys.argv) == 2 or help_mode or info_mode or edit_mode):
-        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --edit-mode | --info-mode mem|pci]")
+    if not (len(sys.argv) == 2 or help_mode or info_mode or edit_mode or irq_mode):
+        print("usage: ps2_graphics_smoke.py image.iso [--help-mode | --edit-mode | --irq-mode | --info-mode mem|pci]")
         return 2
     iso = pathlib.Path(sys.argv[1]).resolve()
     if not iso.is_file():
@@ -80,11 +81,13 @@ def main() -> int:
             monitor = connect_monitor(monitor_path)
             try:
                 # Real emulated i8042 scan codes, never serial input.
-                if help_mode or info_mode or edit_mode:
+                if irq_mode:
+                    wait_for(proc, output, b"WOLFOS_PS2_IRQ_READY vector=33 queue=64")
+                if help_mode or info_mode or edit_mode or irq_mode:
                     wait_for(proc, output, b"WOLFOS_PS2_PROMPT_READY")
                 if edit_mode:
                     keys = ("h",) * 12 + ("x", "ret")
-                elif help_mode:
+                elif help_mode or irq_mode:
                     keys = ("h", "e", "l", "x", "backspace", "p", "ret")
                 elif info_mode:
                     keys = tuple(sys.argv[3]) + ("ret",)
@@ -133,12 +136,25 @@ def main() -> int:
                         if free <= 0 or free > boot_free or mib != free // 256:
                             raise RuntimeError(f"bad graphical memory data: boot={boot_free} free={free} MiB={mib}")
                         print("PASS: PS/2 MEM reports live free MiB with framebuffer pixels")
-                elif help_mode:
+                elif help_mode or irq_mode:
                     wait_for(
                         proc, output,
                         b"WOLFOS_PS2_HELP_OK source=keyboard edit=backspace output=framebuffer pixels=verified",
                     )
-                    print("PASS: independent keyboard HELP command and framebuffer text")
+                    if irq_mode:
+                        wait_for(proc, output, b"WOLFOS_PS2_IRQ_OK keys=7 ")
+                        wait_for(proc, output, b"drops=0 pixels=verified")
+                        match = re.search(
+                            rb"WOLFOS_PS2_IRQ_OK keys=(\d+) irqs=(\d+) eois=(\d+) drops=(\d+) pixels=verified", output
+                        )
+                        if not match:
+                            raise RuntimeError("missing complete real IRQ1 evidence")
+                        count, irqs, eois, dropped = map(int, match.groups())
+                        if count != 7 or irqs < count or eois != irqs or dropped != 0:
+                            raise RuntimeError("IRQ1 did not acknowledge every hardware event or queue lost data")
+                        print(f"PASS: actual PIC IRQ1 queued PS/2 bytes, irqs={irqs}, EOI={eois}, framebuffer verified")
+                    else:
+                        print("PASS: independent keyboard HELP command and framebuffer text")
                 else:
                     wait_for(
                         proc, output,
