@@ -194,6 +194,34 @@ fn main() {
         let value = nm_symbol(&output, symbol);
         generated += &format!("pub const {var}: u64 = {value:#x};\n");
     }
+    // The recovery flavor launches TWO distinct independently linked ELFs:
+    // PID1 deliberately #PFs; PID2 exits normally. Assert ELF symbol parity,
+    // including the trap return RIP and user text/BSS layout. No runtime
+    // code path can silently use PID1 offsets for an incompatible PID2 ELF.
+    if env::var_os("CARGO_FEATURE_USER_PROCESS_FAULT_RECOVERY_SMOKE").is_some() {
+        let second_obj = path.join("wolfos-user-recovery.o");
+        let second_elf = path.join("wolfos-user-recovery.elf");
+        checked("as", &["--64", "--defsym", "WOLFOS_USER_PROCESS_RECOVERY_SECOND=1",
+            "-o", second_obj.to_str().unwrap(), "user/hello.S"]);
+        checked("ld", &["-m", "elf_x86_64", "-nostdlib", "-static",
+            "-T", "user/hello.ld", "-o", second_elf.to_str().unwrap(),
+            second_obj.to_str().unwrap()]);
+        let second_output = Command::new("nm").arg("-n").arg(&second_elf)
+            .output().expect("missing nm for recovery ELF");
+        assert!(second_output.status.success(), "recovery ELF nm failed");
+        let second_map = String::from_utf8(second_output.stdout)
+            .expect("recovery ELF symbol map not utf8");
+        for name in [
+            "_start", "_after_id", "_after_add", "_after_write",
+            "_after_putc", "_after_exit", "hello_text", "hello_end",
+            "fixture_magic", "uninitialized",
+        ] {
+            assert_eq!(nm_symbol(&output, name), nm_symbol(&second_map, name),
+                "PID1 fault ELF / PID2 recovery ELF symbol mismatch: {name}");
+        }
+        assert!(fs::metadata(&second_elf).unwrap().len() < 32768,
+            "unexpectedly large recovery ELF");
+    }
     fs::write(path.join("wolfos_elf_symbols.rs"), generated)
         .expect("cannot persist checked independent ELF symbol addresses");
     assert!(fs::metadata(&elf).unwrap().len() < 32768,
