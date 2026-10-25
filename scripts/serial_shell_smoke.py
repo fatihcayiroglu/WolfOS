@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import select
 import subprocess
 import sys
@@ -91,6 +92,30 @@ def main() -> int:
         if b"WOLFOS_CPU_OK vendor=" not in cpu_record:
             raise RuntimeError(f"CPU command did not report CPUID: {cpu_record!r}")
         print("PASS: real COM1 cpu command reports live read-only CPUID")
+        # Boot-only PCI enumeration is an immutable snapshot: the shell
+        # must show that same snapshot, without a late CF8/CFC rescan.
+        boot = re.search(
+            rb"WOLFOS_PCI_OK devices=(\d+) displays=(\d+) networks=(\d+) storage=(\d+)",
+            output,
+        )
+        if not boot:
+            raise RuntimeError("missing boot-time PCI discovery snapshot")
+        proc.stdin.write(b"pci\r")
+        proc.stdin.flush()
+        await_marker(proc, output, b"WOLFOS_SHELL_PCI_END")
+        begin = output.split(b"WOLFOS_SHELL_PCI_BEGIN", 1)
+        if len(begin) != 2:
+            raise RuntimeError("PCI command never began")
+        scoped_pci = begin[1].split(b"WOLFOS_SHELL_PCI_END", 1)[0]
+        reported = re.search(
+            rb"WOLFOS_SHELL_PCI devices=(\d+) displays=(\d+) networks=(\d+) storage=(\d+)",
+            scoped_pci,
+        )
+        if not reported or reported.groups() != boot.groups():
+            raise RuntimeError(f"PCI shell result differs from boot: {scoped_pci!r}")
+        if int(reported.group(1)) < 1 or int(reported.group(2)) < 1:
+            raise RuntimeError("QEMU PCI discovery did not detect a display device")
+        print("PASS: real COM1 pci command matches immutable boot-time device counts")
         for typed, marker in [
             (b"clear\r", b"WOLFOS_SHELL_CLEAR"),
             (b"somethingelse\r", b"WOLFOS_SHELL_UNKNOWN"),
