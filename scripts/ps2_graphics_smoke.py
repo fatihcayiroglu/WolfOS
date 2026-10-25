@@ -45,9 +45,10 @@ def connect_monitor(path: pathlib.Path) -> socket.socket:
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: ps2_graphics_smoke.py wolfos-ps2-graphics.iso")
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] != "--help-mode"):
+        print("usage: ps2_graphics_smoke.py image.iso [--help-mode]")
         return 2
+    help_mode = len(sys.argv) == 3
     iso = pathlib.Path(sys.argv[1]).resolve()
     if not iso.is_file():
         print(f"missing ISO: {iso}")
@@ -75,32 +76,28 @@ def main() -> int:
             wait_for(proc, output, b"WOLFOS_PS2_READY")
             monitor = connect_monitor(monitor_path)
             try:
-                # sendkey routes through QEMU's emulated i8042 keyboard.
-                # No WolfOS serial input is used, and decoded events are
-                # accepted only from real 0x60/0x64 PS/2 port reads.
-                for i, key in enumerate(("a", "b", "c", "backspace", "d", "ret"), 1):
+                # Real emulated i8042 scan codes, never serial input.
+                if help_mode:
+                    wait_for(proc, output, b"WOLFOS_PS2_PROMPT_READY")
+                    keys = ("h", "e", "l", "x", "backspace", "p", "ret")
+                else:
+                    keys = ("a", "b", "c", "backspace", "d", "ret")
+                for i, key in enumerate(keys, 1):
                     monitor.sendall(f"sendkey {key}\n".encode("ascii"))
                     wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\r\n".encode())
                     print(f"PASS: emulated keyboard key={key} accepted={i}")
-                wait_for(
-                    proc, output,
-                    b"WOLFOS_PS2_GRAPHICS_OK keys=6 text=ABD backspace=1 enter=1 pixels=verified",
-                )
-                print("PASS: actual PS/2 input -> Rust console -> framebuffer pixels")
-                # The first evidence marker may be emitted before the
-                # next prompt is rendered; never race an unpolled PS/2 key.
-                wait_for(proc, output, b"WOLFOS_PS2_PROMPT_READY")
-                # Follow the preserved six-key hardware proof with a genuine
-                # edited graphical help command: helx, Backspace, p, Enter.
-                # Each event must come from emulated i8042, not COM1 input.
-                for i, key in enumerate(("h", "e", "l", "x", "backspace", "p", "ret"), 7):
-                    monitor.sendall(f"sendkey {key}\\n".encode("ascii"))
-                    wait_for(proc, output, f"WOLFOS_PS2_EVENT accepted={i}\\r\\n".encode())
-                wait_for(
-                    proc, output,
-                    b"WOLFOS_PS2_HELP_OK source=keyboard edit=backspace output=framebuffer pixels=verified",
-                )
-                print("PASS: edited graphical HELP rendered to QEMU framebuffer")
+                if help_mode:
+                    wait_for(
+                        proc, output,
+                        b"WOLFOS_PS2_HELP_OK source=keyboard edit=backspace output=framebuffer pixels=verified",
+                    )
+                    print("PASS: independent keyboard HELP command and framebuffer text")
+                else:
+                    wait_for(
+                        proc, output,
+                        b"WOLFOS_PS2_GRAPHICS_OK keys=6 text=ABD backspace=1 enter=1 pixels=verified",
+                    )
+                    print("PASS: original PS/2 ABD edit and framebuffer pixel proof")
                 return 0
             finally:
                 monitor.close()
