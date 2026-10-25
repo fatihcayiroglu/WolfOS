@@ -64,6 +64,13 @@ impl TextConsole {
         self.scrolls = self.scrolls.saturating_add(1);
     }
 
+    pub fn backspace(&mut self) -> bool {
+        if self.cursor_col == 0 { return false; }
+        self.cursor_col -= 1;
+        self.cells[self.cursor_row * MAX_COLS + self.cursor_col] = b' ';
+        true
+    }
+
     pub fn write(&mut self, text: &str) {
         for byte in text.bytes() {
             match byte {
@@ -170,6 +177,23 @@ mod tests {
         // C top-row second pixel had been lit; replacing C with a space
         // must clear it as well as the glyph foreground.
         assert_eq!(&surface[64 * 8 + 4..64 * 8 + 8], &0u32.to_le_bytes());
+    }
+
+    #[test]
+    fn input_backspace_clears_last_cell_but_never_crosses_line_start() {
+        let layout = Layout::new(24, 16, 112).unwrap();
+        let mut c = TextConsole::new(layout, 0, 0, 4, 2).unwrap();
+        assert!(!c.backspace());
+        c.write("abc");
+        assert_eq!(c.cursor(), (3, 0));
+        assert!(c.backspace());
+        assert_eq!(c.cursor(), (2, 0));
+        assert_eq!(c.cell(2, 0), Some(b' '));
+        c.write("d\n");
+        assert_eq!(c.cell(2, 0), Some(b'D'));
+        assert_eq!(c.cursor(), (0, 1));
+        assert!(!c.backspace());
+        assert_eq!(c.cell(2, 0), Some(b'D'));
     }
 
     #[test]
