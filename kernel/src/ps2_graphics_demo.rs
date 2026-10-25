@@ -8,7 +8,7 @@ use crate::{
     graphical_diagnostics,
     graphical_line_editor::LineEditor,
     pci::PciSummary,
-    ps2_keyboard::{Key, Set1Decoder, read_scancode},
+    ps2_keyboard::{Key, Set1Decoder},
     serial,
     shell_command::Command,
 };
@@ -33,6 +33,13 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
     let mut stage = if cfg!(feature = "ps2-graphics-help-smoke") || info_mode || edit_mode { 1u8 } else { 0u8 };
     let mut editor = LineEditor::<12>::new();
     let mut rejected_overlong = false;
+    #[cfg(feature = "ps2-graphics-irq-smoke")]
+    {
+        // Install PIC IRQ1 only after BSP's IDT and mapped framebuffer exist.
+        // The actual ISR does not touch TextConsole or other Rust input state.
+        crate::ps2_irq::start();
+        serial::write_line("WOLFOS_PS2_IRQ_READY vector=33 queue=64");
+    }
     serial::write_line("WOLFOS_PS2_READY mode=polling keyboard=set1 graphical=1");
     if stage == 1 {
         console.write("> ");
@@ -43,7 +50,19 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
         serial::write_line("WOLFOS_PS2_PROMPT_READY");
     }
     loop {
-        if let Some(scancode) = read_scancode() {
+        // Foreground input consumer. In the IRQ flavor all hardware 0x60/0x64
+        // reads occur exclusively inside IRQ1; the consumer only pops bytes.
+        #[cfg(feature = "ps2-graphics-irq-smoke")]
+        let next = match crate::ps2_irq::take() {
+            Ok(value) => value,
+            Err(()) => {
+                serial::write_line("WOLFOS_PS2_IRQ_FAILED dropped_raw_scancode");
+                crate::halt_forever();
+            }
+        };
+        #[cfg(not(feature = "ps2-graphics-irq-smoke"))]
+        let next = crate::ps2_keyboard::read_scancode();
+        if let Some(scancode) = next {
             if let Some(key) = decoder.feed(scancode) {
                 accepted += 1;
                 if accepted > 256 {
@@ -174,6 +193,22 @@ pub fn run(layout: Layout, address: *mut u8, white: u32, pci_summary: PciSummary
                             && pixel(21, 88) == Some(0)
                         {
                             serial::write_line("WOLFOS_PS2_HELP_OK source=keyboard edit=backspace output=framebuffer pixels=verified");
+                            #[cfg(feature = "ps2-graphics-irq-smoke")]
+                            {
+                                // Freeze BSP IRQ dispatch while sampling a
+                                // consistent ISR/EOI snapshot for QEMU proof.
+                                x86_64::instructions::interrupts::disable();
+                                let (irqs, eois, dropped, poisoned) = crate::ps2_irq::evidence();
+                                if irqs < accepted || eois != irqs || dropped != 0 || poisoned {
+                                    serial::write_line("WOLFOS_PS2_IRQ_FAILED missing_ack_or_dropped");
+                                    crate::halt_forever();
+                                }
+                                serial::write_fmt(format_args!(
+                                    "WOLFOS_PS2_IRQ_OK keys={} irqs={} eois={} drops={} pixels=verified\n",
+                                    accepted, irqs, eois, dropped,
+                                ));
+                                crate::halt_forever();
+                            }
                             stage = 2;
                         } else {
                             serial::write_line("WOLFOS_PS2_FAILED help_render");
