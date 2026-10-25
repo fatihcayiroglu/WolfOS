@@ -90,11 +90,13 @@ fn execute(command: Command, pci_summary: crate::pci::PciSummary) {
         Command::Pci => {
             // Do not rescan shared CF8/CFC ports after SMP startup. Show
             // only the immutable discovery snapshot from early BSP boot.
+            serial::write_line("WOLFOS_SHELL_PCI_BEGIN");
             serial::write_fmt(format_args!(
                 "WOLFOS_SHELL_PCI devices={} displays={} networks={} storage={}\n",
                 pci_summary.devices, pci_summary.displays,
                 pci_summary.networks, pci_summary.storage,
             ));
+            serial::write_line("WOLFOS_SHELL_PCI_END");
         }
         Command::Memory => {
             let stats = pmm::statistics();
