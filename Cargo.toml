@@ -58,6 +58,8 @@ user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
 # Genuine relocated two-PT ELF64 in hardware CPL3, eight PMM frames; isolated QEMU gate.
 user-elf-two-pt-run-smoke = ["user-elf-run-smoke"]
+# Three ELF PT_LOAD leaves (RX+RX+RW/NX) actually execute under two PTs, nine owned PMM frames.
+user-elf-three-load-run-smoke = ["user-elf-two-pt-run-smoke"]
 # Real Ring3 EXIT(42) through INT80, status-aware reap and exact PMM release.
 user-exit-status-smoke = ["user-elf-run-smoke"]
 # Fixed real user UD2 recovery: authenticated CPL3 exception, status 132, PMM retirement.
