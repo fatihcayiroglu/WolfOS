@@ -48,14 +48,20 @@ def main() -> int:
             "high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 "
             "high_half_escalation_denied=1 cr3_unchanged=1 freed=8 ring3=0"
         )
+        relocated_marker = (
+            "WOLFOS_USER_RELOCATED_TWO_PT_OK vacant_slot=1 relocated_elf=1 "
+            "relocated_pte=1 byte_source_unshifted=1 staged_admission=1 "
+            "tamper_denied=1 kernel_supervisor=1 cr3_unchanged=1 freed=8 ring3=0"
+        )
         if (MARKER not in output or multi_marker not in output
-                or two_pt_marker not in output or "WOLFOS_BOOT_OK" not in output):
+                or two_pt_marker not in output or relocated_marker not in output
+                or "WOLFOS_BOOT_OK" not in output):
             print("FAIL: missing independently verified user page-table root or normal boot")
             return 1
         for bad in (
             "WOLFOS_USER_ROOT_ERROR", "WOLFOS_USER_ROOT_TEST_FAILED",
             "WOLFOS_USER_MULTI_ERROR", "WOLFOS_USER_MULTI_TEST_FAILED",
-            "WOLFOS_USER_TWO_PT_ERROR",
+            "WOLFOS_USER_TWO_PT_ERROR", "WOLFOS_USER_RELOCATED_TWO_PT_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF",
             "WOLFOS_EXCEPTION_DF", "WOLFOS_PANIC",
         ):
@@ -66,7 +72,7 @@ def main() -> int:
             print(f"FAIL: expected clean debug-exit 33, got {run.returncode}")
             print(run.stderr.decode(errors="replace"))
             return 1
-        print("PASS: two independent roots, single-PT and two-PT staged admission and high-half grafts, no CR3 load")
+        print("PASS: two independent roots, single-PT, raw and relocated two-PT staged admission, no CR3 load")
         return 0
 
 if __name__ == "__main__":
