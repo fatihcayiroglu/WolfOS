@@ -11,6 +11,8 @@ mod user_vm_multi;
 mod user_elf_launch_layout;
 #[path = "../kernel/src/user_vm_two_pt.rs"]
 mod user_vm_two_pt;
+#[path = "../kernel/src/user_elf_two_pt_stager.rs"]
+mod user_elf_two_pt_stager;
 #[path = "../kernel/src/user_image_admission.rs"]
 mod user_image_admission;
 
@@ -540,4 +542,130 @@ fn derived_manifest_rejects_invalid_slots_frame_counts_aliases_and_offsets() {
     ), Err(TwoPtElfError::Image(
         user_elf_launch_layout::LaunchError::TooManyPageTables
     ))));
+}
+
+
+#[test]
+fn atomic_stager_executes_byte_derived_one_two_and_three_load_leaf_plans() {
+    use user_elf_two_pt_stager::stage_relocated_two_pt_elf;
+    let bytes = image();
+    let mut rx = [0u8; 4096];
+    let mut data = [0u8; 4096];
+    let mut stack = [0u8; 4096];
+    let mut dest = [&mut rx, &mut data];
+    let admitted = stage_relocated_two_pt_elf(
+        &bytes, 2, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
+        &mut dest, &mut stack,
+    ).unwrap();
+    assert_eq!(admitted.manifest.load_pages(), 2);
+    assert_eq!(admitted.copied[0].unwrap().copied, 8);
+    assert_eq!(admitted.copied[1].unwrap().copied, 1);
+    assert_eq!(admitted.copied[2], None);
+    assert_eq!(rx[0x100], 0xc3);
+    assert_eq!(data[0x180], 0x5a);
+    assert!(stack.iter().all(|b| *b == 0));
+    assert_eq!(admitted.manifest.pages().len(), 3);
+
+    let mut three = bytes;
+    three[24..32].copy_from_slice(&0x5fe100u64.to_le_bytes());
+    three[80..88].copy_from_slice(&0x5fe100u64.to_le_bytes());
+    three[104..112].copy_from_slice(&0x1100u64.to_le_bytes());
+    let mut first = [0u8; 4096];
+    let mut second = [0u8; 4096];
+    let mut data3 = [0u8; 4096];
+    let mut stack3 = [0u8; 4096];
+    let mut dest3 = [&mut first, &mut second, &mut data3];
+    let staged3 = stage_relocated_two_pt_elf(
+        &three, 7, FRAMES, &[0x15_000, 0x16_000, 0x17_000, 0x18_000],
+        &mut dest3, &mut stack3,
+    ).unwrap();
+    assert_eq!(staged3.manifest.load_pages(), 3);
+    assert_eq!(staged3.copied[0].unwrap().copied, 8);
+    assert_eq!(staged3.copied[1].unwrap().copied, 0);
+    assert_eq!(staged3.copied[2].unwrap().copied, 1);
+    assert_eq!(first[0x100], 0xc3);
+    assert!(second.iter().all(|b| *b == 0));
+    assert_eq!(data3[0x180], 0x5a);
+    assert!(stack3.iter().all(|b| *b == 0));
+
+    let mut one = bytes;
+    one[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let mut rx1 = [0u8; 4096];
+    let mut stack1 = [0u8; 4096];
+    let mut dest1 = [&mut rx1];
+    let staged1 = stage_relocated_two_pt_elf(
+        &one, 255, FRAMES, &[0x15_000, 0x16_000],
+        &mut dest1, &mut stack1,
+    ).unwrap();
+    assert_eq!(staged1.manifest.load_pages(), 1);
+    assert_eq!(staged1.copied[0].unwrap().copied, 8);
+    assert_eq!(staged1.copied[1], None);
+    assert_eq!(rx1[0x100], 0xc3);
+    assert_eq!(staged1.manifest.pages().len(), 2);
+}
+
+#[test]
+fn atomic_stager_rejects_dirty_stack_wrong_frame_count_and_aliases_without_writes() {
+    use user_elf_two_pt_stager::{stage_relocated_two_pt_elf, StageError};
+    let bytes = image();
+    let mut rx = [0u8; 4096];
+    let mut data = [0u8; 4096];
+    let mut stack = [0u8; 4096];
+    stack[99] = 0xa5;
+    {
+        let mut dest = [&mut rx, &mut data];
+        assert_eq!(stage_relocated_two_pt_elf(
+            &bytes, 1, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
+            &mut dest, &mut stack,
+        ), Err(StageError::DirtyOwnedFrame));
+    }
+    assert!(rx.iter().all(|b| *b == 0));
+    assert!(data.iter().all(|b| *b == 0));
+    assert_eq!(stack[99], 0xa5);
+    stack[99] = 0;
+    {
+        let mut dest = [&mut rx, &mut data];
+        assert!(matches!(stage_relocated_two_pt_elf(
+            &bytes, 1, FRAMES, &[0x15_000, 0x15_000, 0x17_000],
+            &mut dest, &mut stack,
+        ), Err(StageError::Manifest(_))));
+        assert!(matches!(stage_relocated_two_pt_elf(
+            &bytes, 1, FRAMES, &[0x15_000, 0x16_000],
+            &mut dest, &mut stack,
+        ), Err(StageError::Manifest(_))));
+        assert_eq!(stage_relocated_two_pt_elf(
+            &bytes, 1, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
+            &mut dest[..1], &mut stack,
+        ), Err(StageError::BackingCount));
+    }
+    assert!(rx.iter().all(|b| *b == 0));
+    assert!(data.iter().all(|b| *b == 0));
+    assert!(stack.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn bounded_batch_inspects_all_file_ranges_and_duplicate_va_before_any_write() {
+    use elf64_page_image::{materialize_bounded, MaterializeError};
+    let bytes = image();
+    let plan = elf64_preflight::preflight(&bytes).unwrap();
+    let text = plan.segments[0].unwrap();
+    let data = plan.segments[1].unwrap();
+    let mut bad = data;
+    bad.file_offset = u64::MAX;
+    let mut rx = [0xa5u8; 4096];
+    let mut rw = [0x5au8; 4096];
+    {
+        let mut dest = [&mut rx, &mut rw];
+        assert_eq!(materialize_bounded::<3>(
+            &bytes, &[(&text, 0x5ff000), (&bad, 0x600000)], &mut dest,
+        ), Err(MaterializeError::InvalidFile));
+        assert_eq!(materialize_bounded::<3>(
+            &bytes, &[(&text, 0x5ff000), (&data, 0x5ff000)], &mut dest,
+        ), Err(MaterializeError::DuplicateVirtualPage));
+        assert_eq!(materialize_bounded::<3>(
+            &bytes, &[(&text, 0x5ff000)], &mut dest,
+        ), Err(MaterializeError::InvalidSegment));
+    }
+    assert!(rx.iter().all(|b| *b == 0xa5));
+    assert!(rw.iter().all(|b| *b == 0x5a));
 }
