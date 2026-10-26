@@ -6,7 +6,7 @@
 //! edits PTEs, takes PMM ownership, activates CR3, or accepts user pointers.
 //! A separate full PTE/byte/HHDM admission remains mandatory before IRET.
 
-use crate::elf64_page_image::{materialize_bounded, MaterializeError, PageContents, PAGE_SIZE};
+use crate::elf64_page_image::{materialize_bounded, MaterializeError, PageBacking, PageContents, PAGE_SIZE};
 use crate::elf64_preflight::LoadSegment;
 use crate::user_elf_launch_layout::MAX_LOAD_PAGES;
 use crate::user_vm_two_pt::{
@@ -17,9 +17,20 @@ use crate::user_vm_two_pt::{
 pub enum StageError {
     Manifest(TwoPtElfError),
     BackingCount,
+    BackingFrameMismatch,
     DirtyOwnedFrame,
     MissingLeafSource,
     Materialize(MaterializeError),
+}
+
+/// Caller-owned, exclusively borrowed backing with its expected PMM frame.
+/// The caller must still prove the pointer's actual HHDM provenance later.
+pub struct OwnedPageBuffer<'a> {
+    pub physical_frame: u64,
+    pub bytes: &'a mut [u8; PAGE_SIZE],
+}
+impl PageBacking for OwnedPageBuffer<'_> {
+    fn page_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] { &mut *self.bytes }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,7 +40,7 @@ pub struct StagedTwoPtElf {
 }
 
 /// Stage one, two or three PT_LOAD pages plus an independent zeroed stack.
-/// Exactly one LOAD buffer must correspond to each ordered ELF-derived leaf.
+/// Exactly one explicitly frame-bound LOAD buffer must match each ELF-derived leaf.
 /// All buffers are exclusively borrowed and pre-zeroed by the PMM owner.
 /// Every source range is inspected BEFORE writing the first destination.
 /// On validation failure, every supplied destination remains byte-identical.
@@ -38,8 +49,8 @@ pub fn stage_relocated_two_pt_elf(
     slot: usize,
     tables: [u64; TABLE_FRAMES],
     frames: &[u64],
-    buffers: &mut [&mut [u8; PAGE_SIZE]],
-    stack: &mut [u8; PAGE_SIZE],
+    buffers: &mut [OwnedPageBuffer<'_>],
+    stack: &mut OwnedPageBuffer<'_>,
 ) -> Result<StagedTwoPtElf, StageError> {
     let manifest = derive_relocated_elf_pages(image, slot, tables, frames)
         .map_err(StageError::Manifest)?;
@@ -48,8 +59,17 @@ pub fn stage_relocated_two_pt_elf(
     if count == 0 || count > MAX_LOAD_PAGES || buffers.len() != count {
         return Err(StageError::BackingCount);
     }
-    if buffers.iter().any(|bytes| bytes.iter().any(|byte| *byte != 0))
-        || stack.iter().any(|byte| *byte != 0)
+    // Compare EVERY borrowed buffer to the immutable ELF/PMM leaf manifest
+    // before zero-checking or writing any destination. Caller-supplied order
+    // alone is never sufficient physical provenance.
+    let mapped = manifest.pages();
+    if buffers.iter().enumerate().any(|(i, buffer)|
+        buffer.physical_frame != mapped[i].physical_frame
+    ) || stack.physical_frame != mapped[count].physical_frame {
+        return Err(StageError::BackingFrameMismatch);
+    }
+    if buffers.iter().any(|buffer| buffer.bytes.iter().any(|byte| *byte != 0))
+        || stack.bytes.iter().any(|byte| *byte != 0)
     { return Err(StageError::DirtyOwnedFrame) }
 
     let first = source.image.segments[0].as_ref().ok_or(StageError::MissingLeafSource)?;

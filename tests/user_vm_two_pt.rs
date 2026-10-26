@@ -547,24 +547,31 @@ fn derived_manifest_rejects_invalid_slots_frame_counts_aliases_and_offsets() {
 
 #[test]
 fn atomic_stager_executes_byte_derived_one_two_and_three_load_leaf_plans() {
-    use user_elf_two_pt_stager::stage_relocated_two_pt_elf;
+    use user_elf_two_pt_stager::{stage_relocated_two_pt_elf, OwnedPageBuffer};
     let bytes = image();
     let mut rx = [0u8; 4096];
     let mut data = [0u8; 4096];
     let mut stack = [0u8; 4096];
-    let mut dest = [&mut rx, &mut data];
-    let admitted = stage_relocated_two_pt_elf(
-        &bytes, 2, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
-        &mut dest, &mut stack,
-    ).unwrap();
-    assert_eq!(admitted.manifest.load_pages(), 2);
-    assert_eq!(admitted.copied[0].unwrap().copied, 8);
-    assert_eq!(admitted.copied[1].unwrap().copied, 1);
-    assert_eq!(admitted.copied[2], None);
+    {
+        let mut dest = [
+            OwnedPageBuffer { physical_frame: 0x15_000, bytes: &mut rx },
+            OwnedPageBuffer { physical_frame: 0x16_000, bytes: &mut data },
+        ];
+        let mut stack_backing =
+            OwnedPageBuffer { physical_frame: 0x17_000, bytes: &mut stack };
+        let admitted = stage_relocated_two_pt_elf(
+            &bytes, 2, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
+            &mut dest, &mut stack_backing,
+        ).unwrap();
+        assert_eq!(admitted.manifest.load_pages(), 2);
+        assert_eq!(admitted.copied[0].unwrap().copied, 8);
+        assert_eq!(admitted.copied[1].unwrap().copied, 1);
+        assert_eq!(admitted.copied[2], None);
+        assert_eq!(admitted.manifest.pages().len(), 3);
+    }
     assert_eq!(rx[0x100], 0xc3);
     assert_eq!(data[0x180], 0x5a);
     assert!(stack.iter().all(|b| *b == 0));
-    assert_eq!(admitted.manifest.pages().len(), 3);
 
     let mut three = bytes;
     three[24..32].copy_from_slice(&0x5fe100u64.to_le_bytes());
@@ -574,15 +581,24 @@ fn atomic_stager_executes_byte_derived_one_two_and_three_load_leaf_plans() {
     let mut second = [0u8; 4096];
     let mut data3 = [0u8; 4096];
     let mut stack3 = [0u8; 4096];
-    let mut dest3 = [&mut first, &mut second, &mut data3];
-    let staged3 = stage_relocated_two_pt_elf(
-        &three, 7, FRAMES, &[0x15_000, 0x16_000, 0x17_000, 0x18_000],
-        &mut dest3, &mut stack3,
-    ).unwrap();
-    assert_eq!(staged3.manifest.load_pages(), 3);
-    assert_eq!(staged3.copied[0].unwrap().copied, 8);
-    assert_eq!(staged3.copied[1].unwrap().copied, 0);
-    assert_eq!(staged3.copied[2].unwrap().copied, 1);
+    {
+        let mut dest3 = [
+            OwnedPageBuffer { physical_frame: 0x15_000, bytes: &mut first },
+            OwnedPageBuffer { physical_frame: 0x16_000, bytes: &mut second },
+            OwnedPageBuffer { physical_frame: 0x17_000, bytes: &mut data3 },
+        ];
+        let mut stack_backing =
+            OwnedPageBuffer { physical_frame: 0x18_000, bytes: &mut stack3 };
+        let staged3 = stage_relocated_two_pt_elf(
+            &three, 7, FRAMES,
+            &[0x15_000, 0x16_000, 0x17_000, 0x18_000],
+            &mut dest3, &mut stack_backing,
+        ).unwrap();
+        assert_eq!(staged3.manifest.load_pages(), 3);
+        assert_eq!(staged3.copied[0].unwrap().copied, 8);
+        assert_eq!(staged3.copied[1].unwrap().copied, 0);
+        assert_eq!(staged3.copied[2].unwrap().copied, 1);
+    }
     assert_eq!(first[0x100], 0xc3);
     assert!(second.iter().all(|b| *b == 0));
     assert_eq!(data3[0x180], 0x5a);
@@ -592,31 +608,43 @@ fn atomic_stager_executes_byte_derived_one_two_and_three_load_leaf_plans() {
     one[56..58].copy_from_slice(&1u16.to_le_bytes());
     let mut rx1 = [0u8; 4096];
     let mut stack1 = [0u8; 4096];
-    let mut dest1 = [&mut rx1];
-    let staged1 = stage_relocated_two_pt_elf(
-        &one, 255, FRAMES, &[0x15_000, 0x16_000],
-        &mut dest1, &mut stack1,
-    ).unwrap();
-    assert_eq!(staged1.manifest.load_pages(), 1);
-    assert_eq!(staged1.copied[0].unwrap().copied, 8);
-    assert_eq!(staged1.copied[1], None);
+    {
+        let mut dest1 = [
+            OwnedPageBuffer { physical_frame: 0x15_000, bytes: &mut rx1 }
+        ];
+        let mut stack_backing =
+            OwnedPageBuffer { physical_frame: 0x16_000, bytes: &mut stack1 };
+        let staged1 = stage_relocated_two_pt_elf(
+            &one, 255, FRAMES, &[0x15_000, 0x16_000],
+            &mut dest1, &mut stack_backing,
+        ).unwrap();
+        assert_eq!(staged1.manifest.load_pages(), 1);
+        assert_eq!(staged1.copied[0].unwrap().copied, 8);
+        assert_eq!(staged1.copied[1], None);
+        assert_eq!(staged1.manifest.pages().len(), 2);
+    }
     assert_eq!(rx1[0x100], 0xc3);
-    assert_eq!(staged1.manifest.pages().len(), 2);
+    assert!(stack1.iter().all(|b| *b == 0));
 }
 
 #[test]
 fn atomic_stager_rejects_dirty_stack_wrong_frame_count_and_aliases_without_writes() {
-    use user_elf_two_pt_stager::{stage_relocated_two_pt_elf, StageError};
+    use user_elf_two_pt_stager::{stage_relocated_two_pt_elf, OwnedPageBuffer, StageError};
     let bytes = image();
     let mut rx = [0u8; 4096];
     let mut data = [0u8; 4096];
     let mut stack = [0u8; 4096];
     stack[99] = 0xa5;
     {
-        let mut dest = [&mut rx, &mut data];
+        let mut dest = [
+            OwnedPageBuffer { physical_frame: 0x15_000, bytes: &mut rx },
+            OwnedPageBuffer { physical_frame: 0x16_000, bytes: &mut data },
+        ];
+        let mut stack_backing =
+            OwnedPageBuffer { physical_frame: 0x17_000, bytes: &mut stack };
         assert_eq!(stage_relocated_two_pt_elf(
             &bytes, 1, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
-            &mut dest, &mut stack,
+            &mut dest, &mut stack_backing,
         ), Err(StageError::DirtyOwnedFrame));
     }
     assert!(rx.iter().all(|b| *b == 0));
@@ -624,22 +652,65 @@ fn atomic_stager_rejects_dirty_stack_wrong_frame_count_and_aliases_without_write
     assert_eq!(stack[99], 0xa5);
     stack[99] = 0;
     {
-        let mut dest = [&mut rx, &mut data];
+        let mut dest = [
+            OwnedPageBuffer { physical_frame: 0x15_000, bytes: &mut rx },
+            OwnedPageBuffer { physical_frame: 0x16_000, bytes: &mut data },
+        ];
+        let mut stack_backing =
+            OwnedPageBuffer { physical_frame: 0x17_000, bytes: &mut stack };
         assert!(matches!(stage_relocated_two_pt_elf(
             &bytes, 1, FRAMES, &[0x15_000, 0x15_000, 0x17_000],
-            &mut dest, &mut stack,
+            &mut dest, &mut stack_backing,
         ), Err(StageError::Manifest(_))));
         assert!(matches!(stage_relocated_two_pt_elf(
             &bytes, 1, FRAMES, &[0x15_000, 0x16_000],
-            &mut dest, &mut stack,
+            &mut dest, &mut stack_backing,
         ), Err(StageError::Manifest(_))));
         assert_eq!(stage_relocated_two_pt_elf(
             &bytes, 1, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
-            &mut dest[..1], &mut stack,
+            &mut dest[..1], &mut stack_backing,
         ), Err(StageError::BackingCount));
     }
     assert!(rx.iter().all(|b| *b == 0));
     assert!(data.iter().all(|b| *b == 0));
+    assert!(stack.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn atomic_stager_binds_all_backings_before_staging_and_preserves_on_failure() {
+    use user_elf_two_pt_stager::{stage_relocated_two_pt_elf, OwnedPageBuffer, StageError};
+    let bytes = image();
+    let frames = [0x15_000, 0x16_000, 0x17_000];
+    let mut rx = [0u8; 4096];
+    let mut data = [0u8; 4096];
+    let mut stack = [0u8; 4096];
+    {
+        // Valid immutable mapping, but caller accidentally swaps frame IDs
+        // when associating the two clean leaf buffers. No writes are allowed.
+        let mut dest = [
+            OwnedPageBuffer { physical_frame: 0x16_000, bytes: &mut rx },
+            OwnedPageBuffer { physical_frame: 0x15_000, bytes: &mut data },
+        ];
+        let mut stack_backing =
+            OwnedPageBuffer { physical_frame: 0x17_000, bytes: &mut stack };
+        assert_eq!(stage_relocated_two_pt_elf(
+            &bytes, 1, FRAMES, &frames, &mut dest, &mut stack_backing,
+        ), Err(StageError::BackingFrameMismatch));
+        dest[0].physical_frame = 0x15_000;
+        dest[1].physical_frame = 0x16_000;
+        stack_backing.physical_frame = 0x18_000;
+        assert_eq!(stage_relocated_two_pt_elf(
+            &bytes, 1, FRAMES, &frames, &mut dest, &mut stack_backing,
+        ), Err(StageError::BackingFrameMismatch));
+        stack_backing.physical_frame = 0x17_000;
+        dest[1].bytes[37] = 0x7a; // A dirty middle LOAD page.
+        assert_eq!(stage_relocated_two_pt_elf(
+            &bytes, 1, FRAMES, &frames, &mut dest, &mut stack_backing,
+        ), Err(StageError::DirtyOwnedFrame));
+    }
+    assert!(rx.iter().all(|b| *b == 0));
+    assert_eq!(data[37], 0x7a);
+    assert!(data.iter().enumerate().all(|(i, b)| i == 37 || *b == 0));
     assert!(stack.iter().all(|b| *b == 0));
 }
 
