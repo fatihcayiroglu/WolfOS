@@ -27,7 +27,7 @@ use x86_64::{
     VirtAddr,
 };
 use crate::{
-    elf64_page_image::{materialize, PAGE_SIZE},
+    elf64_page_image::PAGE_SIZE,
     user_elf_launch_layout::plan_bounded_with_budget,
     user_elf_page_tables::{ElfPageTables, TableBuffers},
     interrupts, kernel_half_shadow, pmm, serial,
@@ -414,17 +414,20 @@ pub fn enter(hhdm: u64) -> ! {
         };
         #[cfg(not(feature = "user-elf-two-pt-run-smoke"))]
         let copied = {
-            let mut copied = [None; LOAD_LEAVES];
-            for (i, outcome) in copied.iter_mut().enumerate() {
-                let Some(leaf) = launch.leaves[i] else { fail("missing_load_leaf") };
-                let Some(segment_index) = leaf.source_segment else { fail("stack_as_elf") };
-                let Some(segment) = plan.segments[segment_index] else { fail("missing_segment") };
-                let page = &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>();
-                let Ok(contents) = materialize(elf, &segment, leaf.virtual_address, page)
-                else { fail("elf_leaf_materialize") };
-                *outcome = Some(contents);
-            }
-            copied
+            // Every real one-PT flavor now uses the same exact ELF/PMM
+            // frame recipe for payload staging as for page-table mapping.
+            let mut destinations:
+                [crate::user_elf_page_tables::OwnedLeafPage<'_>; LOAD_LEAVES] =
+                core::array::from_fn(|i| crate::user_elf_page_tables::OwnedLeafPage {
+                    physical_frame: frames[TABLE_FRAMES + i],
+                    bytes: &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>(),
+                });
+            let mut stack = crate::user_elf_page_tables::OwnedLeafPage {
+                physical_frame: frames[FRAMES - 1],
+                bytes: &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>(),
+            };
+            mapping.stage_load_and_stack(elf, &mut destinations, &mut stack)
+                .unwrap_or_else(|_| fail("one_pt_bound_elf_payload_stage"))
         };
         let Some(t) = copied[0] else { fail("no_text_page") };
         let text_page = &*ptrs[TABLE_FRAMES].cast::<[u8; PAGE_SIZE]>();
