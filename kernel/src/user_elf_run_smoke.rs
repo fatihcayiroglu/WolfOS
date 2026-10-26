@@ -128,10 +128,13 @@ fn hhdm_ptr(hhdm: u64, phys: u64) -> Option<*mut u8> {
         .map(|addr| addr.as_mut_ptr::<u8>())
 }
 
-/// Exactly seven, eight or nine exclusively owned frames by isolated QEMU flavor.
-fn allocate_owned() -> Option<[u64; FRAMES]> {
+/// The validated ELF frame requirement drives PMM calls, while the existing
+/// fixed-size process table still requires an exact per-flavor reservation.
+/// No PMM allocation occurs if those two independent counts disagree.
+fn allocate_owned(requested: usize) -> Option<[u64; FRAMES]> {
+    if requested == 0 || requested != FRAMES { return None; }
     let mut frames = [0u64; FRAMES];
-    for i in 0..FRAMES {
+    for i in 0..requested {
         let Some(phys) = pmm::allocate_frame() else {
             for old in frames[..i].iter().copied().rev() {
                 let _ = pmm::free_frame(old);
@@ -338,7 +341,8 @@ pub fn enter(hhdm: u64) -> ! {
     if efer_lo & (1 << 11) == 0 { fail("efer_nxe") }
 
     let before = pmm::statistics().allocated_frames;
-    let Some(frames) = allocate_owned() else { fail("pmm_owned_frames") };
+    let Some(frames) = allocate_owned(prepared.frames.total_frames)
+    else { fail("pmm_owned_frames") };
     let mut ptrs = [core::ptr::null_mut::<u8>(); FRAMES];
     for (i, phys) in frames.iter().copied().enumerate() {
         let Some(ptr) = hhdm_ptr(hhdm, phys) else { fail("owned_frame_hhdm") };
