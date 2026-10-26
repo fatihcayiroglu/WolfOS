@@ -27,7 +27,7 @@ use x86_64::{
 };
 use crate::{
     elf64_page_image::{materialize, PAGE_SIZE},
-    elf64_preflight::preflight,
+    user_elf_launch_layout::plan_static_image,
     interrupts, kernel_half_shadow, pmm, serial,
     process_lifecycle::ProcessState,
     process_table::{ProcessTableCell, TableError},
@@ -223,8 +223,14 @@ pub fn enter(hhdm: u64) -> ! {
     // the kernel's source or directly copied from a handbuilt instruction
     // array. They must pass the strict ELF64 ET_EXEC parser and PT_LOAD
     // data/BSS materialization path developed in PRs #62-#65.
-    let Ok(plan) = preflight(elf) else { fail("elf_preflight") };
-    if plan.len != 2 || plan.entry != symbols::ENTRY { fail("elf_entry_or_segments") }
+    let Ok(launch) = plan_static_image(elf) else { fail("elf_launch_layout") };
+    let plan = launch.image;
+    if plan.len != 2 || plan.entry != symbols::ENTRY
+        || launch.load_pages() != 2 || launch.stack_page != STACK_VA
+        || launch.leaves[0].and_then(|page| page.source_segment) != Some(0)
+        || launch.leaves[1].and_then(|page| page.source_segment) != Some(1)
+        || launch.leaves[2].and_then(|page| page.source_segment).is_some()
+    { fail("elf_entry_or_segments") }
     let (Some(text), Some(data)) = (plan.segments[0], plan.segments[1])
     else { fail("elf_missing_load") };
     if text.page_start != 0x401000 || text.page_end != 0x402000
@@ -277,7 +283,7 @@ pub fn enter(hhdm: u64) -> ! {
     let code = base + plan.entry;
     let text_va = base + text.page_start;
     let data_va = base + data.page_start;
-    let stack_va = base + STACK_VA;
+    let stack_va = base + launch.stack_page;
     let user_top = stack_va + PAGE;
     if user_ring_entry::validate(Ring3Entry {
         rip: code, user_rsp: user_top, kernel_rsp0: rsp0,
@@ -310,12 +316,22 @@ pub fn enter(hhdm: u64) -> ! {
     // until AFTER segment copying and full source/destination root audit.
     unsafe {
         for ptr in ptrs { core::ptr::write_bytes(ptr, 0, PAGE as usize); }
-        let text_page = &mut *ptrs[4].cast::<[u8; PAGE_SIZE]>();
-        let data_page = &mut *ptrs[5].cast::<[u8; PAGE_SIZE]>();
-        let Ok(t) = materialize(elf, &text, text.page_start, text_page)
-        else { fail("text_materialize") };
-        let Ok(d) = materialize(elf, &data, data.page_start, data_page)
-        else { fail("data_materialize") };
+        // Load leaves are derived from the parsed ELF; no PT index or
+        // virtual address is assumed while selecting ELF bytes to copy.
+        let mut copied = [None; 2];
+        for (i, outcome) in copied.iter_mut().enumerate() {
+            let Some(leaf) = launch.leaves[i] else { fail("missing_load_leaf") };
+            let Some(segment_index) = leaf.source_segment else { fail("stack_as_elf") };
+            let Some(segment) = plan.segments[segment_index] else { fail("missing_segment") };
+            let page = &mut *ptrs[4 + i].cast::<[u8; PAGE_SIZE]>();
+            let Ok(contents) = materialize(elf, &segment, leaf.virtual_address, page)
+            else { fail("elf_leaf_materialize") };
+            *outcome = Some(contents);
+        }
+        let Some(t) = copied[0] else { fail("no_text_page") };
+        let Some(d) = copied[1] else { fail("no_data_page") };
+        let text_page = &*ptrs[4].cast::<[u8; PAGE_SIZE]>();
+        let data_page = &*ptrs[5].cast::<[u8; PAGE_SIZE]>();
         if !t.executable || t.writable || t.copied != text.file_size as usize
             || d.executable || !d.writable || d.copied != 1
             || data_page[0] != 0x5a || data_page[1..65].iter().any(|b| *b != 0)
@@ -325,14 +341,21 @@ pub fn enter(hhdm: u64) -> ! {
         let pdpt = &mut *ptrs[1].cast::<[u64; SLOTS]>();
         let pd = &mut *ptrs[2].cast::<[u64; SLOTS]>();
         let pt = &mut *ptrs[3].cast::<[u64; SLOTS]>();
-        if ((code >> 30) & 511) != 0 || ((code >> 21) & 511) != 2
-            || ((code >> 12) & 511) != 1
+        let pdpt_index = ((code >> 30) & 511) as usize;
+        let pd_index = ((code >> 21) & 511) as usize;
+        if pdpt_index != 0 || pd_index != 2 || ((code >> 12) & 511) != 1
         { fail("user_table_indices") }
-        pdpt[0] = frames[2] | PRESENT | WRITE | USER;
-        pd[2] = frames[3] | PRESENT | WRITE | USER;
-        pt[1] = frames[4] | PRESENT | USER;
-        pt[3] = frames[5] | PRESENT | WRITE | USER | NX;
-        pt[4] = frames[6] | PRESENT | WRITE | USER | NX;
+        pdpt[pdpt_index] = frames[2] | PRESENT | WRITE | USER;
+        pd[pd_index] = frames[3] | PRESENT | WRITE | USER;
+        for (i, leaf) in launch.leaves[..launch.len].iter().enumerate() {
+            let Some(leaf) = leaf else { fail("missing_mapping_leaf") };
+            if leaf.writable && leaf.executable { fail("write_execute_leaf") }
+            let index = ((leaf.virtual_address >> 12) & 511) as usize;
+            if pt[index] != 0 { fail("duplicate_mapping_leaf") }
+            pt[index] = frames[4 + i] | PRESENT | USER
+                | if leaf.writable { WRITE } else { 0 }
+                | if leaf.executable { 0 } else { NX };
+        }
         let entry = frames[1] | PRESENT | WRITE | USER;
         root[slot] = entry;
         let inherited = kernel_half_shadow::graft_kernel_half(
