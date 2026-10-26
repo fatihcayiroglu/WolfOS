@@ -16,6 +16,14 @@
 .global _after_putc
 .global _after_exit
 _start:
+.ifdef WOLFOS_THREE_LOAD_SMOKE
+    // The next instruction executes in a SEPARATE ELF RX page after an
+    // actual CPL3 CALL/RET. The guest fails before its first syscall if the
+    // second page is missing, non-executable, or contains the wrong bytes.
+    call _second_rx_page_probe
+    cmp eax, 0x5345434f
+    jne fail
+.endif
     mov eax, 1
     xor edi, edi
     xor esi, esi
@@ -246,3 +254,12 @@ fixture_magic: .byte 0x5a
 .section .bss
 .global uninitialized
 uninitialized: .zero 64
+
+.ifdef WOLFOS_THREE_LOAD_SMOKE
+// Linked into the SECOND RX user page at 0x402000; not a copied test array.
+.section .text.second_page,"ax"
+.global _second_rx_page_probe
+_second_rx_page_probe:
+    mov eax, 0x5345434f
+    ret
+.endif
