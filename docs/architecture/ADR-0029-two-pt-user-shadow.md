@@ -35,6 +35,22 @@ data/BSS bytes, HHDM frame provenance, tampered data and executable-data
 PTE rejection, unchanged physical CR3, and complete eight-frame cleanup.
 It exposes \`WOLFOS_USER_TWO_PT_OK\` in the real QEMU serial evidence.
 
+The follow-up admission gate also binds these checks in one fail-closed
+`audit_two_pt_staged_image`: all five exact table frames, all 2,560 PTEs,
+immutable ELF-backed RX/RW bytes, exactly one backing for every LOAD leaf
+and a disjoint zeroed RW+NX stack. Host and hardware tests reject mutations
+of staged bytes, forged PTE permission upgrades, duplicates and wrong
+backings. Only after strict admission does the disconnected root borrow
+the live Limine high-half PML4 entries. Their user privilege bits are
+cleared and audited, including a test that rejects a deliberate high-half
+U/S escalation before restoring the expected supervisor-only bytes.
+The original CR3 remains active throughout.
+
+The `WOLFOS_USER_TWO_PT_OK` marker additionally requires
+`staged_admission=1`, `admission_tamper_denied=1`,
+`kernel_supervisor=1`, `high_half_copied=1` and
+`high_half_escalation_denied=1`.
+
 All preexisting one-PT ELF execution / ProcessTable / Shield tests remain
 unchanged and must pass. No physical disk is touched.
 
@@ -44,7 +60,7 @@ This is a **shadow-only**, BSP/IF=0 validation of the two-PT hierarchy,
 not a general-purpose multi-address-space PMM or live Ring3 launcher.
 The runtime ELF hello still uses its previously audited one-PT path;
 new trusted code must pin PMM frames, prove byte-source immutability,
-audit higher-half mappings and process ownership, and perform controlled
+audit higher-half descendants and process ownership, and perform controlled
 CR3/IRET handoff before any new two-PT image is actually executed.
 Future work includes more PD/PT regions, guard pages, dynamic frame
 bookkeeping, ELF loading from trusted packages and signed manifests,

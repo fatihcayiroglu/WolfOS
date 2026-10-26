@@ -93,6 +93,83 @@ pub fn audit_staged_image(
     Ok(plan)
 }
 
+/// A two-PT admission failure. Unlike the legacy one-PT contract, this
+/// independently binds every derived LOAD leaf to its owned data frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TwoPtAdmissionError {
+    Mapping(crate::user_vm_two_pt::TwoPtElfError),
+    BackingCount,
+    BackingMismatch,
+    FileBytes(PageAuditError),
+    StackBytes(usize),
+}
+
+/// Read-only, fail-closed last admission gate for a disconnected two-PT ELF.
+///
+/// Verifies the full five-table hierarchy and every ELF-derived RX/RW/NX
+/// leaf, then demands exactly one distinct immutable backing per LOAD page
+/// and a separate zeroed stack. Call audit_hhdm_backings on the SAME borrowed
+/// frames before accepting any HHDM/PMM provenance claim. After an optional
+/// high-half graft the PML4 differs by design; this entire strict check
+/// must be rerun on a new ungrafted root, not on a live CR3.
+pub fn audit_two_pt_staged_image(
+    image: &[u8],
+    tables: [u64; crate::user_vm_two_pt::TABLE_FRAMES],
+    mapped: &[UserPage],
+    pml4: &[u64; ENTRY_COUNT],
+    pdpt: &[u64; ENTRY_COUNT],
+    pd: &[u64; ENTRY_COUNT],
+    pt0: &[u64; ENTRY_COUNT],
+    pt1: &[u64; ENTRY_COUNT],
+    file_backings: &[BackingPage<'_>],
+    stack: BackingPage<'_>,
+) -> Result<crate::user_elf_launch_layout::StaticLaunchLayout, TwoPtAdmissionError> {
+    let layout = crate::user_vm_two_pt::audit_elf_bindings(
+        image, pml4, pdpt, pd, pt0, pt1, tables, mapped,
+    ).map_err(TwoPtAdmissionError::Mapping)?;
+
+    if file_backings.len().checked_add(1) != Some(mapped.len()) {
+        return Err(TwoPtAdmissionError::BackingCount);
+    }
+    let Some(stack_leaf) = mapped.iter()
+        .find(|page| page.virtual_address == layout.stack_page)
+    else { return Err(TwoPtAdmissionError::BackingMismatch) };
+    if stack.virtual_address != layout.stack_page
+        || stack.physical_frame != stack_leaf.physical_frame
+    {
+        return Err(TwoPtAdmissionError::BackingMismatch);
+    }
+
+    for (i, backing) in file_backings.iter().enumerate() {
+        if backing.virtual_address == layout.stack_page
+            || core::ptr::eq(backing.bytes, stack.bytes)
+            || file_backings[..i].iter().any(|earlier|
+                earlier.virtual_address == backing.virtual_address
+                    || core::ptr::eq(earlier.bytes, backing.bytes))
+        {
+            return Err(TwoPtAdmissionError::BackingMismatch);
+        }
+        let Some(mapped_leaf) = mapped.iter()
+            .find(|page| page.virtual_address == backing.virtual_address)
+        else { return Err(TwoPtAdmissionError::BackingMismatch) };
+        if mapped_leaf.physical_frame != backing.physical_frame {
+            return Err(TwoPtAdmissionError::BackingMismatch);
+        }
+        let Some(source_index) = layout.leaves[..layout.len].iter()
+            .flatten()
+            .find(|leaf| leaf.virtual_address == backing.virtual_address)
+            .and_then(|leaf| leaf.source_segment)
+        else { return Err(TwoPtAdmissionError::BackingMismatch) };
+        let Some(segment) = layout.image.segments[source_index]
+        else { return Err(TwoPtAdmissionError::BackingMismatch) };
+        audit_materialized_batch(
+            image, [(&segment, backing.virtual_address)], [backing.bytes],
+        ).map_err(TwoPtAdmissionError::FileBytes)?;
+    }
+    audit_zeroed_stack(stack.bytes).map_err(TwoPtAdmissionError::StackBytes)?;
+    Ok(layout)
+}
+
 /// A kernel-side provenance check for the physical-to-virtual byte view.
 /// The caller still owns/pins the PMM frames: this validates the actual
 /// reference pointer address is EXACTLY HHDM + its asserted physical frame.

@@ -43,7 +43,10 @@ def main() -> int:
         two_pt_marker = (
             "WOLFOS_USER_TWO_PT_OK frames=8 tables=5 pt_regions=2 load_pages=2 "
             "stack_rw_nx=1 elf_bound=1 bss_zero=1 hhdm_provenance=1 "
-            "tamper_denied=1 pte_denied=1 cr3_unchanged=1 freed=8 ring3=0"
+            "tamper_denied=1 pte_denied=1 staged_admission=1 "
+            "admission_tamper_denied=1 kernel_supervisor=1 "
+            "high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 "
+            "high_half_escalation_denied=1 cr3_unchanged=1 freed=8 ring3=0"
         )
         if (MARKER not in output or multi_marker not in output
                 or two_pt_marker not in output or "WOLFOS_BOOT_OK" not in output):
@@ -63,7 +66,7 @@ def main() -> int:
             print(f"FAIL: expected clean debug-exit 33, got {run.returncode}")
             print(run.stderr.decode(errors="replace"))
             return 1
-        print("PASS: two independent roots, single-PT and two-PT PMM-backed ELF/stack roots, no CR3 load")
+        print("PASS: two independent roots, single-PT and two-PT staged admission and high-half grafts, no CR3 load")
         return 0
 
 if __name__ == "__main__":

@@ -307,7 +307,7 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
 /// Real-PMM-backed SECOND disconnected proof. The SAME eight exclusively
 /// owned frames are reused only after the preceding one-PT audit returned.
 /// Here frames[0..5] are five table frames; frames[5..8] are RX/RW/stack.
-/// No physical disk, hardware CR3 load, or user execution is involved.
+/// The new high-half graft never activates CR3 or runs any user bytes; no disk I/O.
 fn prove_two_pt(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
     let mut file = fixture();
     // Independently derive two LOAD pages straddling exactly 0x600000.
@@ -390,6 +390,32 @@ fn prove_two_pt(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
         ).is_err();
         pt1[0] = original_pte;
 
+        // Deliberately corrupt staged RW ELF data and require the full
+        // two-PT admission gate to reject the bytes, then restore them
+        // BEFORE constructing the long-lived immutable frame borrows.
+        data_page[0x180] ^= 1;
+        let admission_tamper_denied = {
+            let corrupt_files = [
+                BackingPage { virtual_address: 0x5ff000,
+                    physical_frame: frames[5], bytes: &*text_page },
+                BackingPage { virtual_address: 0x600000,
+                    physical_frame: frames[6], bytes: &*data_page },
+            ];
+            let corrupt_stack = BackingPage { virtual_address: 0x601000,
+                physical_frame: frames[7], bytes: &*stack_page };
+            matches!(
+                user_image_admission::audit_two_pt_staged_image(
+                    &file, table_frames, &pages,
+                    root, pdpt, pd, pt0, pt1,
+                    &corrupt_files, corrupt_stack,
+                ),
+                Err(user_image_admission::TwoPtAdmissionError::FileBytes(
+                    PageAuditError::ContentMismatch { index: 0, offset: 0x180 },
+                )),
+            )
+        };
+        data_page[0x180] ^= 1;
+
         let file_backings = [
             BackingPage { virtual_address: 0x5ff000,
                 physical_frame: frames[5], bytes: &*text_page },
@@ -400,17 +426,73 @@ fn prove_two_pt(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
             virtual_address: 0x601000,
             physical_frame: frames[7], bytes: &*stack_page,
         };
-        tamper_rejected && pte_rejected
+        // The all-in-one two-PT admission must bind the same authentic ELF,
+        // all five actual shadow tables and every individual PMM backing.
+        let ready = user_image_admission::audit_two_pt_staged_image(
+            &file, table_frames, &pages,
+            root, pdpt, pd, pt0, pt1,
+            &file_backings, stack_backing,
+        ) == Ok(layout)
             && user_image_admission::audit_hhdm_backings(
                 hhdm, &file_backings, stack_backing,
-            ).is_ok()
+            ).is_ok();
+
+        if !ready || !admission_tamper_denied
+            || user_image_admission::audit_two_pt_staged_image(
+                &file, table_frames, &pages,
+                root, pdpt, pd, pt0, pt1,
+                &file_backings, stack_backing,
+            ) != Ok(layout)
+        {
+            return false;
+        }
+
+        // The shadow hierarchy is still disconnected. Inherit a verified
+        // supervisor-only high-half from the original *active* Limine root;
+        // no CR3 switch, TSS edit, IRET or user execution is performed.
+        let active_pml4_phys = Cr3::read().0.start_address().as_u64();
+        let Some(active_pml4_ptr) = hhdm.checked_add(active_pml4_phys)
+            .and_then(|value| VirtAddr::try_new(value).ok())
+        else { return false };
+        let active = &*active_pml4_ptr.as_ptr::<[u64; ENTRY_COUNT]>();
+        let user_root_entry = root[0];
+        let copied = kernel_half_shadow::graft_kernel_half(
+            active, root, 0, user_root_entry, frames,
+        );
+        let audited = kernel_half_shadow::audit_kernel_half(
+            active, root, 0, user_root_entry, frames,
+        );
+        let kernel_idx = ((crate::kmain as usize as u64 >> 39) & 511) as usize;
+        let hhdm_idx = ((hhdm >> 39) & 511) as usize;
+        if !matches!(copied, Ok(n) if n >= 1)
+            || copied != audited || kernel_idx < 256 || hhdm_idx < 256
+            || active[kernel_idx] & 1 == 0 || active[hhdm_idx] & 1 == 0
+            || root[kernel_idx] != (active[kernel_idx] & !kernel_half_shadow::PTE_USER)
+            || root[hhdm_idx] != (active[hhdm_idx] & !kernel_half_shadow::PTE_USER)
+            || root[kernel_idx] & kernel_half_shadow::PTE_USER != 0
+            || root[hhdm_idx] & kernel_half_shadow::PTE_USER != 0
+        {
+            return false;
+        }
+        let trusted_hhdm_entry = root[hhdm_idx];
+        root[hhdm_idx] |= kernel_half_shadow::PTE_USER;
+        let escalation_denied = matches!(
+            kernel_half_shadow::audit_kernel_half(
+                active, root, 0, user_root_entry, frames,
+            ),
+            Err(kernel_half_shadow::GraftError::UserAccessibleKernel),
+        );
+        root[hhdm_idx] = trusted_hhdm_entry;
+        let repaired = kernel_half_shadow::audit_kernel_half(
+            active, root, 0, user_root_entry, frames,
+        ) == copied;
+
+        tamper_rejected && pte_rejected && admission_tamper_denied
+            && ready && escalation_denied && repaired
             && audit_materialized_batch(
                 &file, requests, [&*text_page, &*data_page],
             ).is_ok()
             && audit_zeroed_stack(stack_page).is_ok()
-            && user_vm_two_pt::audit_elf_bindings(
-                &file, root, pdpt, pd, pt0, pt1, table_frames, &pages,
-            ) == Ok(layout)
             && text_page[0x100] == 0xc3
             && data_page[0x180..0x188] == [1, 2, 3, 4, 5, 6, 7, 8]
     }
@@ -469,7 +551,7 @@ pub fn verify(hhdm: u64) -> bool {
         ));
         return false;
     }
-    serial::write_line("WOLFOS_USER_TWO_PT_OK frames=8 tables=5 pt_regions=2 load_pages=2 stack_rw_nx=1 elf_bound=1 bss_zero=1 hhdm_provenance=1 tamper_denied=1 pte_denied=1 cr3_unchanged=1 freed=8 ring3=0");
+    serial::write_line("WOLFOS_USER_TWO_PT_OK frames=8 tables=5 pt_regions=2 load_pages=2 stack_rw_nx=1 elf_bound=1 bss_zero=1 hhdm_provenance=1 tamper_denied=1 pte_denied=1 staged_admission=1 admission_tamper_denied=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 high_half_escalation_denied=1 cr3_unchanged=1 freed=8 ring3=0");
     serial::write_line(
         "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 hhdm_backing=1 staged_admission=1 frame_batch=1 injected_rollback=3 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );

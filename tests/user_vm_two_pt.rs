@@ -11,6 +11,8 @@ mod user_vm_multi;
 mod user_elf_launch_layout;
 #[path = "../kernel/src/user_vm_two_pt.rs"]
 mod user_vm_two_pt;
+#[path = "../kernel/src/user_image_admission.rs"]
+mod user_image_admission;
 
 use user_vm_multi::UserPage;
 use user_vm_layout::{ENTRY_COUNT, NX, PRESENT, USER, WRITABLE};
@@ -219,4 +221,109 @@ fn unused_second_pt_remains_zero_in_one_region_while_all_frames_stay_unique() {
     assert!(t[4].iter().all(|p| *p == 0));
     assert_eq!(t[2][2], FRAMES[3] | PRESENT | USER | WRITABLE);
     assert_eq!(t[2].iter().filter(|p| **p != 0).count(), 1);
+}
+
+fn admitted_two_pt(
+    bytes: &[u8], t: &Bank, mapped: &[UserPage],
+    code: &[u8; elf64_page_image::PAGE_SIZE],
+    data: &[u8; elf64_page_image::PAGE_SIZE],
+    stack: &[u8; elf64_page_image::PAGE_SIZE],
+) -> Result<user_elf_launch_layout::StaticLaunchLayout,
+            user_image_admission::TwoPtAdmissionError> {
+    let [root, pdpt, pd, pt0, pt1] = t;
+    let files = [
+        user_image_admission::BackingPage {
+            virtual_address: 0x5ff000,
+            physical_frame: PAGES[0].physical_frame, bytes: code,
+        },
+        user_image_admission::BackingPage {
+            virtual_address: 0x600000,
+            physical_frame: PAGES[1].physical_frame, bytes: data,
+        },
+    ];
+    user_image_admission::audit_two_pt_staged_image(
+        bytes, FRAMES, mapped, root, pdpt, pd, pt0, pt1, &files,
+        user_image_admission::BackingPage {
+            virtual_address: 0x601000,
+            physical_frame: PAGES[2].physical_frame, bytes: stack,
+        },
+    )
+}
+
+#[test]
+fn two_pt_admission_binds_exact_elf_bytes_all_ptes_and_private_stack() {
+    use user_image_admission::{BackingPage, TwoPtAdmissionError as E};
+    use elf64_page_image::{materialize, PageAuditError, PAGE_SIZE};
+
+    let bytes = image();
+    let expected = user_elf_launch_layout::plan_two_pt_image(&bytes).unwrap();
+    let text = expected.image.segments[0].unwrap();
+    let writable = expected.image.segments[1].unwrap();
+    let mut rx = [0xa5u8; PAGE_SIZE];
+    let mut rw = [0xa5u8; PAGE_SIZE];
+    let mut stack = [0u8; PAGE_SIZE];
+    materialize(&bytes, &text, 0x5ff000, &mut rx).unwrap();
+    materialize(&bytes, &writable, 0x600000, &mut rw).unwrap();
+    let mut t = bank();
+    populate(&mut t, &PAGES).unwrap();
+
+    assert_eq!(admitted_two_pt(&bytes, &t, &PAGES, &rx, &rw, &stack),
+        Ok(expected));
+
+    rw[0x180] ^= 1;
+    assert_eq!(admitted_two_pt(&bytes, &t, &PAGES, &rx, &rw, &stack),
+        Err(E::FileBytes(PageAuditError::ContentMismatch {
+            index: 0, offset: 0x180,
+        })));
+    rw[0x180] ^= 1;
+    rx[0x100] ^= 1;
+    assert_eq!(admitted_two_pt(&bytes, &t, &PAGES, &rx, &rw, &stack),
+        Err(E::FileBytes(PageAuditError::ContentMismatch {
+            index: 0, offset: 0x100,
+        })));
+    rx[0x100] ^= 1;
+    stack[17] = 1;
+    assert_eq!(admitted_two_pt(&bytes, &t, &PAGES, &rx, &rw, &stack),
+        Err(E::StackBytes(17)));
+    stack[17] = 0;
+
+    let mut changed = bytes;
+    changed[0x180] ^= 1; // Source bytes changed after staging.
+    assert_eq!(admitted_two_pt(&changed, &t, &PAGES, &rx, &rw, &stack),
+        Err(E::FileBytes(PageAuditError::ContentMismatch {
+            index: 0, offset: 0x180,
+        })));
+
+    // A forged PTE mapping cannot be admitted merely because both buffers
+    // still contain the proper immutable ELF bytes.
+    t[4][0] &= !NX;
+    assert_eq!(admitted_two_pt(&bytes, &t, &PAGES, &rx, &rw, &stack),
+        Err(E::Mapping(TwoPtElfError::Mapping(TwoPtError::MismatchedLayout))));
+    t[4][0] |= NX;
+    assert_eq!(admitted_two_pt(&bytes, &t, &PAGES, &rx, &rw, &stack),
+        Ok(expected));
+
+    let [root, pdpt, pd, pt0, pt1] = &t;
+    let b0 = BackingPage { virtual_address: 0x5ff000,
+        physical_frame: PAGES[0].physical_frame, bytes: &rx };
+    let b1 = BackingPage { virtual_address: 0x600000,
+        physical_frame: PAGES[1].physical_frame, bytes: &rw };
+    let stack_backing = BackingPage { virtual_address: 0x601000,
+        physical_frame: PAGES[2].physical_frame, bytes: &stack };
+    let verify = |files: &[BackingPage<'_>], st: BackingPage<'_>| {
+        user_image_admission::audit_two_pt_staged_image(
+            &bytes, FRAMES, &PAGES, root, pdpt, pd, pt0, pt1, files, st,
+        )
+    };
+    assert_eq!(verify(&[b0], stack_backing), Err(E::BackingCount));
+    assert_eq!(verify(&[b0, b0], stack_backing), Err(E::BackingMismatch));
+    assert_eq!(verify(&[b1, b0], stack_backing), Ok(expected));
+    assert_eq!(verify(&[
+        BackingPage { physical_frame: PAGES[1].physical_frame, ..b0 }, b1
+    ], stack_backing), Err(E::BackingMismatch));
+    assert_eq!(verify(&[b0, b1],
+        BackingPage { bytes: &rx, ..stack_backing }),
+        Err(E::BackingMismatch));
+    assert_eq!(admitted_two_pt(&bytes, &t, &PAGES[..2], &rx, &rw, &stack),
+        Err(E::Mapping(TwoPtElfError::MissingOrExtraPage)));
 }
