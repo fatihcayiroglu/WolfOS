@@ -5,7 +5,7 @@ mod elf64_preflight;
 mod user_elf_launch_layout;
 
 use elf64_preflight::{ElfError, PAGE_BYTES, USER_END};
-use user_elf_launch_layout::{plan_static_image, plan_two_pt_image, LaunchError, LaunchLeaf};
+use user_elf_launch_layout::{plan_static_image, plan_two_pt_image, plan_one_pt_with_budget, plan_two_pt_with_budget, LaunchError, LaunchLeaf};
 
 fn fixture(text_page: u64, text_pages: u64, data_page: u64, data_pages: u64) -> [u8; 512] {
     let mut elf = [0u8; 512];
@@ -155,4 +155,79 @@ fn two_pt_plan_never_crosses_one_gigabyte_or_adds_a_third_pt() {
     bytes[224..232].copy_from_slice(&4096u64.to_le_bytes());
     bytes[0x1c0] = 3;
     assert_eq!(plan_two_pt_image(&bytes), Err(LaunchError::TooManyPageTables));
+}
+
+#[test]
+fn exact_prelease_budget_tracks_one_two_and_three_elf_load_pages() {
+    // One-PT gate: two ELF leaves + the independent stack + four tables.
+    let bytes = fixture(0x401000, 1, 0x403000, 1);
+    let one_pt = plan_one_pt_with_budget(&bytes).unwrap();
+    assert_eq!(one_pt.layout, plan_static_image(&bytes).unwrap());
+    assert_eq!(one_pt.frames.table_frames, 4);
+    assert_eq!(one_pt.frames.load_frames, 2);
+    assert_eq!(one_pt.frames.stack_frames, 1);
+    assert_eq!(one_pt.frames.leaf_frames, 3);
+    assert_eq!(one_pt.frames.total_frames, 7);
+    assert!(one_pt.frames.matches_exact_lease(4, 7));
+    assert!(!one_pt.frames.matches_exact_lease(5, 7));
+    assert!(!one_pt.frames.matches_exact_lease(4, 8));
+
+    // Same ELF with the two-PT runtime budget requires five table frames.
+    let two_pt = plan_two_pt_with_budget(&bytes).unwrap();
+    assert_eq!(two_pt.layout, plan_two_pt_image(&bytes).unwrap());
+    assert_eq!(two_pt.frames.table_frames, 5);
+    assert_eq!(two_pt.frames.load_frames, 2);
+    assert_eq!(two_pt.frames.leaf_frames, 3);
+    assert_eq!(two_pt.frames.total_frames, 8);
+    assert!(two_pt.frames.matches_exact_lease(5, 8));
+    assert!(!two_pt.frames.matches_exact_lease(5, 9));
+
+    // Two RX pages and one RW page across two 2-MiB table regions:
+    // five table frames plus three LOAD leaves and one NX stack = nine.
+    let three = fixture(0x5fe000, 2, 0x600000, 1);
+    let plan = plan_two_pt_with_budget(&three).unwrap();
+    assert_eq!(plan.layout.load_pages(), 3);
+    assert_eq!(plan.frames.table_frames, 5);
+    assert_eq!(plan.frames.load_frames, 3);
+    assert_eq!(plan.frames.stack_frames, 1);
+    assert_eq!(plan.frames.leaf_frames, 4);
+    assert_eq!(plan.frames.total_frames, 9);
+    assert!(plan.frames.matches_exact_lease(5, 9));
+    assert!(!plan.frames.matches_exact_lease(5, 8));
+    assert_eq!(plan_one_pt_with_budget(&three),
+        Err(LaunchError::CrossesPageTable));
+
+    // A single-LOAD ELF within one PT needs only six PMM frames in total.
+    let mut one_pt_elf = bytes;
+    one_pt_elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let sole = plan_one_pt_with_budget(&one_pt_elf).unwrap();
+    assert_eq!(sole.frames.load_frames, 1);
+    assert_eq!(sole.frames.leaf_frames, 2);
+    assert_eq!(sole.frames.table_frames, 4);
+    assert_eq!(sole.frames.total_frames, 6);
+    assert!(sole.frames.matches_exact_lease(4, 6));
+
+    // An ELF with only one executable LOAD still reserves a separate stack.
+    let mut one = fixture(0x5ff000, 1, 0x600000, 1);
+    one[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let plan = plan_two_pt_with_budget(&one).unwrap();
+    assert_eq!(plan.frames.load_frames, 1);
+    assert_eq!(plan.frames.stack_frames, 1);
+    assert_eq!(plan.frames.total_frames, 7);
+    assert_eq!(plan.layout.stack_page, 0x600000);
+}
+
+#[test]
+fn invalid_elf_never_produces_a_frame_budget_or_consumes_external_state() {
+    let mut bad = fixture(0x401000, 1, 0x403000, 1);
+    let initial = bad;
+    bad[0] = 0; // no valid ELF => no allocation budget at all
+    assert_eq!(plan_one_pt_with_budget(&bad),
+        Err(LaunchError::Elf(ElfError::Magic)));
+    assert_eq!(plan_two_pt_with_budget(&bad),
+        Err(LaunchError::Elf(ElfError::Magic)));
+    // Both helpers are pure; image bytes and caller state are untouched.
+    assert_eq!(bad[1..], initial[1..]);
+    let previous = plan_two_pt_with_budget(&initial).unwrap();
+    assert_eq!(previous.frames.total_frames, 8);
 }
