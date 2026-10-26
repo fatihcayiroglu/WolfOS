@@ -145,3 +145,26 @@ this change does not generalize the two-PT page-table builder, admit a
 6-frame one-LOAD image into real CPL3, or enable arbitrary ELF execution.
 The exact-head PR and postmerge main CI must continue testing all real
 CPL3 fixture lengths and zero-leak retirement under QEMU.
+
+## 2026-10-26: genuine single-LOAD, six-frame hardware CPL3 proof (P2)
+
+The independent GNU assembler/linker Ring3 guest gains a one-LOAD test
+linker script: exactly one RX `PT_LOAD` contains executable code,
+the 0x5a read-only fixture byte and a zero-initialized 64-byte BSS tail.
+The guest reads both fixture values **in CPL3**. An independent RW/NX user
+stack is allocated immediately after the derived load page, outside ELF.
+The preflight plan must demand four unique page-table frames, one actual
+RX image frame and one clean stack frame: exactly **six** PMM frames.
+
+The real boot flavor `make user-elf-one-load-run-smoke` must witness
+entry via the new CR3, strict PT_LOAD/PTE metadata and materialized
+fixture/BSS bytes, return from ID and ADD via INT80, 19 real PUTC calls,
+EXIT(0), restored boot CR3, counted PID reap, double-reap denial and
+exactly six successful PMM frees with no leak. Its serial proof is
+independently checked in order and rejects falling back to the legacy
+7/8/9-frame exit markers. All other real 7/8/9-frame QEMU tests remain
+required and must keep their own protected RW/NX data and stack leaves.
+
+This is a fixed independently linked ELF fixture and bounded one-PT
+test. It does not confer arbitrary ELF admission, generic user
+scheduling, production process creation or hardware driver support.
