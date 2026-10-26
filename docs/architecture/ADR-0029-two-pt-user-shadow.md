@@ -33,9 +33,13 @@ two-PT layout and shadow-map path, now also reused by a dedicated live CPL3 runn
   **already leased and zeroed** physical leaf buffers. The shared
   `materialize_bounded` contract validates ALL requested segment ranges,
   duplicate VAs and buffer counts before touching the first destination.
-  Wrong frame counts, PMM aliases, dirty LOAD/stack pages and malformed ELF
-  fail with every destination unchanged; the separate full PTE/byte/HHDM
-  audit remains mandatory before hardware CR3/IRET.
+  Caller-provided LOAD/stack buffers now carry explicit physical-frame
+  IDs through `OwnedPageBuffer`; each ID must equal its ELF-derived mapped
+  frame (including the separate stack) before any byte copy. Swapped IDs,
+  wrong frame counts, PMM aliases, dirty LOAD/stack pages and malformed ELF
+  fail with every destination unchanged. The post-stage full PTE/byte/HHDM
+  audit still proves the actual buffer-to-HHDM physical provenance before
+  hardware CR3/IRET.
 
 ## Hardware proof
 
