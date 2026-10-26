@@ -32,6 +32,16 @@ pub enum AcquireError {
     InvalidCount { requested: usize, capacity: usize },
 }
 
+/// Rejection of an external PMM ownership handoff. The complete input frame
+/// array is returned to the caller on every error; the source is untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdoptError {
+    InvalidCount { requested: usize, capacity: usize },
+    InvalidFrame { index: usize, frame: u64 },
+    DuplicateFrame { index: usize, first_index: usize },
+    NonzeroTail { index: usize, frame: u64 },
+}
+
 /// Retains exclusive staged-frame ownership. No copy/clone or implicit
 /// disarm path exists: dropping it MUST return all remaining frames unless
 /// it has been consumed by the explicit ActiveAddressSpace transfer.
@@ -59,6 +69,49 @@ impl<'a, S: FrameSource, const N: usize> FrameBatch<'a, S, N> {
             return Err(AcquireError::InvalidCount { requested, capacity: N });
         }
         Self::acquire_bounded(source, requested)
+    }
+
+    /// Transfer an already allocated PMM frame prefix into a move-only staged
+    /// owner. This makes existing kernel PMM allocations eligible for the
+    /// same rollback and later ActiveAddressSpace publication path as frames
+    /// allocated by `acquire_count`.
+    ///
+    /// No allocate/release call occurs during adoption or its validation.
+    /// Rejection returns the unchanged descriptor, and does not transfer
+    /// ownership: the caller remains responsible for its original frames.
+    /// Successful adoption disarms the caller's prior manual cleanup path;
+    /// dropping the returned guard releases each frame once in reverse order.
+    ///
+    /// # Safety
+    /// The caller must prove that every frame in `frames[..requested]` is a
+    /// live, exclusive allocation from THIS `source`, with no other owner or
+    /// pending cleanup path. The caller must not read/write freed frames or
+    /// independently release them after success. Address validation cannot
+    /// establish PMM provenance, DMA quiescence or absence of stale CR3/TLB
+    /// references. Publish via ActiveAddressSpace before any CPU uses them.
+    pub unsafe fn adopt_allocated(
+        source: &'a mut S,
+        frames: [u64; N],
+        requested: usize,
+    ) -> Result<Self, (AdoptError, [u64; N])> {
+        if requested == 0 || requested > N {
+            return Err((AdoptError::InvalidCount { requested, capacity: N }, frames));
+        }
+        for index in 0..requested {
+            let frame = frames[index];
+            if frame == 0 || frame >= (1 << 52) || frame & 4095 != 0 {
+                return Err((AdoptError::InvalidFrame { index, frame }, frames));
+            }
+            if let Some(first_index) = frames[..index].iter().position(|candidate| *candidate == frame) {
+                return Err((AdoptError::DuplicateFrame { index, first_index }, frames));
+            }
+        }
+        for index in requested..N {
+            if frames[index] != 0 {
+                return Err((AdoptError::NonzeroTail { index, frame: frames[index] }, frames));
+            }
+        }
+        Ok(Self { source, frames, live: requested })
     }
 
     fn acquire_bounded(source: &'a mut S, requested: usize) -> Result<Self, AcquireError> {
