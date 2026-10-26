@@ -30,7 +30,18 @@ pub enum ProcessState {
 pub enum ProcessError {
     InvalidPid, StalePid, InvalidFrame, DuplicateFrame, InvalidRoot,
     AlreadyOwned, WrongState, WrongAddressSpace,
-    ActiveCr3, LockBusy,
+    ActiveCr3, LockBusy, InvalidFrameCount, PartialLease,
+}
+
+/// A fixed-capacity PMM handoff with an exact, nonzero live prefix.
+/// Only as_slice() frames may be returned to PMM; tail slots are padding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CountedFrames<const N: usize> {
+    pub frames: [u64; N],
+    pub count: usize,
+}
+impl<const N: usize> CountedFrames<N> {
+    pub fn as_slice(&self) -> &[u64] { &self.frames[..self.count] }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,29 +50,41 @@ pub struct ProcessRecord<const N: usize> {
     pub state: ProcessState,
     pub cr3_root: u64,
     pub frames: [u64; N],
+    pub frame_count: usize,
     pub exit_status: u32,
 }
 impl<const N: usize> ProcessRecord<N> {
     pub const fn empty() -> Self {
         Self {
             pid: 0, state: ProcessState::Empty, cr3_root: 0,
-            frames: [0; N], exit_status: 0,
+            frames: [0; N], frame_count: 0, exit_status: 0,
         }
     }
 
-    /// Caller has just allocated all frames from its OWN PMM lease.
-    /// On validation failure, the ledger is unchanged. The caller must
-    /// dispose of its tentative PMM lease separately.
+    /// Backwards-compatible, *full* PMM lease admission.
     pub fn admit(&mut self, pid: u64, root: u64, frames: [u64; N])
         -> Result<(), ProcessError>
+    {
+        self.admit_counted(pid, root, frames, N)
+    }
+
+    /// Publish only the actual PMM-owned prefix, never unused zero padding.
+    /// Invalid count, malformed tail, alias or PID leaves the ledger unchanged.
+    /// The caller retains tentative PMM ownership on every failed admission.
+    pub fn admit_counted(&mut self, pid: u64, root: u64, frames: [u64; N],
+                         count: usize) -> Result<(), ProcessError>
     {
         if pid == 0 { return Err(ProcessError::InvalidPid) }
         if self.state != ProcessState::Empty && self.state != ProcessState::Reaped {
             return Err(ProcessError::AlreadyOwned);
         }
         if pid <= self.pid { return Err(ProcessError::StalePid) }
-        if N == 0 || root != frames[0] { return Err(ProcessError::InvalidRoot) }
-        for (i, frame) in frames.iter().copied().enumerate() {
+        if N == 0 { return Err(ProcessError::InvalidRoot) }
+        if count == 0 || count > N || frames[count..].iter().any(|&f| f != 0) {
+            return Err(ProcessError::InvalidFrameCount)
+        }
+        if root != frames[0] { return Err(ProcessError::InvalidRoot) }
+        for (i, frame) in frames[..count].iter().copied().enumerate() {
             if frame == 0 || frame & (PAGE - 1) != 0 || frame >= MAX_PHYSICAL {
                 return Err(ProcessError::InvalidFrame)
             }
@@ -71,10 +94,12 @@ impl<const N: usize> ProcessRecord<N> {
         }
         *self = Self {
             pid, state: ProcessState::Ready, cr3_root: root,
-            frames, exit_status: 0,
+            frames, frame_count: count, exit_status: 0,
         };
         Ok(())
     }
+
+    pub fn owned_frames(&self) -> &[u64] { &self.frames[..self.frame_count] }
 
     /// Called ONLY once the hardware CR3 has switched into this root.
     pub fn mark_running(&mut self, pid: u64, active_cr3: u64)
@@ -170,78 +195,92 @@ impl<const N: usize> ProcessRecord<N> {
         self.exit_with_status(pid, active_cr3, 0)
     }
 
-    /// Roll back a RESERVED/READY process before any user execution.
-    /// A caller must supply the actual hardware CR3, already verified to
-    /// differ from the tentative root. Returned frames remain the caller's
-    /// responsibility and must be released exactly once through PMM.
-    pub fn cancel_ready(&mut self, pid: u64, active_cr3: u64)
-        -> Result<[u64; N], ProcessError>
+    /// Shared release authorization; the caller must independently prove
+    /// actual hardware CR3 and quiescence before releasing PMM frames.
+    fn release_allowed(&self, pid: u64, expected: ProcessState, supervisor_cr3: u64)
+        -> Result<(), ProcessError>
     {
         self.identity(pid)?;
-        if self.state != ProcessState::Ready {
-            return Err(ProcessError::WrongState)
-        }
-        if active_cr3 == 0 || active_cr3 & (PAGE - 1) != 0
-            || active_cr3 >= MAX_PHYSICAL || active_cr3 == self.cr3_root
-        { return Err(ProcessError::ActiveCr3) }
-        let owned = self.frames;
-        self.frames = [0; N];
-        self.cr3_root = 0;
-        self.state = ProcessState::Reaped;
-        Ok(owned)
-    }
-
-    /// Cancel a BLOCKED process only after its exact wait registration and
-    /// queue ticket have been retired, all saved GPR/IRET/FX references are
-    /// quiesced, and hardware is executing a distinct supervisor CR3.
-    /// This is ownership bookkeeping ONLY: caller must independently prove
-    /// those conditions and release the returned pages exactly once via PMM.
-    /// A rejected request never changes this process or any frame lease.
-    pub fn cancel_blocked(&mut self, pid: u64, supervisor_cr3: u64)
-        -> Result<[u64; N], ProcessError>
-    {
-        self.identity(pid)?;
-        if self.state != ProcessState::Blocked {
-            return Err(ProcessError::WrongState)
-        }
+        if self.state != expected { return Err(ProcessError::WrongState) }
         if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
             || supervisor_cr3 >= MAX_PHYSICAL || supervisor_cr3 == self.cr3_root
         { return Err(ProcessError::ActiveCr3) }
-        let owned = self.frames;
+        Ok(())
+    }
+
+    fn relinquish(&mut self, pid: u64, expected: ProcessState, supervisor_cr3: u64)
+        -> Result<CountedFrames<N>, ProcessError>
+    {
+        self.release_allowed(pid, expected, supervisor_cr3)?;
+        let owned = CountedFrames { frames: self.frames, count: self.frame_count };
         self.frames = [0; N];
+        self.frame_count = 0;
         self.cr3_root = 0;
         self.state = ProcessState::Reaped;
         Ok(owned)
     }
 
-    /// Release authorization requires correct PID, EXITED state and
-    /// restored, distinct supervisor CR3. Nonzero exit codes must not pin
-    /// frames forever: report the status while relinquishing the exact lease.
-    /// The caller independently proves CPU quiescence and frees PMM pages.
-    pub fn reap_with_status(&mut self, pid: u64, active_cr3: u64)
-        -> Result<(u32, [u64; N]), ProcessError>
+    /// Count-aware rollback of a never-running READY owner.
+    pub fn cancel_ready_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<CountedFrames<N>, ProcessError>
     {
-        self.identity(pid)?;
-        if self.state != ProcessState::Exited {
-            return Err(ProcessError::WrongState)
-        }
-        if active_cr3 == 0 || active_cr3 & (PAGE - 1) != 0
-            || active_cr3 >= MAX_PHYSICAL || active_cr3 == self.cr3_root
-        { return Err(ProcessError::ActiveCr3) }
+        self.relinquish(pid, ProcessState::Ready, supervisor_cr3)
+    }
+
+    /// Count-aware teardown of a BLOCKED owner. Wait and CPU/FX references
+    /// must already have been independently retired by the trusted caller.
+    pub fn cancel_blocked_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<CountedFrames<N>, ProcessError>
+    {
+        self.relinquish(pid, ProcessState::Blocked, supervisor_cr3)
+    }
+
+    /// Count-aware reap, preserving the actual process exit code.
+    pub fn reap_with_status_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<(u32, CountedFrames<N>), ProcessError>
+    {
         let status = self.exit_status;
-        let owned = self.frames;
-        self.frames = [0; N];
-        self.cr3_root = 0;
-        self.state = ProcessState::Reaped;
+        let owned = self.relinquish(pid, ProcessState::Exited, supervisor_cr3)?;
         Ok((status, owned))
     }
 
-    /// Existing callers only require their exact PMM lease. Exit status
-    /// remains observable through the explicit reap_with_status() variant.
-    pub fn reap(&mut self, pid: u64, active_cr3: u64)
+    pub fn reap_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<CountedFrames<N>, ProcessError>
+    {
+        self.reap_with_status_counted(pid, supervisor_cr3).map(|(_, lease)| lease)
+    }
+
+    /// Legacy full-array return is forbidden for a partial lease: code
+    /// freeing all N entries would attempt to free zero-padded tail slots.
+    pub fn cancel_ready(&mut self, pid: u64, supervisor_cr3: u64)
         -> Result<[u64; N], ProcessError>
     {
-        self.reap_with_status(pid, active_cr3).map(|(_, frames)| frames)
+        self.release_allowed(pid, ProcessState::Ready, supervisor_cr3)?;
+        if self.frame_count != N { return Err(ProcessError::PartialLease) }
+        self.cancel_ready_counted(pid, supervisor_cr3).map(|lease| lease.frames)
+    }
+
+    pub fn cancel_blocked(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<[u64; N], ProcessError>
+    {
+        self.release_allowed(pid, ProcessState::Blocked, supervisor_cr3)?;
+        if self.frame_count != N { return Err(ProcessError::PartialLease) }
+        self.cancel_blocked_counted(pid, supervisor_cr3).map(|lease| lease.frames)
+    }
+
+    pub fn reap_with_status(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<(u32, [u64; N]), ProcessError>
+    {
+        self.release_allowed(pid, ProcessState::Exited, supervisor_cr3)?;
+        if self.frame_count != N { return Err(ProcessError::PartialLease) }
+        self.reap_with_status_counted(pid, supervisor_cr3)
+            .map(|(status, lease)| (status, lease.frames))
+    }
+
+    pub fn reap(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<[u64; N], ProcessError>
+    {
+        self.reap_with_status(pid, supervisor_cr3).map(|(_, frames)| frames)
     }
 
     fn identity(&self, pid: u64) -> Result<(), ProcessError> {
@@ -496,6 +535,97 @@ mod tests {
         assert_eq!(p.reap(17, 0x9000), Err(ProcessError::WrongState));
         p.admit(18, owned()[0], owned()).unwrap();
         assert_eq!(p.cancel_blocked(17, 0x9000), Err(ProcessError::StalePid));
+    }
+
+    fn padded(start: u64, count: usize) -> [u64; 9] {
+        core::array::from_fn(|i| if i < count { start + i as u64 * PAGE } else { 0 })
+    }
+
+    #[test]
+    fn counted_admission_rejects_invalid_lengths_and_tails_atomically() {
+        let mut p = ProcessRecord::<9>::empty();
+        let six = padded(0x1000, 6);
+        for invalid_count in [0, 10, usize::MAX] {
+            let before = p;
+            assert_eq!(p.admit_counted(1, six[0], six, invalid_count),
+                       Err(ProcessError::InvalidFrameCount));
+            assert_eq!(p, before);
+        }
+        let mut nonzero_tail = six;
+        nonzero_tail[6] = 0xa000;
+        assert_eq!(p.admit_counted(1, six[0], nonzero_tail, 6),
+                   Err(ProcessError::InvalidFrameCount));
+        let mut duplicate = six;
+        duplicate[5] = duplicate[3];
+        assert_eq!(p.admit_counted(1, six[0], duplicate, 6),
+                   Err(ProcessError::DuplicateFrame));
+        let mut unaligned = six;
+        unaligned[4] += 1;
+        assert_eq!(p.admit_counted(1, six[0], unaligned, 6),
+                   Err(ProcessError::InvalidFrame));
+        assert_eq!(p, ProcessRecord::empty());
+        p.admit_counted(1, six[0], six, 6).unwrap();
+        assert_eq!(p.frame_count, 6);
+        assert_eq!(p.owned_frames(), &six[..6]);
+        assert_eq!(p.frames[6..], [0; 3]);
+    }
+
+    #[test]
+    fn counted_ready_and_blocked_releases_never_return_padding_to_legacy_caller() {
+        let mut p = ProcessRecord::<9>::empty();
+        let six = padded(0x1000, 6);
+        p.admit_counted(1, six[0], six, 6).unwrap();
+        let before = p;
+        assert_eq!(p.cancel_ready(1, 0x90000), Err(ProcessError::PartialLease));
+        assert_eq!(p.cancel_ready_counted(1, six[0]), Err(ProcessError::ActiveCr3));
+        assert_eq!(p, before);
+        let returned = p.cancel_ready_counted(1, 0x90000).unwrap();
+        assert_eq!(returned.count, 6);
+        assert_eq!(returned.as_slice(), &six[..6]);
+        assert_eq!(returned.frames[6..], [0; 3]);
+        assert_eq!(p.state, ProcessState::Reaped);
+        assert_eq!(p.frame_count, 0);
+        assert_eq!(p.cancel_ready_counted(1, 0x90000), Err(ProcessError::WrongState));
+
+        let eight = padded(0x10000, 8);
+        p.admit_counted(2, eight[0], eight, 8).unwrap();
+        p.mark_running(2, eight[0]).unwrap();
+        p.block_running(2, eight[0]).unwrap();
+        let blocked = p;
+        assert_eq!(p.cancel_blocked(2, 0x90000), Err(ProcessError::PartialLease));
+        assert_eq!(p.cancel_blocked_counted(2, eight[0]), Err(ProcessError::ActiveCr3));
+        assert_eq!(p, blocked);
+        let released = p.cancel_blocked_counted(2, 0x90000).unwrap();
+        assert_eq!(released.as_slice(), &eight[..8]);
+        assert_eq!(p.frame_count, 0);
+        assert_eq!(p.cancel_blocked_counted(2, 0x90000), Err(ProcessError::WrongState));
+    }
+
+    #[test]
+    fn counted_reap_preserves_status_and_full_legacy_lease_behavior() {
+        let mut p = ProcessRecord::<9>::empty();
+        let seven = padded(0x1000, 7);
+        p.admit_counted(17, seven[0], seven, 7).unwrap();
+        p.mark_running(17, seven[0]).unwrap();
+        p.exit_with_status(17, seven[0], 42).unwrap();
+        let exited = p;
+        assert_eq!(p.reap_with_status(17, 0x90000), Err(ProcessError::PartialLease));
+        assert_eq!(p.reap_with_status_counted(17, seven[0]),
+                   Err(ProcessError::ActiveCr3));
+        assert_eq!(p, exited);
+        let (status, returned) = p.reap_with_status_counted(17, 0x90000).unwrap();
+        assert_eq!(status, 42);
+        assert_eq!(returned.as_slice(), &seven[..7]);
+        assert_eq!(p.frame_count, 0);
+        assert_eq!(p.reap_counted(17, 0x90000), Err(ProcessError::WrongState));
+
+        let nine = padded(0x10000, 9);
+        p.admit(18, nine[0], nine).unwrap();
+        assert_eq!(p.frame_count, 9);
+        p.mark_running(18, nine[0]).unwrap();
+        p.exit_zero(18, nine[0]).unwrap();
+        assert_eq!(p.reap(18, 0x90000), Ok(nine));
+        assert_eq!(p.frame_count, 0);
     }
 
     #[test]
