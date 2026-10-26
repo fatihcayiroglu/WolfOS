@@ -158,6 +158,15 @@ pub fn materialize_batch<const N: usize>(
     Ok(contents)
 }
 
+/// Exact-size writable 4-KiB backing for atomic ELF staging.
+/// The element type fixes the page size at compile time, without an allocator.
+pub trait PageBacking {
+    fn page_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE];
+}
+impl PageBacking for &mut [u8; PAGE_SIZE] {
+    fn page_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] { &mut **self }
+}
+
 /// Runtime-length variant of the prevalidated batch, capped by a compile-time
 /// maximum. Every request is inspected (including duplicates and file bounds)
 /// before the FIRST backing page is mutated. Unused capacity is inaccessible;
@@ -166,7 +175,7 @@ pub fn materialize_batch<const N: usize>(
 pub fn materialize_bounded<const MAX: usize>(
     input: &[u8],
     requests: &[(&LoadSegment, u64)],
-    destinations: &mut [&mut [u8; PAGE_SIZE]],
+    destinations: &mut [impl PageBacking],
 ) -> Result<[Option<PageContents>; MAX], MaterializeError> {
     if requests.is_empty() || requests.len() > MAX
         || requests.len() != destinations.len()
@@ -181,7 +190,7 @@ pub fn materialize_bounded<const MAX: usize>(
     let mut copied = [None; MAX];
     for (i, dest) in destinations.iter_mut().enumerate() {
         let page = checked[i].expect("every bounded page was prevalidated");
-        commit(input, &mut **dest, page);
+        commit(input, dest.page_bytes_mut(), page);
         copied[i] = Some(page.contents);
     }
     Ok(copied)
