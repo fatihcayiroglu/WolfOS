@@ -106,6 +106,27 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         self.slots.iter().copied().find(|r| r.pid == pid && Self::live(r.state))
     }
 
+    /// Read-only admission gate BEFORE a trusted scheduler loads a private
+    /// CR3. The selected READY PID must still own precisely the ordered,
+    /// counted PMM lease that was used to materialize its page tables.
+    /// No success here proves a saved IRET/FX frame or grants CPU residency:
+    /// the trap path must authenticate those independently and serialize
+    /// this check with the eventual hardware handoff.
+    pub fn validate_ready_resume_lease(
+        &self, pid: u64, expected_cr3: u64, expected_frames: &[u64],
+    ) -> Result<(), TableError> {
+        let record = self.snapshot(pid).ok_or(TableError::UnknownPid)?;
+        if record.state != ProcessState::Ready {
+            return Err(TableError::Process(ProcessError::WrongState));
+        }
+        if record.cr3_root != expected_cr3
+            || record.owned_frames() != expected_frames
+        {
+            return Err(TableError::Process(ProcessError::WrongAddressSpace));
+        }
+        Ok(())
+    }
+
     fn record_mut(&mut self, pid: u64) -> Result<&mut ProcessRecord<FRAMES>, TableError> {
         if pid == 0 { return Err(TableError::UnknownPid) }
         self.slots.iter_mut()
@@ -867,6 +888,41 @@ mod tests {
 
     fn counted(start: u64, count: usize) -> [u64; 9] {
         core::array::from_fn(|i| if i < count { start + i as u64 * PAGE } else { 0 })
+    }
+
+    #[test]
+    fn ready_resume_gate_rejects_stale_state_root_and_counted_lease_mismatch() {
+        let mut table = ProcessTable::<2, 9>::new();
+        let a = counted(0x1000, 6);
+        let b = counted(0x10000, 8);
+        let pid_a = table.reserve_counted(a[0], a, 6).unwrap();
+        let pid_b = table.reserve_counted(b[0], b, 8).unwrap();
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &a[..6]), Ok(()));
+        assert_eq!(table.validate_ready_resume_lease(pid_b, b[0], &b[..8]), Ok(()));
+        assert_eq!(table.validate_ready_resume_lease(999, a[0], &a[..6]),
+                   Err(TableError::UnknownPid));
+        assert_eq!(table.validate_ready_resume_lease(pid_a, b[0], &a[..6]),
+                   Err(TableError::Process(ProcessError::WrongAddressSpace)));
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &a[..5]),
+                   Err(TableError::Process(ProcessError::WrongAddressSpace)));
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &a),
+                   Err(TableError::Process(ProcessError::WrongAddressSpace)));
+        let mut reversed = a;
+        reversed.swap(1, 2);
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &reversed[..6]),
+                   Err(TableError::Process(ProcessError::WrongAddressSpace)));
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &b[..6]),
+                   Err(TableError::Process(ProcessError::WrongAddressSpace)));
+        table.mark_running(pid_a, a[0]).unwrap();
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &a[..6]),
+                   Err(TableError::Process(ProcessError::WrongState)));
+        table.park_running(pid_a, a[0]).unwrap();
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &a[..6]), Ok(()));
+        table.cancel_ready_counted(pid_a, 0x90000).unwrap();
+        assert_eq!(table.validate_ready_resume_lease(pid_a, a[0], &a[..6]),
+                   Err(TableError::UnknownPid));
+        // The unrelated resident remains ready and unchanged.
+        assert_eq!(table.validate_ready_resume_lease(pid_b, b[0], &b[..8]), Ok(()));
     }
 
     #[test]
