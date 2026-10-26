@@ -4,15 +4,16 @@
 //! and a separate RW+NX stack from checked ELF bytes. No image bytes are
 //! copied, PMM frames allocated, page tables written or CR3/IRET touched.
 //!
-//! Current real Ring3 smoke owns four table frames and three leaf frames:
-//! at most TWO LOAD leaves plus stack execute there today. This reusable
-//! contract permits up to THREE LOAD leaves, but a future runtime must first
-//! obtain/pin the corresponding frame count and audit the actual PTEs.
+//! The live one-PT Ring3 gate leases seven frames; separate two-PT gates
+//! lease eight or nine, depending on their ELF-derived LOAD pages. The
+//! nonallocating frame budget is checked BEFORE any PMM lease is requested.
 
 use crate::elf64_preflight::{preflight, ElfError, ImagePlan, PAGE_BYTES, USER_END};
 
 pub const MAX_LOAD_PAGES: usize = 3;
 pub const MAX_LEAVES: usize = MAX_LOAD_PAGES + 1;
+pub const ONE_PT_TABLE_FRAMES: usize = 4;
+pub const TWO_PT_TABLE_FRAMES: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LaunchError {
@@ -43,6 +44,58 @@ pub struct StaticLaunchLayout {
 
 impl StaticLaunchLayout {
     pub fn load_pages(&self) -> usize { self.len - 1 }
+}
+
+/// Exact nonallocating PMM requirement derived from validated ELF leaves.
+/// The sole stack occupies one independent RW+NX page; the paging hierarchy
+/// consumes either four (one PT) or five (two PTs) distinct table frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaunchFrameBudget {
+    pub table_frames: usize,
+    pub load_frames: usize,
+    pub stack_frames: usize,
+    pub leaf_frames: usize,
+    pub total_frames: usize,
+}
+
+impl LaunchFrameBudget {
+    /// Reject fixed smoke reservations that disagree with the checked ELF.
+    /// Runtime callers must check this BEFORE asking PMM for any frames.
+    pub fn matches_exact_lease(&self, tables: usize, total: usize) -> bool {
+        self.table_frames == tables && self.total_frames == total
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetedLaunch {
+    pub layout: StaticLaunchLayout,
+    pub frames: LaunchFrameBudget,
+}
+
+fn budgeted(layout: StaticLaunchLayout, tables: usize) -> BudgetedLaunch {
+    let load = layout.load_pages();
+    let stack = 1;
+    let leaf = load + stack;
+    BudgetedLaunch {
+        layout,
+        frames: LaunchFrameBudget {
+            table_frames: tables,
+            load_frames: load,
+            stack_frames: stack,
+            leaf_frames: leaf,
+            total_frames: tables + leaf,
+        },
+    }
+}
+
+/// One-PT ELF metadata and exact PMM lease count, with no allocation.
+pub fn plan_one_pt_with_budget(input: &[u8]) -> Result<BudgetedLaunch, LaunchError> {
+    Ok(budgeted(plan_static_image(input)?, ONE_PT_TABLE_FRAMES))
+}
+
+/// Two-PT ELF metadata and exact PMM lease count, with no allocation.
+pub fn plan_two_pt_with_budget(input: &[u8]) -> Result<BudgetedLaunch, LaunchError> {
+    Ok(budgeted(plan_two_pt_image(input)?, TWO_PT_TABLE_FRAMES))
 }
 
 /// Strictly bounded staging contract for any supported static ELF image.

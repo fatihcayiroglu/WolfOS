@@ -27,7 +27,7 @@ use x86_64::{
 };
 use crate::{
     elf64_page_image::{materialize, PAGE_SIZE},
-    user_elf_launch_layout::{plan_static_image, plan_two_pt_image},
+    user_elf_launch_layout::{plan_one_pt_with_budget, plan_two_pt_with_budget},
     interrupts, kernel_half_shadow, pmm, serial,
     process_lifecycle::ProcessState,
     process_table::{ProcessTableCell, TableError},
@@ -233,11 +233,19 @@ pub fn enter(hhdm: u64) -> ! {
     // the kernel's source or directly copied from a handbuilt instruction
     // array. They must pass the strict ELF64 ET_EXEC parser and PT_LOAD
     // data/BSS materialization path developed in PRs #62-#65.
-    let Ok(launch) = (if cfg!(feature = "user-elf-two-pt-run-smoke") {
-        plan_two_pt_image(elf)
+    let Ok(prepared) = (if cfg!(feature = "user-elf-two-pt-run-smoke") {
+        plan_two_pt_with_budget(elf)
     } else {
-        plan_static_image(elf)
+        plan_one_pt_with_budget(elf)
     }) else { fail("elf_launch_layout") };
+    let launch = prepared.layout;
+    // The source ELF, not the smoke's compile-time page count, determines
+    // the exact PMM lease requirement. Mismatched flavors fail BEFORE PMM.
+    if !prepared.frames.matches_exact_lease(TABLE_FRAMES, FRAMES)
+        || prepared.frames.load_frames != LOAD_LEAVES
+        || prepared.frames.leaf_frames != launch.len
+        || prepared.frames.stack_frames != 1
+    { fail("elf_prelease_frame_budget") }
     let plan = launch.image;
     let right_elf_leaf_owners = if cfg!(feature = "user-elf-three-load-run-smoke") {
         launch.leaves[0].and_then(|page| page.source_segment) == Some(0)

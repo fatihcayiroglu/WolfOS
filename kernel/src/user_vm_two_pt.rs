@@ -8,9 +8,9 @@
 use crate::elf64_preflight::PAGE_BYTES;
 use crate::user_vm_layout::{indices, ENTRY_COUNT, NX, PRESENT, USER, WRITABLE};
 use crate::user_vm_multi::UserPage;
-use crate::user_elf_launch_layout::{plan_two_pt_image, LaunchError, StaticLaunchLayout, MAX_LEAVES};
+use crate::user_elf_launch_layout::{plan_two_pt_image, LaunchError, StaticLaunchLayout, MAX_LEAVES, TWO_PT_TABLE_FRAMES};
 
-pub const TABLE_FRAMES: usize = 5;
+pub const TABLE_FRAMES: usize = TWO_PT_TABLE_FRAMES;
 pub const MAX_PAGES: usize = 8;
 const PHYSICAL_END: u64 = 1 << 52;
 
