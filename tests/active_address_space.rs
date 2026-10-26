@@ -89,6 +89,57 @@ fn transfer_and_live_drop_never_call_allocator_release() {
 }
 
 #[test]
+fn externally_allocated_pmm_lease_survives_publication_until_retired() {
+    let mut source = Source::new(&[0x1000, 0x2000, 0x3000]);
+    let trace = source.trace.clone();
+    let frames = [
+        source.allocate().unwrap(),
+        source.allocate().unwrap(),
+        source.allocate().unwrap(),
+        0,
+    ];
+    // SAFETY: source issued these three exclusive PMM leases and no caller
+    // cleanup path remains after the successful staged ownership transfer.
+    let batch = unsafe { FrameBatch::<_, 4>::adopt_allocated(&mut source, frames, 3) }
+        .unwrap_or_else(|_| panic!("adopt"));
+    let mut owner = ActiveAddressSpace::<_, 4, 4>::publish(batch, 7, 0x1000, 0x9000)
+        .unwrap_or_else(|_| panic!("publish"));
+    assert_eq!(owner.leased_frames(), &[0x1000, 0x2000, 0x3000]);
+    let ticket = owner.reserve_cpu(3).unwrap();
+    owner.confirm_active(ticket, 0x1000).unwrap();
+    owner.begin_retirement().unwrap();
+    assert!(trace.borrow().releases.is_empty());
+    owner = match reclaim(owner) {
+        Err((owner, Error::WrongPhase)) => owner,
+        _ => panic!("premature reclaim was allowed"),
+    };
+    owner.acknowledge_quiescent(ticket, 0x9000).unwrap();
+    owner.finish_retirement().unwrap();
+    // SAFETY: synthetic host fixture has no real CPU loaded with this CR3,
+    // no real saved Ring3 frames, mappings, or pending asynchronous users.
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 3, failed: 0 }));
+    assert_eq!(trace.borrow().releases, [0x3000, 0x2000, 0x1000]);
+    assert!(trace.borrow().owned.is_empty());
+}
+
+#[test]
+fn failed_active_publication_returns_adopted_staged_owner_for_rollback() {
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let frames = [source.allocate().unwrap(), source.allocate().unwrap(), 0];
+    // SAFETY: both fresh frames are exclusively held by this handoff.
+    let batch = unsafe { FrameBatch::<_, 3>::adopt_allocated(&mut source, frames, 2) }
+        .unwrap_or_else(|_| panic!("adopt"));
+    let (batch, error) = ActiveAddressSpace::<_, 3, 4>::publish(batch, 7, 0x3000, 0x9000)
+        .err().expect("unowned CR3 must be rejected");
+    assert_eq!(error, PublishError::RootNotOwned);
+    assert!(trace.borrow().releases.is_empty());
+    assert_eq!(batch.close(), ReleaseReport { released: 2, failed: 0 });
+    assert_eq!(trace.borrow().releases, [0x2000, 0x1000]);
+    assert!(trace.borrow().owned.is_empty());
+}
+
+#[test]
 fn pending_retiring_and_retired_drop_all_retain_frames() {
     for phase in 0..3 {
         let mut source = Source::new(&[0x1000]);
