@@ -3,11 +3,16 @@
 mod elf64_preflight;
 #[path = "../kernel/src/user_elf_launch_layout.rs"]
 mod user_elf_launch_layout;
+#[path = "../kernel/src/elf64_page_image.rs"]
+mod elf64_page_image;
+#[path = "../kernel/src/pmm_frame_batch.rs"]
+mod pmm_frame_batch;
 #[path = "../kernel/src/user_elf_page_tables.rs"]
 mod user_elf_page_tables;
 
 use user_elf_launch_layout::{LaunchError, plan_bounded_with_budget};
-use user_elf_page_tables::{ElfPageTables, MappingError, TableBuffers};
+use user_elf_page_tables::{ElfPageTables, MappingError, OwnedLeafPage, StageError, TableBuffers};
+use elf64_page_image::PAGE_SIZE;
 
 fn image(text: u64, text_pages: u64, data: Option<u64>) -> Vec<u8> {
     let mut b = vec![0; 1024];
@@ -295,4 +300,178 @@ fn high_physical_addresses_are_never_truncated_to_32_bits() {
         walk(&bank, &owned, (1 << 39) + 0x401000),
         Some(owned[4] | 5)
     );
+}
+
+#[test]
+fn the_exact_six_seven_eight_and_nine_frame_recipes_stage_real_elf_bytes() {
+    for (mut elf, table_frames, loads, total) in [
+        (image(0x401000, 1, None), 4, 1, 6),
+        (image(0x401000, 1, Some(0x403000)), 4, 2, 7),
+        (image(0x401000, 1, Some(0x600000)), 5, 2, 8),
+        (image(0x401000, 2, Some(0x600000)), 5, 3, 9),
+    ] {
+        elf[0x300] = 0x5a;
+        let owned = frames(total);
+        let mapper = ElfPageTables::bind(&elf, 11, &owned).unwrap();
+        let mut pages = vec![[0u8; PAGE_SIZE]; loads];
+        let mut stack_page = [0u8; PAGE_SIZE];
+        {
+            let mut buffers: Vec<OwnedLeafPage<'_>> = pages.iter_mut().enumerate()
+                .map(|(i, bytes)| OwnedLeafPage {
+                    physical_frame: owned[table_frames + i],
+                    bytes,
+                }).collect();
+            let mut stack = OwnedLeafPage {
+                physical_frame: owned[total - 1],
+                bytes: &mut stack_page,
+            };
+            let result = mapper.stage_load_and_stack(&elf, &mut buffers, &mut stack)
+                .expect("the shared page-table budget also drives safe payload staging");
+            assert_eq!(result[0].unwrap().copied, 8);
+            assert!(result[0].unwrap().executable);
+            assert!(!result[0].unwrap().writable);
+            for inactive in &result[loads..] {
+                assert_eq!(*inactive, None);
+            }
+            if loads == 3 {
+                assert_eq!(result[1].unwrap().copied, 0); // second RX BSS page
+            }
+        }
+        assert_eq!(pages[0][0x200], 0xc3);
+        assert!(pages[0][0x201..].iter().all(|b| *b == 0));
+        if loads > 1 {
+            assert_eq!(pages[loads - 1][0x300], 0x5a);
+        }
+        assert!(stack_page.iter().all(|b| *b == 0));
+        assert!(pages.iter().all(|p| p[PAGE_SIZE - 1] == 0));
+    }
+}
+
+#[test]
+fn stage_rejects_late_wrong_frame_and_dirty_stack_before_any_payload_write() {
+    let elf = image(0x401000, 2, Some(0x600000));
+    let owned = frames(9);
+    let mapper = ElfPageTables::bind(&elf, 7, &owned).unwrap();
+    let mut pages = vec![[0u8; PAGE_SIZE]; 3];
+    let mut stack_page = [0u8; PAGE_SIZE];
+    {
+        let mut buffers: Vec<OwnedLeafPage<'_>> = pages.iter_mut().enumerate()
+            .map(|(i, bytes)| OwnedLeafPage {
+                physical_frame: owned[5 + i], bytes,
+            }).collect();
+        let mut stack = OwnedLeafPage {
+            physical_frame: owned[8], bytes: &mut stack_page,
+        };
+
+        buffers[2].physical_frame = owned[1];
+        assert_eq!(
+            mapper.stage_load_and_stack(&elf, &mut buffers, &mut stack),
+            Err(StageError::BackingFrameMismatch { index: 2 }),
+        );
+        buffers[2].physical_frame = owned[7];
+
+        stack.bytes[PAGE_SIZE - 1] = 0xa5;
+        assert_eq!(
+            mapper.stage_load_and_stack(&elf, &mut buffers, &mut stack),
+            Err(StageError::DirtyOwnedPage { index: 3 }),
+        );
+        assert!(buffers.iter().all(|p| p.bytes.iter().all(|b| *b == 0)));
+        assert_eq!(stack.bytes[PAGE_SIZE - 1], 0xa5);
+        stack.bytes[PAGE_SIZE - 1] = 0;
+
+        let changed = image(0x401000, 1, Some(0x600000));
+        assert_eq!(
+            mapper.stage_load_and_stack(&changed, &mut buffers, &mut stack),
+            Err(StageError::ChangedImageLayout),
+        );
+        assert_eq!(
+            mapper.stage_load_and_stack(&[0u8; 8], &mut buffers, &mut stack),
+            Err(StageError::Image(LaunchError::Elf(
+                elf64_preflight::ElfError::Truncated
+            ))),
+        );
+    }
+    assert!(pages.iter().all(|p| p.iter().all(|b| *b == 0)));
+    assert!(stack_page.iter().all(|b| *b == 0));
+}
+
+#[derive(Default)]
+struct FakePmm {
+    next: usize,
+    fail_after: usize,
+    allocated: Vec<u64>,
+    released: Vec<u64>,
+}
+impl pmm_frame_batch::FrameSource for FakePmm {
+    fn allocate(&mut self) -> Option<u64> {
+        if self.next == self.fail_after { return None }
+        let frame = 0x10000 + 4096 * self.next as u64;
+        self.next += 1;
+        self.allocated.push(frame);
+        Some(frame)
+    }
+    fn release(&mut self, frame: u64) -> bool {
+        self.released.push(frame);
+        true
+    }
+}
+
+#[test]
+fn elf_counted_pmm_staging_rolls_back_after_rejected_payload() {
+    for (elf, expected_frames) in [
+        (image(0x401000, 1, None), 6),
+        (image(0x401000, 1, Some(0x403000)), 7),
+        (image(0x401000, 1, Some(0x600000)), 8),
+        (image(0x401000, 2, Some(0x600000)), 9),
+    ] {
+        let plan = plan_bounded_with_budget(&elf).unwrap();
+        assert_eq!(plan.frames.total_frames, expected_frames);
+        let mut pmm = FakePmm { fail_after: expected_frames, ..Default::default() };
+        {
+            let batch = pmm_frame_batch::FrameBatch::<_, 9>::acquire_count(
+                &mut pmm, plan.frames.total_frames,
+            ).unwrap();
+            let mapper = ElfPageTables::bind(&elf, 3, batch.leased_frames()).unwrap();
+            let count = plan.frames.load_frames;
+            let mut pages = vec![[0u8; PAGE_SIZE]; count];
+            let mut stack_page = [0u8; PAGE_SIZE];
+            stack_page[PAGE_SIZE - 1] = 1; // late admission failure, no payload copied
+            let mut buffers: Vec<OwnedLeafPage<'_>> = pages.iter_mut().enumerate()
+                .map(|(i, bytes)| OwnedLeafPage {
+                    physical_frame: batch.leased_frames()[plan.frames.table_frames + i],
+                    bytes,
+                }).collect();
+            let mut stack = OwnedLeafPage {
+                physical_frame: batch.leased_frames()[expected_frames - 1],
+                bytes: &mut stack_page,
+            };
+            assert_eq!(
+                mapper.stage_load_and_stack(&elf, &mut buffers, &mut stack),
+                Err(StageError::DirtyOwnedPage { index: count }),
+            );
+            assert!(buffers.iter().all(|page| page.bytes.iter().all(|b| *b == 0)));
+            // Neither the sealed recipe nor a staged batch may be published.
+            // Drop returns the exact ELF-derived live prefix in reverse.
+        }
+        assert_eq!(pmm.allocated.len(), expected_frames);
+        assert_eq!(pmm.released.len(), expected_frames);
+        assert_eq!(pmm.released, pmm.allocated.iter().rev().copied().collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn elf_counted_pmm_short_allocation_releases_exact_partial_prefix() {
+    let elf = image(0x401000, 2, Some(0x600000));
+    let needed = plan_bounded_with_budget(&elf).unwrap().frames.total_frames;
+    assert_eq!(needed, 9);
+    let mut pmm = FakePmm { fail_after: 4, ..Default::default() };
+    assert_eq!(
+        pmm_frame_batch::FrameBatch::<_, 9>::acquire_count(&mut pmm, needed)
+            .err().expect("the fifth allocation fails"),
+        pmm_frame_batch::AcquireError::Exhausted {
+            acquired: 4,
+            rollback: pmm_frame_batch::ReleaseReport { released: 4, failed: 0 },
+        }
+    );
+    assert_eq!(pmm.released, pmm.allocated.iter().rev().copied().collect::<Vec<_>>());
 }
