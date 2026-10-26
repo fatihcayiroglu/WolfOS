@@ -87,3 +87,19 @@ allocate kernel process slots, generalize shared Ring3 CPU execution, or
 claim arbitrary ELF readiness. Existing true-CPL3 and fixed-flavor QEMU
 controls must stay green. Subsequent work will integrate the counted lease
 end-to-end with context-retirement and Ring3 process creation.
+ 
+## 2026-10-26 follow-up: count-aware saved-context owner matching (P2)
+
+`Ring3SavedBinding` now reads the registry's typed counted PMM snapshot and
+compares precisely that ordered live prefix to the separately held
+`ActiveAddressSpace` lease. The owner still authenticates PID generation,
+CR3 root, live retirement phase, and exact ordered physical frames; an
+extra/missing/reordered page or a stale PID refuses registration without
+pinning a new saved-context ticket. Legacy full-array matching remains
+fail-closed for partial leases.
+
+Host owner/queue/registry composition tests include all four 6/7/8/9-frame
+leases, incorrect frame counts, different CR3 roots, old PID generations,
+blocked wait cancellation, and real allocator release-count traces.
+This does NOT prove a real CPL3 capture, FPU provenance, scheduler lock,
+IRQ wakeup, or generic ELF deployment; those remain external obligations.

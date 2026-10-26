@@ -100,14 +100,19 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         self.gate.snapshot()
     }
 
-    /// Fail closed unless the live PMM owner corresponds to exactly one
-    /// process-table generation, CR3 root and ordered lease. ProcessTable
-    /// requires its root at index zero. This is only metadata corroboration:
-    /// caller must still prove real saved GPR/IRET/FX and CPU provenance.
-    pub fn matches_process_lease(&self, pid: u64, root: u64, frames: &[u64; N]) -> bool {
+    /// Match the live PID/root and the *actual* ordered physical lease,
+    /// irrespective of backing array capacity. Reject missing, extra or
+    /// reordered frames; the caller still authenticates real saved GPR/FX.
+    pub fn matches_process_lease_counted(&self, pid: u64, root: u64, frames: &[u64]) -> bool {
         self.gate.snapshot().phase == Phase::Live
             && self.gate.matches_process_identity(pid, root)
-            && self.batch.leased_frames() == &frames[..]
+            && self.batch.leased_frames() == frames
+    }
+
+    /// Compatibility check for legacy callers declaring every slot leased.
+    /// A counted short owner never matches a zero-padded full array.
+    pub fn matches_process_lease(&self, pid: u64, root: u64, frames: &[u64; N]) -> bool {
+        self.matches_process_lease_counted(pid, root, &frames[..])
     }
 
     /// Only for a fresh entry that has no saved resumable context. A scheduler

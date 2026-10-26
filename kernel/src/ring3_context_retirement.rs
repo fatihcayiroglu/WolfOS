@@ -131,9 +131,10 @@ impl Ring3SavedBinding {
         if !matches!(state, State::Ready | State::Blocked) {
             return Err(Error::WrongState);
         }
-        let (root, frames) = registry.saved_binding_lease(handle.pid, state == State::Blocked)
-            .ok_or(Error::RegistryMismatch)?;
-        if !owner.matches_process_lease(handle.pid, root, &frames) {
+        let (root, frames) = registry.saved_binding_lease_counted(
+            handle.pid, state == State::Blocked,
+        ).ok_or(Error::RegistryMismatch)?;
+        if !owner.matches_process_lease_counted(handle.pid, root, frames.as_slice()) {
             return Err(Error::OwnerMismatch);
         }
         Self::attach_unchecked(owner, queue, handle, saved_slot)
