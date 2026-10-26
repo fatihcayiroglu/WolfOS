@@ -680,6 +680,149 @@ fn registry_bound_admission_rejects_wrong_state_stale_handle_and_wrong_owner() {
 }
 
 #[test]
+fn counted_registry_binding_accepts_exact_pmm_prefixes_without_padding() {
+    for count in [6usize, 7, 8, 9] {
+        let addresses: [u64; 9] = core::array::from_fn(|i| (i as u64 + 1) * 4096);
+        let mut source = Source::new(&addresses);
+        let trace = source.trace.clone();
+        let batch = FrameBatch::<_, 9>::acquire_count(&mut source, count).unwrap();
+        let mut owner = ActiveAddressSpace::<_, 9, 1>::publish(
+            batch, 1, addresses[0], 0xf000,
+        ).unwrap_or_else(|_| panic!("counted publish"));
+        let padded = *owner.frames();
+        assert!(owner.matches_process_lease_counted(1, addresses[0], &addresses[..count]));
+        assert!(!owner.matches_process_lease_counted(2, addresses[0], &addresses[..count]));
+        assert!(!owner.matches_process_lease_counted(1, addresses[0], &addresses[..count - 1]));
+        assert_eq!(
+            owner.matches_process_lease_counted(1, addresses[0], &padded),
+            count == 9,
+        );
+        if count == 9 {
+            assert!(owner.matches_process_lease(1, addresses[0], &padded));
+        } else {
+            assert!(!owner.matches_process_lease(1, addresses[0], &padded));
+        }
+
+        let mut registry = ProcessTable::<1, 9>::new();
+        let pid = registry.reserve_counted(addresses[0], padded, count).unwrap();
+        assert_eq!(pid, 1);
+        let mut queue = Ring3RunQueue::<1>::new();
+        let handle = queue.admit(pid).unwrap();
+        let binding = Ring3SavedBinding::attach_from_process_table(
+            &mut owner, &registry, &queue, handle, 9,
+        ).unwrap();
+        assert_eq!(owner.context_snapshot().pending, 1 << 9);
+        // SAFETY: isolated host metadata does not publish a real user frame,
+        // CPU load, interrupt, event source, or external queued handoff.
+        unsafe { binding.cancel(&mut queue, &mut owner) }.unwrap();
+        assert_eq!(owner.context_snapshot().pending, 0);
+        let lease = registry.cancel_ready_counted(pid, 0xf000).unwrap();
+        assert_eq!(lease.count, count);
+        assert_eq!(lease.as_slice(), &addresses[..count]);
+        owner.begin_retirement().unwrap();
+        owner.finish_retirement().unwrap();
+        assert_eq!(reclaim(owner).ok(),
+                   Some(ReleaseReport { released: count, failed: 0 }));
+        let observed = trace.borrow();
+        assert!(observed.owned.is_empty());
+        assert_eq!(observed.releases.len(), count);
+    }
+}
+
+#[test]
+fn counted_binding_rejects_wrong_count_root_and_generation_without_context_pin() {
+    let addresses: [u64; 9] = core::array::from_fn(|i| (i as u64 + 1) * 4096);
+    let mut source = Source::new(&addresses);
+    let batch = FrameBatch::<_, 9>::acquire_count(&mut source, 8).unwrap();
+    let mut owner = ActiveAddressSpace::<_, 9, 1>::publish(
+        batch, 1, addresses[0], 0xf000,
+    ).unwrap_or_else(|_| panic!("counted publish"));
+    let mut queue = Ring3RunQueue::<1>::new();
+    let handle = queue.admit(1).unwrap();
+    for count in [6usize, 7, 9] {
+        let padded: [u64; 9] =
+            core::array::from_fn(|i| if i < count { addresses[i] } else { 0 });
+        let mut registry = ProcessTable::<1, 9>::new();
+        assert_eq!(registry.reserve_counted(addresses[0], padded, count), Ok(1));
+        let before = (owner.context_snapshot(), queue);
+        assert_eq!(
+            Ring3SavedBinding::attach_from_process_table(
+                &mut owner, &registry, &queue, handle, 1,
+            ),
+            Err(BindError::OwnerMismatch),
+        );
+        assert_eq!((owner.context_snapshot(), queue), before);
+    }
+    // Correct count but wrong root/order or generation must also fail closed.
+    for (root, frames, count) in [
+        (addresses[1], {
+            let mut frames = *owner.frames();
+            frames[0] = addresses[1];
+            frames[1] = addresses[0];
+            frames
+        }, 8usize),
+    ] {
+        let mut registry = ProcessTable::<1, 9>::new();
+        assert_eq!(registry.reserve_counted(root, frames, count), Ok(1));
+        assert_eq!(
+            Ring3SavedBinding::attach_from_process_table(
+                &mut owner, &registry, &queue, handle, 1,
+            ),
+            Err(BindError::OwnerMismatch),
+        );
+    }
+    assert!(!owner.matches_process_lease_counted(2, addresses[0], owner.leased_frames()));
+    let mut stale_registry = ProcessTable::<1, 9>::new();
+    let padded = *owner.frames();
+    let old_pid = stale_registry.reserve_counted(addresses[0], padded, 8).unwrap();
+    assert_eq!(stale_registry.cancel_ready_counted(old_pid, 0xf000).unwrap().count, 8);
+    assert_eq!(stale_registry.reserve_counted(addresses[0], padded, 8), Ok(2));
+    assert_eq!(
+        Ring3SavedBinding::attach_from_process_table(
+            &mut owner, &stale_registry, &queue, handle, 1,
+        ),
+        Err(BindError::RegistryMismatch),
+    );
+    assert_eq!(owner.context_snapshot().pending, 0);
+    owner.begin_retirement().unwrap();
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(),
+               Some(ReleaseReport { released: 8, failed: 0 }));
+}
+
+#[test]
+fn counted_blocked_binding_tracks_exact_lease_until_safe_cancel() {
+    let addresses: [u64; 9] = core::array::from_fn(|i| (i as u64 + 1) * 4096);
+    let mut source = Source::new(&addresses);
+    let batch = FrameBatch::<_, 9>::acquire_count(&mut source, 7).unwrap();
+    let mut owner = ActiveAddressSpace::<_, 9, 1>::publish(
+        batch, 1, addresses[0], 0xf000,
+    ).unwrap_or_else(|_| panic!("counted publish"));
+    let mut registry = ProcessTable::<1, 9>::new();
+    let pid = registry.reserve_counted(addresses[0], *owner.frames(), 7).unwrap();
+    let mut queue = Ring3RunQueue::<1>::new();
+    let handle = queue.admit(pid).unwrap();
+    assert_eq!(queue.start_next(), Ok(handle));
+    registry.mark_running(pid, addresses[0]).unwrap();
+    registry.block_running(pid, addresses[0]).unwrap();
+    assert_eq!(queue.block_current(handle), Ok(None));
+    let binding = Ring3SavedBinding::attach_from_process_table(
+        &mut owner, &registry, &queue, handle, 3,
+    ).unwrap();
+    assert_eq!(owner.context_snapshot().pending, 1 << 3);
+    owner.begin_retirement().unwrap();
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingContexts));
+    // SAFETY: host fixture holds no real saved user CPU/FX frame or IRQ wait.
+    unsafe { binding.cancel(&mut queue, &mut owner) }.unwrap();
+    let lease = registry.cancel_blocked_counted(pid, 0xf000).unwrap();
+    assert_eq!(lease.as_slice(), &addresses[..7]);
+    assert_eq!(owner.context_snapshot().pending, 0);
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(),
+               Some(ReleaseReport { released: 7, failed: 0 }));
+}
+
+#[test]
 fn counted_owner_publishes_only_budgeted_frames_and_reclaims_exact_count() {
     for count in [6usize, 7, 8, 9] {
         let addresses: [u64; 9] = core::array::from_fn(|i| (i as u64 + 1) * 4096);
