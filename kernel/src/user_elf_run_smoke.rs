@@ -35,7 +35,7 @@ use crate::{
     user_syscall_abi::{self, Outcome, UserSyscallFrame},
 };
 #[cfg(feature = "user-elf-two-pt-run-smoke")]
-use crate::{user_vm_two_pt, user_image_admission::{self, BackingPage}};
+use crate::{user_vm_two_pt, user_elf_two_pt_stager, user_image_admission::{self, BackingPage}};
 
 mod symbols {
     include!(concat!(env!("OUT_DIR"), "/wolfos_elf_symbols.rs"));
@@ -341,18 +341,39 @@ pub fn enter(hhdm: u64) -> ! {
     // until AFTER segment copying and full source/destination root audit.
     unsafe {
         for ptr in ptrs { core::ptr::write_bytes(ptr, 0, PAGE as usize); }
-        // Load leaves are derived from the parsed ELF; no PT index or
-        // virtual address is assumed while selecting ELF bytes to copy.
-        let mut copied = [None; LOAD_LEAVES];
-        for (i, outcome) in copied.iter_mut().enumerate() {
-            let Some(leaf) = launch.leaves[i] else { fail("missing_load_leaf") };
-            let Some(segment_index) = leaf.source_segment else { fail("stack_as_elf") };
-            let Some(segment) = plan.segments[segment_index] else { fail("missing_segment") };
-            let page = &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>();
-            let Ok(contents) = materialize(elf, &segment, leaf.virtual_address, page)
-            else { fail("elf_leaf_materialize") };
-            *outcome = Some(contents);
-        }
+        // The two-PT loader first checks the ELF, ALL owned frames, source
+        // ranges and clean destination buffers BEFORE changing any LOAD bytes.
+        // It supports either 2 or 3 executable/data leaves without assuming
+        // a static PT_LOAD page address. The legacy one-PT path stays intact.
+        #[cfg(feature = "user-elf-two-pt-run-smoke")]
+        let table_frames = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+        #[cfg(feature = "user-elf-two-pt-run-smoke")]
+        let (manifest, copied) = {
+            let mut destinations: [&mut [u8; PAGE_SIZE]; LOAD_LEAVES] =
+                core::array::from_fn(|i| {
+                    &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>()
+                });
+            let stack = &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>();
+            let Ok(staged) = user_elf_two_pt_stager::stage_relocated_two_pt_elf(
+                elf, slot, table_frames, &frames[TABLE_FRAMES..],
+                &mut destinations, stack,
+            ) else { fail("two_pt_atomic_elf_payload_stage") };
+            (staged.manifest, staged.copied)
+        };
+        #[cfg(not(feature = "user-elf-two-pt-run-smoke"))]
+        let copied = {
+            let mut copied = [None; LOAD_LEAVES];
+            for (i, outcome) in copied.iter_mut().enumerate() {
+                let Some(leaf) = launch.leaves[i] else { fail("missing_load_leaf") };
+                let Some(segment_index) = leaf.source_segment else { fail("stack_as_elf") };
+                let Some(segment) = plan.segments[segment_index] else { fail("missing_segment") };
+                let page = &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>();
+                let Ok(contents) = materialize(elf, &segment, leaf.virtual_address, page)
+                else { fail("elf_leaf_materialize") };
+                *outcome = Some(contents);
+            }
+            copied
+        };
         let Some(t) = copied[0] else { fail("no_text_page") };
         let Some(d) = copied[LOAD_LEAVES - 1] else { fail("no_data_page") };
         let text_page = &*ptrs[TABLE_FRAMES].cast::<[u8; PAGE_SIZE]>();
@@ -384,10 +405,6 @@ pub fn enter(hhdm: u64) -> ! {
         {
             let pt0 = &mut *ptrs[3].cast::<[u64; SLOTS]>();
             let pt1 = &mut *ptrs[4].cast::<[u64; SLOTS]>();
-            let table_frames = [frames[0], frames[1], frames[2], frames[3], frames[4]];
-            let Ok(manifest) = user_vm_two_pt::derive_relocated_elf_pages(
-                elf, slot, table_frames, &frames[TABLE_FRAMES..],
-            ) else { fail("two_pt_byte_derived_page_manifest") };
             let pages = manifest.pages();
             if manifest.layout.source != launch || manifest.load_pages() != LOAD_LEAVES
                 || manifest.layout.entry != code || pages.len() != LOAD_LEAVES + 1

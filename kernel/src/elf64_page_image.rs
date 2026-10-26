@@ -158,6 +158,35 @@ pub fn materialize_batch<const N: usize>(
     Ok(contents)
 }
 
+/// Runtime-length variant of the prevalidated batch, capped by a compile-time
+/// maximum. Every request is inspected (including duplicates and file bounds)
+/// before the FIRST backing page is mutated. Unused capacity is inaccessible;
+/// callers may admit one, two or three ELF LOAD leaves without heap allocation.
+/// This does not own frames, map PTEs, or activate a CR3.
+pub fn materialize_bounded<const MAX: usize>(
+    input: &[u8],
+    requests: &[(&LoadSegment, u64)],
+    destinations: &mut [&mut [u8; PAGE_SIZE]],
+) -> Result<[Option<PageContents>; MAX], MaterializeError> {
+    if requests.is_empty() || requests.len() > MAX
+        || requests.len() != destinations.len()
+    { return Err(MaterializeError::InvalidSegment) }
+    let mut checked: [Option<CheckedPage>; MAX] = [None; MAX];
+    for (i, (segment, va)) in requests.iter().copied().enumerate() {
+        if requests[..i].iter().any(|(_, old_va)| *old_va == va) {
+            return Err(MaterializeError::DuplicateVirtualPage);
+        }
+        checked[i] = Some(inspect(input, segment, va)?);
+    }
+    let mut copied = [None; MAX];
+    for (i, dest) in destinations.iter_mut().enumerate() {
+        let page = checked[i].expect("every bounded page was prevalidated");
+        commit(input, &mut **dest, page);
+        copied[i] = Some(page.contents);
+    }
+    Ok(copied)
+}
+
 /// Failure after a completed batch cannot be ignored during admission:
 /// a PTE may have the correct flags while its PMM-backed *bytes* do not
 /// match the immutable ELF source, including the zeroed BSS and page tails.
