@@ -127,3 +127,21 @@ Scope limit: the tested ELFs are still independently linked fixed
 fixtures and preflight still requires the expected flavor-specific
 page budget. This does not yet admit arbitrary ELF layouts, reclaim
 pages on other CPUs, or offer a production generic process launcher.
+
+## 2026-10-26: bounded, counted hardware PMM allocation buffer (P2)
+
+The real CPL3 ELF smoke allocator now uses one nine-frame maximum staging
+buffer and allocates only `prepared.frames.total_frames` validated entries.
+The zero-filled tail is checked before page-table staging and passed intact
+to `reserve_counted`; VMM mapping, source-root alias auditing, and syscall
+access use only the active 7/8/9-frame prefix. A failed partial allocation
+rolls back its distinct acquired frames in reverse and treats PMM rollback
+failure as fatal rather than silently ignoring it. A duplicate allocator
+result is never freed as a second independently owned frame.
+
+The execution fixture still checks the expected table and leaf count for
+its chosen independently linked test ELF before allocation. In particular,
+this change does not generalize the two-PT page-table builder, admit a
+6-frame one-LOAD image into real CPL3, or enable arbitrary ELF execution.
+The exact-head PR and postmerge main CI must continue testing all real
+CPL3 fixture lengths and zero-leak retirement under QEMU.
