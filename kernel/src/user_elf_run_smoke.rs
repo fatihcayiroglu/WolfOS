@@ -4,7 +4,8 @@
 //! The guest lives in user/hello.S + user/hello.ld, built by GNU as/ld into
 //! a genuine ELF file by build.rs. The kernel consumes that binary ONLY via
 //! strict existing elf64_preflight::preflight + elf64_page_image::materialize:
-//! user text RX, ELF data+BSS RW/NX, and an independent RW/NX user stack.
+//! user text RX (optionally including read-only fixture/BSS), and a separate
+//! RW/NX user stack. Multi-LOAD flavors retain their RW/NX ELF data page.
 //! Two ordinary INT80 syscalls, 19 user-console PUTC syscalls, and EXIT(0)
 //! are verified by saved GPRs, user RIP and real TSS.RSP0 stack bounds.
 //! Upon exit, the BSP MUST restore boot CR3 and release every allocated
@@ -50,15 +51,18 @@ const WRITE: u64 = 2;
 const USER: u64 = 4;
 const NX: u64 = 1 << 63;
 const SLOTS: usize = 512;
-const FRAMES: usize = if cfg!(feature = "user-elf-three-load-run-smoke") { 9 }
+const ONE_LOAD: bool = cfg!(feature = "user-elf-one-load-run-smoke");
+const FRAMES: usize = if ONE_LOAD { 6 }
+    else if cfg!(feature = "user-elf-three-load-run-smoke") { 9 }
     else if cfg!(feature = "user-elf-two-pt-run-smoke") { 8 } else { 7 };
 /// Maximum resident record capacity, independent of the exact ELF-derived
-/// 7/8/9-frame lease. Unused slots in a record must remain zero.
+/// 6/7/8/9-frame lease. Unused slots in a record must remain zero.
 const PROCESS_FRAME_CAPACITY: usize = 9;
 const TABLE_FRAMES: usize = if cfg!(feature = "user-elf-two-pt-run-smoke") { 5 } else { 4 };
-const LOAD_LEAVES: usize = if cfg!(feature = "user-elf-three-load-run-smoke") { 3 } else { 2 };
+const LOAD_LEAVES: usize = if ONE_LOAD { 1 }
+    else if cfg!(feature = "user-elf-three-load-run-smoke") { 3 } else { 2 };
 const DATA_VA: u64 = if cfg!(feature = "user-elf-two-pt-run-smoke") { 0x600000 } else { 0x403000 };
-const STACK_VA: u64 = DATA_VA + PAGE;
+const STACK_VA: u64 = if ONE_LOAD { 0x402000 } else { DATA_VA + PAGE };
 const RETURN_COUNT: usize = if cfg!(feature = "user-file-io-smoke") { 13 }
     else if cfg!(feature = "user-copy-smoke") { 3 } else { HELLO.len() + 2 };
 const TOTAL_CALLS: usize = RETURN_COUNT + 1;
@@ -231,8 +235,15 @@ pub fn enter(hhdm: u64) -> ! {
         || symbols::AFTER_EXIT <= symbols::AFTER_PUTC
         || symbols::HELLO_TEXT <= symbols::AFTER_EXIT
         || symbols::HELLO_END != symbols::HELLO_TEXT + HELLO.len() as u64
-        || symbols::FIXTURE_MAGIC != DATA_VA
-        || symbols::BSS_START != DATA_VA + 1
+        || (if ONE_LOAD {
+            symbols::FIXTURE_MAGIC < symbols::HELLO_END
+                || symbols::FIXTURE_MAGIC >= STACK_VA
+                || symbols::BSS_START != symbols::FIXTURE_MAGIC + 1
+                || symbols::BSS_START + 64 > STACK_VA
+        } else {
+            symbols::FIXTURE_MAGIC != DATA_VA
+                || symbols::BSS_START != DATA_VA + 1
+        })
         || elf.len() >= 32768
     { fail("unexpected_independent_elf_symbols") }
 
@@ -256,7 +267,10 @@ pub fn enter(hhdm: u64) -> ! {
         || prepared.frames.stack_frames != 1
     { fail("elf_prelease_frame_budget") }
     let plan = launch.image;
-    let right_elf_leaf_owners = if cfg!(feature = "user-elf-three-load-run-smoke") {
+    let right_elf_leaf_owners = if ONE_LOAD {
+        launch.leaves[0].and_then(|page| page.source_segment) == Some(0)
+            && launch.leaves[1].and_then(|page| page.source_segment).is_none()
+    } else if cfg!(feature = "user-elf-three-load-run-smoke") {
         launch.leaves[0].and_then(|page| page.source_segment) == Some(0)
             && launch.leaves[1].and_then(|page| page.source_segment) == Some(0)
             && launch.leaves[2].and_then(|page| page.source_segment) == Some(1)
@@ -266,26 +280,37 @@ pub fn enter(hhdm: u64) -> ! {
             && launch.leaves[1].and_then(|page| page.source_segment) == Some(1)
             && launch.leaves[2].and_then(|page| page.source_segment).is_none()
     };
-    if plan.len != 2 || plan.entry != symbols::ENTRY
+    if plan.len != (if ONE_LOAD { 1 } else { 2 }) || plan.entry != symbols::ENTRY
         || launch.load_pages() != LOAD_LEAVES || launch.stack_page != STACK_VA
         || !right_elf_leaf_owners
     { fail("elf_entry_or_segments") }
-    let (Some(text), Some(data)) = (plan.segments[0], plan.segments[1])
-    else { fail("elf_missing_load") };
+    let Some(text) = plan.segments[0] else { fail("elf_missing_rx_load") };
     if text.page_start != 0x401000
         || text.page_end != (if cfg!(feature = "user-elf-three-load-run-smoke") {
             0x403000
         } else { 0x402000 })
         || text.virtual_address != 0x401000
         || text.writable || !text.executable
-        || text.memory_size != text.file_size
         || text.file_size < symbols::HELLO_END - text.virtual_address
-        || data.page_start != DATA_VA || data.page_end != STACK_VA
-        || data.virtual_address != DATA_VA
-        || !data.writable || data.executable
-        || data.file_size != 1 || data.memory_size != 65
         || symbols::AFTER_EXIT >= symbols::HELLO_TEXT
-    { fail("elf_permissions_or_layout") }
+    { fail("elf_rx_permissions_or_layout") }
+    if ONE_LOAD {
+        // Independently linked RX PT_LOAD contains genuine file bytes and a
+        // zero-filled BSS tail. Writable memory is the separate NX stack.
+        if text.file_size < symbols::FIXTURE_MAGIC + 1 - text.virtual_address
+            || text.memory_size < symbols::BSS_START + 64 - text.virtual_address
+            || text.memory_size <= text.file_size
+            || plan.segments[1].is_some()
+        { fail("one_load_rx_bss_layout") }
+    } else {
+        let Some(data) = plan.segments[1] else { fail("elf_missing_rw_load") };
+        if text.memory_size != text.file_size
+            || data.page_start != DATA_VA || data.page_end != STACK_VA
+            || data.virtual_address != DATA_VA
+            || !data.writable || data.executable
+            || data.file_size != 1 || data.memory_size != 65
+        { fail("elf_rw_permissions_or_layout") }
+    }
     let hello_offset = usize::try_from(symbols::HELLO_TEXT - text.virtual_address)
         .unwrap_or(usize::MAX);
     let hello_in_file = usize::try_from(text.file_offset).ok()
@@ -324,7 +349,6 @@ pub fn enter(hhdm: u64) -> ! {
     let base = (slot as u64) << 39;
     let code = base + plan.entry;
     let text_va = base + text.page_start;
-    let data_va = base + data.page_start;
     let stack_va = base + launch.stack_page;
     let user_top = stack_va + PAGE;
     if user_ring_entry::validate(Ring3Entry {
@@ -401,15 +425,28 @@ pub fn enter(hhdm: u64) -> ! {
             copied
         };
         let Some(t) = copied[0] else { fail("no_text_page") };
-        let Some(d) = copied[LOAD_LEAVES - 1] else { fail("no_data_page") };
         let text_page = &*ptrs[TABLE_FRAMES].cast::<[u8; PAGE_SIZE]>();
-        let data_page = &*ptrs[TABLE_FRAMES + LOAD_LEAVES - 1]
-            .cast::<[u8; PAGE_SIZE]>();
         if !t.executable || t.writable
             || t.copied != (text.file_size as usize).min(PAGE_SIZE)
-            || d.executable || !d.writable || d.copied != 1
-            || data_page[0] != 0x5a || data_page[1..65].iter().any(|b| *b != 0)
-        { fail("elf_pt_load_incorrect") }
+        { fail("elf_rx_leaf_incorrect") }
+        if ONE_LOAD {
+            let fixture = usize::try_from(symbols::FIXTURE_MAGIC - text.page_start)
+                .unwrap_or(usize::MAX);
+            let bss = usize::try_from(symbols::BSS_START - text.page_start)
+                .unwrap_or(usize::MAX);
+            if text_page.get(fixture) != Some(&0x5a)
+                || text_page.get(bss..bss.saturating_add(64))
+                    != Some(&[0u8; 64][..])
+            { fail("one_load_rx_fixture_or_bss") }
+        } else {
+            let Some(d) = copied[LOAD_LEAVES - 1] else { fail("no_data_page") };
+            let data_page = &*ptrs[TABLE_FRAMES + LOAD_LEAVES - 1]
+                .cast::<[u8; PAGE_SIZE]>();
+            if d.executable || !d.writable || d.copied != 1
+                || data_page[0] != 0x5a
+                || data_page[1..65].iter().any(|b| *b != 0)
+            { fail("elf_rw_data_or_bss_incorrect") }
+        }
         #[cfg(feature = "user-elf-three-load-run-smoke")]
         {
             let Some(second) = copied[1] else { fail("missing_second_elf_rx_page") };
@@ -485,7 +522,7 @@ pub fn enter(hhdm: u64) -> ! {
                     | if leaf.writable { WRITE } else { 0 }
                     | if leaf.executable { 0 } else { NX };
             }
-            if pt.iter().filter(|entry| **entry != 0).count() != 3
+            if pt.iter().filter(|entry| **entry != 0).count() != launch.len
                 || pd.iter().filter(|entry| **entry != 0).count() != 1
                 || pdpt.iter().filter(|entry| **entry != 0).count() != 1
             { fail("one_pt_cardinality") }
@@ -508,7 +545,15 @@ pub fn enter(hhdm: u64) -> ! {
         ALLOCATED_BEFORE.store(before, Ordering::Release);
         ENTRY.store(code, Ordering::Release);
         STACK_TOP.store(user_top, Ordering::Release);
-        DATA_HHDM.store(ptrs[TABLE_FRAMES + LOAD_LEAVES - 1] as u64, Ordering::Release);
+        let data_ptr = if ONE_LOAD {
+            // This byte is in the materialized RX LOAD page; never grant write.
+            (ptrs[TABLE_FRAMES] as u64)
+                .checked_add(symbols::FIXTURE_MAGIC - text.page_start)
+                .unwrap_or_else(|| fail("one_load_fixture_hhdm"))
+        } else {
+            ptrs[TABLE_FRAMES + LOAD_LEAVES - 1] as u64
+        };
+        DATA_HHDM.store(data_ptr, Ordering::Release);
         CR3_PHYS.store(frames[0], Ordering::Release);
         STAGE.store(0, Ordering::Release);
         #[cfg(feature = "user-file-io-smoke")]
@@ -547,9 +592,15 @@ pub fn enter(hhdm: u64) -> ! {
             pid,
         ));
         serial::write_fmt(format_args!(
-            "WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 bss_zero=1 cr3_new=1 root_slot={} user_entry={:#x}\n",
-            slot, plan.entry,
+            "WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load={} rx=1 rw_nx={} bss_zero=1 cr3_new=1 root_slot={} user_entry={:#x}\n",
+            plan.len, if ONE_LOAD { 1 } else { 2 }, slot, plan.entry,
         ));
+        if ONE_LOAD {
+            serial::write_fmt(format_args!(
+                "WOLFOS_ELF_ONE_LOAD_ENTER hardware_cr3=1 load_segments=1 rx_leaves=1 nx_stack=1 owned_frames=6 root_slot={}\n",
+                slot,
+            ));
+        }
         #[cfg(all(feature = "user-elf-two-pt-run-smoke",
                   not(feature = "user-elf-three-load-run-smoke")))]
         serial::write_fmt(format_args!(
@@ -717,6 +768,8 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
         serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=14 exit=0 resources_released=1 persistent=0 production=0");
     } else if cfg!(feature = "user-copy-smoke") {
         serial::write_line("WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 int80_calls=4 exit=0 resources_released=1 production_user_copy=0");
+    } else if ONE_LOAD {
+        serial::write_line("WOLFOS_ELF_ONE_LOAD_RUN_OK linked_elf=1 hardware_cpl3=1 one_pt_load=1 rx_leaves=1 stack_rw_nx=1 int80_calls=22 exit=0 restored_cr3=1 frames_freed=6 pmm_no_leak=1");
     } else if cfg!(feature = "user-elf-three-load-run-smoke") {
         serial::write_line("WOLFOS_ELF_THREE_LOAD_RUN_OK linked_elf=1 hardware_cpl3=1 pt_frames=2 rx_leaves=2 second_rx_called=1 int80_calls=22 exit=0 restored_cr3=1 frames_freed=9 pmm_no_leak=1");
     } else if cfg!(feature = "user-elf-two-pt-run-smoke") {
