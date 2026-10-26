@@ -63,6 +63,17 @@ _after_file_bad_open:
     cmp rax, -14
     jne fail
 
+    // A real existing private file must remain inaccessible under a grant
+    // scoped ONLY to /tmp/msg.txt, even when the path points to valid RX.
+    lea rdi, [rip + private_file_path]
+    mov esi, private_file_path_end - private_file_path
+    xor edx, edx
+    mov eax, 6
+    int 0x80
+_after_file_private_denied_open:
+    cmp rax, -13
+    jne fail
+
     // Positive: OPEN_RO a user RX-text path (the 4-level walker may read RX).
     lea rdi, [rip + file_path]
     mov esi, file_path_end - file_path
@@ -108,7 +119,17 @@ _after_file_policy_revoked_read:
     cmp rax, -13
     jne fail
 
-    // Trusted test policy re-grants FileRead; now EOF and clean release.
+    // A kernel re-grant for a DIFFERENT file does not authorize this old FD.
+    mov rdi, r12
+    lea rsi, [rsp - 32]
+    mov edx, 8
+    mov eax, 7
+    int 0x80
+_after_file_wrong_scope_read:
+    cmp rax, -13
+    jne fail
+
+    // Trusted test policy restores the original exact path; now EOF.
     mov rdi, r12
     lea rsi, [rsp - 32]
     mov edx, 8
@@ -214,6 +235,9 @@ hello_end:
 file_path:
     .ascii "/tmp/msg.txt"
 file_path_end:
+private_file_path:
+    .ascii "/tmp/private.txt"
+private_file_path_end:
 
 .section .data
 .global fixture_magic

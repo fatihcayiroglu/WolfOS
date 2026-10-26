@@ -95,6 +95,13 @@ impl<const N: usize, const CAP: usize> RamFs<N, CAP> {
         }
         Ok(node)
     }
+    /// Canonical path of a live generation-checked file, for security policy.
+    pub fn name(&self, id: FileId) -> Result<&str, FsError> {
+        let node = self.get(id)?;
+        // Node names only enter through strict ASCII path validation.
+        core::str::from_utf8(&node.name[..node.name_len])
+            .map_err(|_| FsError::InvalidPath)
+    }
     pub fn info(&self, id: FileId) -> Result<FileInfo, FsError> {
         let node = self.get(id)?;
         Ok(FileInfo { size: node.size, sealed: node.sealed })
@@ -150,6 +157,7 @@ mod tests {
         let mut fs = fs();
         let id = fs.create("/bin/hello.elf").unwrap();
         assert_eq!(fs.open("/bin/hello.elf"), Ok(id));
+        assert_eq!(fs.name(id), Ok("/bin/hello.elf"));
         assert_eq!(fs.write(id, 0, b"ELF"), Ok(3));
         let mut out = [0xaau8; 8];
         assert_eq!(fs.read(id, 0, &mut out), Ok(3));
@@ -182,6 +190,7 @@ mod tests {
         assert_eq!(fs.write(id, 0, b"bad"), Err(FsError::Sealed));
         fs.unlink(id).unwrap();
         assert_eq!(fs.info(id), Err(FsError::StaleHandle));
+        assert_eq!(fs.name(id), Err(FsError::StaleHandle));
         let next = fs.create("/b").unwrap();
         assert_eq!(id.slot, next.slot);
         assert!(next.generation > id.generation);

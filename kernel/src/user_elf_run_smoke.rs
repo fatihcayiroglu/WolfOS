@@ -50,7 +50,7 @@ const NX: u64 = 1 << 63;
 const SLOTS: usize = 512;
 const FRAMES: usize = 7; // new PML4, PDPT, PD, PT, RX text, RW data/BSS, RW stack
 const STACK_VA: u64 = 0x404000;
-const RETURN_COUNT: usize = if cfg!(feature = "user-file-io-smoke") { 11 }
+const RETURN_COUNT: usize = if cfg!(feature = "user-file-io-smoke") { 13 }
     else if cfg!(feature = "user-copy-smoke") { 3 } else { HELLO.len() + 2 };
 const TOTAL_CALLS: usize = RETURN_COUNT + 1;
 
@@ -187,17 +187,21 @@ pub fn enter(hhdm: u64) -> ! {
     #[cfg(feature = "user-file-io-smoke")]
     if !(symbols::AFTER_ADD < symbols::FILE_POLICY_DENIED_OPEN
         && symbols::FILE_POLICY_DENIED_OPEN < symbols::FILE_BAD_OPEN
-        && symbols::FILE_BAD_OPEN < symbols::FILE_OPEN
+        && symbols::FILE_BAD_OPEN < symbols::FILE_PRIVATE_DENIED_OPEN
+        && symbols::FILE_PRIVATE_DENIED_OPEN < symbols::FILE_OPEN
         && symbols::FILE_OPEN < symbols::FILE_BAD_READ
         && symbols::FILE_BAD_READ < symbols::FILE_READ
         && symbols::FILE_READ < symbols::FILE_POLICY_REVOKED_READ
-        && symbols::FILE_POLICY_REVOKED_READ < symbols::FILE_EOF
+        && symbols::FILE_POLICY_REVOKED_READ < symbols::FILE_WRONG_SCOPE_READ
+        && symbols::FILE_WRONG_SCOPE_READ < symbols::FILE_EOF
         && symbols::FILE_EOF < symbols::FILE_CLOSE
         && symbols::FILE_CLOSE < symbols::FILE_STALE_CLOSE
         && symbols::FILE_STALE_CLOSE <= symbols::AFTER_PUTC
         && symbols::FILE_PATH >= symbols::HELLO_END
         && symbols::FILE_PATH_END - symbols::FILE_PATH == 12
-        && symbols::FILE_PATH_END < 0x402000)
+        && symbols::PRIVATE_FILE_PATH >= symbols::FILE_PATH_END
+        && symbols::PRIVATE_FILE_PATH_END - symbols::PRIVATE_FILE_PATH == 16
+        && symbols::PRIVATE_FILE_PATH_END < 0x402000)
     { fail("independent_file_io_symbols") }
     #[cfg(feature = "user-copy-smoke")]
     if symbols::AFTER_WRITE <= symbols::AFTER_ADD
@@ -250,6 +254,15 @@ pub fn enter(hhdm: u64) -> ! {
             .and_then(|start| elf.get(start..start + 12));
         if path_from_file != Some(&b"/tmp/msg.txt"[..]) {
             fail("independently_linked_file_path")
+        }
+        let private_offset = usize::try_from(
+            symbols::PRIVATE_FILE_PATH - text.virtual_address
+        ).unwrap_or(usize::MAX);
+        let private_from_file = usize::try_from(text.file_offset).ok()
+            .and_then(|begin| begin.checked_add(private_offset))
+            .and_then(|start| elf.get(start..start + 16));
+        if private_from_file != Some(&b"/tmp/private.txt"[..]) {
+            fail("independently_linked_private_file_path")
         }
     }
 
@@ -526,7 +539,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     } else if cfg!(feature = "user-exit-status-smoke") {
         serial::write_line("WOLFOS_ELF_STATUS_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=42 resources_released=1 real_process_manager=0");
     } else if cfg!(feature = "user-file-io-smoke") {
-        serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=12 exit=0 resources_released=1 persistent=0 production=0");
+        serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=14 exit=0 resources_released=1 persistent=0 production=0");
     } else if cfg!(feature = "user-copy-smoke") {
         serial::write_line("WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 int80_calls=4 exit=0 resources_released=1 production_user_copy=0");
     } else {
@@ -598,16 +611,21 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                   12, 0, crate::user_file_io::EACCES as u64),
             3 => (symbols::FILE_BAD_OPEN, 6, 0xffff_8000_0000_0000,
                   12, 0, crate::user_file_io::EFAULT as u64),
-            4 => (symbols::FILE_OPEN, 6, base + symbols::FILE_PATH,
+            4 => (symbols::FILE_PRIVATE_DENIED_OPEN, 6,
+                  base + symbols::PRIVATE_FILE_PATH, 16, 0,
+                  crate::user_file_io::EACCES as u64),
+            5 => (symbols::FILE_OPEN, 6, base + symbols::FILE_PATH,
                   12, 0, 256),
-            5 => (symbols::FILE_BAD_READ, 7, fd,
+            6 => (symbols::FILE_BAD_READ, 7, fd,
                   base + symbols::HELLO_TEXT, 8, crate::user_file_io::EFAULT as u64),
-            6 => (symbols::FILE_READ, 7, fd, user_top - 32, 8, 8),
-            7 => (symbols::FILE_POLICY_REVOKED_READ, 7, fd,
+            7 => (symbols::FILE_READ, 7, fd, user_top - 32, 8, 8),
+            8 => (symbols::FILE_POLICY_REVOKED_READ, 7, fd,
                   user_top - 32, 8, crate::user_file_io::EACCES as u64),
-            8 => (symbols::FILE_EOF, 7, fd, user_top - 32, 8, 0),
-            9 => (symbols::FILE_CLOSE, 8, fd, 0, 0, 0),
-            10 => (symbols::FILE_STALE_CLOSE, 8, fd, 0, 0,
+            9 => (symbols::FILE_WRONG_SCOPE_READ, 7, fd,
+                  user_top - 32, 8, crate::user_file_io::EACCES as u64),
+            10 => (symbols::FILE_EOF, 7, fd, user_top - 32, 8, 0),
+            11 => (symbols::FILE_CLOSE, 8, fd, 0, 0, 0),
+            12 => (symbols::FILE_STALE_CLOSE, 8, fd, 0, 0,
                   crate::user_file_io::EBADF as u64),
             _ => fail("invalid_file_io_stage"),
         };
@@ -618,7 +636,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             || !user_syscall_abi::valid_user_rflags(frame.hardware.rflags)
             || frame.registers.rax != nr || frame.registers.rdi != a0
             || frame.registers.rsi != a1 || frame.registers.rdx != a2
-            || (stage >= 5 && frame.registers.r12 != fd)
+            || (stage >= 6 && frame.registers.r12 != fd)
         { fail("file_io_guest_trap_frame_or_registers") }
         let result = crate::user_file_io_smoke::dispatch(pid, active, nr, a0, a1, a2);
         if result != want { 
@@ -634,12 +652,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 crate::user_file_io_smoke::grant_file_read(pid, 0);
             },
             3 => serial::write_line("WOLFOS_FILE_IO_BAD_OPEN_OK supervisor_denied=1"),
-            4 => {
+            4 => crate::user_file_io_smoke::prove_private_open_denied(pid),
+            5 => {
                 FILE_FD.store(result, Ordering::Release);
                 serial::write_line("WOLFOS_FILE_IO_OPEN_OK path_user_rx=1 fd=256");
             },
-            5 => serial::write_line("WOLFOS_FILE_IO_BAD_READ_OK rx_write_denied=1 cursor_rollback=1"),
-            6 => {
+            6 => serial::write_line("WOLFOS_FILE_IO_BAD_READ_OK rx_write_denied=1 cursor_rollback=1"),
+            7 => {
                 let mut proof = [0u8;8];
                 if crate::user_copy::copy_from(
                     active, user_top - 32, &mut proof, private_pte, private_byte
@@ -648,13 +667,17 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                 serial::write_line("WOLFOS_FILE_IO_READ_OK bytes=8 user_stack=1 payload=FILE_OK");
                 crate::user_file_io_smoke::revoke_file_read(pid);
             },
-            7 => {
+            8 => {
                 crate::user_file_io_smoke::prove_revoked_read(pid);
-                crate::user_file_io_smoke::grant_file_read(pid, 1);
+                crate::user_file_io_smoke::scope_private_file_read(pid);
             },
-            8 => serial::write_line("WOLFOS_FILE_IO_EOF_OK read=0"),
-            9 => serial::write_line("WOLFOS_FILE_IO_CLOSE_OK released=1"),
-            10 => serial::write_line("WOLFOS_FILE_IO_STALE_OK ebadf=1"),
+            9 => {
+                crate::user_file_io_smoke::prove_wrong_scope_read(pid);
+                crate::user_file_io_smoke::restore_file_read_scope(pid);
+            },
+            10 => serial::write_line("WOLFOS_FILE_IO_EOF_OK read=0"),
+            11 => serial::write_line("WOLFOS_FILE_IO_CLOSE_OK released=1"),
+            12 => serial::write_line("WOLFOS_FILE_IO_STALE_OK ebadf=1"),
             _ => fail("invalid_file_io_marker"),
         }
         frame.registers.rax = result;
@@ -800,7 +823,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
             if cfg!(feature = "user-exit-status-smoke") {
                 serial::write_line("WOLFOS_ELF_EXIT_STATUS_OK code=42 cpl3=1 calls=22 saved_rdi=42");
             } else if cfg!(feature = "user-file-io-smoke") {
-                serial::write_line("WOLFOS_FILE_IO_EXIT_OK code=0 cpl3=1 calls=12");
+                serial::write_line("WOLFOS_FILE_IO_EXIT_OK code=0 cpl3=1 calls=14");
             } else if cfg!(feature = "user-copy-smoke") {
                 serial::write_line("WOLFOS_USERCOPY_EXIT_OK code=0 cpl3=1 calls=4");
             } else {
