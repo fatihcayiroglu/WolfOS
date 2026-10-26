@@ -543,6 +543,9 @@ test:
 	$(OUT)/user_elf_launch_layout_tests
 	rustc --edition=2024 --test tests/user_elf_page_tables.rs -o $(OUT)/user_elf_page_tables_tests
 	$(OUT)/user_elf_page_tables_tests
+	rustc --edition=2024 --target x86_64-unknown-none --crate-type lib --crate-name wolfos_launch_contract tests/elf_launch_transaction_no_std.rs -o $(OUT)/libwolfos_launch_contract.rlib
+	rustc --edition=2024 --test tests/elf_launch_transaction.rs -o $(OUT)/elf_launch_transaction_tests
+	$(OUT)/elf_launch_transaction_tests
 	rustc --edition=2024 --test tests/user_vm_layout.rs -o $(OUT)/user_vm_layout_tests
 	$(OUT)/user_vm_layout_tests
 	rustc --edition=2024 --test tests/user_vm_two_pt.rs -o $(OUT)/user_vm_two_pt_tests
