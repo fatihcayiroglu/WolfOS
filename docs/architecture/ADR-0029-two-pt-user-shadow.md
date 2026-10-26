@@ -51,6 +51,29 @@ The `WOLFOS_USER_TWO_PT_OK` marker additionally requires
 `kernel_supervisor=1`, `high_half_copied=1` and
 `high_half_escalation_denied=1`.
 
+## Relocatable user-slot staging (follow-up)
+
+Real WolfOS CPL3 smoke selects a vacant *nonzero* PML4 user slot before
+entering Ring3. A separate byte-derived `validate_relocated_elf_bindings`
+now translates an otherwise bounded static ELF within its original low slot
+into exactly one checked slot in `1..255`. Both the PML4 slot and the full
+per-leaf addresses, permissions, data frames and sole stack are independently
+audited. Slots 0, 256..511, an ELF spanning beyond its original 512-GiB
+slot, forged shifted pointers and unsafe permission changes fail closed.
+
+`audit_relocated_two_pt_staged_image` binds the shifted PTE locations
+back to the **unshifted** immutable ELF byte sources and verifies full
+RX/RW/BSS contents plus zeroed stack. The real-PMM QEMU proof chooses an
+actually vacant PML4 slot from the live Limine root, populates five fresh
+two-PT tables, verifies source-byte provenance and high-half inheritance,
+and rejects a deliberately corrupted data byte. The QEMU marker is
+`WOLFOS_USER_RELOCATED_TWO_PT_OK`. Hardware CR3 remains unchanged and
+the same eight PMM frames are reaped.
+
+This is an additional *disconnected* acceptance contract, NOT a live
+two-PT Ring3 ELF process. The next step must reuse the gate in the actual
+single-BSP launcher with a dedicated PMM lease and verified CR3/IRET exit.
+
 All preexisting one-PT ELF execution / ProcessTable / Shield tests remain
 unchanged and must pass. No physical disk is touched.
 
