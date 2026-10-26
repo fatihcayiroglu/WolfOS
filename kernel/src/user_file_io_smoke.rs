@@ -58,6 +58,27 @@ fn checked(pid: u64) -> &'static mut FileService {
     unsafe { &mut *SERVICE.0.get() }
 }
 
+/// Called only after the loader validated the independent ELF, entered its
+/// own CR3 and marked the same ProcessTable PID as RUNNING. The trusted
+/// baseline is separately embedded in the kernel: neither PID nor user
+/// registers can choose what binary is approved.
+pub fn attest_running_image(pid: u64, loaded: &[u8]) {
+    static APPROVED_ELF: &[u8] = include_bytes!(concat!(
+        env!("OUT_DIR"), "/wolfos-user-hello.elf"
+    ));
+    let state = checked(pid);
+    if state.grants.image_verified(pid)
+        || state.grants.allows(pid, Permission::FileRead)
+        || loaded.len() < 2
+        || state.grants.bind_verified_image(pid, &loaded[..loaded.len() - 1], APPROVED_ELF)
+            != Err(PermissionError::ImageMismatch)
+        || state.grants.bind_verified_image(pid, loaded, APPROVED_ELF).is_err()
+        || !state.grants.image_verified(pid)
+        || state.grants.allows(pid, Permission::FileRead)
+    { fail("elf_identity_admission_or_default_deny") }
+    serial::write_line("WOLFOS_SHIELD_IMAGE_ATTEST_OK pid=1 exact_elf=1 tampered_denied=1 default_deny=1");
+}
+
 /// The caller first authenticated the genuine CPL3 INT80, registers and
 /// active user CR3. A denied OPEN must not allocate ANY VFS descriptor.
 pub fn prove_default_denial(pid: u64) {
@@ -190,6 +211,7 @@ pub fn verify_exit(pid: u64) {
         || state.grants.retire(pid).is_err()
         || state.grants.allows(pid, Permission::FileRead)
         || state.grants.live() != 0
+        || state.grants.image_verified(pid)
         || state.grants.grant_file_read_path(pid, PATH)
             != Err(PermissionError::NotRegistered)
     { fail("descriptor_leak_or_permission_retirement") }

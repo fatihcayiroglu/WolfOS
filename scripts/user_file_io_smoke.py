@@ -12,6 +12,7 @@ ENTER = re.compile(
 )
 PROOFS = [
     "WOLFOS_FILE_IO_READY tmp_mount=1 sealed_files=2 pid_owner=1",
+    "WOLFOS_SHIELD_IMAGE_ATTEST_OK pid=1 exact_elf=1 tampered_denied=1 default_deny=1",
     "WOLFOS_ELF_ID_OK cpl3=1 return_rax=0x574f4c46",
     "WOLFOS_ELF_ADD_OK cpl3=1 return_rax=42",
     "WOLFOS_SHIELD_FILE_DENIED_OK pid=1 fd_open=0 policy_default_deny=1",
