@@ -5,9 +5,10 @@
 //! payload bytes and kernel grafts separately before publishing a CR3.
 
 use crate::{
-    elf64_preflight::{PAGE_BYTES, USER_END},
+    elf64_page_image::{materialize_bounded, MaterializeError, PageBacking, PageContents, PAGE_SIZE},
+    elf64_preflight::{LoadSegment, PAGE_BYTES, USER_END},
     user_elf_launch_layout::{
-        BudgetedLaunch, LaunchError, MAX_LEAVES, TWO_PT_TABLE_FRAMES, plan_bounded_with_budget,
+        BudgetedLaunch, LaunchError, MAX_LEAVES, MAX_LOAD_PAGES, TWO_PT_TABLE_FRAMES, plan_bounded_with_budget,
     },
 };
 
@@ -31,6 +32,29 @@ pub enum MappingError {
     DirtyTable,
     MismatchedTable,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageError {
+    Image(LaunchError),
+    ChangedImageLayout,
+    BackingCount,
+    BackingFrameMismatch { index: usize },
+    DirtyOwnedPage { index: usize },
+    MissingSource,
+    Materialize(MaterializeError),
+}
+
+/// A caller-owned HHDM page accompanied by its claimed PMM frame number.
+/// The caller must separately authenticate pointer-to-physical provenance.
+pub struct OwnedLeafPage<'a> {
+    pub physical_frame: u64,
+    pub bytes: &'a mut [u8; PAGE_SIZE],
+}
+
+impl PageBacking for OwnedLeafPage<'_> {
+    fn page_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] { &mut *self.bytes }
+}
+
 
 /// Actual distinct caller-owned table buffers, rather than a fictitious
 /// fifth table borrowed from a data page in a six/seven-frame launch.
@@ -118,6 +142,60 @@ impl ElfPageTables {
     }
     pub fn stack_page(&self) -> u64 {
         self.base + self.launch.layout.stack_page
+    }
+
+    /// Stage only validated PT_LOAD leaves into already-owned, zeroed PMM
+    /// buffers from this exact page-table recipe. The stack is an independent
+    /// zero-filled leaf, never taken from the ELF. All frame identities,
+    /// destination cleanliness and source ranges are checked before any
+    /// backing byte changes. No table entry, ownership or CR3 is mutated.
+    ///
+    /// The trusted caller must keep the ELF bytes stable from bind through
+    /// staging and perform final HHDM, page-byte and table admission audits.
+    pub fn stage_load_and_stack(
+        &self,
+        image: &[u8],
+        loads: &mut [OwnedLeafPage<'_>],
+        stack: &mut OwnedLeafPage<'_>,
+    ) -> Result<[Option<PageContents>; MAX_LOAD_PAGES], StageError> {
+        let again = plan_bounded_with_budget(image).map_err(StageError::Image)?;
+        if again != self.launch {
+            return Err(StageError::ChangedImageLayout);
+        }
+        let count = self.launch.layout.load_pages();
+        if count == 0 || count > MAX_LOAD_PAGES || loads.len() != count {
+            return Err(StageError::BackingCount);
+        }
+        let tables = self.launch.frames.table_frames;
+        for (i, page) in loads.iter().enumerate() {
+            if page.physical_frame != self.frames[tables + i] {
+                return Err(StageError::BackingFrameMismatch { index: i });
+            }
+        }
+        if stack.physical_frame != self.frames[tables + count] {
+            return Err(StageError::BackingFrameMismatch { index: count });
+        }
+        for (i, page) in loads.iter().enumerate() {
+            if page.bytes.iter().any(|byte| *byte != 0) {
+                return Err(StageError::DirtyOwnedPage { index: i });
+            }
+        }
+        if stack.bytes.iter().any(|byte| *byte != 0) {
+            return Err(StageError::DirtyOwnedPage { index: count });
+        }
+        let first = self.launch.layout.image.segments[0]
+            .as_ref().ok_or(StageError::MissingSource)?;
+        let mut requests: [(&LoadSegment, u64); MAX_LOAD_PAGES] =
+            [(first, 0); MAX_LOAD_PAGES];
+        for (i, request) in requests[..count].iter_mut().enumerate() {
+            let leaf = self.launch.layout.leaves[i].ok_or(StageError::MissingSource)?;
+            let source = leaf.source_segment.ok_or(StageError::MissingSource)?;
+            let segment = self.launch.layout.image.segments[source]
+                .as_ref().ok_or(StageError::MissingSource)?;
+            *request = (segment, leaf.virtual_address);
+        }
+        materialize_bounded::<MAX_LOAD_PAGES>(image, &requests[..count], loads)
+            .map_err(StageError::Materialize)
     }
 
     fn check_buffers(&self, tables: &TableBuffers<'_>) -> Result<(), MappingError> {
