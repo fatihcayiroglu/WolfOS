@@ -28,6 +28,14 @@ two-PT layout and shadow-map path, now also reused by a dedicated live CPL3 runn
   per LOAD/stack page; callers cannot invent VAs or permissions. It checks
   slot bounds, frame count, aliases, W^X and both PT regions before mapping.
   Host tests also admit an ELF spanning three LOAD leaves and two PTs.
+- `stage_relocated_two_pt_elf` stages one to three ELF LOAD leaves from
+  independently verified ELF byte ranges into exactly matching, distinct,
+  **already leased and zeroed** physical leaf buffers. The shared
+  `materialize_bounded` contract validates ALL requested segment ranges,
+  duplicate VAs and buffer counts before touching the first destination.
+  Wrong frame counts, PMM aliases, dirty LOAD/stack pages and malformed ELF
+  fail with every destination unchanged; the separate full PTE/byte/HHDM
+  audit remains mandatory before hardware CR3/IRET.
 
 ## Hardware proof
 
@@ -91,7 +99,8 @@ A **separate** `user-elf-three-load-run-smoke` hardware gate links two genuine
 executable ELF pages at `0x401000` and `0x402000`, RW data+BSS at
 `0x600000`, and an NX stack at `0x601000`. It allocates NINE distinct
 PMM frames (five tables, four leaf frames), uses the same ELF-derived manifest,
-copies three LOAD leaves, audits each exact byte source and all 2,560 PTEs,
+atomically stages three LOAD leaves after a whole-batch preflight,
+audits each exact byte source and all 2,560 PTEs,
 and enters actual hardware CPL3. The first RX page CALLs a function in the
 second RX page and checks its return value before any syscall; a missing or
 nonexecuting second page cannot reach the successful EXIT path. On completion
