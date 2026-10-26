@@ -27,7 +27,13 @@ use x86_64::{
 };
 use crate::{
     elf64_page_image::{materialize, PAGE_SIZE},
-    user_elf_launch_layout::plan_static_image,
+    user_elf_launch_layout::{plan_static_image, plan_two_pt_image},
+    #[cfg(feature = "user-elf-two-pt-run-smoke")]
+    user_vm_multi::UserPage,
+    #[cfg(feature = "user-elf-two-pt-run-smoke")]
+    user_vm_two_pt,
+    #[cfg(feature = "user-elf-two-pt-run-smoke")]
+    user_image_admission::{self, BackingPage},
     interrupts, kernel_half_shadow, pmm, serial,
     process_lifecycle::ProcessState,
     process_table::{ProcessTableCell, TableError},
@@ -48,8 +54,10 @@ const WRITE: u64 = 2;
 const USER: u64 = 4;
 const NX: u64 = 1 << 63;
 const SLOTS: usize = 512;
-const FRAMES: usize = 7; // new PML4, PDPT, PD, PT, RX text, RW data/BSS, RW stack
-const STACK_VA: u64 = 0x404000;
+const FRAMES: usize = if cfg!(feature = "user-elf-two-pt-run-smoke") { 8 } else { 7 };
+const TABLE_FRAMES: usize = if cfg!(feature = "user-elf-two-pt-run-smoke") { 5 } else { 4 };
+const DATA_VA: u64 = if cfg!(feature = "user-elf-two-pt-run-smoke") { 0x600000 } else { 0x403000 };
+const STACK_VA: u64 = DATA_VA + PAGE;
 const RETURN_COUNT: usize = if cfg!(feature = "user-file-io-smoke") { 13 }
     else if cfg!(feature = "user-copy-smoke") { 3 } else { HELLO.len() + 2 };
 const TOTAL_CALLS: usize = RETURN_COUNT + 1;
@@ -122,7 +130,7 @@ fn hhdm_ptr(hhdm: u64, phys: u64) -> Option<*mut u8> {
         .map(|addr| addr.as_mut_ptr::<u8>())
 }
 
-/// The seven frames are exclusively owned by this single-BSP isolated smoke.
+/// Exactly seven or eight exclusively owned frames, according to the isolated flavor.
 fn allocate_owned() -> Option<[u64; FRAMES]> {
     let mut frames = [0u64; FRAMES];
     for i in 0..FRAMES {
@@ -214,8 +222,8 @@ pub fn enter(hhdm: u64) -> ! {
         || symbols::AFTER_EXIT <= symbols::AFTER_PUTC
         || symbols::HELLO_TEXT <= symbols::AFTER_EXIT
         || symbols::HELLO_END != symbols::HELLO_TEXT + HELLO.len() as u64
-        || symbols::FIXTURE_MAGIC != 0x403000
-        || symbols::BSS_START != 0x403001
+        || symbols::FIXTURE_MAGIC != DATA_VA
+        || symbols::BSS_START != DATA_VA + 1
         || elf.len() >= 32768
     { fail("unexpected_independent_elf_symbols") }
 
@@ -223,7 +231,11 @@ pub fn enter(hhdm: u64) -> ! {
     // the kernel's source or directly copied from a handbuilt instruction
     // array. They must pass the strict ELF64 ET_EXEC parser and PT_LOAD
     // data/BSS materialization path developed in PRs #62-#65.
-    let Ok(launch) = plan_static_image(elf) else { fail("elf_launch_layout") };
+    let Ok(launch) = (if cfg!(feature = "user-elf-two-pt-run-smoke") {
+        plan_two_pt_image(elf)
+    } else {
+        plan_static_image(elf)
+    }) else { fail("elf_launch_layout") };
     let plan = launch.image;
     if plan.len != 2 || plan.entry != symbols::ENTRY
         || launch.load_pages() != 2 || launch.stack_page != STACK_VA
@@ -238,8 +250,8 @@ pub fn enter(hhdm: u64) -> ! {
         || text.writable || !text.executable
         || text.memory_size != text.file_size
         || text.file_size < symbols::HELLO_END - text.virtual_address
-        || data.page_start != 0x403000 || data.page_end != 0x404000
-        || data.virtual_address != 0x403000
+        || data.page_start != DATA_VA || data.page_end != STACK_VA
+        || data.virtual_address != DATA_VA
         || !data.writable || data.executable
         || data.file_size != 1 || data.memory_size != 65
         || symbols::AFTER_EXIT >= symbols::HELLO_TEXT
@@ -305,7 +317,7 @@ pub fn enter(hhdm: u64) -> ! {
     if efer_lo & (1 << 11) == 0 { fail("efer_nxe") }
 
     let before = pmm::statistics().allocated_frames;
-    let Some(frames) = allocate_owned() else { fail("pmm_seven_frames") };
+    let Some(frames) = allocate_owned() else { fail("pmm_owned_frames") };
     let mut ptrs = [core::ptr::null_mut::<u8>(); FRAMES];
     for (i, phys) in frames.iter().copied().enumerate() {
         let Some(ptr) = hhdm_ptr(hhdm, phys) else { fail("owned_frame_hhdm") };
@@ -323,15 +335,15 @@ pub fn enter(hhdm: u64) -> ! {
             let Some(leaf) = launch.leaves[i] else { fail("missing_load_leaf") };
             let Some(segment_index) = leaf.source_segment else { fail("stack_as_elf") };
             let Some(segment) = plan.segments[segment_index] else { fail("missing_segment") };
-            let page = &mut *ptrs[4 + i].cast::<[u8; PAGE_SIZE]>();
+            let page = &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>();
             let Ok(contents) = materialize(elf, &segment, leaf.virtual_address, page)
             else { fail("elf_leaf_materialize") };
             *outcome = Some(contents);
         }
         let Some(t) = copied[0] else { fail("no_text_page") };
         let Some(d) = copied[1] else { fail("no_data_page") };
-        let text_page = &*ptrs[4].cast::<[u8; PAGE_SIZE]>();
-        let data_page = &*ptrs[5].cast::<[u8; PAGE_SIZE]>();
+        let text_page = &*ptrs[TABLE_FRAMES].cast::<[u8; PAGE_SIZE]>();
+        let data_page = &*ptrs[TABLE_FRAMES + 1].cast::<[u8; PAGE_SIZE]>();
         if !t.executable || t.writable || t.copied != text.file_size as usize
             || d.executable || !d.writable || d.copied != 1
             || data_page[0] != 0x5a || data_page[1..65].iter().any(|b| *b != 0)
@@ -340,24 +352,75 @@ pub fn enter(hhdm: u64) -> ! {
         let root = &mut *ptrs[0].cast::<[u64; SLOTS]>();
         let pdpt = &mut *ptrs[1].cast::<[u64; SLOTS]>();
         let pd = &mut *ptrs[2].cast::<[u64; SLOTS]>();
-        let pt = &mut *ptrs[3].cast::<[u64; SLOTS]>();
-        let pdpt_index = ((code >> 30) & 511) as usize;
-        let pd_index = ((code >> 21) & 511) as usize;
-        if pdpt_index != 0 || pd_index != 2 || ((code >> 12) & 511) != 1
-        { fail("user_table_indices") }
-        pdpt[pdpt_index] = frames[2] | PRESENT | WRITE | USER;
-        pd[pd_index] = frames[3] | PRESENT | WRITE | USER;
-        for (i, leaf) in launch.leaves[..launch.len].iter().enumerate() {
-            let Some(leaf) = leaf else { fail("missing_mapping_leaf") };
-            if leaf.writable && leaf.executable { fail("write_execute_leaf") }
-            let index = ((leaf.virtual_address >> 12) & 511) as usize;
-            if pt[index] != 0 { fail("duplicate_mapping_leaf") }
-            pt[index] = frames[4 + i] | PRESENT | USER
-                | if leaf.writable { WRITE } else { 0 }
-                | if leaf.executable { 0 } else { NX };
+        #[cfg(feature = "user-elf-two-pt-run-smoke")]
+        {
+            let pt0 = &mut *ptrs[3].cast::<[u64; SLOTS]>();
+            let pt1 = &mut *ptrs[4].cast::<[u64; SLOTS]>();
+            let table_frames = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+            let pages = [
+                UserPage { virtual_address: base + text.page_start,
+                    physical_frame: frames[5], writable: false, executable: true },
+                UserPage { virtual_address: base + data.page_start,
+                    physical_frame: frames[6], writable: true, executable: false },
+                UserPage { virtual_address: base + launch.stack_page,
+                    physical_frame: frames[7], writable: true, executable: false },
+            ];
+            if user_vm_two_pt::populate(root, pdpt, pd, pt0, pt1, table_frames, &pages).is_err() {
+                fail("two_pt_populate")
+            }
+            let file_backings = [
+                BackingPage { virtual_address: pages[0].virtual_address,
+                    physical_frame: frames[5], bytes: text_page },
+                BackingPage { virtual_address: pages[1].virtual_address,
+                    physical_frame: frames[6], bytes: data_page },
+            ];
+            let stack_backing = BackingPage {
+                virtual_address: pages[2].virtual_address, physical_frame: frames[7],
+                bytes: &*ptrs[7].cast::<[u8; PAGE_SIZE]>(),
+            };
+            let Ok(admitted) = user_image_admission::audit_relocated_two_pt_staged_image(
+                elf, slot, table_frames, &pages,
+                root, pdpt, pd, pt0, pt1, &file_backings, stack_backing,
+            ) else { fail("two_pt_exact_elf_and_frame_admission") };
+            if admitted.entry != code || admitted.stack_page != stack_va
+                || admitted.source != launch
+                || user_image_admission::audit_hhdm_backings(
+                    hhdm, &file_backings, stack_backing,
+                ).is_err()
+            { fail("two_pt_entry_or_hhdm_provenance") }
+            // Both 2-MiB regions MUST be reached via separate actual PTs.
+            if pd.iter().filter(|entry| **entry != 0).count() != 2
+                || pt0.iter().filter(|entry| **entry != 0).count() != 1
+                || pt1.iter().filter(|entry| **entry != 0).count() != 2
+                || pdpt.iter().filter(|entry| **entry != 0).count() != 1
+            { fail("two_pt_cardinality") }
+        }
+        #[cfg(not(feature = "user-elf-two-pt-run-smoke"))]
+        {
+            let pt = &mut *ptrs[3].cast::<[u64; SLOTS]>();
+            let pdpt_index = ((code >> 30) & 511) as usize;
+            let pd_index = ((code >> 21) & 511) as usize;
+            if pdpt_index != 0 || pd_index != 2 || ((code >> 12) & 511) != 1
+            { fail("user_table_indices") }
+            pdpt[pdpt_index] = frames[2] | PRESENT | WRITE | USER;
+            pd[pd_index] = frames[3] | PRESENT | WRITE | USER;
+            for (i, leaf) in launch.leaves[..launch.len].iter().enumerate() {
+                let Some(leaf) = leaf else { fail("missing_mapping_leaf") };
+                if leaf.writable && leaf.executable { fail("write_execute_leaf") }
+                let index = ((leaf.virtual_address >> 12) & 511) as usize;
+                if pt[index] != 0 { fail("duplicate_mapping_leaf") }
+                pt[index] = frames[4 + i] | PRESENT | USER
+                    | if leaf.writable { WRITE } else { 0 }
+                    | if leaf.executable { 0 } else { NX };
+            }
+            if pt.iter().filter(|entry| **entry != 0).count() != 3
+                || pd.iter().filter(|entry| **entry != 0).count() != 1
+                || pdpt.iter().filter(|entry| **entry != 0).count() != 1
+            { fail("one_pt_cardinality") }
         }
         let entry = frames[1] | PRESENT | WRITE | USER;
-        root[slot] = entry;
+        if root[slot] == 0 { root[slot] = entry; }
+        if root[slot] != entry { fail("incorrect_user_pml4_entry") }
         let inherited = kernel_half_shadow::graft_kernel_half(
             source, root, slot, entry, &frames
         );
@@ -367,16 +430,13 @@ pub fn enter(hhdm: u64) -> ! {
             ) != inherited
             || root[256..].iter().any(|e| e & USER != 0)
             || root[..256].iter().filter(|e| **e != 0).count() != 1
-            || pt.iter().filter(|e| **e != 0).count() != 3
-            || pd.iter().filter(|e| **e != 0).count() != 1
-            || pdpt.iter().filter(|e| **e != 0).count() != 1
         { fail("sanitized_root_or_permissions") }
 
         BOOT_CR3.store(boot_cr3, Ordering::Release);
         ALLOCATED_BEFORE.store(before, Ordering::Release);
         ENTRY.store(code, Ordering::Release);
         STACK_TOP.store(user_top, Ordering::Release);
-        DATA_HHDM.store(ptrs[5] as u64, Ordering::Release);
+        DATA_HHDM.store(ptrs[TABLE_FRAMES + 1] as u64, Ordering::Release);
         CR3_PHYS.store(frames[0], Ordering::Release);
         STAGE.store(0, Ordering::Release);
         #[cfg(feature = "user-file-io-smoke")]
@@ -413,6 +473,11 @@ pub fn enter(hhdm: u64) -> ! {
         serial::write_fmt(format_args!(
             "WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 bss_zero=1 cr3_new=1 root_slot={} user_entry={:#x}\n",
             slot, plan.entry,
+        ));
+        #[cfg(feature = "user-elf-two-pt-run-smoke")]
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_TWO_PT_ENTER hardware_cr3=1 root_slot={} pd_regions=2 pt_frames=2 rx=1 rw_nx=2 elf_admitted=1 hhdm_checked=1 owned_frames=8\n",
+            slot,
         ));
         #[cfg(feature = "user-file-io-smoke")]
         crate::user_file_io_smoke::attest_running_image(pid, elf);
@@ -550,7 +615,10 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     }
     if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
     { fail("pmm_frame_leak") }
-    serial::write_line("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1");
+    serial::write_fmt(format_args!(
+        "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed={} pmm_no_leak=1\n",
+        FRAMES,
+    ));
     serial::write_fmt(format_args!(
         "WOLFOS_PROCESS_TABLE_REAP_OK pid={} slots=2 occupied=0 running=0 stale_denied=1 double_reap_denied=1 real_cpl3=1\n",
         pid,
@@ -567,6 +635,8 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
         serial::write_line("WOLFOS_FILE_IO_RUN_OK linked_elf=1 hardware_cpl3=1 real_file_syscalls=3 int80_calls=14 exit=0 resources_released=1 persistent=0 production=0");
     } else if cfg!(feature = "user-copy-smoke") {
         serial::write_line("WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 int80_calls=4 exit=0 resources_released=1 production_user_copy=0");
+    } else if cfg!(feature = "user-elf-two-pt-run-smoke") {
+        serial::write_line("WOLFOS_ELF_TWO_PT_RUN_OK linked_elf=1 hardware_cpl3=1 pt_frames=2 user_console=1 int80_calls=22 exit=0 restored_cr3=1 frames_freed=8 pmm_no_leak=1");
     } else {
         serial::write_line("WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 int80_calls=22 exit=0 resources_released=1 real_process_manager=0");
     }
