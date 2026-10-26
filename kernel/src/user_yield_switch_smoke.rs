@@ -355,9 +355,9 @@ pub extern "C" fn observe_timer_irq(
         if next_frame!=s.stacks[next].top
                 -user_syscall_abi::FRAME_BYTES as u64
             || next_frame&15!=0
-            || s.processes.snapshot((next+1) as u64)
-                .is_none_or(|p| p.state!=ProcessState::Ready
-                    || p.cr3_root!=s.leases[next][0]) {
+            || s.processes.validate_ready_resume_lease(
+                (next+1) as u64, s.leases[next][0], &s.leases[next]
+            ).is_err() {
             fail("involuntary_next_pid_frame_or_root")
         }
         // The IRQ's captured GPR+5-word hardware frame remains pinned
@@ -490,6 +490,9 @@ fn irq_wake_blocked_user(
         || s.rr.timer_switches()!=1 {
         fail("real_IRQ_round_robin_handoff")
     }
+    if s.processes.validate_ready_resume_lease(
+        1,s.leases[0][0],&s.leases[0]
+    ).is_err(){fail("real_IRQ_woken_pid_lease_mismatch")}
     s.frames[1]=raw as u64;
     if s.processes.park_running(2,outgoing_root).is_err(){
         fail("real_IRQ_source_process_not_parked")
@@ -1226,6 +1229,9 @@ pub fn enter(hhdm:u64)->!{
     );
     // All accessible supervisor mappings are inherited in BOTH roots.
     // Real Ring3 selection happens only after actual private CR3 activated.
+    if s.processes.validate_ready_resume_lease(
+        1,s.leases[0][0],&s.leases[0]
+    ).is_err(){fail("boot_first_pid_lease_preflight")}
     unsafe{
         asm!("mov cr3, {}",in(reg)s.leases[0][0],
             options(nostack,preserves_flags));
@@ -1454,9 +1460,9 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
                     || unsafe{(*saved).registers.rax}!=0
                     || unsafe{(*saved).registers.r12}!=1
                     || unsafe{(*saved).registers.r14}!=USER_ID[0]
-                    || s.processes.snapshot(1).is_none_or(|p|
-                        p.state!=ProcessState::Ready
-                        || p.cr3_root!=s.leases[0][0]) {
+                    || s.processes.validate_ready_resume_lease(
+                        1,s.leases[0][0],&s.leases[0]
+                    ).is_err() {
                     fail("trusted_wake_lost_saved_hardware_frame")
                 }
                 s.event_wakes+=1;
@@ -1781,7 +1787,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
     }
     if s.frames[next]==0||s.frames[next]!=
         s.stacks[next].top-user_syscall_abi::FRAME_BYTES as u64
-        ||s.exits[next]{
+        ||s.exits[next]
+        ||s.processes.validate_ready_resume_lease(
+            (next+1) as u64,s.leases[next][0],&s.leases[next]
+        ).is_err(){
         fail("next_trap_frame_not_owned")
     }
     // The target frame was either synthesized in its own kernel stack
