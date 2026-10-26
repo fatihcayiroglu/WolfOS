@@ -435,3 +435,109 @@ fn relocated_two_pt_admission_keeps_file_offsets_unrelocated() {
     t[4][0] |= NX;
     assert_eq!(verify(&t, &code, &data, &stack), Ok(expected));
 }
+
+#[test]
+fn derived_relocated_page_manifest_uses_only_elf_leaves_and_owned_frames() {
+    let bytes = image();
+    for slot in [1usize, 17, 255] {
+        let manifest = user_vm_two_pt::derive_relocated_elf_pages(
+            &bytes, slot, FRAMES, &[0x15_000, 0x16_000, 0x17_000],
+        ).unwrap();
+        assert_eq!(manifest.pages(), &relocated_pages(slot));
+        assert_eq!(manifest.load_pages(), 2);
+        assert_eq!(manifest.layout.entry, ((slot as u64) << 39) + 0x5ff100);
+        assert_eq!(manifest.layout.stack_page, ((slot as u64) << 39) + 0x601000);
+        let mut t = bank();
+        populate(&mut t, manifest.pages()).unwrap();
+        let [root, pdpt, pd, pt0, pt1] = &t;
+        assert_eq!(
+            user_vm_two_pt::audit_relocated_elf_bindings(
+                &bytes, slot, root, pdpt, pd, pt0, pt1, FRAMES, manifest.pages(),
+            ),
+            Ok(manifest.layout),
+        );
+    }
+}
+
+#[test]
+fn derived_manifest_supports_three_load_pages_across_two_page_tables() {
+    let mut bytes = image();
+    bytes[24..32].copy_from_slice(&0x5fe100u64.to_le_bytes());
+    bytes[80..88].copy_from_slice(&0x5fe100u64.to_le_bytes());
+    bytes[104..112].copy_from_slice(&0x1100u64.to_le_bytes());
+    let immutable = bytes;
+    let frames = [0x15_000, 0x16_000, 0x17_000, 0x18_000];
+    let manifest = user_vm_two_pt::derive_relocated_elf_pages(
+        &bytes, 7, FRAMES, &frames,
+    ).unwrap();
+    assert_eq!(manifest.load_pages(), 3);
+    assert_eq!(manifest.layout.source.len, 4);
+    assert_eq!(manifest.layout.entry, (7u64 << 39) + 0x5fe100);
+    assert_eq!(manifest.layout.stack_page, (7u64 << 39) + 0x601000);
+    assert_eq!(
+        manifest.pages().iter().map(|p| p.virtual_address - (7u64 << 39))
+            .collect::<Vec<u64>>(),
+        [0x5fe000, 0x5ff000, 0x600000, 0x601000],
+    );
+    assert_eq!(manifest.pages().iter().map(|p| p.physical_frame)
+        .collect::<Vec<u64>>(), frames);
+    assert_eq!(
+        manifest.pages().iter().map(|p| (p.writable, p.executable))
+            .collect::<Vec<_>>(),
+        [(false, true), (false, true), (true, false), (true, false)],
+    );
+    let mut t = bank();
+    populate(&mut t, manifest.pages()).unwrap();
+    let [root, pdpt, pd, pt0, pt1] = &t;
+    assert_eq!(pt0.iter().filter(|pte| **pte != 0).count(), 2);
+    assert_eq!(pt1.iter().filter(|pte| **pte != 0).count(), 2);
+    assert_eq!(
+        user_vm_two_pt::audit_relocated_elf_bindings(
+            &bytes, 7, root, pdpt, pd, pt0, pt1, FRAMES, manifest.pages(),
+        ),
+        Ok(manifest.layout),
+    );
+    assert_eq!(bytes, immutable); // staging metadata never edits ELF bytes
+}
+
+#[test]
+fn derived_manifest_rejects_invalid_slots_frame_counts_aliases_and_offsets() {
+    let bytes = image();
+    let frames = [0x15_000, 0x16_000, 0x17_000];
+    let derive = |slot, data: &[u64]| {
+        user_vm_two_pt::derive_relocated_elf_pages(&bytes, slot, FRAMES, data)
+    };
+    assert!(matches!(derive(0, &frames), Err(TwoPtElfError::InvalidUserSlot)));
+    assert!(matches!(derive(256, &frames), Err(TwoPtElfError::InvalidUserSlot)));
+    assert!(matches!(derive(511, &frames), Err(TwoPtElfError::InvalidUserSlot)));
+    assert!(matches!(derive(1, &frames[..2]),
+        Err(TwoPtElfError::MissingOrExtraPage)));
+    assert!(matches!(derive(1, &[0x15_000, 0x16_000, 0x17_000, 0x18_000]),
+        Err(TwoPtElfError::MissingOrExtraPage)));
+    for bad in [
+        [0x15_000, 0x15_000, 0x17_000],
+        [FRAMES[2], 0x16_000, 0x17_000],
+        [0x15_001, 0x16_000, 0x17_000],
+        [0, 0x16_000, 0x17_000],
+        [1 << 52, 0x16_000, 0x17_000],
+    ] {
+        assert!(matches!(derive(1, &bad),
+            Err(TwoPtElfError::Mapping(
+                TwoPtError::AliasedPhysicalFrame | TwoPtError::InvalidPhysicalFrame
+            ))), "bad frames {bad:?} accepted");
+    }
+    let mut malformed = bytes;
+    malformed[0] = 0;
+    assert!(matches!(user_vm_two_pt::derive_relocated_elf_pages(
+        &malformed, 1, FRAMES, &frames,
+    ), Err(TwoPtElfError::Image(_))));
+    let mut three_regions = bytes;
+    // RX spans PD regions 2 and 3; RW data introduces a third region 4.
+    three_regions[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+    three_regions[136..144].copy_from_slice(&0x801180u64.to_le_bytes());
+    assert!(matches!(user_vm_two_pt::derive_relocated_elf_pages(
+        &three_regions, 1, FRAMES, &frames,
+    ), Err(TwoPtElfError::Image(
+        user_elf_launch_layout::LaunchError::TooManyPageTables
+    ))));
+}

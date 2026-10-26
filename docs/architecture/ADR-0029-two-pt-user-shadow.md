@@ -6,7 +6,7 @@ Date: 2026-10-26
 
 Keep the original one-PT ELF admission contract unchanged for all existing
 real CPL3 smoke flavors, and introduce a **separate**, allocation-free
-two-PT layout and shadow-map path:
+two-PT layout and shadow-map path, now also reused by a dedicated live CPL3 runner:
 
 - \`plan_two_pt_image\` derives each static PT_LOAD and RW+NX stack leaf
   from strictly checked ELF64 bytes. It allows at most three LOAD leaves
@@ -23,6 +23,11 @@ two-PT layout and shadow-map path:
 - \`validate_elf_bindings\` and \`audit_elf_bindings\` verify all advertised
   page VAs and RX/RW+NX flags against the original immutable ELF bytes,
   including a separate NX stack, rather than trusting caller metadata.
+- `derive_relocated_elf_pages` constructs a fixed-capacity leaf manifest
+  directly from the immutable ELF and exactly one owned physical data frame
+  per LOAD/stack page; callers cannot invent VAs or permissions. It checks
+  slot bounds, frame count, aliases, W^X and both PT regions before mapping.
+  Host tests also admit an ELF spanning three LOAD leaves and two PTs.
 
 ## Hardware proof
 
@@ -70,21 +75,33 @@ and rejects a deliberately corrupted data byte. The QEMU marker is
 `WOLFOS_USER_RELOCATED_TWO_PT_OK`. Hardware CR3 remains unchanged and
 the same eight PMM frames are reaped.
 
-This is an additional *disconnected* acceptance contract, NOT a live
-two-PT Ring3 ELF process. The next step must reuse the gate in the actual
-single-BSP launcher with a dedicated PMM lease and verified CR3/IRET exit.
+The `user-vm-shadow` and relocated shadow acceptance flavors remain
+**disconnected proofs**: their physical CR3 does not change. Independently,
+the dedicated `user-elf-two-pt-run-smoke` QEMU flavor now exercises a truly
+live two-PT Ring3 ELF process. It selects a vacant PML4 user slot, leases
+five page-table frames and three data frames from PMM, derives RX text,
+RW+NX data/BSS and RW+NX stack leaves from the ELF, and requires exact
+PTE/byte-source/HHDM audits before grafting supervisor-only kernel mappings.
+With interrupts disabled on the single BSP it switches hardware CR3,
+IRETs into CPL3, executes 22 INT80 syscalls, restores boot CR3 on exit,
+and releases all eight owned frames. The live evidence is
+`WOLFOS_ELF_TWO_PT_ENTER` with `derived_pages=1 owned_frames=8` plus the
+existing CPL3 exit/retirement markers. This proof runs the original
+**two-LOAD-leaf** static ELF; the three-LOAD-leaf manifest is host-tested
+and is **not yet exercised by the live QEMU launcher**.
 
 All preexisting one-PT ELF execution / ProcessTable / Shield tests remain
 unchanged and must pass. No physical disk is touched.
 
 ## Security boundary / next work
 
-This is a **shadow-only**, BSP/IF=0 validation of the two-PT hierarchy,
-not a general-purpose multi-address-space PMM or live Ring3 launcher.
-The runtime ELF hello still uses its previously audited one-PT path;
-new trusted code must pin PMM frames, prove byte-source immutability,
-audit higher-half descendants and process ownership, and perform controlled
-CR3/IRET handoff before any new two-PT image is actually executed.
-Future work includes more PD/PT regions, guard pages, dynamic frame
-bookkeeping, ELF loading from trusted packages and signed manifests,
-device drivers, persistent storage, and graphical user-facing permissions.
+The **disconnected** two-PT proof remains a BSP/IF=0 shadow test, but a
+separate dedicated smoke path now executes an admitted image under a real
+relocated two-PT CR3. Neither is a production executable loader or a
+general-purpose multi-address-space process model. Frame lease and
+high-half borrowing are intentionally BSP-scoped; only the fixed two-LOAD
+ELF has been run on hardware. Next steps include executing three-LOAD
+images after generalized per-leaf materialization, guard pages and dynamic
+frame bookkeeping, multiple PD/PT regions, trusted-package and untrusted
+ELF loading, real process lifecycle integration, device drivers, persistent
+storage, and graphical user-facing permissions.

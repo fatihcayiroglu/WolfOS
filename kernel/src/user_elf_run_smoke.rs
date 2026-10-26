@@ -35,7 +35,7 @@ use crate::{
     user_syscall_abi::{self, Outcome, UserSyscallFrame},
 };
 #[cfg(feature = "user-elf-two-pt-run-smoke")]
-use crate::{user_vm_multi::UserPage, user_vm_two_pt, user_image_admission::{self, BackingPage}};
+use crate::{user_vm_two_pt, user_image_admission::{self, BackingPage}};
 
 mod symbols {
     include!(concat!(env!("OUT_DIR"), "/wolfos_elf_symbols.rs"));
@@ -353,29 +353,29 @@ pub fn enter(hhdm: u64) -> ! {
             let pt0 = &mut *ptrs[3].cast::<[u64; SLOTS]>();
             let pt1 = &mut *ptrs[4].cast::<[u64; SLOTS]>();
             let table_frames = [frames[0], frames[1], frames[2], frames[3], frames[4]];
-            let pages = [
-                UserPage { virtual_address: base + text.page_start,
-                    physical_frame: frames[5], writable: false, executable: true },
-                UserPage { virtual_address: base + data.page_start,
-                    physical_frame: frames[6], writable: true, executable: false },
-                UserPage { virtual_address: base + launch.stack_page,
-                    physical_frame: frames[7], writable: true, executable: false },
-            ];
-            if user_vm_two_pt::populate(root, pdpt, pd, pt0, pt1, table_frames, &pages).is_err() {
+            let Ok(manifest) = user_vm_two_pt::derive_relocated_elf_pages(
+                elf, slot, table_frames, &frames[TABLE_FRAMES..],
+            ) else { fail("two_pt_byte_derived_page_manifest") };
+            let pages = manifest.pages();
+            if manifest.layout.source != launch || manifest.load_pages() != 2
+                || manifest.layout.entry != code || pages.len() != 3
+            { fail("two_pt_manifest_elf_mismatch") }
+            if user_vm_two_pt::populate(root, pdpt, pd, pt0, pt1, table_frames, pages).is_err() {
                 fail("two_pt_populate")
             }
             let file_backings = [
                 BackingPage { virtual_address: pages[0].virtual_address,
-                    physical_frame: frames[5], bytes: text_page },
+                    physical_frame: pages[0].physical_frame, bytes: text_page },
                 BackingPage { virtual_address: pages[1].virtual_address,
-                    physical_frame: frames[6], bytes: data_page },
+                    physical_frame: pages[1].physical_frame, bytes: data_page },
             ];
             let stack_backing = BackingPage {
-                virtual_address: pages[2].virtual_address, physical_frame: frames[7],
+                virtual_address: pages[2].virtual_address,
+                physical_frame: pages[2].physical_frame,
                 bytes: &*ptrs[7].cast::<[u8; PAGE_SIZE]>(),
             };
             let Ok(admitted) = user_image_admission::audit_relocated_two_pt_staged_image(
-                elf, slot, table_frames, &pages,
+                elf, slot, table_frames, pages,
                 root, pdpt, pd, pt0, pt1, &file_backings, stack_backing,
             ) else { fail("two_pt_exact_elf_and_frame_admission") };
             if admitted.entry != code || admitted.stack_page != stack_va
@@ -472,7 +472,7 @@ pub fn enter(hhdm: u64) -> ! {
         ));
         #[cfg(feature = "user-elf-two-pt-run-smoke")]
         serial::write_fmt(format_args!(
-            "WOLFOS_ELF_TWO_PT_ENTER hardware_cr3=1 root_slot={} pd_regions=2 pt_frames=2 rx=1 rw_nx=2 elf_admitted=1 hhdm_checked=1 owned_frames=8\n",
+            "WOLFOS_ELF_TWO_PT_ENTER hardware_cr3=1 root_slot={} pd_regions=2 pt_frames=2 rx=1 rw_nx=2 elf_admitted=1 hhdm_checked=1 derived_pages=1 owned_frames=8\n",
             slot,
         ));
         #[cfg(feature = "user-file-io-smoke")]
