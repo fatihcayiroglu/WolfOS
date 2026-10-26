@@ -13,6 +13,8 @@ mod user_elf_launch_layout;
 mod user_vm_two_pt;
 #[path = "../kernel/src/user_elf_two_pt_stager.rs"]
 mod user_elf_two_pt_stager;
+#[path = "../kernel/src/user_elf_page_tables.rs"]
+mod user_elf_page_tables;
 #[path = "../kernel/src/user_image_admission.rs"]
 mod user_image_admission;
 
@@ -625,6 +627,103 @@ fn atomic_stager_executes_byte_derived_one_two_and_three_load_leaf_plans() {
     }
     assert_eq!(rx1[0x100], 0xc3);
     assert!(stack1.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn common_two_pt_payloads_match_legacy_control_and_pass_independent_admission() {
+    use user_elf_page_tables::{ElfPageTables, OwnedLeafPage, TableBuffers};
+    use user_elf_two_pt_stager::{OwnedPageBuffer, stage_relocated_two_pt_elf};
+    use user_image_admission::BackingPage;
+
+    for loads in [2, 3] {
+        let mut elf = image();
+        if loads == 3 {
+            elf[24..32].copy_from_slice(&0x5fe100u64.to_le_bytes());
+            elf[80..88].copy_from_slice(&0x5fe100u64.to_le_bytes());
+            elf[104..112].copy_from_slice(&0x1100u64.to_le_bytes());
+        }
+        let owned: Vec<u64> = (0..5 + loads + 1)
+            .map(|i| 0x10000 + 4096 * i as u64)
+            .collect();
+        let mapper = ElfPageTables::bind(&elf, 7, &owned).unwrap();
+        let mut common = vec![[0u8; 4096]; loads];
+        let mut reference = vec![[0u8; 4096]; loads];
+        let mut common_stack = [0u8; 4096];
+        let mut reference_stack = [0u8; 4096];
+        let common_contents = {
+            let mut buffers: Vec<_> = common
+                .iter_mut()
+                .enumerate()
+                .map(|(i, bytes)| OwnedLeafPage {
+                    physical_frame: owned[5 + i],
+                    bytes,
+                })
+                .collect();
+            let mut stack = OwnedLeafPage {
+                physical_frame: owned[5 + loads],
+                bytes: &mut common_stack,
+            };
+            mapper
+                .stage_load_and_stack(&elf, &mut buffers, &mut stack)
+                .unwrap()
+        };
+        let reference_staged = {
+            let mut buffers: Vec<_> = reference
+                .iter_mut()
+                .enumerate()
+                .map(|(i, bytes)| OwnedPageBuffer {
+                    physical_frame: owned[5 + i],
+                    bytes,
+                })
+                .collect();
+            let mut stack = OwnedPageBuffer {
+                physical_frame: owned[5 + loads],
+                bytes: &mut reference_stack,
+            };
+            stage_relocated_two_pt_elf(&elf, 7, FRAMES, &owned[5..], &mut buffers, &mut stack)
+                .unwrap()
+        };
+        assert_eq!(common_contents, reference_staged.copied);
+        assert_eq!(common, reference);
+        assert_eq!(common_stack, reference_stack);
+
+        let mut tables = bank();
+        {
+            let [pml4, pdpt, pd, pt0, pt1] = &mut tables;
+            let mut buffers = TableBuffers {
+                pml4,
+                pdpt,
+                pd,
+                pt0,
+                pt1: Some(pt1),
+            };
+            mapper.populate(&mut buffers).unwrap();
+            mapper.audit(&buffers).unwrap();
+        }
+        let pages = reference_staged.manifest.pages();
+        let backings: Vec<_> = common
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| BackingPage {
+                virtual_address: pages[i].virtual_address,
+                physical_frame: owned[5 + i],
+                bytes,
+            })
+            .collect();
+        let stack = BackingPage {
+            virtual_address: mapper.stack_page(),
+            physical_frame: owned[5 + loads],
+            bytes: &common_stack,
+        };
+        let [pml4, pdpt, pd, pt0, pt1] = &tables;
+        assert_eq!(
+            user_image_admission::audit_relocated_two_pt_staged_image(
+                &elf, 7, FRAMES, pages, pml4, pdpt, pd, pt0, pt1, &backings, stack,
+            )
+            .unwrap(),
+            reference_staged.manifest.layout
+        );
+    }
 }
 
 #[test]

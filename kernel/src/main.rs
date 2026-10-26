@@ -122,8 +122,6 @@ mod user_vm_shadow_smoke;
 mod user_vm_multi;
 #[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-elf-two-pt-run-smoke"))]
 mod user_vm_two_pt;
-#[cfg(feature = "user-elf-two-pt-run-smoke")]
-mod user_elf_two_pt_stager;
 #[cfg(any(feature = "user-vm-shadow-smoke", feature = "smp-address-space-retirement-smoke"))]
 mod pmm_frame_batch;
 #[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-elf-two-pt-run-smoke"))]

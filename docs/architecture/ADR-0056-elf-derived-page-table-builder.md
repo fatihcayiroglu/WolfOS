@@ -105,3 +105,41 @@ from an active CPU by this new API.
 transaction, including independently authenticated HHDM provenance, a
 complete final byte/PTE audit, and safe verified retirement/quiescence.
 This change alone is not a general process loader.
+
+## 2026-10-26: converge real two-PT payload staging
+
+The actual eight/nine-frame two-PT CPL3 paths now call the same sealed
+`ElfPageTables::stage_load_and_stack` operation as the six/seven-frame paths.
+Only the independently derived two-PT page manifest and final byte/PTE/HHDM
+audits remain specific to those bounds. The separate legacy stager stays in
+host tests as an independent control; it is no longer compiled into a kernel
+flavor. No physical allocation, active-owner publication or retirement rule
+is changed by this convergence.
+
+Before valid two-PT staging, each hardware fixture deliberately supplies a
+wrong last-LOAD frame identity that aliases its still-disconnected PML4.
+The common stage must return the exact backing mismatch. The test checks
+every LOAD and stack byte, every table entry, and the real PMM allocation
+count: all must remain unchanged. Only the claimed frame metadata is then
+corrected; the same retained frames must subsequently run the real native
+ELF and complete exact eight/nine-frame cleanup. This is an actual PMM/HHDM
+rejection proof, not a simulated processor acknowledgement or ownership
+transfer. It does not free any frame during rejection.
+
+Every launch emits an exact ordered common-payload proof. Two-PT acceptance
+also requires the full atomic-rejection proof before the table audit and real
+private-root entry. Missing, duplicate, reordered, decorated or partial proof
+rows are failures. All prior Ring3 entry, syscall, fault, kernel isolation,
+second-RX-page execution, counted reap and zero-leak assertions remain.
+
+A host composition regression compares both two-PT layouts byte-for-byte to
+the legacy control, maps them through the common recipe and requires the
+independent full staged-image admission to accept all PTEs, file/BSS bytes
+and the separate zeroed NX stack. Existing partial-allocation and rejected
+staging FrameBatch rollback tests remain mandatory.
+
+Next: a reusable fallible launch transaction connecting existing counted
+FrameBatch reservation, trusted HHDM views, staging, mapping/admission and
+explicit active-owner transfer. A staged guard must never remain armed after
+any CPU can load its CR3. This increment does not provide that transaction,
+arbitrary ELF support, general Ring3 scheduling or multicore crash recovery.

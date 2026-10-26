@@ -37,7 +37,7 @@ use crate::{
     user_syscall_abi::{self, Outcome, UserSyscallFrame},
 };
 #[cfg(feature = "user-elf-two-pt-run-smoke")]
-use crate::{user_vm_two_pt, user_elf_two_pt_stager, user_image_admission::{self, BackingPage}};
+use crate::{user_vm_two_pt, user_image_admission::{self, BackingPage}};
 
 mod symbols {
     include!(concat!(env!("OUT_DIR"), "/wolfos_elf_symbols.rs"));
@@ -388,34 +388,15 @@ pub fn enter(hhdm: u64) -> ! {
     // until AFTER segment copying and full source/destination root audit.
     unsafe {
         for ptr in ptrs { core::ptr::write_bytes(ptr, 0, PAGE as usize); }
-        // The two-PT loader first checks the ELF, ALL owned frames, source
-        // ranges and clean destination buffers BEFORE changing any LOAD bytes.
-        // It supports either 2 or 3 executable/data leaves without assuming
-        // a static PT_LOAD page address. The legacy one-PT path stays intact.
+        // Independent two-PT admission still rederives its page manifest;
+        // payload copying for EVERY layout uses the sealed common recipe.
         #[cfg(feature = "user-elf-two-pt-run-smoke")]
         let table_frames = [frames[0], frames[1], frames[2], frames[3], frames[4]];
         #[cfg(feature = "user-elf-two-pt-run-smoke")]
-        let (manifest, copied) = {
-            let mut destinations:
-                [user_elf_two_pt_stager::OwnedPageBuffer<'_>; LOAD_LEAVES] =
-                core::array::from_fn(|i| user_elf_two_pt_stager::OwnedPageBuffer {
-                    physical_frame: frames[TABLE_FRAMES + i],
-                    bytes: &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>(),
-                });
-            let mut stack = user_elf_two_pt_stager::OwnedPageBuffer {
-                physical_frame: frames[FRAMES - 1],
-                bytes: &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>(),
-            };
-            let Ok(staged) = user_elf_two_pt_stager::stage_relocated_two_pt_elf(
-                elf, slot, table_frames, &frames[TABLE_FRAMES..FRAMES],
-                &mut destinations, &mut stack,
-            ) else { fail("two_pt_bound_elf_payload_stage") };
-            (staged.manifest, staged.copied)
-        };
-        #[cfg(not(feature = "user-elf-two-pt-run-smoke"))]
+        let manifest = user_vm_two_pt::derive_relocated_elf_pages(
+            elf, slot, table_frames, &frames[TABLE_FRAMES..FRAMES],
+        ).unwrap_or_else(|_| fail("two_pt_independent_manifest"));
         let copied = {
-            // Every real one-PT flavor now uses the same exact ELF/PMM
-            // frame recipe for payload staging as for page-table mapping.
             let mut destinations:
                 [crate::user_elf_page_tables::OwnedLeafPage<'_>; LOAD_LEAVES] =
                 core::array::from_fn(|i| crate::user_elf_page_tables::OwnedLeafPage {
@@ -426,8 +407,29 @@ pub fn enter(hhdm: u64) -> ! {
                 physical_frame: frames[FRAMES - 1],
                 bytes: &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>(),
             };
+            #[cfg(feature = "user-elf-two-pt-run-smoke")]
+            {
+                // Real disconnected PMM/HHDM buffers: reject a late claimed
+                // LOAD/root alias before any payload or PTE can be changed.
+                // The private root is NOT active and no frame is released.
+                let last = LOAD_LEAVES - 1;
+                destinations[last].physical_frame = frames[0];
+                let refused = mapping.stage_load_and_stack(elf, &mut destinations, &mut stack);
+                destinations[last].physical_frame = frames[TABLE_FRAMES + last];
+                if refused != Err(crate::user_elf_page_tables::StageError::BackingFrameMismatch {
+                    index: last,
+                }) || destinations.iter().any(|page| page.bytes.iter().any(|b| *b != 0))
+                    || stack.bytes.iter().any(|b| *b != 0)
+                    || ptrs[..TABLE_FRAMES].iter().any(|ptr|
+                        (&*ptr.cast::<[u64; SLOTS]>()).iter().any(|entry| *entry != 0))
+                    || pmm::statistics().allocated_frames != before + prepared.frames.total_frames
+                { fail("two_pt_rejected_stage_mutated_memory_or_ownership") }
+                serial::write_line(
+                    "WOLFOS_ELF_TWO_PT_STAGE_REJECT_OK wrong_last_frame=1 tables_unchanged=1 loads_unchanged=1 stack_unchanged=1 pmm_unchanged=1",
+                );
+            }
             mapping.stage_load_and_stack(elf, &mut destinations, &mut stack)
-                .unwrap_or_else(|_| fail("one_pt_bound_elf_payload_stage"))
+                .unwrap_or_else(|_| fail("common_bound_elf_payload_stage"))
         };
         let Some(t) = copied[0] else { fail("no_text_page") };
         let text_page = &*ptrs[TABLE_FRAMES].cast::<[u8; PAGE_SIZE]>();
@@ -581,6 +583,10 @@ pub fn enter(hhdm: u64) -> ! {
             "WOLFOS_ELF_TABLE_PLAN_OK source=elf tables={} loads={} stack=1 total={} exact_audit=1\n",
             prepared.frames.table_frames, prepared.frames.load_frames,
             prepared.frames.total_frames,
+        ));
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_PAYLOAD_PLAN_OK source=recipe loads={} stack=1 total={}\n",
+            prepared.frames.load_frames, prepared.frames.total_frames,
         ));
         #[cfg(feature = "user-process-smoke")]
         serial::write_fmt(format_args!(
