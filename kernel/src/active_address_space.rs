@@ -58,7 +58,9 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
             Ok(contexts) => contexts,
             Err(error) => return Err((batch, PublishError::Context(error))),
         };
-        let frames = batch.frames();
+        // Only exact leased addresses are owned; a bounded counted batch
+        // may have a zero-filled unused capacity tail.
+        let frames = batch.leased_frames();
         let error = if !frames.contains(&root) {
             Some(PublishError::RootNotOwned)
         } else if frames.contains(&supervisor) {
@@ -83,8 +85,15 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         })
     }
 
+    /// Fixed-capacity backing array for legacy full-size owners; unused
+    /// counted-lease tail slots are zeros and are NOT owned physical frames.
     pub fn frames(&self) -> &[u64; N] {
         self.batch.frames()
+    }
+
+    /// Exact physical ownership, safe for counted batches and audits.
+    pub fn leased_frames(&self) -> &[u64] {
+        self.batch.leased_frames()
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -98,7 +107,7 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
     pub fn matches_process_lease(&self, pid: u64, root: u64, frames: &[u64; N]) -> bool {
         self.gate.snapshot().phase == Phase::Live
             && self.gate.matches_process_identity(pid, root)
-            && self.batch.frames() == frames
+            && self.batch.leased_frames() == &frames[..]
     }
 
     /// Only for a fresh entry that has no saved resumable context. A scheduler

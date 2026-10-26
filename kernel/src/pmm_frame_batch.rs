@@ -29,6 +29,7 @@ pub enum AcquireError {
         acquired: usize,
         rollback: ReleaseReport,
     },
+    InvalidCount { requested: usize, capacity: usize },
 }
 
 /// Retains exclusive staged-frame ownership. No copy/clone or implicit
@@ -46,12 +47,27 @@ impl<'a, S: FrameSource, const N: usize> FrameBatch<'a, S, N> {
     /// loop, all preceding successful allocations are rolled back in reverse
     /// order before returning an error with explicit cleanup evidence.
     pub fn acquire(source: &'a mut S) -> Result<Self, AcquireError> {
+        Self::acquire_bounded(source, N)
+    }
+
+    /// Allocate precisely `requested` frames, not the full array capacity.
+    /// Reject empty or oversized leases WITHOUT asking the provider for any
+    /// frames. Counts come from validated image metadata, never raw ELF fields.
+    /// Unused array entries remain zero and are not transferred or released.
+    pub fn acquire_count(source: &'a mut S, requested: usize) -> Result<Self, AcquireError> {
+        if requested == 0 || requested > N {
+            return Err(AcquireError::InvalidCount { requested, capacity: N });
+        }
+        Self::acquire_bounded(source, requested)
+    }
+
+    fn acquire_bounded(source: &'a mut S, requested: usize) -> Result<Self, AcquireError> {
         let mut batch = Self {
             source,
             frames: [0; N],
             live: 0,
         };
-        while batch.live < N {
+        while batch.live < requested {
             let Some(frame) = batch.source.allocate() else {
                 let acquired = batch.live;
                 let rollback = batch.release_all();
@@ -67,6 +83,12 @@ impl<'a, S: FrameSource, const N: usize> FrameBatch<'a, S, N> {
     /// the right to free or publish them as a running userspace image.
     pub fn frames(&self) -> &[u64; N] {
         &self.frames
+    }
+
+    /// Only the currently leased frames, excluding the unused zero tail.
+    /// Ownership and publication checks MUST use this bounded slice.
+    pub fn leased_frames(&self) -> &[u64] {
+        &self.frames[..self.live]
     }
 
     fn release_all(&mut self) -> ReleaseReport {

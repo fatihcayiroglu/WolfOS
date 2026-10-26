@@ -678,3 +678,64 @@ fn registry_bound_admission_rejects_wrong_state_stale_handle_and_wrong_owner() {
         assert_eq!(reclaim(other_owner).ok(), Some(ReleaseReport { released: 2, failed: 0 }));
     }
 }
+
+#[test]
+fn counted_owner_publishes_only_budgeted_frames_and_reclaims_exact_count() {
+    for count in [6usize, 7, 8, 9] {
+        let addresses: [u64; 9] = core::array::from_fn(|i| (i as u64 + 1) * 4096);
+        let mut source = Source::new(&addresses);
+        let trace = source.trace.clone();
+        let batch = FrameBatch::<_, 9>::acquire_count(&mut source, count)
+            .unwrap_or_else(|_| panic!("counted batch"));
+        assert_eq!(batch.leased_frames(), &addresses[..count]);
+        let mut owner = ActiveAddressSpace::<_, 9, 1>::publish(
+            batch, 7, addresses[0], 0xf000,
+        ).unwrap_or_else(|_| panic!("counted publish"));
+        assert_eq!(owner.leased_frames(), &addresses[..count]);
+        assert!(owner.frames()[count..].iter().all(|frame| *frame == 0));
+        // A legacy fixed-size process lease must never match a padded owner.
+        assert_eq!(
+            owner.matches_process_lease(7, addresses[0], owner.frames()),
+            count == addresses.len(),
+        );
+        let cpu = owner.reserve_cpu(0).unwrap();
+        owner.confirm_active(cpu, addresses[0]).unwrap();
+        owner.begin_retirement().unwrap();
+        assert_eq!(owner.finish_retirement(), Err(Error::OutstandingCpus));
+        assert_eq!(trace.borrow().owned.len(), count);
+        owner.acknowledge_quiescent(cpu, 0xf000).unwrap();
+        owner.finish_retirement().unwrap();
+        assert_eq!(reclaim(owner).ok(),
+            Some(ReleaseReport { released: count, failed: 0 }));
+        let observed = trace.borrow();
+        assert!(observed.owned.is_empty());
+        assert_eq!(observed.releases.len(), count);
+        for i in 0..count {
+            assert_eq!(observed.releases[i], addresses[count - 1 - i]);
+        }
+    }
+}
+
+#[test]
+fn counted_publish_failure_preserves_exact_partial_lease_for_rollback() {
+    let addresses: [u64; 9] = core::array::from_fn(|i| (i as u64 + 1) * 4096);
+    let mut source = Source::new(&addresses);
+    let trace = source.trace.clone();
+    let batch = FrameBatch::<_, 9>::acquire_count(&mut source, 6)
+        .unwrap_or_else(|_| panic!("counted batch"));
+    // Frame 7 is outside the leased prefix, although the backing capacity is 9.
+    let (batch, error) = match ActiveAddressSpace::<_, 9, 1>::publish(
+        batch, 7, addresses[6], 0xf000,
+    ) {
+        Err(value) => value,
+        Ok(_) => panic!("accepted unleased CR3 root"),
+    };
+    assert_eq!(error, PublishError::RootNotOwned);
+    assert_eq!(batch.leased_frames(), &addresses[..6]);
+    assert!(trace.borrow().releases.is_empty());
+    assert_eq!(batch.close(), ReleaseReport { released: 6, failed: 0 });
+    assert_eq!(trace.borrow().releases,
+        [addresses[5], addresses[4], addresses[3],
+         addresses[2], addresses[1], addresses[0]]);
+    assert!(trace.borrow().owned.is_empty());
+}
