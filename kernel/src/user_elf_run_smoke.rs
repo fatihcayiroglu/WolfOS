@@ -16,20 +16,21 @@
 //! Kernel high-half descendant page tables remain borrowed from Limine.
 
 use core::arch::asm;
+use core::cell::UnsafeCell;
 #[cfg(any(feature = "user-invalid-opcode-retire-smoke", feature = "user-page-fault-retire-smoke"))]
 use x86_64::structures::idt::InterruptStackFrame;
 #[cfg(feature = "user-page-fault-retire-smoke")]
 use x86_64::{registers::control::Cr2, structures::idt::PageFaultErrorCode};
-use core::sync::atomic::{compiler_fence, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use x86_64::{
     instructions::segmentation::{CS, Segment},
-    registers::control::Cr3,
+    registers::control::{Cr3, Cr4, Cr4Flags},
     VirtAddr,
 };
 use crate::{
     elf64_page_image::PAGE_SIZE,
     user_elf_launch_layout::plan_bounded_with_budget,
-    user_elf_page_tables::{ElfPageTables, TableBuffers},
+    user_elf_page_tables::TableBuffers,
     interrupts, kernel_half_shadow, pmm, serial,
     process_lifecycle::ProcessState,
     process_table::{ProcessTableCell, TableError},
@@ -77,9 +78,8 @@ static STAGE: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "user-file-io-smoke")]
 static FILE_FD: AtomicU64 = AtomicU64::new(0);
 static OWNED: [AtomicU64; FRAMES] = [const { AtomicU64::new(0) }; FRAMES];
-/// The same bounded multi-PID ownership table tested with real PMM leases
-/// now owns the hardware Ring3 ELF path. Slots can be reused after reap,
-/// while PID generations increase monotonically.
+/// PID metadata mirrors the canonical LiveElf frame owner; it never frees
+/// physical frames. Slots can be reused while PID generations increase.
 static PROCESS_TABLE: ProcessTableCell<2, PROCESS_FRAME_CAPACITY> = ProcessTableCell::new();
 static RUN_INDEX: AtomicUsize = AtomicUsize::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
@@ -135,35 +135,181 @@ fn hhdm_ptr(hhdm: u64, phys: u64) -> Option<*mut u8> {
         .map(|addr| addr.as_mut_ptr::<u8>())
 }
 
-/// The validated ELF budget drives the PMM lease length, independently of
-/// the maximum process-record capacity and fixture-specific paging layout.
-/// The unused tail remains zero and is never allocated or freed.
-fn allocate_owned(requested: usize) -> Option<[u64; PROCESS_FRAME_CAPACITY]> {
-    if requested == 0 || requested > PROCESS_FRAME_CAPACITY { return None; }
-    let mut frames = [0u64; PROCESS_FRAME_CAPACITY];
-    for i in 0..requested {
-        let Some(phys) = pmm::allocate_frame() else {
-            for old in frames[..i].iter().copied().rev() {
-                if pmm::free_frame(old).is_err() { fail("pmm_rollback_release") }
-            }
-            return None;
-        };
-        if phys == 0 || phys & (PAGE - 1) != 0
-            || phys >= (1 << 52) || frames[..i].contains(&phys)
-        {
-            // A duplicate would still be owned by the earlier slot: never
-            // release the aliased frame twice or corrupt PMM accounting.
-            for old in frames[..i].iter().copied().rev() {
-                if pmm::free_frame(old).is_err() { fail("pmm_rollback_release") }
-            }
-            return None;
-        }
-        frames[i] = phys;
+/// This fixed IF=0 path is entered only by the BSP. APs never receive its
+/// private root, and there is no scheduler, saved resumable context or DMA.
+/// The provider borrow remains pinned in the active owner until reclamation.
+struct PmmSource;
+impl crate::pmm_frame_batch::FrameSource for PmmSource {
+    fn allocate(&mut self) -> Option<u64> {
+        pmm::allocate_frame()
     }
-    Some(frames)
+    fn release(&mut self, frame: u64) -> bool {
+        pmm::free_frame(frame).is_ok()
+    }
+}
+struct SourceCell(UnsafeCell<PmmSource>);
+// SAFETY: SOURCE_BUSY forbids a second provider borrow until its prior owner
+// is consumed, and only the BSP's non-reentrant IF=0 path uses this source.
+unsafe impl Sync for SourceCell {}
+static SOURCE: SourceCell = SourceCell(UnsafeCell::new(PmmSource));
+static SOURCE_BUSY: AtomicBool = AtomicBool::new(false);
+type ActiveElf =
+    crate::active_address_space::ActiveAddressSpace<'static, PmmSource, PROCESS_FRAME_CAPACITY, 1>;
+struct LiveElf {
+    owner: ActiveElf,
+    ticket: crate::address_space_retirement::Ticket,
+}
+struct OwnerCell(UnsafeCell<Option<LiveElf>>);
+// SAFETY: only this BSP IF=0 launch/terminal-exit path accesses the slot.
+// No reference escapes a slot access; retirement takes the owner permanently.
+unsafe impl Sync for OwnerCell {}
+static LIVE_ELF: OwnerCell = OwnerCell(UnsafeCell::new(None));
+
+// Fallible ELF preparation has deeper stack use than a terminal trap. Never
+// recursively prepare PID2 on the fixed 16-KiB TSS.RSP0 exception stack.
+// The previous trap and all its return paths are terminal before this switch.
+#[cfg(feature = "user-process-smoke")]
+const RELAUNCH_STACK_BYTES: usize = 64 * 1024;
+#[cfg(feature = "user-process-smoke")]
+const RELAUNCH_CANARY: u64 = 0x574f_4c46_4c41_554e;
+#[cfg(feature = "user-process-smoke")]
+#[repr(C, align(16))]
+struct RelaunchStack([u8; RELAUNCH_STACK_BYTES]);
+#[cfg(feature = "user-process-smoke")]
+static mut RELAUNCH_STACK: RelaunchStack = RelaunchStack([0; RELAUNCH_STACK_BYTES]);
+
+#[cfg(feature = "user-process-smoke")]
+fn relaunch_after_reap(hhdm: u64) -> ! {
+    require_serial_bsp();
+    if SOURCE_BUSY.load(Ordering::Acquire) || unsafe { (&*LIVE_ELF.0.get()).is_some() } {
+        fail("relaunch_before_owner_retired")
+    }
+    let base = (&raw mut RELAUNCH_STACK).cast::<u8>() as u64;
+    // SAFETY: BSP-only, no prior preparation on this stack is resumable.
+    // All PID1 frames and return references have been retired. A fresh CALL
+    // supplies the SysV entry alignment; this handoff can never return.
+    unsafe {
+        (base as *mut u64).write(RELAUNCH_CANARY);
+        (base as *mut u64).add(1).write(!RELAUNCH_CANARY);
+        asm!("mov rsp, {top}", "xor rbp, rbp", "call {launch}", "ud2",
+            top = in(reg) base + RELAUNCH_STACK_BYTES as u64,
+            launch = sym enter, in("rdi") hhdm, options(noreturn));
+    }
 }
 
-pub fn enter(hhdm: u64) -> ! {
+fn require_serial_bsp() {
+    let (apic_base, _high): (u32, u32);
+    // SAFETY: x86-64 BSP/AP identity from IA32_APIC_BASE, never user data.
+    unsafe {
+        asm!("rdmsr", in("ecx") 0x1bu32, out("eax") apic_base,
+            out("edx") _high, options(nostack, preserves_flags));
+    }
+    if x86_64::instructions::interrupts::are_enabled()
+        || Cr4::read().contains(Cr4Flags::PCID)
+        || apic_base & (1 << 8) == 0
+    {
+        fail("owner_requires_if_zero_and_no_pcid")
+    }
+}
+
+fn verify_preparation_stacks(index: usize) {
+    let valid = if index == 0 {
+        // First publication keeps the strict initial SS selector admission.
+        interrupts::verify_ring3_preconditions()
+    } else {
+        #[cfg(feature = "user-process-smoke")]
+        {
+            let base = (&raw const RELAUNCH_STACK).cast::<u64>();
+            let rsp: u64;
+            // SAFETY: reads this BSP's current preparation-stack pointer.
+            unsafe {
+                asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags));
+            }
+            interrupts::verify_ring3_reentry_preconditions()
+                && unsafe {
+                    base.read() == RELAUNCH_CANARY && base.add(1).read() == !RELAUNCH_CANARY
+                }
+                && rsp > base as u64 + 16
+                && rsp < base as u64 + RELAUNCH_STACK_BYTES as u64
+        }
+        #[cfg(not(feature = "user-process-smoke"))]
+        {
+            false
+        }
+    };
+    if !valid {
+        fail("preparation_rsp0_or_relaunch_stack")
+    }
+}
+
+/// Exercise failure and explicit rollback with actual disconnected PMM pages,
+/// before admitting any PID. The normal launch then uses a fresh transaction.
+#[inline(never)]
+fn probe_launch_rollback(elf: &[u8], slot: usize, hhdm: u64, before: usize) {
+    let mut source = PmmSource;
+    let tx = crate::elf_launch_transaction::ElfLaunch::<
+        _,
+        PROCESS_FRAME_CAPACITY,
+        crate::elf_launch_transaction::Reserved,
+    >::reserve(&mut source, elf, slot)
+    .unwrap_or_else(|_| fail("rollback_probe_reserve"));
+    let mut ptrs = [core::ptr::null_mut::<u8>(); FRAMES];
+    if tx.leased_frames().len() != FRAMES {
+        fail("rollback_probe_budget")
+    }
+    for (i, frame) in tx.leased_frames().iter().copied().enumerate() {
+        ptrs[i] = hhdm_ptr(hhdm, frame).unwrap_or_else(|| fail("rollback_probe_hhdm"));
+        // SAFETY: exact freshly leased PMM frames, never published or aliased.
+        unsafe {
+            core::ptr::write_bytes(ptrs[i], 0, PAGE_SIZE);
+        }
+    }
+    let tx = unsafe {
+        let mut loads: [crate::user_elf_page_tables::OwnedLeafPage<'_>; LOAD_LEAVES] =
+            core::array::from_fn(|i| crate::user_elf_page_tables::OwnedLeafPage {
+                physical_frame: tx.leased_frames()[TABLE_FRAMES + i],
+                bytes: &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>(),
+            });
+        let mut stack = crate::user_elf_page_tables::OwnedLeafPage {
+            physical_frame: tx.leased_frames()[FRAMES - 1],
+            bytes: &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>(),
+        };
+        loads[LOAD_LEAVES - 1].physical_frame = tx.leased_frames()[0];
+        let tx = match tx.stage_payload(&mut loads, &mut stack) {
+            Err((tx, crate::user_elf_page_tables::StageError::BackingFrameMismatch { index }))
+                if index == LOAD_LEAVES - 1 =>
+            {
+                tx
+            }
+            _ => fail("rollback_probe_not_rejected"),
+        };
+        if ptrs
+            .iter()
+            .any(|ptr| (&*ptr.cast::<[u8; PAGE_SIZE]>()).iter().any(|b| *b != 0))
+            || pmm::statistics().allocated_frames != before + FRAMES
+            || !matches!(PROCESS_TABLE.with(|t| t.occupied()), Ok(0))
+        {
+            fail("rollback_probe_changed_backings_or_pid")
+        }
+        tx
+    };
+    // All physical-buffer views ended. No root, PID or return context was
+    // published; explicit rollback must release exactly the derived prefix.
+    let report = tx.abort();
+    if report.released != FRAMES
+        || report.failed != 0
+        || pmm::statistics().allocated_frames != before
+    {
+        fail("rollback_probe_release")
+    }
+    serial::write_fmt(format_args!(
+        "WOLFOS_ELF_TX_ROLLBACK_OK frames={} rejected=1 bytes_unchanged=1 pid_unpublished=1 pmm_no_leak=1\n",
+        FRAMES,
+    ));
+}
+
+pub extern "C" fn enter(hhdm: u64) -> ! {
+    require_serial_bsp();
     let index = RUN_INDEX.load(Ordering::Acquire);
     if index >= MAX_RUNS || hhdm == 0 { fail("invalid_process_launch") }
     let pid = index as u64 + 1;
@@ -368,8 +514,20 @@ pub fn enter(hhdm: u64) -> ! {
     if efer_lo & (1 << 11) == 0 { fail("efer_nxe") }
 
     let before = pmm::statistics().allocated_frames;
-    let Some(frames) = allocate_owned(prepared.frames.total_frames)
-    else { fail("pmm_owned_frames") };
+    if SOURCE_BUSY.load(Ordering::Acquire)
+        || unsafe { (&*LIVE_ELF.0.get()).is_some() }
+    { fail("live_owner_or_source_already_present") }
+    probe_launch_rollback(elf, slot, hhdm, before);
+    verify_preparation_stacks(index);
+    if SOURCE_BUSY.swap(true, Ordering::AcqRel) { fail("source_reentry") }
+    // SAFETY: exclusive provider borrow spans this staged/active owner only.
+    // It is not borrowed again until successful terminal reclamation.
+    let source_owner = unsafe { &mut *SOURCE.0.get() };
+    let tx = crate::elf_launch_transaction::ElfLaunch::<_, PROCESS_FRAME_CAPACITY,
+        crate::elf_launch_transaction::Reserved>::reserve(source_owner, elf, slot)
+        .unwrap_or_else(|_| fail("counted_launch_reserve"));
+    let mut frames = [0; PROCESS_FRAME_CAPACITY];
+    frames[..tx.leased_frames().len()].copy_from_slice(tx.leased_frames());
     if frames[prepared.frames.total_frames..].iter().any(|frame| *frame != 0) {
         fail("pmm_owned_tail_not_zero")
     }
@@ -378,10 +536,8 @@ pub fn enter(hhdm: u64) -> ! {
         let Some(ptr) = hhdm_ptr(hhdm, phys) else { fail("owned_frame_hhdm") };
         ptrs[i] = ptr;
     }
-    let mapping = ElfPageTables::bind(elf, slot, &frames[..prepared.frames.total_frames])
-        .unwrap_or_else(|_| fail("elf_table_binding"));
-    if mapping.launch() != &prepared || mapping.entry() != code
-        || mapping.stack_page() != stack_va
+    if tx.recipe().launch() != &prepared || tx.recipe().entry() != code
+        || tx.recipe().stack_page() != stack_va
     { fail("elf_table_plan_disagrees") }
 
     // SAFETY: all frames fresh and disjoint. No CR3 points to the new root
@@ -396,7 +552,9 @@ pub fn enter(hhdm: u64) -> ! {
         let manifest = user_vm_two_pt::derive_relocated_elf_pages(
             elf, slot, table_frames, &frames[TABLE_FRAMES..FRAMES],
         ).unwrap_or_else(|_| fail("two_pt_independent_manifest"));
-        let copied = {
+        let (tx, copied) = {
+            #[allow(unused_mut)]
+            let mut tx = tx;
             let mut destinations:
                 [crate::user_elf_page_tables::OwnedLeafPage<'_>; LOAD_LEAVES] =
                 core::array::from_fn(|i| crate::user_elf_page_tables::OwnedLeafPage {
@@ -414,11 +572,13 @@ pub fn enter(hhdm: u64) -> ! {
                 // The private root is NOT active and no frame is released.
                 let last = LOAD_LEAVES - 1;
                 destinations[last].physical_frame = frames[0];
-                let refused = mapping.stage_load_and_stack(elf, &mut destinations, &mut stack);
+                tx = match tx.stage_payload(&mut destinations, &mut stack) {
+                    Err((tx, crate::user_elf_page_tables::StageError::BackingFrameMismatch { index }))
+                        if index == last => tx,
+                    _ => fail("two_pt_transaction_probe_not_refused"),
+                };
                 destinations[last].physical_frame = frames[TABLE_FRAMES + last];
-                if refused != Err(crate::user_elf_page_tables::StageError::BackingFrameMismatch {
-                    index: last,
-                }) || destinations.iter().any(|page| page.bytes.iter().any(|b| *b != 0))
+                if destinations.iter().any(|page| page.bytes.iter().any(|b| *b != 0))
                     || stack.bytes.iter().any(|b| *b != 0)
                     || ptrs[..TABLE_FRAMES].iter().any(|ptr|
                         (&*ptr.cast::<[u64; SLOTS]>()).iter().any(|entry| *entry != 0))
@@ -428,7 +588,7 @@ pub fn enter(hhdm: u64) -> ! {
                     "WOLFOS_ELF_TWO_PT_STAGE_REJECT_OK wrong_last_frame=1 tables_unchanged=1 loads_unchanged=1 stack_unchanged=1 pmm_unchanged=1",
                 );
             }
-            mapping.stage_load_and_stack(elf, &mut destinations, &mut stack)
+            tx.stage_payload(&mut destinations, &mut stack)
                 .unwrap_or_else(|_| fail("common_bound_elf_payload_stage"))
         };
         let Some(t) = copied[0] else { fail("no_text_page") };
@@ -471,18 +631,31 @@ pub fn enter(hhdm: u64) -> ! {
         let root = &mut *ptrs[0].cast::<[u64; SLOTS]>();
         let pdpt = &mut *ptrs[1].cast::<[u64; SLOTS]>();
         let pd = &mut *ptrs[2].cast::<[u64; SLOTS]>();
-        {
+        let tx = {
             let mut tables = TableBuffers {
                 pml4: &mut *root, pdpt: &mut *pdpt, pd: &mut *pd,
                 pt0: &mut *ptrs[3].cast::<[u64; SLOTS]>(),
-                pt1: if mapping.launch().frames.table_frames == 5 {
+                pt1: if tx.recipe().launch().frames.table_frames == 5 {
                     Some(&mut *ptrs[4].cast::<[u64; SLOTS]>())
                 } else { None },
             };
-            if mapping.populate(&mut tables).is_err() || mapping.audit(&tables).is_err() {
-                fail("elf_derived_table_population_or_audit")
-            }
-        }
+            tx.build_tables(&mut tables)
+                .unwrap_or_else(|_| fail("elf_derived_table_population_or_audit"))
+        };
+        // Independent final read-only admission covers every LOAD byte,
+        // BSS/padding byte and the entire separate stack for ALL layouts.
+        let requests = core::array::from_fn(|i| {
+            let leaf = launch.leaves[i].unwrap_or_else(|| fail("final_missing_leaf"));
+            let segment = leaf.source_segment.unwrap_or_else(|| fail("final_missing_segment"));
+            (plan.segments[segment].as_ref().unwrap_or_else(|| fail("final_missing_load")),
+             leaf.virtual_address)
+        });
+        let backings: [&[u8; PAGE_SIZE]; LOAD_LEAVES] = core::array::from_fn(|i|
+            &*ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>());
+        if crate::elf64_page_image::audit_materialized_batch(elf, requests, backings).is_err()
+            || crate::elf64_page_image::audit_zeroed_stack(
+                &*ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>()).is_err()
+        { fail("final_complete_payload_or_stack_audit") }
         #[cfg(feature = "user-elf-two-pt-run-smoke")]
         {
             let pt0 = &mut *ptrs[3].cast::<[u64; SLOTS]>();
@@ -558,11 +731,50 @@ pub fn enter(hhdm: u64) -> ! {
             frames[0], frames, prepared.frames.total_frames,
         )), Ok(Ok(issued)) if issued == pid
         ) { fail("process_table_admission_or_pid_generation") }
+        verify_preparation_stacks(index);
+        #[cfg(feature = "user-process-smoke")]
+        if index != 0 {
+            serial::write_line("WOLFOS_ELF_RELAUNCH_STACK_OK pid=2 preparation_stack_kib=64 rsp0_stack_kib=16 canary=1 terminal_handoff=1");
+        }
+        // SAFETY: exact PMM/HHDM provenance, complete bytes/stack/PTE and
+        // kernel graft audits above precede the FIRST exposure to a CPU.
+        // All private leaves are non-global; PCID and interrupts are off.
+        // Borrowed kernel tables remain pinned under Limine's boot root.
+        let mut owner = match tx.publish::<1>(pid, boot_cr3) {
+            Ok(owner) => owner,
+            Err((tx, _)) => {
+                // Revoke the unpublished READY registry before rollback.
+                if !matches!(PROCESS_TABLE.with(|t| t.cancel_ready_counted(pid, boot_cr3)),
+                    Ok(Ok(lease)) if lease.as_slice() == tx.leased_frames())
+                { fail("publish_refusal_ready_rollback") }
+                for frame in &OWNED { frame.store(0, Ordering::Release); }
+                ENTRY.store(0, Ordering::Release);
+                STACK_TOP.store(0, Ordering::Release);
+                DATA_HHDM.store(0, Ordering::Release);
+                CR3_PHYS.store(0, Ordering::Release);
+                let report = tx.abort();
+                if report.released != FRAMES || report.failed != 0
+                    || pmm::statistics().allocated_frames != before
+                { fail("publish_refusal_frame_rollback") }
+                SOURCE_BUSY.store(false, Ordering::Release);
+                fail("counted_launch_publish_refused")
+            }
+        };
+        let ticket = owner.reserve_cpu(0).unwrap_or_else(|_| fail("launch_cpu_reservation"));
+        *LIVE_ELF.0.get() = Some(LiveElf { owner, ticket });
         compiler_fence(Ordering::SeqCst);
         asm!("mov cr3, {}", in(reg) frames[0],
             options(nostack, preserves_flags));
         let (now, _) = Cr3::read();
-        if now.start_address().as_u64() != frames[0] { fail("new_cr3_not_active") }
+        let actual = now.start_address().as_u64();
+        let live = (&mut *LIVE_ELF.0.get()).as_mut().unwrap_or_else(|| fail("missing_active_owner"));
+        if actual != frames[0] || live.owner.confirm_active(live.ticket, actual).is_err()
+            || !live.owner.matches_process_lease_counted(pid, actual, &frames[..FRAMES])
+        { fail("new_cr3_not_active_or_owned") }
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_TX_ACTIVE_OK pid={} frames={} transferred_before_cr3=1 cpu_reserved=1 actual_cr3=1 full_bytes=1 pcid_off=1 bsp_only=1\n",
+            pid, FRAMES,
+        ));
         if !matches!(PROCESS_TABLE.with(|t| t.mark_running(pid, frames[0])), Ok(Ok(()))) {
             fail("process_table_running_transition")
         }
@@ -706,6 +918,23 @@ pub(crate) fn retire_user_page_fault(frame: &InterruptStackFrame, code: PageFaul
 /// #UD and #PF paths, after the PID has entered Exited state.
 /// Never dereference the former user root after restoring supervisor CR3.
 fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
+    require_serial_bsp();
+    let mut live = unsafe { (&mut *LIVE_ELF.0.get()).take() }
+        .unwrap_or_else(|| fail("retire_missing_active_owner"));
+    let (actual, _) = Cr3::read();
+    if actual.start_address().as_u64() != active
+        || !matches!(PROCESS_TABLE.with(|t| t.snapshot(pid)), Ok(Some(record))
+            if record.state == ProcessState::Exited
+                && live.owner.matches_process_lease_counted(pid, active, record.owned_frames()))
+        || live.owner.begin_retirement().is_err()
+        || live.owner.finish_retirement() != Err(crate::address_space_retirement::Error::OutstandingCpus)
+        || live.owner.acknowledge_quiescent(live.ticket, actual.start_address().as_u64())
+            != Err(crate::address_space_retirement::Error::WrongCr3)
+        || pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
+    { fail("retirement_must_pin_actual_active_cr3") }
+    serial::write_fmt(format_args!(
+        "WOLFOS_ELF_TX_RETIRE_BLOCKED_OK pid={} cpu_outstanding=1 active_ack_denied=1 frames_pinned=1\n", pid,
+    ));
     // Hardware restoration before FREE: the boot CR3 has all needed
     // kernel, HHDM, TSS and serial mappings. Never release an ACTIVE
     // PML4; interrupt return will NOT be executed after this exit.
@@ -716,7 +945,9 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
             options(nostack, preserves_flags));
     }
     let (now, _) = Cr3::read();
-    if now.start_address().as_u64() != boot { fail("boot_cr3_not_restored") }
+    if now.start_address().as_u64() != boot
+        || live.owner.acknowledge_quiescent(live.ticket, now.start_address().as_u64()).is_err()
+    { fail("boot_cr3_not_restored_or_acknowledged") }
     // The audited PID ledger authorizes release ONLY after CR3
     // restoration, only for this exact owning PID, exactly once.
     let owned_by_pid = match PROCESS_TABLE.with(|t| t.reap_with_status_counted(pid, boot)) {
@@ -735,11 +966,36 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     for i in (0..owned_by_pid.count).rev() {
         let owned = OWNED[i].swap(0, Ordering::AcqRel);
         if owned == 0 || owned != owned_by_pid.as_slice()[i]
-            || pmm::free_frame(owned).is_err()
+            || live.owner.leased_frames().get(i) != Some(&owned)
         {
             fail("owned_user_frame_free_failed")
         }
     }
+    ENTRY.store(0, Ordering::Release);
+    STACK_TOP.store(0, Ordering::Release);
+    DATA_HHDM.store(0, Ordering::Release);
+    CR3_PHYS.store(0, Ordering::Release);
+    if live.owner.leased_frames() != owned_by_pid.as_slice()
+        || live.owner.context_snapshot().pending != 0
+        || live.owner.finish_retirement().is_err()
+    { fail("retire_live_reference_or_lease_mismatch") }
+    // SAFETY: this authenticated BSP restored boot CR3 with PCID off,
+    // completing local non-global invalidation. No AP ever received this root.
+    // Terminal EXIT/#UD/#PF never IRET to the old TSS-stack trap frame; this
+    // path has no saved scheduler contexts, queued resumes, walkers or DMA.
+    // The PID record and user-copy/return caches are revoked above. All raw
+    // staging HHDM views ended at the noreturn entry. Shared boot tables stay
+    // resident and are excluded from the exact private lease.
+    let report = unsafe { live.owner.reclaim() }
+        .unwrap_or_else(|_| fail("retired_owner_reclaim_refused"));
+    if report.released != FRAMES || report.failed != 0 {
+        fail("retired_owner_release_report")
+    }
+    SOURCE_BUSY.store(false, Ordering::Release);
+    serial::write_fmt(format_args!(
+        "WOLFOS_ELF_TX_RECLAIM_OK pid={} frames={} actual_boot_cr3=1 cpu_drained=1 pid_revoked=1 returns_revoked=1 failed=0\n",
+        pid, report.released,
+    ));
     // The exact former PID must be absent, its slot free, and an attempted
     // second reap must fail. No other live table entry may remain.
     if !matches!(PROCESS_TABLE.with(|t| (
@@ -793,7 +1049,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
             // No return to user kernel-stack frames from PID 1:
             // only start a new independent root after full CR3
             // restoration and prior PMM resources were reclaimed.
-            enter(HHDM_OFFSET.load(Ordering::Acquire));
+            relaunch_after_reap(HHDM_OFFSET.load(Ordering::Acquire));
         }
         if pid != 2 { fail("invalid_second_process_pid") }
         RUN_INDEX.store(2, Ordering::Release);
@@ -830,7 +1086,13 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         || frame_addr & 7 != 0 || frame_addr < rsp0 - (16 * 1024)
         || frame_addr.checked_add(user_syscall_abi::FRAME_BYTES as u64)
             .is_none_or(|end| end > rsp0)
-    { fail("trap_cr3_rsp0_or_privilege") }
+    {
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_TRAP_DIAGNOSTIC actual={:#x} expected={:#x} entry={:#x} cs={:#x} frame={:#x} rsp0={:#x}\n",
+            root.start_address().as_u64(), active, user_entry, CS::get_reg().0, frame_addr, rsp0,
+        ));
+        fail("trap_cr3_rsp0_or_privilege")
+    }
     // SAFETY: the custom assembly saved ALL registers onto the checked
     // TSS.RSP0 supervisor stack before calling this dispatcher. No user
     // pointer is dereferenced; all virtual user inputs are only numbers.

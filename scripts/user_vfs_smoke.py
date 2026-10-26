@@ -12,6 +12,12 @@ import subprocess
 import sys
 import tempfile
 
+if __package__:
+    from .elf_launch_evidence import valid_launch_transactions
+else:
+    from elf_launch_evidence import valid_launch_transactions
+
+
 READY = re.compile(
     r"WOLFOS_VFS_READY root_mount=1 tmp_mount=1 owner_fds=1 stale_fds=1 "
     r"busy_unlink=1 sealed_elf=1 path_denial=1 elf_bytes=(\d+) cap=32768"
@@ -57,6 +63,9 @@ def main() -> int:
             return 2
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
+        if not valid_launch_transactions(output, 7, (1,)):
+            print("FAIL: counted launch rollback, CPU ownership or terminal retirement evidence missing")
+            return 1
         ready, entry = READY.search(output), ENTER.search(output)
         if ready is None or entry is None:
             print("FAIL: missing verified VFS mount/FD or ELF execution")

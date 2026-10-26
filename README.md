@@ -48,16 +48,25 @@ frame without changing any payload/table byte or PMM ownership, then execute
 the valid ELF using the retained frames and verify exact cleanup. Independent
 ELF-byte, PTE and HHDM admission remains mandatory before user execution.
 
-A separate counted preparation coordinator now composes reservation,
-payload/table preparation and explicit transfer to the active frame owner.
-Consuming type stages prevent early publication; rejection preserves the
-staging owner for retry/rollback. It is host-tested and cross-compiled without
-std, but is not yet wired into the real Ring3 launcher. Final HHDM/image
-admission and hardware retirement remain external safety obligations.
+The counted preparation coordinator now drives the real bounded BSP Ring3
+path: exact reservation, payload/table preparation, final complete byte/PTE
+admission, then consuming transfer to one active frame owner before CR3 is
+loaded. Every launch first proves rejection and exact PMM rollback using real
+disconnected pages. EXIT and authenticated #UD/#PF close CPU admission, reject
+retirement while the private CR3 is active, restore boot CR3 with PCID off,
+revoke PID/return references and reclaim only through the retired owner.
+PID2 preparation uses a separate checked supervisor stack after terminal reap;
+it does not recursively consume the 16-KiB TSS exception stack. These paths
+remain fixed ELF fixtures, BSP-only and IF=0. General multicore process
+retirement, resumable-context cancellation and arbitrary ELF loading remain
+unfinished; the separate four-vCPU retirement/TLB controls do not prove them.
 
 The verified scope remains an experimental Rust-owned kernel: boot execution, frame allocation, CPU tables/exceptions, paging, ACPI topology, saved-context kernel threads, **four-process** Ring 3 ELF execution, address-space isolation, and timer-origin preemptive handoff in isolated QEMU scenarios. A genuine hardware IRQ → blocked WAIT wake → saved IRET resume **has been demonstrated for two fixed ELF processes**; generalized dynamic process creation, device-event registration, scheduling, and arbitrary workload-safe Block → Wake → Resume integration remain incomplete. Host-only queue, process/PMM lease and context-bank policy regressions are not substitutes for physical CPU/IRQ proof. The reference-clock calibration is a QEMU test variant, not a validated general scheduling or wall-clock source.
 
-The no-heap PID lifecycle ledger now supports retaining a nonzero trusted EXIT status and returning it together with the exact retired physical-frame lease. Host regressions require correct PID/CR3, reject early or duplicate reaping, preserve unrelated process owners, and prove monotonic PID reuse. Existing EXIT(0) paths keep their behavior. This is a **metadata contract**, not yet a real Ring3 nonzero-exit syscall, crash isolation, parent wait/reap interface or hardware fault recovery.
+The no-heap PID lifecycle ledger preserves EXIT status and exact counted leases.
+Real QEMU fixtures cover CPL3 EXIT(42), authenticated #UD/#PF retirement and
+faulted PID1 followed by healthy PID2. A general parent wait/reap interface,
+dynamic crash recovery and concurrent process retirement remain unfinished.
 
 The opt-in `make ps2-graphics-smoke` exercises a real emulated 8042 PS/2 keyboard in QEMU, injecting A/B/C/Backspace/D/Enter through the QEMU monitor and verifying both decoded key events and the ABD text pixels. The independent `make ps2-graphics-overflow-smoke` test deliberately reduces the isolated IRQ1 queue to eight bytes, then injects real QEMU PS/2 keyboard events while the foreground consumer is paused. It demands at least nine real IRQ1 deliveries, matching PIC EOIs, nonzero discarded scan codes, a permanently poisoned queue, and an unchanged graphical prompt without any decoded or authorized commands. This is a controlled fail-closed stress test, **not** general keyboard recovery; normal 64-byte queue behavior is unchanged.
 
