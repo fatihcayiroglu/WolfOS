@@ -384,7 +384,7 @@ fn prove_two_pt(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
         );
         data_page[0x180] = original;
         let original_pte = pt1[0];
-        pt1[0] &= !user_vm_layout::NX; // data may never become executable
+        pt1[0] &= !crate::user_vm_layout::NX; // data may never become executable
         let pte_rejected = user_vm_two_pt::audit(
             root, pdpt, pd, pt0, pt1, table_frames, &pages,
         ).is_err();
