@@ -16,9 +16,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[path = "process_lifecycle.rs"]
 pub(crate) mod standalone_process;
 #[cfg(test)]
-use standalone_process::{ProcessError, ProcessRecord, ProcessState, PAGE};
+use standalone_process::{CountedFrames, ProcessError, ProcessRecord, ProcessState, PAGE};
 #[cfg(not(test))]
-use crate::process_lifecycle::{ProcessError, ProcessRecord, ProcessState, PAGE};
+use crate::process_lifecycle::{CountedFrames, ProcessError, ProcessRecord, ProcessState, PAGE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableError {
@@ -68,8 +68,21 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
     pub fn saved_binding_lease(&self, pid: u64, blocked: bool) -> Option<(u64, [u64; FRAMES])> {
         let record = self.snapshot(pid)?;
         let expected = if blocked { ProcessState::Blocked } else { ProcessState::Ready };
-        if record.state != expected { return None; }
+        if record.state != expected || record.frame_count != FRAMES { return None; }
         Some((record.cr3_root, record.frames))
+    }
+
+    /// Count-preserving saved binding for future owner/CPU-context integration.
+    /// Legacy saved_binding_lease() deliberately fails closed on partial leases.
+    pub fn saved_binding_lease_counted(&self, pid: u64, blocked: bool)
+        -> Option<(u64, CountedFrames<FRAMES>)>
+    {
+        let record = self.snapshot(pid)?;
+        let expected = if blocked { ProcessState::Blocked } else { ProcessState::Ready };
+        if record.state != expected { return None }
+        Some((record.cr3_root, CountedFrames {
+            frames: record.frames, count: record.frame_count,
+        }))
     }
 
     /// A supplied supervisor CR3 must not use ANY frame leased to a live
@@ -79,7 +92,7 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
     /// keep those frames pinned until their exact lease is relinquished.
     pub fn owns_live_cr3(&self, root: u64) -> bool {
         root != 0 && self.slots.iter().any(|p|
-            Self::live(p.state) && p.frames.contains(&root)
+            Self::live(p.state) && p.owned_frames().contains(&root)
         )
     }
 
@@ -100,36 +113,36 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
             .ok_or(TableError::UnknownPid)
     }
 
-    /// PID is minted by this table, not accepted from a requester. No slot,
-    /// frame, or PID generation is modified when admission is refused.
+    /// Legacy full-count admission. Every frame in this array is owned.
     pub fn reserve(&mut self, root: u64, frames: [u64; FRAMES])
+        -> Result<u64, TableError>
+    {
+        self.reserve_counted(root, frames, FRAMES)
+    }
+
+    /// Mint an exclusive PID for a counted PMM lease. Only the live prefix
+    /// participates in alias validation; unused tail must be all zero.
+    /// Refused admissions consume neither a slot nor a PID generation.
+    pub fn reserve_counted(&mut self, root: u64, frames: [u64; FRAMES], count: usize)
         -> Result<u64, TableError>
     {
         let pid = self.last_pid.checked_add(1).ok_or(TableError::PidExhausted)?;
         let index = self.slots.iter().position(|r| !Self::live(r.state))
             .ok_or(TableError::Full)?;
 
-        // Run the SAME strict per-process root/alignment/duplicate-frame
-        // checks as the existing real-CPL3 process lifecycle tests.
         let mut candidate = ProcessRecord::empty();
-        candidate.admit(pid, root, frames).map_err(TableError::from)?;
-
-        // Comparing every physical frame (including each CR3 root) means
-        // no process can claim a page table or leaf already owned by another
-        // still-resident PID, even when the generations are different.
+        candidate.admit_counted(pid, root, frames, count).map_err(TableError::from)?;
         for entry in self.slots.iter().filter(|r| Self::live(r.state)) {
-            if frames.iter().any(|frame| entry.frames.contains(frame)) {
+            if candidate.owned_frames().iter().any(|f| entry.owned_frames().contains(f)) {
                 return Err(TableError::PhysicalAlias)
             }
         }
-
-        // Previous slot tombstones retain their PID; the global last_pid
-        // is strictly greater than all previous generations.
-        self.slots[index].admit(pid, root, frames).map_err(TableError::from)?;
+        // Tombstone PID remains monotonic; mutation only after full validation.
+        self.slots[index].admit_counted(pid, root, frames, count)
+            .map_err(TableError::from)?;
         self.last_pid = pid;
         Ok(pid)
     }
-
 
     /// Stage several independently allocated user PMM leases as one bounded,
     /// all-or-nothing metadata admission. Validate all roots and frames using
@@ -150,6 +163,19 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         let mut minted = [0; COUNT];
         for (i, (root, frames)) in leases.into_iter().enumerate() {
             minted[i] = staged.reserve(root, frames)?;
+        }
+        *self = staged;
+        Ok(minted)
+    }
+
+    /// Mixed-size bounded lease batch with all-or-nothing PID publication.
+    pub fn reserve_batch_counted<const COUNT: usize>(
+        &mut self, leases: [(u64, [u64; FRAMES], usize); COUNT],
+    ) -> Result<[u64; COUNT], TableError> {
+        let mut staged = Self { slots: self.slots, last_pid: self.last_pid };
+        let mut minted = [0; COUNT];
+        for (i, (root, frames, count)) in leases.into_iter().enumerate() {
+            minted[i] = staged.reserve_counted(root, frames, count)?;
         }
         *self = staged;
         Ok(minted)
@@ -221,24 +247,31 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
             .map_err(TableError::from)
     }
 
-    /// Cancel a BLOCKED process only after the trusted caller has retired
-    /// its matching EventWaitGate and Ring3RunQueue wait instance, quiesced
-    /// saved interrupt/user CPU+FX contexts, and verified the real supervisor
-    /// CR3. Reject every resident userspace root (not merely the victim's).
-    /// Returned PMM leases remain the caller's exactly-once responsibility.
-    /// No physical memory is freed here.
+    /// One supervisor root may never be any physical page of any live PID.
+    fn verify_supervisor_cr3(&self, root: u64) -> Result<(), TableError> {
+        if root == 0 || root & (PAGE - 1) != 0
+            || root >= (1 << 52) || self.owns_live_cr3(root)
+        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
+        Ok(())
+    }
+
+    pub fn cancel_blocked_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<CountedFrames<FRAMES>, TableError>
+    {
+        self.verify_supervisor_cr3(supervisor_cr3)?;
+        self.record_mut(pid)?.cancel_blocked_counted(pid, supervisor_cr3)
+            .map_err(TableError::from)
+    }
+
+    /// Legacy full-array return refuses a partial lease before mutation.
     pub fn cancel_blocked(&mut self, pid: u64, supervisor_cr3: u64)
         -> Result<[u64; FRAMES], TableError>
     {
-        if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
-            || supervisor_cr3 >= (1 << 52) || self.owns_live_cr3(supervisor_cr3)
-        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
+        self.verify_supervisor_cr3(supervisor_cr3)?;
         self.record_mut(pid)?.cancel_blocked(pid, supervisor_cr3)
             .map_err(TableError::from)
     }
 
-    /// Record a trusted RUNNING owner's exit code. Status does not release
-    /// pages: a later reap requires a separate verified supervisor CR3.
     pub fn exit_with_status(&mut self, pid: u64, actual_cr3: u64, status: u32)
         -> Result<(), TableError>
     {
@@ -252,35 +285,48 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         self.exit_with_status(pid, actual_cr3, 0)
     }
 
-    /// Only AFTER independently verifying supervisor CR3 is not ANY live
-    /// user's address space: relinquish exact PMM frame ownership once,
-    /// returning the original (possibly nonzero) exit status as well.
-    /// The caller separately proves hardware quiescence and releases PMM.
-    pub fn reap_with_status(&mut self, pid: u64, actual_cr3: u64)
+    pub fn reap_with_status_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<(u32, CountedFrames<FRAMES>), TableError>
+    {
+        self.verify_supervisor_cr3(supervisor_cr3)?;
+        self.record_mut(pid)?.reap_with_status_counted(pid, supervisor_cr3)
+            .map_err(TableError::from)
+    }
+
+    pub fn reap_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<CountedFrames<FRAMES>, TableError>
+    {
+        self.reap_with_status_counted(pid, supervisor_cr3).map(|(_, lease)| lease)
+    }
+
+    pub fn reap_with_status(&mut self, pid: u64, supervisor_cr3: u64)
         -> Result<(u32, [u64; FRAMES]), TableError>
     {
-        if actual_cr3 == 0 || actual_cr3 & (PAGE - 1) != 0
-            || actual_cr3 >= (1 << 52) || self.owns_live_cr3(actual_cr3)
-        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
-        self.record_mut(pid)?.reap_with_status(pid, actual_cr3).map_err(TableError::from)
+        self.verify_supervisor_cr3(supervisor_cr3)?;
+        self.record_mut(pid)?.reap_with_status(pid, supervisor_cr3)
+            .map_err(TableError::from)
     }
 
-    /// Compatibility with the existing EXIT(0) path and PMM lease callers.
-    pub fn reap(&mut self, pid: u64, actual_cr3: u64)
+    pub fn reap(&mut self, pid: u64, supervisor_cr3: u64)
         -> Result<[u64; FRAMES], TableError>
     {
-        self.reap_with_status(pid, actual_cr3).map(|(_, frames)| frames)
+        self.reap_with_status(pid, supervisor_cr3).map(|(_, frames)| frames)
     }
 
-    /// Failure/rollback path for a never-running READY process. Reject an
-    /// observed CR3 owned by any other still-resident user, not only this PID.
-    pub fn cancel_ready(&mut self, pid: u64, actual_cr3: u64)
+    pub fn cancel_ready_counted(&mut self, pid: u64, supervisor_cr3: u64)
+        -> Result<CountedFrames<FRAMES>, TableError>
+    {
+        self.verify_supervisor_cr3(supervisor_cr3)?;
+        self.record_mut(pid)?.cancel_ready_counted(pid, supervisor_cr3)
+            .map_err(TableError::from)
+    }
+
+    pub fn cancel_ready(&mut self, pid: u64, supervisor_cr3: u64)
         -> Result<[u64; FRAMES], TableError>
     {
-        if actual_cr3 == 0 || actual_cr3 & (PAGE - 1) != 0
-            || actual_cr3 >= (1 << 52) || self.owns_live_cr3(actual_cr3)
-        { return Err(TableError::Process(ProcessError::ActiveCr3)) }
-        self.record_mut(pid)?.cancel_ready(pid, actual_cr3).map_err(TableError::from)
+        self.verify_supervisor_cr3(supervisor_cr3)?;
+        self.record_mut(pid)?.cancel_ready(pid, supervisor_cr3)
+            .map_err(TableError::from)
     }
 }
 
@@ -816,6 +862,98 @@ mod tests {
         let mut t = ProcessTable::<1,7>::new();
         t.last_pid = u64::MAX;
         assert_eq!(t.reserve(0x1000, frames(0x1000)), Err(TableError::PidExhausted));
+        assert_eq!(t.occupied(), 0);
+    }
+
+    fn counted(start: u64, count: usize) -> [u64; 9] {
+        core::array::from_fn(|i| if i < count { start + i as u64 * PAGE } else { 0 })
+    }
+
+    #[test]
+    fn mixed_counted_residents_preserve_exact_ownership_and_legacy_guards() {
+        let mut t = ProcessTable::<3, 9>::new();
+        let six = counted(0x1000, 6);
+        let seven = counted(0x10000, 7);
+        let nine = counted(0x20000, 9);
+        let a = t.reserve_counted(six[0], six, 6).unwrap();
+        let b = t.reserve_counted(seven[0], seven, 7).unwrap();
+        let c = t.reserve(nine[0], nine).unwrap();
+        assert_eq!((a, b, c), (1, 2, 3));
+        assert_eq!(t.occupied(), 3);
+        assert_eq!(t.snapshot(a).unwrap().frame_count, 6);
+        assert_eq!(t.snapshot(b).unwrap().frame_count, 7);
+        assert_eq!(t.snapshot(c).unwrap().frame_count, 9);
+        assert_eq!(t.saved_binding_lease(a, false), None);
+        assert_eq!(t.saved_binding_lease_counted(a, false),
+                   Some((six[0], CountedFrames { frames: six, count: 6 })));
+        assert_eq!(t.saved_binding_lease(c, false), Some((nine[0], nine)));
+        assert!(!t.owns_live_cr3(0));
+        assert!(t.owns_live_cr3(six[5]));
+        assert!(t.owns_live_cr3(seven[6]));
+        assert!(t.owns_live_cr3(nine[8]));
+        let before = (t.slots, t.last_pid);
+        assert_eq!(t.cancel_ready(a, 0x90000),
+                   Err(TableError::Process(ProcessError::PartialLease)));
+        assert_eq!(t.cancel_ready_counted(a, seven[6]),
+                   Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!((t.slots, t.last_pid), before);
+        assert_eq!(t.cancel_ready_counted(a, 0x90000).unwrap().as_slice(), &six[..6]);
+        assert!(!t.owns_live_cr3(six[5]));
+        assert_eq!(t.cancel_ready_counted(a, 0x90000), Err(TableError::UnknownPid));
+
+        t.mark_running(b, seven[0]).unwrap();
+        t.exit_with_status(b, seven[0], 127).unwrap();
+        let exited = t.snapshot(b);
+        assert_eq!(t.reap(b, 0x90000),
+                   Err(TableError::Process(ProcessError::PartialLease)));
+        assert_eq!(t.reap_counted(b, seven[0]),
+                   Err(TableError::Process(ProcessError::ActiveCr3)));
+        assert_eq!(t.snapshot(b), exited);
+        let (status, owned) = t.reap_with_status_counted(b, 0x90000).unwrap();
+        assert_eq!(status, 127);
+        assert_eq!(owned.count, 7);
+        assert_eq!(owned.as_slice(), &seven[..7]);
+        assert_eq!(t.cancel_ready(c, 0x90000), Ok(nine));
+        assert_eq!(t.occupied(), 0);
+        let next = t.reserve_counted(six[0], six, 6).unwrap();
+        assert_eq!(next, 4);
+        assert_eq!(t.cancel_ready_counted(next, 0x90000).unwrap().count, 6);
+    }
+
+    #[test]
+    fn counted_aliases_bad_tail_and_batch_errors_do_not_mint_pids() {
+        let mut t = ProcessTable::<4, 9>::new();
+        let a = counted(0x1000, 6);
+        let b = counted(0x10000, 8);
+        let c = counted(0x20000, 7);
+        assert_eq!(t.reserve_counted(a[0], a, 6), Ok(1));
+        let before = (t.slots, t.last_pid);
+        let mut alias = b;
+        alias[7] = a[5];
+        assert_eq!(t.reserve_counted(alias[0], alias, 8),
+                   Err(TableError::PhysicalAlias));
+        let mut corrupt_tail = b;
+        corrupt_tail[8] = 0x40000;
+        assert_eq!(t.reserve_counted(b[0], corrupt_tail, 8),
+                   Err(TableError::Process(ProcessError::InvalidFrameCount)));
+        for invalid in [0, 10, usize::MAX] {
+            assert_eq!(t.reserve_counted(b[0], b, invalid),
+                       Err(TableError::Process(ProcessError::InvalidFrameCount)));
+        }
+        assert_eq!((t.slots, t.last_pid), before);
+
+        let mut between_batch = c;
+        between_batch[6] = b[3];
+        assert_eq!(t.reserve_batch_counted([(b[0], b, 8),
+                                             (between_batch[0], between_batch, 7)]),
+                   Err(TableError::PhysicalAlias));
+        assert_eq!((t.slots, t.last_pid), before);
+        assert_eq!(t.reserve_batch_counted([(b[0], b, 8), (c[0], c, 7)]), Ok([2, 3]));
+        assert_eq!(t.snapshot(2).unwrap().frame_count, 8);
+        assert_eq!(t.snapshot(3).unwrap().frame_count, 7);
+        assert_eq!(t.cancel_ready_counted(1, 0x90000).unwrap().as_slice(), &a[..6]);
+        assert_eq!(t.cancel_ready_counted(2, 0x90000).unwrap().as_slice(), &b[..8]);
+        assert_eq!(t.cancel_ready_counted(3, 0x90000).unwrap().as_slice(), &c[..7]);
         assert_eq!(t.occupied(), 0);
     }
 
