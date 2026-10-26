@@ -327,3 +327,111 @@ fn two_pt_admission_binds_exact_elf_bytes_all_ptes_and_private_stack() {
     assert_eq!(admitted_two_pt(&bytes, &t, &PAGES[..2], &rx, &rw, &stack),
         Err(E::Mapping(TwoPtElfError::MissingOrExtraPage)));
 }
+
+fn relocated_pages(slot: usize) -> [UserPage; 3] {
+    let base = (slot as u64) << 39;
+    let mut pages = PAGES;
+    for page in &mut pages {
+        page.virtual_address += base;
+    }
+    pages
+}
+
+#[test]
+fn relocated_elf_requires_one_nonzero_vacant_user_pml4_slot_and_exact_flags() {
+    for slot in [1usize, 17, 255] {
+        let pages = relocated_pages(slot);
+        let expected = user_vm_two_pt::validate_relocated_elf_bindings(
+            &image(), slot, FRAMES, &pages,
+        ).unwrap();
+        assert_eq!(expected.source,
+            user_elf_launch_layout::plan_two_pt_image(&image()).unwrap());
+        assert_eq!(expected.user_pml4_slot, slot);
+        assert_eq!(expected.entry, ((slot as u64) << 39) + 0x5ff100);
+        assert_eq!(expected.stack_page, ((slot as u64) << 39) + 0x601000);
+        let mut t = bank();
+        populate(&mut t, &pages).unwrap();
+        assert_eq!(t[0][slot], FRAMES[1] | PRESENT | USER | WRITABLE);
+        assert_eq!(t[0][0], 0); // do not shadow the boot low slot
+        let [root, pdpt, pd, pt0, pt1] = &t;
+        assert_eq!(user_vm_two_pt::audit_relocated_elf_bindings(
+            &image(), slot, root, pdpt, pd, pt0, pt1, FRAMES, &pages,
+        ), Ok(expected));
+        let mut wrong = pages;
+        wrong[1].executable = true;
+        assert_eq!(user_vm_two_pt::validate_relocated_elf_bindings(
+            &image(), slot, FRAMES, &wrong,
+        ), Err(TwoPtElfError::PermissionMismatch));
+        wrong = pages;
+        wrong[0].virtual_address += 1u64 << 39;
+        assert_eq!(user_vm_two_pt::validate_relocated_elf_bindings(
+            &image(), slot, FRAMES, &wrong,
+        ), Err(TwoPtElfError::MissingOrExtraPage));
+        t[0][slot] ^= USER; // actual permission downgrade detected
+        let [root, pdpt, pd, pt0, pt1] = &t;
+        assert_eq!(user_vm_two_pt::audit_relocated_elf_bindings(
+            &image(), slot, root, pdpt, pd, pt0, pt1, FRAMES, &pages,
+        ), Err(TwoPtElfError::Mapping(TwoPtError::MismatchedLayout)));
+    }
+    assert_eq!(user_vm_two_pt::validate_relocated_elf_bindings(
+        &image(), 0, FRAMES, &PAGES,
+    ), Err(TwoPtElfError::InvalidUserSlot));
+    assert_eq!(user_vm_two_pt::validate_relocated_elf_bindings(
+        &image(), 256, FRAMES, &PAGES,
+    ), Err(TwoPtElfError::InvalidUserSlot));
+}
+
+#[test]
+fn relocated_two_pt_admission_keeps_file_offsets_unrelocated() {
+    use elf64_page_image::{materialize, PageAuditError, PAGE_SIZE};
+    use user_image_admission::{
+        BackingPage, TwoPtAdmissionError as E,
+    };
+    let bytes = image();
+    let plan = user_elf_launch_layout::plan_two_pt_image(&bytes).unwrap();
+    let mut code = [0xa5; PAGE_SIZE];
+    let mut data = [0xa5; PAGE_SIZE];
+    let mut stack = [0u8; PAGE_SIZE];
+    materialize(&bytes, &plan.image.segments[0].unwrap(),
+        0x5ff000, &mut code).unwrap();
+    materialize(&bytes, &plan.image.segments[1].unwrap(),
+        0x600000, &mut data).unwrap();
+    let slot = 7;
+    let pages = relocated_pages(slot);
+    let base = (slot as u64) << 39;
+    let mut t = bank();
+    populate(&mut t, &pages).unwrap();
+    let verify = |bank: &Bank, code: &[u8; PAGE_SIZE],
+                  data: &[u8; PAGE_SIZE], stack: &[u8; PAGE_SIZE]| {
+        let [root, pdpt, pd, pt0, pt1] = bank;
+        user_image_admission::audit_relocated_two_pt_staged_image(
+            &bytes, slot, FRAMES, &pages, root, pdpt, pd, pt0, pt1,
+            &[
+                BackingPage { virtual_address: base + 0x5ff000,
+                    physical_frame: pages[0].physical_frame, bytes: code },
+                BackingPage { virtual_address: base + 0x600000,
+                    physical_frame: pages[1].physical_frame, bytes: data },
+            ],
+            BackingPage { virtual_address: base + 0x601000,
+                physical_frame: pages[2].physical_frame, bytes: stack },
+        )
+    };
+    let expected = user_vm_two_pt::validate_relocated_elf_bindings(
+        &bytes, slot, FRAMES, &pages,
+    ).unwrap();
+    assert_eq!(verify(&t, &code, &data, &stack), Ok(expected));
+    data[0x180] ^= 1;
+    assert_eq!(verify(&t, &code, &data, &stack),
+        Err(E::FileBytes(PageAuditError::ContentMismatch {
+            index: 0, offset: 0x180,
+        })));
+    data[0x180] ^= 1;
+    stack[31] = 1;
+    assert_eq!(verify(&t, &code, &data, &stack), Err(E::StackBytes(31)));
+    stack[31] = 0;
+    t[4][0] &= !NX;
+    assert_eq!(verify(&t, &code, &data, &stack),
+        Err(E::Mapping(TwoPtElfError::Mapping(TwoPtError::MismatchedLayout))));
+    t[4][0] |= NX;
+    assert_eq!(verify(&t, &code, &data, &stack), Ok(expected));
+}

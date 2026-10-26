@@ -191,6 +191,8 @@ pub fn audit(
 /// Exact ELF-to-PTE binding, independent of a caller's claimed page list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TwoPtElfError {
+    InvalidUserSlot,
+    AddressOverflow,
     Image(LaunchError),
     MissingOrExtraPage,
     PermissionMismatch,
@@ -217,6 +219,85 @@ pub fn validate_elf_bindings(
         }
     }
     validate(frames, pages).map_err(TwoPtElfError::Mapping)?;
+    Ok(layout)
+}
+
+/// A bounded static ELF whose low virtual addresses have been placed
+/// inside one explicitly selected, previously unused user PML4 slot.
+/// `source` retains original ELF-relative load VAs for byte materialization;
+/// `entry` and `stack_page` are addresses to use for a future Ring3 handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelocatedLaunchLayout {
+    pub source: StaticLaunchLayout,
+    pub user_pml4_slot: usize,
+    pub base: u64,
+    pub entry: u64,
+    pub stack_page: u64,
+}
+
+/// Derive a relocated two-PT mapping from immutable ELF bytes, NEVER from
+/// caller-provided target page metadata. Slots 0 and 256..511 are forbidden:
+/// runtime selects an UNUSED slot in 1..255 from its still-active PML4.
+/// The original image must fit wholly within low PML4 slot zero before shift,
+/// so adding the base cannot silently relocate one leaf into another slot.
+pub fn validate_relocated_elf_bindings(
+    image: &[u8],
+    user_pml4_slot: usize,
+    frames: [u64; TABLE_FRAMES],
+    pages: &[UserPage],
+) -> Result<RelocatedLaunchLayout, TwoPtElfError> {
+    if !(1..256).contains(&user_pml4_slot) {
+        return Err(TwoPtElfError::InvalidUserSlot);
+    }
+    let source = plan_two_pt_image(image).map_err(TwoPtElfError::Image)?;
+    const SLOT_SIZE: u64 = 1 << 39;
+    let stack_top = source.stack_page.checked_add(PAGE_BYTES)
+        .ok_or(TwoPtElfError::AddressOverflow)?;
+    if stack_top > SLOT_SIZE || source.image.entry >= SLOT_SIZE {
+        return Err(TwoPtElfError::AddressOverflow);
+    }
+    let base = (user_pml4_slot as u64) << 39;
+    let entry = base.checked_add(source.image.entry)
+        .ok_or(TwoPtElfError::AddressOverflow)?;
+    let stack_page = base.checked_add(source.stack_page)
+        .ok_or(TwoPtElfError::AddressOverflow)?;
+    if pages.len() != source.len {
+        return Err(TwoPtElfError::MissingOrExtraPage);
+    }
+    for leaf in source.leaves[..source.len].iter().flatten() {
+        let va = base.checked_add(leaf.virtual_address)
+            .ok_or(TwoPtElfError::AddressOverflow)?;
+        let Some(page) = pages.iter().find(|p| p.virtual_address == va)
+        else { return Err(TwoPtElfError::MissingOrExtraPage) };
+        if page.writable != leaf.writable || page.executable != leaf.executable {
+            return Err(TwoPtElfError::PermissionMismatch);
+        }
+    }
+    validate(frames, pages).map_err(TwoPtElfError::Mapping)?;
+    Ok(RelocatedLaunchLayout {
+        source, user_pml4_slot, base, entry, stack_page,
+    })
+}
+
+/// Same exact 2,560-entry audit as the raw-VA path, after byte-derived,
+/// slot-aware address relocation. Kernel high-half must still be empty;
+/// a separate supervisor graft may follow after this full admission.
+pub fn audit_relocated_elf_bindings(
+    image: &[u8],
+    user_pml4_slot: usize,
+    pml4: &[u64; ENTRY_COUNT],
+    pdpt: &[u64; ENTRY_COUNT],
+    pd: &[u64; ENTRY_COUNT],
+    pt0: &[u64; ENTRY_COUNT],
+    pt1: &[u64; ENTRY_COUNT],
+    frames: [u64; TABLE_FRAMES],
+    pages: &[UserPage],
+) -> Result<RelocatedLaunchLayout, TwoPtElfError> {
+    let layout = validate_relocated_elf_bindings(
+        image, user_pml4_slot, frames, pages,
+    )?;
+    audit(pml4, pdpt, pd, pt0, pt1, frames, pages)
+        .map_err(TwoPtElfError::Mapping)?;
     Ok(layout)
 }
 

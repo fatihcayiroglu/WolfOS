@@ -170,6 +170,69 @@ pub fn audit_two_pt_staged_image(
     Ok(layout)
 }
 
+/// Strict two-PT admission after selecting a vacant *nonzero* user PML4
+/// slot. PT entries hold relocated user addresses, but ELF segment bytes
+/// remain indexed by the original unrelocated source VA. Never use the
+/// shifted VA as an offset into a file or BSS page.
+pub fn audit_relocated_two_pt_staged_image(
+    image: &[u8],
+    user_pml4_slot: usize,
+    tables: [u64; crate::user_vm_two_pt::TABLE_FRAMES],
+    mapped: &[UserPage],
+    pml4: &[u64; ENTRY_COUNT],
+    pdpt: &[u64; ENTRY_COUNT],
+    pd: &[u64; ENTRY_COUNT],
+    pt0: &[u64; ENTRY_COUNT],
+    pt1: &[u64; ENTRY_COUNT],
+    file_backings: &[BackingPage<'_>],
+    stack: BackingPage<'_>,
+) -> Result<crate::user_vm_two_pt::RelocatedLaunchLayout, TwoPtAdmissionError> {
+    let layout = crate::user_vm_two_pt::audit_relocated_elf_bindings(
+        image, user_pml4_slot, pml4, pdpt, pd, pt0, pt1, tables, mapped,
+    ).map_err(TwoPtAdmissionError::Mapping)?;
+    if file_backings.len().checked_add(1) != Some(mapped.len()) {
+        return Err(TwoPtAdmissionError::BackingCount);
+    }
+    let Some(stack_leaf) = mapped.iter()
+        .find(|page| page.virtual_address == layout.stack_page)
+    else { return Err(TwoPtAdmissionError::BackingMismatch) };
+    if stack.virtual_address != layout.stack_page
+        || stack.physical_frame != stack_leaf.physical_frame
+    {
+        return Err(TwoPtAdmissionError::BackingMismatch);
+    }
+    for (i, backing) in file_backings.iter().enumerate() {
+        if backing.virtual_address == layout.stack_page
+            || core::ptr::eq(backing.bytes, stack.bytes)
+            || file_backings[..i].iter().any(|earlier|
+                earlier.virtual_address == backing.virtual_address
+                    || core::ptr::eq(earlier.bytes, backing.bytes))
+        {
+            return Err(TwoPtAdmissionError::BackingMismatch);
+        }
+        let Some(mapped_leaf) = mapped.iter()
+            .find(|page| page.virtual_address == backing.virtual_address)
+        else { return Err(TwoPtAdmissionError::BackingMismatch) };
+        if mapped_leaf.physical_frame != backing.physical_frame {
+            return Err(TwoPtAdmissionError::BackingMismatch);
+        }
+        let Some(source_va) = backing.virtual_address.checked_sub(layout.base)
+        else { return Err(TwoPtAdmissionError::BackingMismatch) };
+        let Some(source_index) = layout.source.leaves[..layout.source.len].iter()
+            .flatten()
+            .find(|leaf| leaf.virtual_address == source_va)
+            .and_then(|leaf| leaf.source_segment)
+        else { return Err(TwoPtAdmissionError::BackingMismatch) };
+        let Some(segment) = layout.source.image.segments[source_index]
+        else { return Err(TwoPtAdmissionError::BackingMismatch) };
+        audit_materialized_batch(
+            image, [(&segment, source_va)], [backing.bytes],
+        ).map_err(TwoPtAdmissionError::FileBytes)?;
+    }
+    audit_zeroed_stack(stack.bytes).map_err(TwoPtAdmissionError::StackBytes)?;
+    Ok(layout)
+}
+
 /// A kernel-side provenance check for the physical-to-virtual byte view.
 /// The caller still owns/pins the PMM frames: this validates the actual
 /// reference pointer address is EXACTLY HHDM + its asserted physical frame.
