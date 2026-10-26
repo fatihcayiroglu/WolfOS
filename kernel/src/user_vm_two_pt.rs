@@ -8,7 +8,7 @@
 use crate::elf64_preflight::PAGE_BYTES;
 use crate::user_vm_layout::{indices, ENTRY_COUNT, NX, PRESENT, USER, WRITABLE};
 use crate::user_vm_multi::UserPage;
-use crate::user_elf_launch_layout::{plan_two_pt_image, LaunchError, StaticLaunchLayout};
+use crate::user_elf_launch_layout::{plan_two_pt_image, LaunchError, StaticLaunchLayout, MAX_LEAVES};
 
 pub const TABLE_FRAMES: usize = 5;
 pub const MAX_PAGES: usize = 8;
@@ -277,6 +277,60 @@ pub fn validate_relocated_elf_bindings(
     Ok(RelocatedLaunchLayout {
         source, user_pml4_slot, base, entry, stack_page,
     })
+}
+
+/// Immutable, fixed-capacity translation of one ELF layout into a concrete
+/// PMM-backed relocated page set. Only `pages()` is a valid mapping slice;
+/// unused array slots are intentionally inaccessible to PTE consumers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelocatedElfPages {
+    pub layout: RelocatedLaunchLayout,
+    pages: [UserPage; MAX_LEAVES],
+    len: usize,
+}
+
+impl RelocatedElfPages {
+    pub fn pages(&self) -> &[UserPage] { &self.pages[..self.len] }
+    pub fn load_pages(&self) -> usize { self.len - 1 }
+}
+
+/// Turn genuine ELF PT_LOAD page boundaries and the fresh RW+NX stack into
+/// exact user mappings, using *caller-owned* physical frames in ELF leaf order.
+/// Caller never chooses VAs or permissions: only supplies the 5 distinct table
+/// frames and exactly one separately owned data frame for each derived leaf.
+/// Full prevalidation and alias checking occur before any page-table writes.
+pub fn derive_relocated_elf_pages(
+    image: &[u8],
+    user_pml4_slot: usize,
+    tables: [u64; TABLE_FRAMES],
+    data_frames: &[u64],
+) -> Result<RelocatedElfPages, TwoPtElfError> {
+    if !(1..256).contains(&user_pml4_slot) {
+        return Err(TwoPtElfError::InvalidUserSlot);
+    }
+    let source = plan_two_pt_image(image).map_err(TwoPtElfError::Image)?;
+    if data_frames.len() != source.len {
+        return Err(TwoPtElfError::MissingOrExtraPage);
+    }
+    let base = (user_pml4_slot as u64) << 39;
+    let mut pages = [UserPage {
+        virtual_address: 0, physical_frame: 0,
+        writable: false, executable: false,
+    }; MAX_LEAVES];
+    for (i, leaf) in source.leaves[..source.len].iter().enumerate() {
+        let leaf = leaf.ok_or(TwoPtElfError::MissingOrExtraPage)?;
+        pages[i] = UserPage {
+            virtual_address: base.checked_add(leaf.virtual_address)
+                .ok_or(TwoPtElfError::AddressOverflow)?,
+            physical_frame: data_frames[i],
+            writable: leaf.writable,
+            executable: leaf.executable,
+        };
+    }
+    let layout = validate_relocated_elf_bindings(
+        image, user_pml4_slot, tables, &pages[..source.len],
+    )?;
+    Ok(RelocatedElfPages { layout, pages, len: source.len })
 }
 
 /// Same exact 2,560-entry audit as the raw-VA path, after byte-derived,
