@@ -26,6 +26,15 @@ MARKERS = (
     "int80_calls=22 exit=0 resources_released=1 real_process_manager=0",
 )
 
+TWO_PT_MARKERS = (
+    "WOLFOS_ELF_TWO_PT_ENTER hardware_cr3=1 root_slot=",
+    *MARKERS[:4],
+    MARKERS[4],
+    "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=8 pmm_no_leak=1",
+    "WOLFOS_ELF_TWO_PT_RUN_OK linked_elf=1 hardware_cpl3=1 pt_frames=2 "
+    "user_console=1 int80_calls=22 exit=0 restored_cr3=1 frames_freed=8 pmm_no_leak=1",
+)
+
 STATUS_MARKERS = (
     *MARKERS[:4],
     "WOLFOS_ELF_EXIT_STATUS_OK code=42 cpl3=1 calls=22 saved_rdi=42",
@@ -55,13 +64,14 @@ PF_FAULT_MARKERS = (
 
 def main() -> int:
     mode = sys.argv[2] if len(sys.argv) == 3 else None
+    two_pt_mode = mode == "--two-pt"
     status_mode = mode == "--exit-status"
     fault_mode = mode == "--user-ud-fault"
     pf_mode = mode == "--user-pf-fault"
-    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode)) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--exit-status|--user-ud-fault|--user-pf-fault]")
+    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode or two_pt_mode)) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--two-pt|--exit-status|--user-ud-fault|--user-pf-fault]")
         return 2
-    markers = PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
+    markers = TWO_PT_MARKERS if two_pt_mode else PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
     with tempfile.TemporaryDirectory(prefix="wolfos-real-elf-run-") as tmp:
         serial = Path(tmp) / "serial.log"
         command = [
@@ -121,7 +131,12 @@ def main() -> int:
             print(f"FAIL: expected clean QEMU debug-exit 33, got {result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if pf_mode:
+        if two_pt_mode:
+            if "WOLFOS_ELF_RUN_OK " in output or "frames_freed=7" in output:
+                print("FAIL: two-PT acceptance fell back to legacy seven-frame runner")
+                return 1
+            print("PASS: two-PT independent ELF -> real CPL3 INT80 -> EXIT -> CR3 restore + eight PMM free")
+        elif pf_mode:
             print("PASS: linked ELF64 -> genuine CPL3 denied supervisor read #PF -> status 139 -> 7 PMM free")
         elif fault_mode:
             print("PASS: linked ELF64 -> genuine CPL3 #UD -> status 132 -> CR3 restore + 7 PMM free")

@@ -110,17 +110,17 @@ mod user_elf_launch_layout;
 mod elf64_preflight_smoke;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_page_image;
-#[cfg(feature = "user-vm-shadow-smoke")]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-elf-two-pt-run-smoke"))]
 mod user_vm_layout;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_shadow_smoke;
-#[cfg(feature = "user-vm-shadow-smoke")]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-elf-two-pt-run-smoke"))]
 mod user_vm_multi;
-#[cfg(feature = "user-vm-shadow-smoke")]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-elf-two-pt-run-smoke"))]
 mod user_vm_two_pt;
 #[cfg(any(feature = "user-vm-shadow-smoke", feature = "smp-address-space-retirement-smoke"))]
 mod pmm_frame_batch;
-#[cfg(feature = "user-vm-shadow-smoke")]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-elf-two-pt-run-smoke"))]
 mod user_image_admission;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-vm-shadow-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke")))))]
 mod kernel_half_shadow;
