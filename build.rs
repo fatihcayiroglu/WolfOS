@@ -123,6 +123,7 @@ fn main() {
     println!("cargo:rerun-if-changed=user/hello.S");
     println!("cargo:rerun-if-changed=user/hello.ld");
     println!("cargo:rerun-if-changed=user/hello-two-pt.ld");
+    println!("cargo:rerun-if-changed=user/hello-three-load.ld");
     if env::var_os("CARGO_FEATURE_USER_ELF_RUN_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_RAMFS_SMOKE").is_none()
@@ -135,7 +136,10 @@ fn main() {
     fs::create_dir_all(&path).expect("make OUT_DIR");
     let obj = path.join("wolfos-user-hello.o");
     let elf = path.join("wolfos-user-hello.elf");
-    if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
+    if env::var_os("CARGO_FEATURE_USER_ELF_THREE_LOAD_RUN_SMOKE").is_some() {
+        checked("as", &["--64", "--defsym", "WOLFOS_THREE_LOAD_SMOKE=1",
+            "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    } else if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
         checked("as", &["--64", "--defsym", "WOLFOS_FILE_IO_SMOKE=1",
             "-o", obj.to_str().unwrap(), "user/hello.S"]);
     } else if env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_some() {
@@ -153,7 +157,9 @@ fn main() {
     } else {
         checked("as", &["--64", "-o", obj.to_str().unwrap(), "user/hello.S"]);
     }
-    let linker = if env::var_os("CARGO_FEATURE_USER_ELF_TWO_PT_RUN_SMOKE").is_some() {
+    let linker = if env::var_os("CARGO_FEATURE_USER_ELF_THREE_LOAD_RUN_SMOKE").is_some() {
+        "user/hello-three-load.ld"
+    } else if env::var_os("CARGO_FEATURE_USER_ELF_TWO_PT_RUN_SMOKE").is_some() {
         "user/hello-two-pt.ld"
     } else { "user/hello.ld" };
     checked("ld", &["-m", "elf_x86_64", "-nostdlib", "-static",
@@ -174,6 +180,9 @@ fn main() {
         ("fixture_magic", "FIXTURE_MAGIC"),
         ("uninitialized", "BSS_START"),
     ];
+    if env::var_os("CARGO_FEATURE_USER_ELF_THREE_LOAD_RUN_SMOKE").is_some() {
+        symbols.push(("_second_rx_page_probe", "SECOND_RX_PROBE"));
+    }
     if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
         symbols.extend_from_slice(&[
             ("_after_file_policy_denied_open", "FILE_POLICY_DENIED_OPEN"),
