@@ -48,6 +48,13 @@ frame without changing any payload/table byte or PMM ownership, then execute
 the valid ELF using the retained frames and verify exact cleanup. Independent
 ELF-byte, PTE and HHDM admission remains mandatory before user execution.
 
+A separate counted preparation coordinator now composes reservation,
+payload/table preparation and explicit transfer to the active frame owner.
+Consuming type stages prevent early publication; rejection preserves the
+staging owner for retry/rollback. It is host-tested and cross-compiled without
+std, but is not yet wired into the real Ring3 launcher. Final HHDM/image
+admission and hardware retirement remain external safety obligations.
+
 The verified scope remains an experimental Rust-owned kernel: boot execution, frame allocation, CPU tables/exceptions, paging, ACPI topology, saved-context kernel threads, **four-process** Ring 3 ELF execution, address-space isolation, and timer-origin preemptive handoff in isolated QEMU scenarios. A genuine hardware IRQ → blocked WAIT wake → saved IRET resume **has been demonstrated for two fixed ELF processes**; generalized dynamic process creation, device-event registration, scheduling, and arbitrary workload-safe Block → Wake → Resume integration remain incomplete. Host-only queue, process/PMM lease and context-bank policy regressions are not substitutes for physical CPU/IRQ proof. The reference-clock calibration is a QEMU test variant, not a validated general scheduling or wall-clock source.
 
 The no-heap PID lifecycle ledger now supports retaining a nonzero trusted EXIT status and returning it together with the exact retired physical-frame lease. Host regressions require correct PID/CR3, reject early or duplicate reaping, preserve unrelated process owners, and prove monotonic PID reuse. Existing EXIT(0) paths keep their behavior. This is a **metadata contract**, not yet a real Ring3 nonzero-exit syscall, crash isolation, parent wait/reap interface or hardware fault recovery.
