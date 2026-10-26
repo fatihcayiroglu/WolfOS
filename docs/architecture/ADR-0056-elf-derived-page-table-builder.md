@@ -77,3 +77,31 @@ ELF loader, dynamic linker, heap, scheduler or general process manager.
 Next: bind materialization buffers and exact counted PMM staging to the same
 immutable plan, preserve rollback on every prepublication failure, then offer
 a reusable launch transaction without duplicating fixture assumptions.
+
+## 2026-10-26: bind one-PT ELF payload bytes to the same checked recipe
+
+The shared `ElfPageTables` recipe now also exposes a no-heap,
+pre-publication `stage_load_and_stack` operation for exclusively borrowed,
+caller-owned PMM backings. It rederives the validated image layout, checks
+the exact ELF leaf count, checks **every** expected frame identity (including
+the independently zeroed stack), checks **every** owned destination is clean,
+and prevalidates all materialization source ranges before copying any page.
+Wrong last-page provenance, a stale or changed ELF layout, dirty backing
+pages and malformed source images leave every destination unchanged.
+
+The real one-PT six- and seven-frame Ring3 paths use this common recipe
+rather than their earlier open-coded per-leaf copy loop. The separate
+existing two-PT stager and its full audit retain their established
+eight/nine-frame hardware contracts until they can be converged safely.
+
+Independent host tests check the bounded six/seven/eight/nine-frame
+materialization layouts and their exact preflight-derived PMM counts,
+negative last-leaf/stack failures, and rollback on a failed partial PMM
+allocation or rejected prepublication staging. A staged
+`FrameBatch` is still never an active CR3 owner; no memory is reclaimed
+from an active CPU by this new API.
+
+**Remaining work:** bind this stage to a reusable ownership-transfer
+transaction, including independently authenticated HHDM provenance, a
+complete final byte/PTE audit, and safe verified retirement/quiescence.
+This change alone is not a general process loader.
