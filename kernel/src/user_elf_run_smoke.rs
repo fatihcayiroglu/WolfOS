@@ -349,15 +349,20 @@ pub fn enter(hhdm: u64) -> ! {
         let table_frames = [frames[0], frames[1], frames[2], frames[3], frames[4]];
         #[cfg(feature = "user-elf-two-pt-run-smoke")]
         let (manifest, copied) = {
-            let mut destinations: [&mut [u8; PAGE_SIZE]; LOAD_LEAVES] =
-                core::array::from_fn(|i| {
-                    &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>()
+            let mut destinations:
+                [user_elf_two_pt_stager::OwnedPageBuffer<'_>; LOAD_LEAVES] =
+                core::array::from_fn(|i| user_elf_two_pt_stager::OwnedPageBuffer {
+                    physical_frame: frames[TABLE_FRAMES + i],
+                    bytes: &mut *ptrs[TABLE_FRAMES + i].cast::<[u8; PAGE_SIZE]>(),
                 });
-            let stack = &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>();
+            let mut stack = user_elf_two_pt_stager::OwnedPageBuffer {
+                physical_frame: frames[FRAMES - 1],
+                bytes: &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>(),
+            };
             let Ok(staged) = user_elf_two_pt_stager::stage_relocated_two_pt_elf(
                 elf, slot, table_frames, &frames[TABLE_FRAMES..],
-                &mut destinations, stack,
-            ) else { fail("two_pt_atomic_elf_payload_stage") };
+                &mut destinations, &mut stack,
+            ) else { fail("two_pt_bound_elf_payload_stage") };
             (staged.manifest, staged.copied)
         };
         #[cfg(not(feature = "user-elf-two-pt-run-smoke"))]
