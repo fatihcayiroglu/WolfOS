@@ -131,25 +131,26 @@ fn hhdm_ptr(hhdm: u64, phys: u64) -> Option<*mut u8> {
         .map(|addr| addr.as_mut_ptr::<u8>())
 }
 
-/// The validated ELF frame requirement drives PMM calls, while the existing
-/// fixed-size process table still requires an exact per-flavor reservation.
-/// No PMM allocation occurs if those two independent counts disagree.
-fn allocate_owned(requested: usize) -> Option<[u64; FRAMES]> {
-    if requested == 0 || requested != FRAMES { return None; }
-    let mut frames = [0u64; FRAMES];
+/// The validated ELF budget drives the PMM lease length, independently of
+/// the maximum process-record capacity and fixture-specific paging layout.
+/// The unused tail remains zero and is never allocated or freed.
+fn allocate_owned(requested: usize) -> Option<[u64; PROCESS_FRAME_CAPACITY]> {
+    if requested == 0 || requested > PROCESS_FRAME_CAPACITY { return None; }
+    let mut frames = [0u64; PROCESS_FRAME_CAPACITY];
     for i in 0..requested {
         let Some(phys) = pmm::allocate_frame() else {
             for old in frames[..i].iter().copied().rev() {
-                let _ = pmm::free_frame(old);
+                if pmm::free_frame(old).is_err() { fail("pmm_rollback_release") }
             }
             return None;
         };
         if phys == 0 || phys & (PAGE - 1) != 0
             || phys >= (1 << 52) || frames[..i].contains(&phys)
         {
-            let _ = pmm::free_frame(phys);
+            // A duplicate would still be owned by the earlier slot: never
+            // release the aliased frame twice or corrupt PMM accounting.
             for old in frames[..i].iter().copied().rev() {
-                let _ = pmm::free_frame(old);
+                if pmm::free_frame(old).is_err() { fail("pmm_rollback_release") }
             }
             return None;
         }
@@ -348,8 +349,11 @@ pub fn enter(hhdm: u64) -> ! {
     let before = pmm::statistics().allocated_frames;
     let Some(frames) = allocate_owned(prepared.frames.total_frames)
     else { fail("pmm_owned_frames") };
+    if frames[prepared.frames.total_frames..].iter().any(|frame| *frame != 0) {
+        fail("pmm_owned_tail_not_zero")
+    }
     let mut ptrs = [core::ptr::null_mut::<u8>(); FRAMES];
-    for (i, phys) in frames.iter().copied().enumerate() {
+    for (i, phys) in frames[..prepared.frames.total_frames].iter().copied().enumerate() {
         let Some(ptr) = hhdm_ptr(hhdm, phys) else { fail("owned_frame_hhdm") };
         ptrs[i] = ptr;
     }
@@ -377,7 +381,7 @@ pub fn enter(hhdm: u64) -> ! {
                 bytes: &mut *ptrs[FRAMES - 1].cast::<[u8; PAGE_SIZE]>(),
             };
             let Ok(staged) = user_elf_two_pt_stager::stage_relocated_two_pt_elf(
-                elf, slot, table_frames, &frames[TABLE_FRAMES..],
+                elf, slot, table_frames, &frames[TABLE_FRAMES..FRAMES],
                 &mut destinations, &mut stack,
             ) else { fail("two_pt_bound_elf_payload_stage") };
             (staged.manifest, staged.copied)
@@ -490,11 +494,11 @@ pub fn enter(hhdm: u64) -> ! {
         if root[slot] == 0 { root[slot] = entry; }
         if root[slot] != entry { fail("incorrect_user_pml4_entry") }
         let inherited = kernel_half_shadow::graft_kernel_half(
-            source, root, slot, entry, &frames
+            source, root, slot, entry, &frames[..FRAMES]
         );
         if !matches!(inherited, Ok(count) if count >= 1)
             || kernel_half_shadow::audit_kernel_half(
-                source, root, slot, entry, &frames
+                source, root, slot, entry, &frames[..FRAMES]
             ) != inherited
             || root[256..].iter().any(|e| e & USER != 0)
             || root[..256].iter().filter(|e| **e != 0).count() != 1
@@ -509,13 +513,11 @@ pub fn enter(hhdm: u64) -> ! {
         STAGE.store(0, Ordering::Release);
         #[cfg(feature = "user-file-io-smoke")]
         FILE_FD.store(0, Ordering::Release);
-        for (at, phys) in frames.iter().copied().enumerate() {
+        for (at, phys) in frames[..FRAMES].iter().copied().enumerate() {
             OWNED[at].store(phys, Ordering::Release);
         }
-        let mut padded = [0u64; PROCESS_FRAME_CAPACITY];
-        padded[..FRAMES].copy_from_slice(&frames);
         if !matches!(PROCESS_TABLE.with(|t| t.reserve_counted(
-            frames[0], padded, prepared.frames.total_frames,
+            frames[0], frames, prepared.frames.total_frames,
         )), Ok(Ok(issued)) if issued == pid
         ) { fail("process_table_admission_or_pid_generation") }
         compiler_fence(Ordering::SeqCst);
@@ -536,7 +538,7 @@ pub fn enter(hhdm: u64) -> ! {
         )))) if record.state == ProcessState::Running
             && record.cr3_root == frames[0]
             && record.frame_count == prepared.frames.total_frames
-            && record.owned_frames() == &frames[..]
+            && record.owned_frames() == &frames[..FRAMES]
             && record.frames[FRAMES..].iter().all(|frame| *frame == 0)
         ) { fail("process_table_active_cr3_guard") }
         #[cfg(feature = "user-process-smoke")]
