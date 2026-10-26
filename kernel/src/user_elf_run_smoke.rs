@@ -52,6 +52,9 @@ const NX: u64 = 1 << 63;
 const SLOTS: usize = 512;
 const FRAMES: usize = if cfg!(feature = "user-elf-three-load-run-smoke") { 9 }
     else if cfg!(feature = "user-elf-two-pt-run-smoke") { 8 } else { 7 };
+/// Maximum resident record capacity, independent of the exact ELF-derived
+/// 7/8/9-frame lease. Unused slots in a record must remain zero.
+const PROCESS_FRAME_CAPACITY: usize = 9;
 const TABLE_FRAMES: usize = if cfg!(feature = "user-elf-two-pt-run-smoke") { 5 } else { 4 };
 const LOAD_LEAVES: usize = if cfg!(feature = "user-elf-three-load-run-smoke") { 3 } else { 2 };
 const DATA_VA: u64 = if cfg!(feature = "user-elf-two-pt-run-smoke") { 0x600000 } else { 0x403000 };
@@ -73,7 +76,7 @@ static OWNED: [AtomicU64; FRAMES] = [const { AtomicU64::new(0) }; FRAMES];
 /// The same bounded multi-PID ownership table tested with real PMM leases
 /// now owns the hardware Ring3 ELF path. Slots can be reused after reap,
 /// while PID generations increase monotonically.
-static PROCESS_TABLE: ProcessTableCell<2, FRAMES> = ProcessTableCell::new();
+static PROCESS_TABLE: ProcessTableCell<2, PROCESS_FRAME_CAPACITY> = ProcessTableCell::new();
 static RUN_INDEX: AtomicUsize = AtomicUsize::new(0);
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 const MAX_RUNS: usize = if cfg!(feature = "user-process-smoke") { 2 } else { 1 };
@@ -242,9 +245,11 @@ pub fn enter(hhdm: u64) -> ! {
         plan_one_pt_with_budget(elf)
     }) else { fail("elf_launch_layout") };
     let launch = prepared.layout;
-    // The source ELF, not the smoke's compile-time page count, determines
-    // the exact PMM lease requirement. Mismatched flavors fail BEFORE PMM.
+    // The source ELF determines the physical lease requirement. Each tested
+    // ELF is still fixed-flavor by hardware preflight, but its resulting count
+    // can be less than the process-record capacity without padding ownership.
     if !prepared.frames.matches_exact_lease(TABLE_FRAMES, FRAMES)
+        || prepared.frames.total_frames > PROCESS_FRAME_CAPACITY
         || prepared.frames.load_frames != LOAD_LEAVES
         || prepared.frames.leaf_frames != launch.len
         || prepared.frames.stack_frames != 1
@@ -507,8 +512,11 @@ pub fn enter(hhdm: u64) -> ! {
         for (at, phys) in frames.iter().copied().enumerate() {
             OWNED[at].store(phys, Ordering::Release);
         }
-        if !matches!(PROCESS_TABLE.with(|t| t.reserve(frames[0], frames)),
-            Ok(Ok(issued)) if issued == pid
+        let mut padded = [0u64; PROCESS_FRAME_CAPACITY];
+        padded[..FRAMES].copy_from_slice(&frames);
+        if !matches!(PROCESS_TABLE.with(|t| t.reserve_counted(
+            frames[0], padded, prepared.frames.total_frames,
+        )), Ok(Ok(issued)) if issued == pid
         ) { fail("process_table_admission_or_pid_generation") }
         compiler_fence(Ordering::SeqCst);
         asm!("mov cr3, {}", in(reg) frames[0],
@@ -522,11 +530,14 @@ pub fn enter(hhdm: u64) -> ! {
         // freeing a RUNNING user root or any of its own PMM frames.
         if !matches!(PROCESS_TABLE.with(|t| (
             t.snapshot(pid), t.occupied(), t.running(),
-            t.reap_with_status(pid, frames[0]),
+            t.reap_with_status_counted(pid, frames[0]),
         )), Ok((Some(record), 1, 1, Err(TableError::Process(
             crate::process_lifecycle::ProcessError::ActiveCr3
         )))) if record.state == ProcessState::Running
-            && record.cr3_root == frames[0] && record.frames == frames
+            && record.cr3_root == frames[0]
+            && record.frame_count == prepared.frames.total_frames
+            && record.owned_frames() == &frames[..]
+            && record.frames[FRAMES..].iter().all(|frame| *frame == 0)
         ) { fail("process_table_active_cr3_guard") }
         #[cfg(feature = "user-process-smoke")]
         serial::write_fmt(format_args!(
@@ -653,8 +664,8 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     if now.start_address().as_u64() != boot { fail("boot_cr3_not_restored") }
     // The audited PID ledger authorizes release ONLY after CR3
     // restoration, only for this exact owning PID, exactly once.
-    let owned_by_pid = match PROCESS_TABLE.with(|t| t.reap_with_status(pid, boot)) {
-        Ok(Ok((code, frames))) if code == exit_status => frames,
+    let owned_by_pid = match PROCESS_TABLE.with(|t| t.reap_with_status_counted(pid, boot)) {
+        Ok(Ok((code, lease))) if code == exit_status && lease.count == FRAMES => lease,
         _ => fail("process_reap_or_exit_status"),
     };
     if cfg!(feature = "user-page-fault-retire-smoke")
@@ -666,9 +677,9 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     } else if cfg!(feature = "user-exit-status-smoke") {
         serial::write_line("WOLFOS_ELF_STATUS_REAP_OK pid=1 code=42 active_cr3_restored=1 lease=7");
     }
-    for i in (0..FRAMES).rev() {
+    for i in (0..owned_by_pid.count).rev() {
         let owned = OWNED[i].swap(0, Ordering::AcqRel);
-        if owned == 0 || owned != owned_by_pid[i]
+        if owned == 0 || owned != owned_by_pid.as_slice()[i]
             || pmm::free_frame(owned).is_err()
         {
             fail("owned_user_frame_free_failed")
@@ -678,7 +689,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     // second reap must fail. No other live table entry may remain.
     if !matches!(PROCESS_TABLE.with(|t| (
         t.snapshot(pid), t.occupied(), t.running(),
-        t.reap_with_status(pid, boot),
+        t.reap_with_status_counted(pid, boot),
     )), Ok((None, 0, 0, Err(TableError::UnknownPid)))) {
         fail("process_table_stale_pid_or_double_reap")
     }
