@@ -2,7 +2,7 @@
 //! deterministic fake provider (no physical memory or disk touched).
 #[path = "../kernel/src/pmm_frame_batch.rs"]
 mod pmm_frame_batch;
-use pmm_frame_batch::{AcquireError, FrameBatch, FrameSource, ReleaseReport};
+use pmm_frame_batch::{AcquireError, AdoptError, FrameBatch, FrameSource, ReleaseReport};
 
 struct MockFrames {
     issued: usize,
@@ -157,4 +157,85 @@ fn counted_early_drop_releases_only_live_frames_and_reports_failure() {
         .unwrap_or_else(|_| panic!("counted allocation"));
     assert_eq!(batch.close(), ReleaseReport { released: 0, failed: 7 });
     assert_eq!(failing.frees, 7);
+}
+
+#[test]
+fn adopted_external_pmm_frames_have_one_staged_owner_and_release_once() {
+    for count in [6usize, 7, 8, 9] {
+        let mut source = MockFrames::with_ceiling(9);
+        let mut frames = [0u64; 9];
+        for frame in &mut frames[..count] {
+            *frame = source.allocate().unwrap();
+        }
+        // SAFETY: each address was freshly allocated from this exact source,
+        // and the test gives up manual release on successful adoption.
+        let batch = unsafe { FrameBatch::<_, 9>::adopt_allocated(&mut source, frames, count) }
+            .unwrap_or_else(|_| panic!("valid PMM handoff"));
+        assert_eq!(batch.leased_frames(), &frames[..count]);
+        assert!(batch.frames()[count..].iter().all(|frame| *frame == 0));
+        assert_eq!(batch.close(), ReleaseReport { released: count, failed: 0 });
+        assert_eq!(source.issued, count); // adoption did not reallocate
+        assert_eq!(source.frees, count);
+        for index in 0..count {
+            assert_eq!(source.freed[index], (count - index) as u64 * 4096);
+        }
+    }
+}
+
+#[test]
+fn adopted_staged_scope_exit_rolls_back_exactly_once() {
+    let mut source = MockFrames::with_ceiling(3);
+    let frames = [source.allocate().unwrap(), source.allocate().unwrap(), 0];
+    {
+        // SAFETY: both issued allocations have exactly one owner after this
+        // transfer; Drop must release them if publication never happens.
+        let batch = unsafe { FrameBatch::<_, 3>::adopt_allocated(&mut source, frames, 2) }
+            .unwrap_or_else(|_| panic!("adopt"));
+        assert_eq!(batch.leased_frames(), &frames[..2]);
+    }
+    assert_eq!(source.issued, 2);
+    assert_eq!(source.frees, 2);
+    assert_eq!(&source.freed[..2], &[0x2000, 0x1000]);
+}
+
+#[test]
+fn rejected_external_handoff_returns_descriptor_without_touching_provider() {
+    let invalid: [(usize, [u64; 3], AdoptError); 9] = [
+        (0, [0x1000, 0, 0], AdoptError::InvalidCount { requested: 0, capacity: 3 }),
+        (4, [0x1000, 0x2000, 0], AdoptError::InvalidCount { requested: 4, capacity: 3 }),
+        (1, [0, 0, 0], AdoptError::InvalidFrame { index: 0, frame: 0 }),
+        (1, [0x1001, 0, 0], AdoptError::InvalidFrame { index: 0, frame: 0x1001 }),
+        (1, [1 << 52, 0, 0], AdoptError::InvalidFrame { index: 0, frame: 1 << 52 }),
+        (1, [u64::MAX, 0, 0], AdoptError::InvalidFrame { index: 0, frame: u64::MAX }),
+        (2, [0x1000, 0x1000, 0], AdoptError::DuplicateFrame { index: 1, first_index: 0 }),
+        (1, [0x1000, 0x2000, 0], AdoptError::NonzeroTail { index: 1, frame: 0x2000 }),
+        (2, [0x1000, 0x2000, 0x3000], AdoptError::NonzeroTail { index: 2, frame: 0x3000 }),
+    ];
+    for (requested, frames, expected) in invalid {
+        let mut source = MockFrames::with_ceiling(3);
+        // SAFETY: rejected metadata is checked before ownership is formed;
+        // the source is untouched and no rejected frame is ever released.
+        let failure = unsafe { FrameBatch::<_, 3>::adopt_allocated(&mut source, frames, requested) };
+        assert_eq!(failure.err().map(|(reason, returned)| (reason, returned)), Some((expected, frames)));
+        assert_eq!(source.issued, 0);
+        assert_eq!(source.frees, 0);
+    }
+}
+
+#[test]
+fn rejected_handoff_keeps_existing_frame_ownership_with_caller() {
+    let mut source = MockFrames::with_ceiling(3);
+    let first = source.allocate().unwrap();
+    let second = source.allocate().unwrap();
+    // SAFETY: the two valid PMM allocations remain caller-owned because the
+    // invalid nonzero tail forces rejection before the guard is constructed.
+    let (reason, returned) = unsafe {
+        FrameBatch::<_, 3>::adopt_allocated(&mut source, [first, second, 0], 1)
+    }.err().expect("reject nonzero tail");
+    assert_eq!(reason, AdoptError::NonzeroTail { index: 1, frame: second });
+    assert_eq!(returned, [first, second, 0]);
+    assert_eq!(source.frees, 0);
+    assert!(source.release(second));
+    assert!(source.release(first));
+    assert_eq!(source.frees, 2);
 }
