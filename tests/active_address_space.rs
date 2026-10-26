@@ -823,6 +823,117 @@ fn counted_blocked_binding_tracks_exact_lease_until_safe_cancel() {
 }
 
 #[test]
+fn bound_wake_rechecks_live_registry_and_atomically_updates_both_ledgers() {
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let batch = FrameBatch::<_, 2>::acquire(&mut source).unwrap();
+    let mut owner = ActiveAddressSpace::<_, 2, 1>::publish(
+        batch, 1, 0x1000, 0x9000,
+    ).unwrap_or_else(|_| panic!("publish"));
+    let mut registry = ProcessTable::<2, 2>::new();
+    let pid = registry.reserve(0x1000, [0x1000, 0x2000]).unwrap();
+    let mut queue = Ring3RunQueue::<2>::new();
+    let handle = queue.admit(pid).unwrap();
+    assert_eq!(queue.start_next(), Ok(handle));
+    registry.mark_running(pid, 0x1000).unwrap();
+    let (next, wait) = queue.block_current_for_event(handle, 0xabc).unwrap();
+    assert_eq!(next, None);
+    registry.block_running(pid, 0x1000).unwrap();
+    let binding = Ring3SavedBinding::attach_from_process_table(
+        &mut owner, &registry, &queue, handle, 5,
+    ).unwrap();
+    let queue_before = queue;
+    let registry_before = registry.snapshot(pid);
+    assert_eq!(
+        binding.wake_for_event_with_registry(
+            &mut queue, &mut registry, &owner, 0x9000, wait, 0xabd,
+        ),
+        Err(BindError::Queue(QueueError::WrongEvent)),
+    );
+    assert_eq!(
+        binding.wake_for_event_with_registry(
+            &mut queue, &mut registry, &owner, 0xa000, wait, 0xabc,
+        ),
+        Err(BindError::WrongSupervisorRoot),
+    );
+    assert_eq!(queue, queue_before);
+    assert_eq!(registry.snapshot(pid), registry_before);
+
+    let mut wrong_owner_registry = ProcessTable::<2, 2>::new();
+    assert_eq!(wrong_owner_registry.reserve(0x1000, [0x1000, 0x3000]), Ok(pid));
+    wrong_owner_registry.mark_running(pid, 0x1000).unwrap();
+    wrong_owner_registry.block_running(pid, 0x1000).unwrap();
+    let wrong_owner_before = wrong_owner_registry.snapshot(pid);
+    assert_eq!(
+        binding.wake_for_event_with_registry(
+            &mut queue, &mut wrong_owner_registry, &owner, 0x9000, wait, 0xabc,
+        ),
+        Err(BindError::OwnerMismatch),
+    );
+    assert_eq!(queue, queue_before);
+    assert_eq!(wrong_owner_registry.snapshot(pid), wrong_owner_before);
+
+    // Even with a correct blocked PID, an independently admitted peer may
+    // own the alleged supervisor root. Reject the registry transition and
+    // do not publish the already-staged READY queue entry.
+    let mut alias_registry = ProcessTable::<2, 2>::new();
+    assert_eq!(alias_registry.reserve(0x1000, [0x1000, 0x2000]), Ok(pid));
+    alias_registry.mark_running(pid, 0x1000).unwrap();
+    alias_registry.block_running(pid, 0x1000).unwrap();
+    let other = alias_registry.reserve(0x9000, [0x9000, 0xa000]).unwrap();
+    let alias_before = (alias_registry.snapshot(pid), alias_registry.snapshot(other));
+    assert_eq!(
+        binding.wake_for_event_with_registry(
+            &mut queue, &mut alias_registry, &owner, 0x9000, wait, 0xabc,
+        ),
+        Err(BindError::RegistryTransition(
+            process_table::TableError::Process(
+                process_table::standalone_process::ProcessError::ActiveCr3,
+            ),
+        )),
+    );
+    assert_eq!(queue, queue_before);
+    assert_eq!((alias_registry.snapshot(pid), alias_registry.snapshot(other)), alias_before);
+
+    binding.wake_for_event_with_registry(
+        &mut queue, &mut registry, &owner, 0x9000, wait, 0xabc,
+    ).unwrap();
+    assert_eq!(queue.slots()[0].state, QueueState::Ready);
+    assert_eq!(registry.snapshot(pid).unwrap().state,
+               process_table::standalone_process::ProcessState::Ready);
+    assert_eq!(queue.wake_for_event(wait, 0xabc), Err(QueueError::WrongState));
+
+    // A registry with the right PID/root but a changed frame lease cannot
+    // reserve a CPU or publish the RUNNING queue state.
+    let ready_before = queue;
+    let mut forged_ready = ProcessTable::<2, 2>::new();
+    assert_eq!(forged_ready.reserve(0x1000, [0x1000, 0x3000]), Ok(pid));
+    assert_eq!(
+        binding.start_next_with_registry(&mut queue, &forged_ready, &mut owner, 0),
+        Err(BindError::OwnerMismatch),
+    );
+    assert_eq!(queue, ready_before);
+    assert_eq!(owner.snapshot().reserved, 0);
+
+    let cpu = binding.start_next_with_registry(&mut queue, &registry, &mut owner, 0)
+        .unwrap();
+    assert_eq!(queue.running(), Some(handle));
+    owner.confirm_active(cpu, 0x1000).unwrap();
+    registry.mark_running(pid, 0x1000).unwrap();
+    assert_eq!(queue.exit_current(handle), Ok(None));
+    registry.exit_zero(pid, 0x1000).unwrap();
+    owner.begin_retirement().unwrap();
+    owner.acknowledge_quiescent(cpu, 0x9000).unwrap();
+    // SAFETY: host fixture has no genuine user GPR/IRET/FX frame, pending
+    // event source, hardware CR3 load, timer, IPI or saved hardware user.
+    unsafe { binding.retire_exited(&queue, &mut owner) }.unwrap();
+    assert_eq!(registry.reap(pid, 0x9000), Ok([0x1000, 0x2000]));
+    owner.finish_retirement().unwrap();
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 2, failed: 0 }));
+    assert_eq!(trace.borrow().releases, [0x2000, 0x1000]);
+}
+
+#[test]
 fn counted_owner_publishes_only_budgeted_frames_and_reclaims_exact_count() {
     for count in [6usize, 7, 8, 9] {
         let addresses: [u64; 9] = core::array::from_fn(|i| (i as u64 + 1) * 4096);

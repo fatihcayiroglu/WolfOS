@@ -126,6 +126,13 @@ impl<const CPUS: usize> RetirementGate<CPUS> {
         self.generation == pid && self.root == root
     }
 
+    /// Read-only identity check for the *registered* trusted supervisor
+    /// page-table root. This is not evidence that a CPU loaded that root;
+    /// the caller must independently read/authenticate its hardware CR3.
+    pub fn matches_supervisor_root(&self, root: u64) -> bool {
+        self.supervisor_root == root
+    }
+
     /// Publish only after disconnected image/ownership admission succeeds.
     pub fn publish(&mut self) -> Result<(), Error> {
         if self.phase != Phase::Staged {

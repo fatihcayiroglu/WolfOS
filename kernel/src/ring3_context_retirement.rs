@@ -12,7 +12,7 @@ use crate::{
     active_address_space::{ActiveAddressSpace, ResumeError},
     address_space_retirement::Ticket as CpuTicket,
     pmm_frame_batch::FrameSource,
-    process_table::ProcessTable,
+    process_table::{ProcessTable, TableError},
     ring3_runqueue::{Error as QueueError, Handle, Ring3RunQueue, State, WaitTicket},
     saved_context_retirement::{ContextTicket, Error as ContextError},
 };
@@ -30,7 +30,9 @@ pub enum Error {
     Reserve(ResumeError),
     Quiesce(crate::address_space_retirement::Error),
     RegistryMismatch,
+    RegistryTransition(TableError),
     OwnerMismatch,
+    WrongSupervisorRoot,
     #[cfg(not(test))]
     FrameEvidence(FrameEvidenceError),
 }
@@ -45,6 +47,21 @@ pub struct Ring3SavedBinding {
 }
 
 impl Ring3SavedBinding {
+    fn verify_registry_lease<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        owner: &ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        registry: &ProcessTable<QUEUE, FRAMES>,
+        pid: u64,
+        blocked: bool,
+    ) -> Result<(), Error> {
+        let (root, frames) = registry.saved_binding_lease_counted(pid, blocked)
+            .ok_or(Error::RegistryMismatch)?;
+        if !owner.matches_process_lease_counted(pid, root, frames.as_slice()) {
+            return Err(Error::OwnerMismatch);
+        }
+        Ok(())
+    }
+
     fn state<const QUEUE: usize>(
         &self,
         queue: &Ring3RunQueue<QUEUE>,
@@ -131,12 +148,7 @@ impl Ring3SavedBinding {
         if !matches!(state, State::Ready | State::Blocked) {
             return Err(Error::WrongState);
         }
-        let (root, frames) = registry.saved_binding_lease_counted(
-            handle.pid, state == State::Blocked,
-        ).ok_or(Error::RegistryMismatch)?;
-        if !owner.matches_process_lease_counted(handle.pid, root, frames.as_slice()) {
-            return Err(Error::OwnerMismatch);
-        }
+        Self::verify_registry_lease(owner, registry, handle.pid, state == State::Blocked)?;
         Self::attach_unchecked(owner, queue, handle, saved_slot)
     }
 
@@ -238,6 +250,38 @@ impl Ring3SavedBinding {
         queue.wake_for_event(wait, event).map_err(Error::Queue)
     }
 
+    /// Joint, fail-closed BLOCKED -> READY metadata wake. Reauthenticate
+    /// the *current* process registry and exact active PMM lease, not only
+    /// the saved token from initial attachment. Stage the queue first; only
+    /// after it accepts the exact wait ticket do we update the process table.
+    /// A rejected event, stale PID, wrong lease, supervisor root or process
+    /// transition leaves BOTH ledgers unchanged.
+    ///
+    /// This is still metadata: the event source, real saved GPR/IRET/FX
+    /// frame, actual CPU CR3 and exclusive scheduler lock must be proven by
+    /// the trusted caller. It performs no hardware operation or IPI.
+    pub fn wake_for_event_with_registry<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        &self,
+        queue: &mut Ring3RunQueue<QUEUE>,
+        registry: &mut ProcessTable<QUEUE, FRAMES>,
+        owner: &ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        trusted_supervisor_cr3: u64,
+        wait: WaitTicket,
+        event: u64,
+    ) -> Result<(), Error> {
+        let mut staged = *queue;
+        self.wake_for_event(&mut staged, owner, wait, event)?;
+        Self::verify_registry_lease(owner, registry, self.handle.pid, true)?;
+        if !owner.matches_trusted_supervisor_root(trusted_supervisor_cr3) {
+            return Err(Error::WrongSupervisorRoot);
+        }
+        registry.wake_blocked(self.handle.pid, trusted_supervisor_cr3)
+            .map_err(Error::RegistryTransition)?;
+        *queue = staged;
+        Ok(())
+    }
+
     /// Transactional policy dispatch: stage the queue on the stack, verify
     /// the exact selected handle, then obtain the actual CPU reservation.
     /// Any pre-commit failure leaves the queue unchanged. A successful
@@ -262,6 +306,26 @@ impl Ring3SavedBinding {
         let ticket = owner.reserve_saved_resume(self.context, cpu).map_err(Error::Reserve)?;
         *queue = staged;
         Ok(ticket)
+    }
+
+    /// Recheck the current READY process table and exact owner lease before
+    /// allocating a CPU reservation or publishing a RUNNING queue entry.
+    /// The caller must still authenticate the stored hardware trap frame,
+    /// then perform CR3/TSS/FX/IRET handoff and mark the process RUNNING
+    /// under its single external coordinator lock. This does none of that.
+    pub fn start_next_with_registry<'a, S: FrameSource, const FRAMES: usize,
+        const CPUS: usize, const QUEUE: usize>(
+        &self,
+        queue: &mut Ring3RunQueue<QUEUE>,
+        registry: &ProcessTable<QUEUE, FRAMES>,
+        owner: &mut ActiveAddressSpace<'a, S, FRAMES, CPUS>,
+        cpu: usize,
+    ) -> Result<CpuTicket, Error> {
+        if self.state(queue)? != State::Ready {
+            return Err(Error::WrongState);
+        }
+        Self::verify_registry_lease(owner, registry, self.handle.pid, false)?;
+        self.start_next(queue, owner, cpu)
     }
 
     /// Revoke a running process's saved context after a trusted exit trap
