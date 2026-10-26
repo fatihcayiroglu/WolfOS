@@ -7,6 +7,10 @@ mod elf64_page_image;
 mod user_vm_layout;
 #[path = "../kernel/src/user_vm_multi.rs"]
 mod user_vm_multi;
+#[path = "../kernel/src/user_elf_launch_layout.rs"]
+mod user_elf_launch_layout;
+#[path = "../kernel/src/user_vm_two_pt.rs"]
+mod user_vm_two_pt;
 #[path = "../kernel/src/user_image_admission.rs"]
 mod user_image_admission;
 
