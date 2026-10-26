@@ -103,3 +103,27 @@ leases, incorrect frame counts, different CR3 roots, old PID generations,
 blocked wait cancellation, and real allocator release-count traces.
 This does NOT prove a real CPL3 capture, FPU provenance, scheduler lock,
 IRQ wakeup, or generic ELF deployment; those remain external obligations.
+ 
+## 2026-10-26: exact counted owner records in real CPL3 ELF smokes (P2)
+
+The existing independently linked ET_EXEC Ring3 QEMU launch paths now
+reserve and reap via `ProcessTableCell<2, 9>` with an exact frame-counted
+lease. A validated ELF/page-layout budget (7, 8 or 9 frames in the
+existing real hardware flavors) is copied into a zero-padded maximum
+capacity slot, then admitted through `reserve_counted`. The table
+authenticates the live owned prefix and rejects premature active-CR3
+reap. The actual hardware exit/fault cleanup restores supervisor CR3,
+performs `reap_with_status_counted`, validates the returned length,
+releases exactly that prefix through the real PMM, and proves zero
+outstanding pages and no double reap. The fixed count array is now
+a per-flavor allocation buffer; it is not the process registry's
+declared ownership capacity.
+
+All pre-existing 7/8/9-frame real CPL3 hardware QEMU workflows,
+including faults, multi-PID sequential launches, and independent
+host ownership tests remain required on the exact PR head.
+
+Scope limit: the tested ELFs are still independently linked fixed
+fixtures and preflight still requires the expected flavor-specific
+page budget. This does not yet admit arbitrary ELF layouts, reclaim
+pages on other CPUs, or offer a production generic process launcher.
