@@ -23,6 +23,15 @@ two-PT layout and shadow-map path, now also reused by a dedicated live CPL3 runn
 - \`validate_elf_bindings\` and \`audit_elf_bindings\` verify all advertised
   page VAs and RX/RW+NX flags against the original immutable ELF bytes,
   including a separate NX stack, rather than trusting caller metadata.
+- `plan_one_pt_with_budget` / `plan_two_pt_with_budget` derive the
+  exact no-allocation PMM frame budget BEFORE reserving any physical page:
+  four or five private paging-table frames, one frame per ELF LOAD page,
+  plus one separate RW+NX stack. The real CPL3 runner now checks that
+  the actual fixed test lease agrees with that ELF-derived total before
+  calling PMM. Host regressions cover 1/2/3 LOAD leaves, 6/7/8/9
+  frame budgets, under/over-reservations, invalid ELF and strict
+  one-PT vs two-PT boundaries. This does not dynamically allocate
+  arbitrary process images yet.
 - `derive_relocated_elf_pages` constructs a fixed-capacity leaf manifest
   directly from the immutable ELF and exactly one owned physical data frame
   per LOAD/stack page; callers cannot invent VAs or permissions. It checks
