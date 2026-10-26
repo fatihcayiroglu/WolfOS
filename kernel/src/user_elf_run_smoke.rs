@@ -28,7 +28,8 @@ use x86_64::{
 };
 use crate::{
     elf64_page_image::{materialize, PAGE_SIZE},
-    user_elf_launch_layout::{plan_one_pt_with_budget, plan_two_pt_with_budget},
+    user_elf_launch_layout::plan_bounded_with_budget,
+    user_elf_page_tables::{ElfPageTables, TableBuffers},
     interrupts, kernel_half_shadow, pmm, serial,
     process_lifecycle::ProcessState,
     process_table::{ProcessTableCell, TableError},
@@ -49,7 +50,6 @@ const PAGE: u64 = 4096;
 const PRESENT: u64 = 1;
 const WRITE: u64 = 2;
 const USER: u64 = 4;
-const NX: u64 = 1 << 63;
 const SLOTS: usize = 512;
 const ONE_LOAD: bool = cfg!(feature = "user-elf-one-load-run-smoke");
 const FRAMES: usize = if ONE_LOAD { 6 }
@@ -251,11 +251,8 @@ pub fn enter(hhdm: u64) -> ! {
     // the kernel's source or directly copied from a handbuilt instruction
     // array. They must pass the strict ELF64 ET_EXEC parser and PT_LOAD
     // data/BSS materialization path developed in PRs #62-#65.
-    let Ok(prepared) = (if cfg!(feature = "user-elf-two-pt-run-smoke") {
-        plan_two_pt_with_budget(elf)
-    } else {
-        plan_one_pt_with_budget(elf)
-    }) else { fail("elf_launch_layout") };
+    let Ok(prepared) = plan_bounded_with_budget(elf)
+    else { fail("elf_launch_layout") };
     let launch = prepared.layout;
     // The source ELF determines the physical lease requirement. Each tested
     // ELF is still fixed-flavor by hardware preflight, but its resulting count
@@ -381,6 +378,11 @@ pub fn enter(hhdm: u64) -> ! {
         let Some(ptr) = hhdm_ptr(hhdm, phys) else { fail("owned_frame_hhdm") };
         ptrs[i] = ptr;
     }
+    let mapping = ElfPageTables::bind(elf, slot, &frames[..prepared.frames.total_frames])
+        .unwrap_or_else(|_| fail("elf_table_binding"));
+    if mapping.launch() != &prepared || mapping.entry() != code
+        || mapping.stack_page() != stack_va
+    { fail("elf_table_plan_disagrees") }
 
     // SAFETY: all frames fresh and disjoint. No CR3 points to the new root
     // until AFTER segment copying and full source/destination root audit.
@@ -464,6 +466,18 @@ pub fn enter(hhdm: u64) -> ! {
         let root = &mut *ptrs[0].cast::<[u64; SLOTS]>();
         let pdpt = &mut *ptrs[1].cast::<[u64; SLOTS]>();
         let pd = &mut *ptrs[2].cast::<[u64; SLOTS]>();
+        {
+            let mut tables = TableBuffers {
+                pml4: &mut *root, pdpt: &mut *pdpt, pd: &mut *pd,
+                pt0: &mut *ptrs[3].cast::<[u64; SLOTS]>(),
+                pt1: if mapping.launch().frames.table_frames == 5 {
+                    Some(&mut *ptrs[4].cast::<[u64; SLOTS]>())
+                } else { None },
+            };
+            if mapping.populate(&mut tables).is_err() || mapping.audit(&tables).is_err() {
+                fail("elf_derived_table_population_or_audit")
+            }
+        }
         #[cfg(feature = "user-elf-two-pt-run-smoke")]
         {
             let pt0 = &mut *ptrs[3].cast::<[u64; SLOTS]>();
@@ -472,9 +486,6 @@ pub fn enter(hhdm: u64) -> ! {
             if manifest.layout.source != launch || manifest.load_pages() != LOAD_LEAVES
                 || manifest.layout.entry != code || pages.len() != LOAD_LEAVES + 1
             { fail("two_pt_manifest_elf_mismatch") }
-            if user_vm_two_pt::populate(root, pdpt, pd, pt0, pt1, table_frames, pages).is_err() {
-                fail("two_pt_populate")
-            }
             let file_backings: [BackingPage<'_>; LOAD_LEAVES] =
                 core::array::from_fn(|i| BackingPage {
                     virtual_address: pages[i].virtual_address,
@@ -503,29 +514,6 @@ pub fn enter(hhdm: u64) -> ! {
                 || pt1.iter().filter(|entry| **entry != 0).count() != 2
                 || pdpt.iter().filter(|entry| **entry != 0).count() != 1
             { fail("two_pt_cardinality") }
-        }
-        #[cfg(not(feature = "user-elf-two-pt-run-smoke"))]
-        {
-            let pt = &mut *ptrs[3].cast::<[u64; SLOTS]>();
-            let pdpt_index = ((code >> 30) & 511) as usize;
-            let pd_index = ((code >> 21) & 511) as usize;
-            if pdpt_index != 0 || pd_index != 2 || ((code >> 12) & 511) != 1
-            { fail("user_table_indices") }
-            pdpt[pdpt_index] = frames[2] | PRESENT | WRITE | USER;
-            pd[pd_index] = frames[3] | PRESENT | WRITE | USER;
-            for (i, leaf) in launch.leaves[..launch.len].iter().enumerate() {
-                let Some(leaf) = leaf else { fail("missing_mapping_leaf") };
-                if leaf.writable && leaf.executable { fail("write_execute_leaf") }
-                let index = ((leaf.virtual_address >> 12) & 511) as usize;
-                if pt[index] != 0 { fail("duplicate_mapping_leaf") }
-                pt[index] = frames[4 + i] | PRESENT | USER
-                    | if leaf.writable { WRITE } else { 0 }
-                    | if leaf.executable { 0 } else { NX };
-            }
-            if pt.iter().filter(|entry| **entry != 0).count() != launch.len
-                || pd.iter().filter(|entry| **entry != 0).count() != 1
-                || pdpt.iter().filter(|entry| **entry != 0).count() != 1
-            { fail("one_pt_cardinality") }
         }
         let entry = frames[1] | PRESENT | WRITE | USER;
         if root[slot] == 0 { root[slot] = entry; }
@@ -586,6 +574,11 @@ pub fn enter(hhdm: u64) -> ! {
             && record.owned_frames() == &frames[..FRAMES]
             && record.frames[FRAMES..].iter().all(|frame| *frame == 0)
         ) { fail("process_table_active_cr3_guard") }
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_TABLE_PLAN_OK source=elf tables={} loads={} stack=1 total={} exact_audit=1\n",
+            prepared.frames.table_frames, prepared.frames.load_frames,
+            prepared.frames.total_frames,
+        ));
         #[cfg(feature = "user-process-smoke")]
         serial::write_fmt(format_args!(
             "WOLFOS_PROCESS_START pid={} state=running private_cr3=1 owned_frames=7\n",

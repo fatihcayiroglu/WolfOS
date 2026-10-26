@@ -541,6 +541,8 @@ test:
 	$(OUT)/elf64_preflight_tests
 	rustc --edition=2024 --test tests/user_elf_launch_layout.rs -o $(OUT)/user_elf_launch_layout_tests
 	$(OUT)/user_elf_launch_layout_tests
+	rustc --edition=2024 --test tests/user_elf_page_tables.rs -o $(OUT)/user_elf_page_tables_tests
+	$(OUT)/user_elf_page_tables_tests
 	rustc --edition=2024 --test tests/user_vm_layout.rs -o $(OUT)/user_vm_layout_tests
 	$(OUT)/user_vm_layout_tests
 	rustc --edition=2024 --test tests/user_vm_two_pt.rs -o $(OUT)/user_vm_two_pt_tests
