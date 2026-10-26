@@ -86,6 +86,16 @@ PF_FAULT_MARKERS = (
     "status=139 int80_calls=21 frames_freed=7 pmm_no_leak=1",
 )
 
+
+def valid_table_plan(output: str, tables: int, loads: int, total: int,
+                     entry_start: int) -> bool:
+    """Require the exact shared-mapper proof before the real CR3 entry row."""
+    expected = (f"WOLFOS_ELF_TABLE_PLAN_OK source=elf tables={tables} "
+                f"loads={loads} stack=1 total={total} exact_audit=1")
+    found = [row for row in output.splitlines() if "WOLFOS_ELF_TABLE_PLAN_OK" in row]
+    return (found == [expected]
+            and 0 <= output.find("WOLFOS_BOOT_OK") < output.find(expected) < entry_start)
+
 def main() -> int:
     mode = sys.argv[2] if len(sys.argv) == 3 else None
     one_load_mode = mode == "--one-load"
@@ -123,6 +133,12 @@ def main() -> int:
         entry = (ONE_LOAD_ENTER if one_load_mode else ENTER).search(output)
         if not entry or not 1 <= int(entry.group(1)) <= 255:
             print("FAIL: genuine ELF64 independent sanitized CR3 entry missing")
+            return 1
+        tables, loads, total = ((4, 1, 6) if one_load_mode else
+                               (5, 3, 9) if three_load_mode else
+                               (5, 2, 8) if two_pt_mode else (4, 2, 7))
+        if not valid_table_plan(output, tables, loads, total, entry.start()):
+            print("FAIL: exact ELF-derived table/frame plan and full PTE audit missing")
             return 1
         if one_load_mode:
             live = re.search(

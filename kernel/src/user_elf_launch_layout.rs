@@ -98,6 +98,23 @@ pub fn plan_two_pt_with_budget(input: &[u8]) -> Result<BudgetedLaunch, LaunchErr
     Ok(budgeted(plan_two_pt_image(input)?, TWO_PT_TABLE_FRAMES))
 }
 
+/// Choose the exact hierarchy from ELF leaves, including the fresh stack.
+/// Unlike the fixed one/two-PT contracts, no fixture flag chooses the budget.
+/// At most two distinct 2-MiB regions inside one 1-GiB directory are supported.
+pub fn plan_bounded_with_budget(input: &[u8]) -> Result<BudgetedLaunch, LaunchError> {
+    let layout = plan_two_pt_image(input)?;
+    let mut regions = [None; 2];
+    let mut used = 0;
+    for leaf in layout.leaves[..layout.len].iter().flatten() {
+        let region = Some(leaf.virtual_address >> 21);
+        if !regions[..used].contains(&region) {
+            regions[used] = region;
+            used += 1;
+        }
+    }
+    Ok(budgeted(layout, 3 + used))
+}
+
 /// Strictly bounded staging contract for any supported static ELF image.
 ///
 /// All LOAD leaves must fit one 2-MiB PT, and a clean stack is reserved at
