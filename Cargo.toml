@@ -56,6 +56,8 @@ user-ring3-smoke = ["smoke-exit"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
+# Genuine single RX PT_LOAD + isolated RW/NX stack in hardware CPL3, six PMM frames.
+user-elf-one-load-run-smoke = ["user-elf-run-smoke"]
 # Genuine relocated two-PT ELF64 in hardware CPL3, eight PMM frames; isolated QEMU gate.
 user-elf-two-pt-run-smoke = ["user-elf-run-smoke"]
 # Three ELF PT_LOAD leaves (RX+RX+RW/NX) actually execute under two PTs, nine owned PMM frames.
