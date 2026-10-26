@@ -498,6 +498,143 @@ fn prove_two_pt(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
     }
 }
 
+/// A THIRD, independent real-PMM proof: the identical two-PT ELF is
+/// relocated into an actually vacant nonzero user PML4 slot, just as the
+/// existing live Ring3 launcher selects its address-space slot. It is still
+/// a disconnected shadow: no new CR3/IRET path is executed here.
+fn prove_relocated_two_pt(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
+    let mut file = fixture();
+    put64(&mut file, 24, 0x5ff100);
+    put64(&mut file, 80, 0x5ff100);
+    put64(&mut file, 104, 0xf00);
+    put64(&mut file, 136, 0x600180);
+    put64(&mut file, 160, 0xe80);
+
+    let active_physical = Cr3::read().0.start_address().as_u64();
+    let Some(active_ptr) = hhdm.checked_add(active_physical)
+        .and_then(|value| VirtAddr::try_new(value).ok())
+    else { return false };
+    // SAFETY: IF=0, BSP-only, active Limine root is HHDM mapped. The
+    // borrowed live PML4 is never modified by this proof.
+    let active = unsafe { &*active_ptr.as_ptr::<[u64; ENTRY_COUNT]>() };
+    let Some(slot) = (1..256).find(|s| active[*s] == 0)
+    else { return false };
+    let base = (slot as u64) << 39;
+    let pages = [
+        UserPage { virtual_address: base + 0x5ff000,
+            physical_frame: frames[5], writable: false, executable: true },
+        UserPage { virtual_address: base + 0x600000,
+            physical_frame: frames[6], writable: true, executable: false },
+        UserPage { virtual_address: base + 0x601000,
+            physical_frame: frames[7], writable: true, executable: false },
+    ];
+    let table_frames = [frames[0], frames[1], frames[2], frames[3], frames[4]];
+    let Ok(layout) = user_vm_two_pt::validate_relocated_elf_bindings(
+        &file, slot, table_frames, &pages,
+    ) else { return false };
+    if layout.stack_page != base + 0x601000
+        || layout.entry != base + 0x5ff100
+        || layout.source.len != 3
+    { return false }
+
+    let mut pointers = [core::ptr::null_mut::<u8>(); FRAME_TOTAL];
+    for (i, physical) in frames.iter().copied().enumerate() {
+        let Some(vaddr) = hhdm.checked_add(physical)
+            .and_then(|value| VirtAddr::try_new(value).ok())
+        else { return false };
+        pointers[i] = vaddr.as_mut_ptr::<u8>();
+    }
+    // SAFETY: all eight PMM frames remain exclusively owned by this
+    // synchronous, IF=0 BSP smoke. None belongs to the live CR3 root.
+    unsafe {
+        for ptr in pointers { core::ptr::write_bytes(ptr, 0, PAGE_SIZE); }
+        let root = &mut *pointers[0].cast::<[u64; ENTRY_COUNT]>();
+        let pdpt = &mut *pointers[1].cast::<[u64; ENTRY_COUNT]>();
+        let pd = &mut *pointers[2].cast::<[u64; ENTRY_COUNT]>();
+        let pt0 = &mut *pointers[3].cast::<[u64; ENTRY_COUNT]>();
+        let pt1 = &mut *pointers[4].cast::<[u64; ENTRY_COUNT]>();
+        if user_vm_two_pt::populate(
+            root, pdpt, pd, pt0, pt1, table_frames, &pages,
+        ).is_err() || user_vm_two_pt::audit_relocated_elf_bindings(
+            &file, slot, root, pdpt, pd, pt0, pt1, table_frames, &pages,
+        ) != Ok(layout)
+        { return false }
+
+        let text_page = &mut *pointers[5].cast::<[u8; PAGE_SIZE]>();
+        let data_page = &mut *pointers[6].cast::<[u8; PAGE_SIZE]>();
+        let stack_page = &mut *pointers[7].cast::<[u8; PAGE_SIZE]>();
+        let Some(text) = layout.source.image.segments[0] else { return false };
+        let Some(data) = layout.source.image.segments[1] else { return false };
+        let requests = [(&text, 0x5ff000), (&data, 0x600000)];
+        // NOTE: ELF byte offsets are derived from SOURCE virtual addresses.
+        // Only PTE lookup, RIP and RSP use the base-relocated address.
+        if materialize_batch(
+            &file, requests, [&mut *text_page, &mut *data_page],
+        ).is_err() || audit_zeroed_stack(stack_page).is_err()
+        { return false }
+
+        data_page[0x180] ^= 1;
+        let rejected = {
+            let files = [
+                BackingPage { virtual_address: pages[0].virtual_address,
+                    physical_frame: frames[5], bytes: &*text_page },
+                BackingPage { virtual_address: pages[1].virtual_address,
+                    physical_frame: frames[6], bytes: &*data_page },
+            ];
+            let stack = BackingPage { virtual_address: pages[2].virtual_address,
+                physical_frame: frames[7], bytes: &*stack_page };
+            matches!(
+                user_image_admission::audit_relocated_two_pt_staged_image(
+                    &file, slot, table_frames, &pages,
+                    root, pdpt, pd, pt0, pt1, &files, stack,
+                ),
+                Err(user_image_admission::TwoPtAdmissionError::FileBytes(
+                    PageAuditError::ContentMismatch { index: 0, offset: 0x180 },
+                )),
+            )
+        };
+        data_page[0x180] ^= 1;
+        let files = [
+            BackingPage { virtual_address: pages[0].virtual_address,
+                physical_frame: frames[5], bytes: &*text_page },
+            BackingPage { virtual_address: pages[1].virtual_address,
+                physical_frame: frames[6], bytes: &*data_page },
+        ];
+        let stack = BackingPage { virtual_address: pages[2].virtual_address,
+            physical_frame: frames[7], bytes: &*stack_page };
+        let admitted = user_image_admission::audit_relocated_two_pt_staged_image(
+            &file, slot, table_frames, &pages,
+            root, pdpt, pd, pt0, pt1, &files, stack,
+        ) == Ok(layout)
+            && user_image_admission::audit_hhdm_backings(
+                hhdm, &files, stack,
+            ).is_ok();
+        if !admitted || !rejected || root[0] != 0
+            || root[slot] & (kernel_half_shadow::PTE_USER | 1)
+                != (kernel_half_shadow::PTE_USER | 1)
+        { return false }
+
+        let user_entry = root[slot];
+        let copied = kernel_half_shadow::graft_kernel_half(
+            active, root, slot, user_entry, frames,
+        );
+        let kernel_idx = ((crate::kmain as usize as u64 >> 39) & 511) as usize;
+        let hhdm_idx = ((hhdm >> 39) & 511) as usize;
+        matches!(copied, Ok(n) if n > 0)
+            && kernel_half_shadow::audit_kernel_half(
+                active, root, slot, user_entry, frames,
+            ) == copied
+            && kernel_idx >= 256 && hhdm_idx >= 256
+            && root[kernel_idx] == (active[kernel_idx] & !kernel_half_shadow::PTE_USER)
+            && root[hhdm_idx] == (active[hhdm_idx] & !kernel_half_shadow::PTE_USER)
+            && root[kernel_idx] & kernel_half_shadow::PTE_USER == 0
+            && root[hhdm_idx] & kernel_half_shadow::PTE_USER == 0
+            && text_page[0x100] == 0xc3
+            && data_page[0x180..0x188] == [1, 2, 3, 4, 5, 6, 7, 8]
+            && audit_zeroed_stack(stack_page).is_ok()
+    }
+}
+
 pub fn verify(hhdm: u64) -> bool {
     let before = pmm::statistics().allocated_frames;
     let (cr3, _) = Cr3::read();
@@ -536,7 +673,8 @@ pub fn verify(hhdm: u64) -> bool {
         *frame != 0 && *frame % 4096 == 0 && !frames[..i].contains(frame)
     );
     let verified = exclusive && prove(hhdm, &frames)
-        && prove_two_pt(hhdm, &frames);
+        && prove_two_pt(hhdm, &frames)
+        && prove_relocated_two_pt(hhdm, &frames);
     let cleanup = batch.close();
     let freed = cleanup.released;
     let (now, _) = Cr3::read();
@@ -551,6 +689,7 @@ pub fn verify(hhdm: u64) -> bool {
         ));
         return false;
     }
+    serial::write_line("WOLFOS_USER_RELOCATED_TWO_PT_OK vacant_slot=1 relocated_elf=1 relocated_pte=1 byte_source_unshifted=1 staged_admission=1 tamper_denied=1 kernel_supervisor=1 cr3_unchanged=1 freed=8 ring3=0");
     serial::write_line("WOLFOS_USER_TWO_PT_OK frames=8 tables=5 pt_regions=2 load_pages=2 stack_rw_nx=1 elf_bound=1 bss_zero=1 hhdm_provenance=1 tamper_denied=1 pte_denied=1 staged_admission=1 admission_tamper_denied=1 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 high_half_escalation_denied=1 cr3_unchanged=1 freed=8 ring3=0");
     serial::write_line(
         "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 hhdm_backing=1 staged_admission=1 frame_batch=1 injected_rollback=3 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
