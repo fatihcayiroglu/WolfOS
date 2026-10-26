@@ -98,6 +98,16 @@ def main() -> int:
         if not entry or not 1 <= int(entry.group(1)) <= 255:
             print("FAIL: genuine ELF64 independent sanitized CR3 entry missing")
             return 1
+        if two_pt_mode:
+            live = re.search(
+                r"(?m)^WOLFOS_ELF_TWO_PT_ENTER hardware_cr3=1 root_slot=(\d+) "
+                r"pd_regions=2 pt_frames=2 rx=1 rw_nx=2 elf_admitted=1 "
+                r"hhdm_checked=1 derived_pages=1 owned_frames=8$",
+                output,
+            )
+            if not live or live.group(1) != entry.group(1):
+                print("FAIL: live two-PT manifest/CR3 root provenance missing or disagrees")
+                return 1
         positions = [output.find("WOLFOS_BOOT_OK"), entry.start()]
         positions += [output.find(m) for m in markers]
         if any(i < 0 for i in positions) or positions != sorted(positions):
