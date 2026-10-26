@@ -391,6 +391,8 @@ pub fn enter(hhdm: u64) -> ! {
             "WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 bss_zero=1 cr3_new=1 root_slot={} user_entry={:#x}\n",
             slot, plan.entry,
         ));
+        #[cfg(feature = "user-file-io-smoke")]
+        crate::user_file_io_smoke::attest_running_image(pid, elf);
         // Real CPU IRETQ into independently LINKED & VALIDATED ELF image.
         asm!(
             "push {ss}", "push {rsp}", "push {flags}",

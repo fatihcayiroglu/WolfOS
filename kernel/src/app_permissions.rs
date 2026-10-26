@@ -33,6 +33,10 @@ pub enum PermissionError {
     NotRegistered,
     InvalidPath,
     PathRequired,
+    UnverifiedImage,
+    ImageMismatch,
+    ImageTooLarge,
+    AlreadyVerified,
 }
 
 #[derive(Clone, Copy)]
@@ -40,9 +44,10 @@ struct Entry {
     pid: u64,
     grants: u8,
     file_path: Option<&'static str>,
+    approved_image: Option<&'static [u8]>,
 }
 impl Entry {
-    const fn empty() -> Self { Self { pid: 0, grants: 0, file_path: None } }
+    const fn empty() -> Self { Self { pid: 0, grants: 0, file_path: None, approved_image: None } }
 }
 
 pub struct AppPermissions<const SLOTS: usize> {
@@ -65,7 +70,7 @@ impl<const SLOTS: usize> AppPermissions<SLOTS> {
         if pid <= self.last_pid { return Err(PermissionError::StalePid) }
         let Some(index) = self.entries.iter().position(|e| e.pid == 0)
         else { return Err(PermissionError::Full) };
-        self.entries[index] = Entry { pid, grants: 0, file_path: None };
+        self.entries[index] = Entry { pid, grants: 0, file_path: None, approved_image: None };
         self.last_pid = pid;
         Ok(())
     }
@@ -75,6 +80,33 @@ impl<const SLOTS: usize> AppPermissions<SLOTS> {
         pid != 0 && self.entries.iter()
             .find(|e| e.pid == pid)
             .is_some_and(|e| e.grants & permission.bit() != 0)
+    }
+
+    /// Bind the ProcessTable-minted PID to an *immutable kernel-approved*
+    /// exact ELF image. The caller must supply the actual admitted ELF bytes
+    /// and a separately controlled static allowlist image after verifying its
+    /// owned CR3, process state and mapped bytes. This is a local built-in
+    /// image allowlist, NOT a signature check for downloaded executables.
+    pub fn bind_verified_image(&mut self, pid: u64, loaded: &[u8],
+        approved: &'static [u8]) -> Result<(), PermissionError>
+    {
+        const MAX_APPROVED_IMAGE: usize = 32768;
+        let entry = self.entry_mut(pid)?;
+        if entry.approved_image.is_some() { return Err(PermissionError::AlreadyVerified) }
+        if loaded.is_empty() || loaded.len() > MAX_APPROVED_IMAGE
+            || approved.is_empty() || approved.len() > MAX_APPROVED_IMAGE
+        { return Err(PermissionError::ImageTooLarge) }
+        // Full byte equality, never merely filename, size, PID or a
+        // collision-prone short hash. Failure never mutates the ledger.
+        if loaded != approved { return Err(PermissionError::ImageMismatch) }
+        entry.approved_image = Some(approved);
+        Ok(())
+    }
+
+    pub fn image_verified(&self, pid: u64) -> bool {
+        pid != 0 && self.entries.iter()
+            .find(|entry| entry.pid == pid)
+            .is_some_and(|entry| entry.approved_image.is_some())
     }
 
     /// Exact absolute path only: no aliases, traversal, NUL or ambiguous
@@ -97,6 +129,7 @@ impl<const SLOTS: usize> AppPermissions<SLOTS> {
     {
         if !Self::valid_scope(path) { return Err(PermissionError::InvalidPath) }
         let entry = self.entry_mut(pid)?;
+        if entry.approved_image.is_none() { return Err(PermissionError::UnverifiedImage) }
         entry.file_path = Some(path);
         entry.grants |= Permission::FileRead.bit();
         Ok(())
@@ -129,7 +162,9 @@ impl<const SLOTS: usize> AppPermissions<SLOTS> {
         if permission == Permission::FileRead {
             return Err(PermissionError::PathRequired)
         }
-        self.entry_mut(pid)?.grants |= permission.bit();
+        let entry = self.entry_mut(pid)?;
+        if entry.approved_image.is_none() { return Err(PermissionError::UnverifiedImage) }
+        entry.grants |= permission.bit();
         Ok(())
     }
 
@@ -155,6 +190,10 @@ impl<const SLOTS: usize> AppPermissions<SLOTS> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const APPROVED_ELF: &[u8] = b"\x7fELF-WolfOS-approved";
+    fn approve<const N: usize>(ledger: &mut AppPermissions<N>, pid: u64) {
+        ledger.bind_verified_image(pid, APPROVED_ELF, APPROVED_ELF).unwrap();
+    }
 
     #[test]
     fn every_domain_denies_by_default_and_only_kernel_grant_activates() {
@@ -169,6 +208,8 @@ mod tests {
         }
         ledger.enroll(1).unwrap();
         ledger.enroll(2).unwrap();
+        approve(&mut ledger, 1);
+        approve(&mut ledger, 2);
         ledger.grant_file_read_path(1, "/tmp/msg.txt").unwrap();
         assert!(ledger.allows(1, Permission::FileRead));
         assert!(!ledger.allows(2, Permission::FileRead));
@@ -182,6 +223,7 @@ mod tests {
     fn live_revoke_and_regrant_never_leak_to_other_permissions() {
         let mut ledger = AppPermissions::<1>::new();
         ledger.enroll(7).unwrap();
+        approve(&mut ledger, 7);
         ledger.grant_file_read_path(7, "/tmp/msg.txt").unwrap();
         ledger.grant(7, Permission::Microphone).unwrap();
         ledger.revoke(7, Permission::FileRead).unwrap();
@@ -198,6 +240,7 @@ mod tests {
     fn retire_revokes_every_domain_and_stale_pid_cannot_reenroll() {
         let mut ledger = AppPermissions::<1>::new();
         ledger.enroll(99).unwrap();
+        approve(&mut ledger, 99);
         for permission in [
             Permission::FileRead, Permission::Network,
             Permission::Microphone, Permission::Camera,
@@ -226,6 +269,7 @@ mod tests {
         assert_eq!(ledger.grant(0, Permission::Network),
                    Err(PermissionError::InvalidPid));
         ledger.enroll(4).unwrap();
+        approve(&mut ledger, 4);
         ledger.grant_file_read_path(4, "/tmp/msg.txt").unwrap();
         assert_eq!(ledger.enroll(4), Err(PermissionError::StalePid));
         assert_eq!(ledger.enroll(3), Err(PermissionError::StalePid));
@@ -244,6 +288,9 @@ mod tests {
         assert_eq!(ledger.grant(10, Permission::FileRead),
                    Err(PermissionError::PathRequired));
         assert!(!ledger.allows_file_read_path(10, "/tmp/msg.txt"));
+        assert_eq!(ledger.grant_file_read_path(10, "/tmp/msg.txt"),
+                   Err(PermissionError::UnverifiedImage));
+        approve(&mut ledger, 10);
         for invalid in ["", "/", "tmp/msg.txt", "/tmp/", "//tmp/file",
             "/tmp/../msg.txt", "/tmp/./msg.txt", "/tmp//msg.txt",
             "/tmp/msg.txt/", "/tmp/m\\sg.txt", "/tmp/m sg.txt", "/tmp/é",
@@ -267,6 +314,54 @@ mod tests {
         ledger.retire(10).unwrap();
         ledger.enroll(11).unwrap();
         assert_eq!(ledger.file_read_scope(11), None);
+    }
+
+    #[test]
+    fn tampered_elf_never_enables_any_permission_or_changes_ledger() {
+        let mut ledger = AppPermissions::<2>::new();
+        ledger.enroll(21).unwrap();
+        assert_eq!(ledger.grant(21, Permission::Network),
+                   Err(PermissionError::UnverifiedImage));
+        assert_eq!(ledger.grant_file_read_path(21, "/tmp/msg.txt"),
+                   Err(PermissionError::UnverifiedImage));
+        let mut corrupted = APPROVED_ELF.to_vec();
+        corrupted[6] ^= 0x01;
+        assert_eq!(ledger.bind_verified_image(21, &corrupted, APPROVED_ELF),
+                   Err(PermissionError::ImageMismatch));
+        assert_eq!(ledger.bind_verified_image(21, &APPROVED_ELF[..4], APPROVED_ELF),
+                   Err(PermissionError::ImageMismatch));
+        assert_eq!(ledger.bind_verified_image(21, &[], APPROVED_ELF),
+                   Err(PermissionError::ImageTooLarge));
+        assert!(!ledger.image_verified(21));
+        assert_eq!(ledger.live(), 1);
+        assert!(!ledger.allows(21, Permission::FileRead));
+        approve(&mut ledger, 21);
+        assert!(ledger.image_verified(21));
+        assert_eq!(ledger.bind_verified_image(21, APPROVED_ELF, APPROVED_ELF),
+                   Err(PermissionError::AlreadyVerified));
+        ledger.grant_file_read_path(21, "/tmp/msg.txt").unwrap();
+        ledger.retire(21).unwrap();
+        assert!(!ledger.image_verified(21));
+        assert_eq!(ledger.bind_verified_image(21, APPROVED_ELF, APPROVED_ELF),
+                   Err(PermissionError::NotRegistered));
+        ledger.enroll(22).unwrap();
+        assert!(!ledger.image_verified(22));
+        assert_eq!(ledger.grant_file_read_path(22, "/tmp/msg.txt"),
+                   Err(PermissionError::UnverifiedImage));
+    }
+
+    #[test]
+    fn admission_requires_nonempty_bounded_trusted_image() {
+        static OVERSIZED: [u8; 32769] = [0xa5; 32769];
+        let mut ledger = AppPermissions::<1>::new();
+        ledger.enroll(1).unwrap();
+        assert_eq!(ledger.bind_verified_image(1, &OVERSIZED, &OVERSIZED),
+                   Err(PermissionError::ImageTooLarge));
+        assert_eq!(ledger.bind_verified_image(1, b"x", &[]),
+                   Err(PermissionError::ImageTooLarge));
+        assert!(!ledger.image_verified(1));
+        approve(&mut ledger, 1);
+        assert!(ledger.image_verified(1));
     }
 
 }
