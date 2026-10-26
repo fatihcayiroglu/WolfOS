@@ -28,18 +28,14 @@ use x86_64::{
 use crate::{
     elf64_page_image::{materialize, PAGE_SIZE},
     user_elf_launch_layout::{plan_static_image, plan_two_pt_image},
-    #[cfg(feature = "user-elf-two-pt-run-smoke")]
-    user_vm_multi::UserPage,
-    #[cfg(feature = "user-elf-two-pt-run-smoke")]
-    user_vm_two_pt,
-    #[cfg(feature = "user-elf-two-pt-run-smoke")]
-    user_image_admission::{self, BackingPage},
     interrupts, kernel_half_shadow, pmm, serial,
     process_lifecycle::ProcessState,
     process_table::{ProcessTableCell, TableError},
     user_ring_entry::{self, Ring3Entry},
     user_syscall_abi::{self, Outcome, UserSyscallFrame},
 };
+#[cfg(feature = "user-elf-two-pt-run-smoke")]
+use crate::{user_vm_multi::UserPage, user_vm_two_pt, user_image_admission::{self, BackingPage}};
 
 mod symbols {
     include!(concat!(env!("OUT_DIR"), "/wolfos_elf_symbols.rs"));
