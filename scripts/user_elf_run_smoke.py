@@ -96,6 +96,31 @@ def valid_table_plan(output: str, tables: int, loads: int, total: int,
     return (found == [expected]
             and 0 <= output.find("WOLFOS_BOOT_OK") < output.find(expected) < entry_start)
 
+
+TWO_PT_STAGE_REJECT_PROOF = (
+    "WOLFOS_ELF_TWO_PT_STAGE_REJECT_OK wrong_last_frame=1 tables_unchanged=1 "
+    "loads_unchanged=1 stack_unchanged=1 pmm_unchanged=1"
+)
+
+
+def valid_payload_plan(output: str, loads: int, total: int, entry_start: int,
+                       *, two_pt: bool) -> bool:
+    """All layouts use common staging; two-PT runs also prove real rejection."""
+    if not valid_table_plan(output, 5 if two_pt else 4, loads, total, entry_start):
+        return False
+    expected = (f"WOLFOS_ELF_PAYLOAD_PLAN_OK source=recipe loads={loads} "
+                f"stack=1 total={total}")
+    found = [row for row in output.splitlines() if "WOLFOS_ELF_PAYLOAD_PLAN_OK" in row]
+    table = output.find("WOLFOS_ELF_TABLE_PLAN_OK")
+    if found != [expected] or not table < output.find(expected) < entry_start:
+        return False
+    rejected = [row for row in output.splitlines()
+                if "WOLFOS_ELF_TWO_PT_STAGE_REJECT_OK" in row]
+    if not two_pt:
+        return not rejected
+    return (rejected == [TWO_PT_STAGE_REJECT_PROOF]
+            and output.find("WOLFOS_BOOT_OK") < output.find(TWO_PT_STAGE_REJECT_PROOF) < table)
+
 def main() -> int:
     mode = sys.argv[2] if len(sys.argv) == 3 else None
     one_load_mode = mode == "--one-load"
@@ -139,6 +164,9 @@ def main() -> int:
                                (5, 2, 8) if two_pt_mode else (4, 2, 7))
         if not valid_table_plan(output, tables, loads, total, entry.start()):
             print("FAIL: exact ELF-derived table/frame plan and full PTE audit missing")
+            return 1
+        if not valid_payload_plan(output, loads, total, entry.start(), two_pt=tables == 5):
+            print("FAIL: common payload staging or atomic two-PT rejection proof missing")
             return 1
         if one_load_mode:
             live = re.search(
