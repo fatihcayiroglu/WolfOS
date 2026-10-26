@@ -11,6 +11,8 @@ use crate::{
     pmm_frame_batch::{FrameBatch, FrameSource, AcquireError, ReleaseReport},
     user_vm_layout::ENTRY_COUNT,
     user_vm_multi::{self, UserPage},
+    user_vm_two_pt,
+    user_elf_launch_layout::{plan_static_image, plan_two_pt_image},
 };
 use x86_64::{registers::control::Cr3, VirtAddr};
 
@@ -302,6 +304,118 @@ fn prove(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
     }
 }
 
+/// Real-PMM-backed SECOND disconnected proof. The SAME eight exclusively
+/// owned frames are reused only after the preceding one-PT audit returned.
+/// Here frames[0..5] are five table frames; frames[5..8] are RX/RW/stack.
+/// No physical disk, hardware CR3 load, or user execution is involved.
+fn prove_two_pt(hhdm: u64, frames: &[u64; FRAME_TOTAL]) -> bool {
+    let mut file = fixture();
+    // Independently derive two LOAD pages straddling exactly 0x600000.
+    put64(&mut file, 24, 0x5ff100);
+    put64(&mut file, 80, 0x5ff100);
+    put64(&mut file, 104, 0xf00);
+    put64(&mut file, 136, 0x600180);
+    put64(&mut file, 160, 0xe80);
+    if plan_static_image(&file).is_ok() { return false; }
+    let Ok(layout) = plan_two_pt_image(&file) else { return false };
+    if layout.len != 3 || layout.stack_page != 0x601000 {
+        return false;
+    }
+    let Some(text) = layout.image.segments[0] else { return false };
+    let Some(data) = layout.image.segments[1] else { return false };
+    let pages = [
+        UserPage { virtual_address: 0x5ff000, physical_frame: frames[5],
+            writable: false, executable: true },
+        UserPage { virtual_address: 0x600000, physical_frame: frames[6],
+            writable: true, executable: false },
+        UserPage { virtual_address: 0x601000, physical_frame: frames[7],
+            writable: true, executable: false },
+    ];
+    let table_frames: [u64; user_vm_two_pt::TABLE_FRAMES] =
+        [frames[0], frames[1], frames[2], frames[3], frames[4]];
+    if user_vm_two_pt::validate_elf_bindings(&file, table_frames, &pages)
+        != Ok(layout)
+    {
+        return false;
+    }
+    let mut pointers = [core::ptr::null_mut::<u8>(); FRAME_TOTAL];
+    for (i, physical) in frames.iter().copied().enumerate() {
+        let Some(vaddr) = hhdm.checked_add(physical)
+            .and_then(|value| VirtAddr::try_new(value).ok())
+        else { return false; };
+        pointers[i] = vaddr.as_mut_ptr::<u8>();
+    }
+    // SAFETY: every PMM frame remains pinned, disjoint, kernel-HHDM mapped,
+    // and not reachable from an active CR3. No other CPU has these pointers.
+    unsafe {
+        for ptr in pointers { core::ptr::write_bytes(ptr, 0, PAGE_SIZE); }
+        let root = &mut *pointers[0].cast::<[u64; ENTRY_COUNT]>();
+        let pdpt = &mut *pointers[1].cast::<[u64; ENTRY_COUNT]>();
+        let pd = &mut *pointers[2].cast::<[u64; ENTRY_COUNT]>();
+        let pt0 = &mut *pointers[3].cast::<[u64; ENTRY_COUNT]>();
+        let pt1 = &mut *pointers[4].cast::<[u64; ENTRY_COUNT]>();
+        if user_vm_two_pt::populate(
+            root, pdpt, pd, pt0, pt1, table_frames, &pages,
+        ).is_err() { return false; }
+        if user_vm_two_pt::audit_elf_bindings(
+            &file, root, pdpt, pd, pt0, pt1, table_frames, &pages,
+        ) != Ok(layout)
+            || root[256..].iter().any(|entry| *entry != 0)
+        {
+            return false;
+        }
+        let text_page = &mut *pointers[5].cast::<[u8; PAGE_SIZE]>();
+        let data_page = &mut *pointers[6].cast::<[u8; PAGE_SIZE]>();
+        let stack_page = &mut *pointers[7].cast::<[u8; PAGE_SIZE]>();
+        let requests = [(&text, 0x5ff000), (&data, 0x600000)];
+        if materialize_batch(&file, requests, [&mut *text_page, &mut *data_page]).is_err()
+            || audit_materialized_batch(
+                &file, requests, [&*text_page, &*data_page],
+            ).is_err()
+            || audit_zeroed_stack(stack_page).is_err()
+        {
+            return false;
+        }
+        let original = data_page[0x180];
+        data_page[0x180] ^= 1;
+        let tamper_rejected = matches!(
+            audit_materialized_batch(&file, requests, [&*text_page, &*data_page]),
+            Err(PageAuditError::ContentMismatch { index: 1, offset: 0x180 }),
+        );
+        data_page[0x180] = original;
+        let original_pte = pt1[0];
+        pt1[0] &= !user_vm_layout::NX; // data may never become executable
+        let pte_rejected = user_vm_two_pt::audit(
+            root, pdpt, pd, pt0, pt1, table_frames, &pages,
+        ).is_err();
+        pt1[0] = original_pte;
+
+        let file_backings = [
+            BackingPage { virtual_address: 0x5ff000,
+                physical_frame: frames[5], bytes: &*text_page },
+            BackingPage { virtual_address: 0x600000,
+                physical_frame: frames[6], bytes: &*data_page },
+        ];
+        let stack_backing = BackingPage {
+            virtual_address: 0x601000,
+            physical_frame: frames[7], bytes: &*stack_page,
+        };
+        tamper_rejected && pte_rejected
+            && user_image_admission::audit_hhdm_backings(
+                hhdm, &file_backings, stack_backing,
+            ).is_ok()
+            && audit_materialized_batch(
+                &file, requests, [&*text_page, &*data_page],
+            ).is_ok()
+            && audit_zeroed_stack(stack_page).is_ok()
+            && user_vm_two_pt::audit_elf_bindings(
+                &file, root, pdpt, pd, pt0, pt1, table_frames, &pages,
+            ) == Ok(layout)
+            && text_page[0x100] == 0xc3
+            && data_page[0x180..0x188] == [1, 2, 3, 4, 5, 6, 7, 8]
+    }
+}
+
 pub fn verify(hhdm: u64) -> bool {
     let before = pmm::statistics().allocated_frames;
     let (cr3, _) = Cr3::read();
@@ -339,7 +453,8 @@ pub fn verify(hhdm: u64) -> bool {
     let exclusive = frames.iter().enumerate().all(|(i, frame)|
         *frame != 0 && *frame % 4096 == 0 && !frames[..i].contains(frame)
     );
-    let verified = exclusive && prove(hhdm, &frames);
+    let verified = exclusive && prove(hhdm, &frames)
+        && prove_two_pt(hhdm, &frames);
     let cleanup = batch.close();
     let freed = cleanup.released;
     let (now, _) = Cr3::read();
@@ -354,6 +469,7 @@ pub fn verify(hhdm: u64) -> bool {
         ));
         return false;
     }
+    serial::write_line("WOLFOS_USER_TWO_PT_OK frames=8 tables=5 pt_regions=2 load_pages=2 stack_rw_nx=1 elf_bound=1 bss_zero=1 hhdm_provenance=1 tamper_denied=1 pte_denied=1 cr3_unchanged=1 freed=8 ring3=0");
     serial::write_line(
         "WOLFOS_USER_MULTI_OK roots=1 pages=4 rx=2 rw_nx=2 elf_segments=2 bss_zero=1 atomic_page_copy=1 elf_pte_contract=1 byte_audit=1 tamper_rejected=4 stack_zero=1 ready_image_gate=1 hhdm_backing=1 staged_admission=1 frame_batch=1 injected_rollback=3 kernel_supervisor=1 high_half_copied=1 kernel_anchor=1 hhdm_anchor=1 freed=8 cr3_unchanged=1 ring3=0"
     );
