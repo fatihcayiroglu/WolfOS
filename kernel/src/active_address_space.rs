@@ -109,6 +109,13 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
             && self.batch.leased_frames() == frames
     }
 
+    /// Compare a separately authenticated CPU/supervisor root to the root
+    /// registered before publishing this owner. Metadata identity alone
+    /// cannot prove an actual hardware CR3 transition.
+    pub fn matches_trusted_supervisor_root(&self, root: u64) -> bool {
+        self.gate.matches_supervisor_root(root)
+    }
+
     /// Compatibility check for legacy callers declaring every slot leased.
     /// A counted short owner never matches a zero-padded full array.
     pub fn matches_process_lease(&self, pid: u64, root: u64, frames: &[u64; N]) -> bool {
