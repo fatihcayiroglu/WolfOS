@@ -61,3 +61,29 @@ Next: give every table entry its own saved user trap-frame/TSS.RSP0
 context, prove strict alternating resumptions of two real ELF tasks under
 independently owned CR3 roots, then attach input queues and an interactive
 WolfShell. Do not claim generic ELF execution or physical-hardware safety.
+
+## 2026-10-26 follow-up: counted process PMM ownership (P2)
+
+The fixed-capacity tables now record an explicit `frame_count` for each live
+PID. `admit_counted` / `reserve_counted` validate `1..=capacity`, require an
+all-zero unused tail, and scan only the exact owned prefix for per-process
+duplicates and cross-process aliases. Invalid count, malformed padding, and
+inter-PID alias attempts must not spend a PID, occupy a slot, or mutate PMM
+ownership metadata. `reserve_batch_counted` stages mixed frame-count
+admissions atomically on a private table copy.
+
+READY cancellation, BLOCKED cancellation, and EXITED reaping have explicitly
+counted return forms. A returned `CountedFrames` is a transfer of metadata
+ownership, not a PMM deallocation: callers must release only `as_slice()`,
+once, and only after authenticating the hardware supervisor CR3 and retiring
+any CPU/FX, wait-gate, or queue references. The old full-array release API
+rejects a counted short lease without mutating state. The existing
+`saved_binding_lease` registration path also refuses short leases until
+its separate PMM-owner/context-retirement contract is made count-aware;
+`saved_binding_lease_counted` exposes the necessary typed handoff.
+
+This P2 step does **not** change actual hardware ELF launch counts, dynamically
+allocate kernel process slots, generalize shared Ring3 CPU execution, or
+claim arbitrary ELF readiness. Existing true-CPL3 and fixed-flavor QEMU
+controls must stay green. Subsequent work will integrate the counted lease
+end-to-end with context-retirement and Ring3 process creation.
