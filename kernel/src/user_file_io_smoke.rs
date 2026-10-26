@@ -15,6 +15,7 @@ use crate::{
 const PID: u64 = 1;
 const CONTENT: &[u8; 8] = b"FILE_OK\n";
 const PATH: &str = "/tmp/msg.txt";
+const PRIVATE_PATH: &str = "/tmp/private.txt";
 struct FileService {
     fs: Vfs<2, 256>,
     grants: AppPermissions<2>,
@@ -38,13 +39,14 @@ pub fn prepare() {
     // SAFETY: this isolated flavor has no other access before READY.
     let state = unsafe { &mut *SERVICE.0.get() };
     if state.fs.create(PATH, CONTENT, true).is_err()
+        || state.fs.create(PRIVATE_PATH, b"PRIVATE\n", true).is_err()
         || state.fs.open_count() != 0
-        || state.fs.volume_counts() != (0, 1)
+        || state.fs.volume_counts() != (0, 2)
         || state.grants.enroll(PID).is_err()
         || state.grants.allows(PID, Permission::FileRead)
     { fail("file_stage_or_default_deny") }
     READY.store(true, Ordering::Release);
-    serial::write_line("WOLFOS_FILE_IO_READY tmp_mount=1 sealed_file=1 pid_owner=1");
+    serial::write_line("WOLFOS_FILE_IO_READY tmp_mount=1 sealed_files=2 pid_owner=1");
 }
 
 fn checked(pid: u64) -> &'static mut FileService {
@@ -71,14 +73,55 @@ pub fn grant_file_read(pid: u64, expected_open: usize) {
     let state = checked(pid);
     if state.fs.open_count() != expected_open
         || state.grants.allows(pid, Permission::FileRead)
-        || state.grants.grant(pid, Permission::FileRead).is_err()
-        || !state.grants.allows(pid, Permission::FileRead)
+        || state.grants.grant_file_read_path(pid, PATH).is_err()
+        || !state.grants.allows_file_read_path(pid, PATH)
     { fail("permission_grant_transition") }
     if expected_open == 0 {
         serial::write_line("WOLFOS_SHIELD_FILE_GRANT_OK pid=1 handles=0");
     } else {
         serial::write_line("WOLFOS_SHIELD_FILE_REGRANT_OK pid=1 handles=1");
     }
+}
+
+pub fn scope_private_file_read(pid: u64) {
+    let state = checked(pid);
+    if state.fs.open_count() != 1
+        || state.grants.file_read_scope(pid).is_some()
+        || state.grants.grant_file_read_path(pid, PRIVATE_PATH).is_err()
+        || !state.grants.allows_file_read_path(pid, PRIVATE_PATH)
+        || state.grants.allows_file_read_path(pid, PATH)
+    { fail("private_scope_transition") }
+    serial::write_line("WOLFOS_SHIELD_PRIVATE_SCOPE_OK pid=1 handles=1");
+}
+
+pub fn restore_file_read_scope(pid: u64) {
+    let state = checked(pid);
+    if state.fs.open_count() != 1
+        || !state.grants.allows_file_read_path(pid, PRIVATE_PATH)
+        || state.grants.grant_file_read_path(pid, PATH).is_err()
+        || !state.grants.allows_file_read_path(pid, PATH)
+        || state.grants.allows_file_read_path(pid, PRIVATE_PATH)
+    { fail("restore_scope_transition") }
+    serial::write_line("WOLFOS_SHIELD_SCOPE_RESTORED_OK pid=1 handles=1");
+}
+
+pub fn prove_wrong_scope_read(pid: u64) {
+    let state = checked(pid);
+    if state.fs.open_count() != 1
+        || !state.grants.allows_file_read_path(pid, PRIVATE_PATH)
+        || state.grants.allows_file_read_path(pid, PATH)
+    { fail("wrong_scope_read_not_blocked") }
+    serial::write_line("WOLFOS_SHIELD_WRONG_SCOPE_READ_DENIED_OK pid=1 fd_kept=1");
+}
+
+pub fn prove_private_open_denied(pid: u64) {
+    let state = checked(pid);
+    if state.fs.open_count() != 0
+        || !state.grants.allows_file_read_path(pid, PATH)
+        || state.grants.allows_file_read_path(pid, PRIVATE_PATH)
+        || state.fs.immutable(PRIVATE_PATH).is_err()
+    { fail("private_path_policy_bypass") }
+    serial::write_line("WOLFOS_SHIELD_PRIVATE_OPEN_DENIED_OK pid=1 fd_open=0");
 }
 
 pub fn revoke_file_read(pid: u64) {
@@ -107,22 +150,26 @@ pub fn dispatch(pid: u64, cr3: u64, nr: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     let state = checked(pid);
     match nr {
         SYS_OPEN_RO if a2 == 0 => {
-            if !state.grants.allows(pid, Permission::FileRead) {
-                user_file_io::EACCES as u64
-            } else {
+            if let Some(path) = state.grants.file_read_scope(pid) {
                 user_file_io::open_read_only(
-                    &mut state.fs, pid, cr3, a0, a1, private_pte, private_byte
+                    &mut state.fs, pid, cr3, a0, a1, path,
+                    private_pte, private_byte
                 )
-            }
+            } else { user_file_io::EACCES as u64 }
         },
         SYS_READ => {
-            if !state.grants.allows(pid, Permission::FileRead) {
+            if state.grants.file_read_scope(pid).is_none() {
                 user_file_io::EACCES as u64
             } else {
-                user_file_io::read_into_user(
-                    &mut state.fs, pid, a0, cr3, a1, a2,
-                    private_pte, private_rw_byte
-                )
+                match user_file_io::read_target_path(&state.fs, pid, a0) {
+                    Err(code) => code,
+                    Ok(path) if !state.grants.allows_file_read_path(pid, path) =>
+                        user_file_io::EACCES as u64,
+                    Ok(_) => user_file_io::read_into_user(
+                        &mut state.fs, pid, a0, cr3, a1, a2,
+                        private_pte, private_rw_byte
+                    ),
+                }
             }
         },
         // CLOSE is always permitted so an app can release its own handle
@@ -138,6 +185,7 @@ pub fn verify_exit(pid: u64) {
     if state.fs.open_count() != 0
         || state.fs.close_all(pid) != Ok(0)
         || state.fs.immutable(PATH).ok() != Some(CONTENT.as_slice())
+        || state.fs.immutable(PRIVATE_PATH).ok() != Some(&b"PRIVATE\n"[..])
         || !state.grants.allows(pid, Permission::FileRead)
         || state.grants.retire(pid).is_err()
         || state.grants.allows(pid, Permission::FileRead)

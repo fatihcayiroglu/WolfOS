@@ -56,7 +56,7 @@ fn fixture() -> (Vfs<3, 128>, Guest) {
 }
 fn open(fs: &mut Vfs<3, 128>, guest: &Guest, pid: u64) -> u64 {
     let tables = guest.tables;
-    open_read_only(fs, pid, ROOT, PATH_VA, NAME.len() as u64,
+    open_read_only(fs, pid, ROOT, PATH_VA, NAME.len() as u64, "/tmp/msg.txt",
         |a| pte(&tables, a), |a| read_owned(&guest.data, a))
 }
 fn read(fs: &mut Vfs<3, 128>, guest: &mut Guest, pid: u64,
@@ -118,11 +118,11 @@ fn forged_cross_pid_stale_and_invalid_handles_are_rejected() {
 fn path_fault_or_traversal_never_opens_descriptor() {
     let (mut fs, mut guest) = fixture();
     let tables = guest.tables;
-    assert_eq!(open_read_only(&mut fs, 1, ROOT, 0, NAME.len() as u64,
+    assert_eq!(open_read_only(&mut fs, 1, ROOT, 0, NAME.len() as u64, "/tmp/msg.txt",
         |a|pte(&tables,a),|a|read_owned(&guest.data,a)), EFAULT as u64);
-    assert_eq!(open_read_only(&mut fs, 1, ROOT, 0x403fff, NAME.len() as u64,
+    assert_eq!(open_read_only(&mut fs, 1, ROOT, 0x403fff, NAME.len() as u64, "/tmp/msg.txt",
         |a|pte(&tables,a),|a|read_owned(&guest.data,a)), EFAULT as u64);
-    assert_eq!(open_read_only(&mut fs, 1, ROOT, PATH_VA, 64,
+    assert_eq!(open_read_only(&mut fs, 1, ROOT, PATH_VA, 64, "/tmp/msg.txt",
         |a|pte(&tables,a),|a|read_owned(&guest.data,a)), EINVAL as u64);
     guest.data[..10].copy_from_slice(b"/tmp/../xx");
     assert_ne!(open(&mut fs, &guest, 1), 256);
@@ -138,3 +138,22 @@ fn Vfs_is_not_exposed_as_readwrite_to_user_processes() {
     assert_eq!(fs.close_all(2), Ok(1));
     assert_eq!(fs.close_all(3), Ok(1));
 }
+#[test]
+fn scoped_open_rejects_real_other_file_before_fd_allocation() {
+    let (mut fs, mut guest) = fixture();
+    fs.create("/tmp/private.txt", b"NOPE", true).unwrap();
+    guest.data[..16].copy_from_slice(b"/tmp/private.txt");
+    let tables = guest.tables;
+    assert_eq!(open_read_only(&mut fs, 7, ROOT, PATH_VA, 16,
+        "/tmp/msg.txt", |a| pte(&tables, a), |a| read_owned(&guest.data, a)),
+        EACCES as u64);
+    assert_eq!(fs.open_count(), 0);
+    guest.data[..NAME.len()].copy_from_slice(NAME);
+    let fd = open(&mut fs, &guest, 7);
+    assert_eq!(read_target_path(&fs, 7, fd), Ok("/tmp/msg.txt"));
+    assert_eq!(read_target_path(&fs, 8, fd), Err(EACCES as u64));
+    assert_eq!(read_target_path(&fs, 7, 0), Err(EBADF as u64));
+    assert_eq!(fs.close_all(7), Ok(1));
+    assert_eq!(read_target_path(&fs, 7, fd), Err(EBADF as u64));
+}
+

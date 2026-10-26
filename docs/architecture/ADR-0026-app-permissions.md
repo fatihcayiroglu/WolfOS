@@ -43,3 +43,28 @@ The demonstration remains single-BSP, IF=0, fixed ELF, bounded VFS and
 seven-frame address space. Never infer that full Windows/Steam compatibility
 or a daily-usable desktop exists. All previous QEMU and host safety tests
 must remain mandatory.
+
+## Exact path-scoped FILE_READ leases (extension)
+
+The FileRead policy is not a directory wildcard or a general filesystem
+capability: a trusted kernel policy decision must bind it to exactly one
+canonical, bounded absolute pathname. Invalid, ambiguous, traversing, or
+non-ASCII paths cannot become grants. A generic `grant(FileRead)` call fails
+with `PathRequired`, and there is no user syscall to choose its own path.
+
+OPEN_RO first checks the process has a lease, then copies the filename through
+its proven user CR3 and requires an **exact byte-for-byte scope match** before
+opening any VFS descriptor. On each READ, the kernel resolves the opaque
+PID-owned descriptor to its live canonical RamFS pathname, checks that the
+scope **still matches**, and only then touches VFS data or the user buffer.
+Changing the lease to a different file makes an already-open old descriptor
+inaccessible. CLOSE remains possible without a lease. This is also exercised
+with two real sealed files in the isolated CPL3/QEMU test: the ungranted file
+cannot be opened, and an open descriptor cannot be read after the scope is
+changed to the other file. Matching the old scope again permits EOF.
+
+This is still not a user consent dialog, durable security-label provenance,
+filesystem-wide mediation, or generalized multi-process hardware enforcement;
+the fixed QEMU policy harness remains trusted. Real hardware security requires
+app identity attestation, a kernel-wide broker, concurrency-safe revocation,
+mount/rename protections, a policy UI, and persistent consent lifecycle.

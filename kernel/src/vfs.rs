@@ -123,6 +123,14 @@ impl<const FILES: usize, const CAP: usize> Vfs<FILES, CAP> {
         if fd.owner != pid { return Err(VfsError::PermissionDenied) }
         Ok(fd)
     }
+    /// Resolve a validated PID-owned descriptor back to the underlying
+    /// canonical path. Authorization is checked again on *each* READ.
+    pub fn descriptor_path(&self, pid: u64, token: Descriptor)
+        -> Result<&str, VfsError>
+    {
+        let fd = self.fd(pid, token)?;
+        self.backend(fd.volume).name(fd.file).map_err(Into::into)
+    }
     pub fn close(&mut self, pid: u64, token: Descriptor)
         -> Result<(), VfsError>
     {
@@ -222,6 +230,8 @@ mod tests {
         assert_eq!(fs.read(11,a,&mut two),Ok(2));
         assert_eq!(&two,b"ab");
         assert_eq!(fs.tell(11,a),Ok(2));
+        assert_eq!(fs.descriptor_path(11,a),Ok("/notes"));
+        assert_eq!(fs.descriptor_path(12,a),Err(VfsError::PermissionDenied));
         assert_eq!(fs.tell(11,b),Ok(0));
         assert_eq!(fs.read(12,a,&mut two),Err(VfsError::PermissionDenied));
         assert_eq!(fs.close(12,a),Err(VfsError::PermissionDenied));
@@ -235,6 +245,7 @@ mod tests {
         assert_eq!(c.slot,a.slot);
         assert_ne!(c.generation,a.generation);
         assert_eq!(fs.read(11,a,&mut two),Err(VfsError::StaleDescriptor));
+        assert_eq!(fs.descriptor_path(11,a),Err(VfsError::StaleDescriptor));
     }
     #[test]
     fn sealed_elf_busy_and_stale_fd() {

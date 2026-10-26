@@ -68,6 +68,7 @@ pub fn open_read_only<const FILES: usize, const CAP: usize>(
     root: u64,
     path_va: u64,
     path_len: u64,
+    authorized_path: &str,
     pte: impl FnMut(u64) -> Option<u64>,
     read_phys: impl FnMut(u64) -> Option<u8>,
 ) -> u64 {
@@ -87,6 +88,9 @@ pub fn open_read_only<const FILES: usize, const CAP: usize>(
     let Ok(name) = core::str::from_utf8(&path[..len]) else {
         return negative(EINVAL)
     };
+    // Check the exact path copied from the verified user page table before
+    // allocating a descriptor. Prefix matches are NEVER sufficient.
+    if name != authorized_path { return negative(EACCES) }
     let token = match fs.open(pid, name, Mode::Read) {
         Ok(fd) => fd,
         Err(error) => return vfs_errno(error),
@@ -96,6 +100,15 @@ pub fn open_read_only<const FILES: usize, const CAP: usize>(
         let _ = fs.close(pid, token);
         negative(EMFILE)
     }
+}
+
+/// Canonical pathname on a validated PID-owned live descriptor. The caller
+/// enforces its current policy lease against this pathname on EVERY READ.
+pub fn read_target_path<const FILES: usize, const CAP: usize>(
+    fs: &Vfs<FILES, CAP>, pid: u64, handle: u64,
+) -> Result<&str, u64> {
+    let token = decode_fd(handle).ok_or_else(|| negative(EBADF))?;
+    fs.descriptor_path(pid, token).map_err(vfs_errno)
 }
 
 /// Read up to #76's maximum buffer size, transferring only through

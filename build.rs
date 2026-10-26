@@ -174,15 +174,19 @@ fn main() {
         symbols.extend_from_slice(&[
             ("_after_file_policy_denied_open", "FILE_POLICY_DENIED_OPEN"),
             ("_after_file_bad_open", "FILE_BAD_OPEN"),
+            ("_after_file_private_denied_open", "FILE_PRIVATE_DENIED_OPEN"),
             ("_after_file_open", "FILE_OPEN"),
             ("_after_file_bad_read", "FILE_BAD_READ"),
             ("_after_file_read", "FILE_READ"),
             ("_after_file_policy_revoked_read", "FILE_POLICY_REVOKED_READ"),
+            ("_after_file_wrong_scope_read", "FILE_WRONG_SCOPE_READ"),
             ("_after_file_eof", "FILE_EOF"),
             ("_after_file_close", "FILE_CLOSE"),
             ("_after_file_stale_close", "FILE_STALE_CLOSE"),
             ("file_path", "FILE_PATH"),
             ("file_path_end", "FILE_PATH_END"),
+            ("private_file_path", "PRIVATE_FILE_PATH"),
+            ("private_file_path_end", "PRIVATE_FILE_PATH_END"),
         ]);
     }
     if env::var_os("CARGO_FEATURE_USER_INVALID_OPCODE_RETIRE_SMOKE").is_some() {
