@@ -35,6 +35,16 @@ TWO_PT_MARKERS = (
     "user_console=1 int80_calls=22 exit=0 restored_cr3=1 frames_freed=8 pmm_no_leak=1",
 )
 
+THREE_LOAD_MARKERS = (
+    "WOLFOS_ELF_THREE_LOAD_ENTER hardware_cr3=1 root_slot=",
+    *MARKERS[:4],
+    MARKERS[4],
+    "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=9 pmm_no_leak=1",
+    "WOLFOS_ELF_THREE_LOAD_RUN_OK linked_elf=1 hardware_cpl3=1 pt_frames=2 "
+    "rx_leaves=2 second_rx_called=1 int80_calls=22 exit=0 restored_cr3=1 "
+    "frames_freed=9 pmm_no_leak=1",
+)
+
 STATUS_MARKERS = (
     *MARKERS[:4],
     "WOLFOS_ELF_EXIT_STATUS_OK code=42 cpl3=1 calls=22 saved_rdi=42",
@@ -65,13 +75,14 @@ PF_FAULT_MARKERS = (
 def main() -> int:
     mode = sys.argv[2] if len(sys.argv) == 3 else None
     two_pt_mode = mode == "--two-pt"
+    three_load_mode = mode == "--three-load"
     status_mode = mode == "--exit-status"
     fault_mode = mode == "--user-ud-fault"
     pf_mode = mode == "--user-pf-fault"
-    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode or two_pt_mode)) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--two-pt|--exit-status|--user-ud-fault|--user-pf-fault]")
+    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode or two_pt_mode or three_load_mode)) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--two-pt|--three-load|--exit-status|--user-ud-fault|--user-pf-fault]")
         return 2
-    markers = TWO_PT_MARKERS if two_pt_mode else PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
+    markers = THREE_LOAD_MARKERS if three_load_mode else TWO_PT_MARKERS if two_pt_mode else PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
     with tempfile.TemporaryDirectory(prefix="wolfos-real-elf-run-") as tmp:
         serial = Path(tmp) / "serial.log"
         command = [
@@ -98,6 +109,16 @@ def main() -> int:
         if not entry or not 1 <= int(entry.group(1)) <= 255:
             print("FAIL: genuine ELF64 independent sanitized CR3 entry missing")
             return 1
+        if three_load_mode:
+            live = re.search(
+                r"(?m)^WOLFOS_ELF_THREE_LOAD_ENTER hardware_cr3=1 root_slot=(\d+) "
+                r"pd_regions=2 pt_frames=2 rx_leaves=2 data_nx=1 stack_nx=1 "
+                r"elf_admitted=1 derived_pages=1 owned_frames=9$",
+                output,
+            )
+            if not live or live.group(1) != entry.group(1):
+                print("FAIL: real second RX page and nine-frame manifest provenance missing")
+                return 1
         if two_pt_mode:
             live = re.search(
                 r"(?m)^WOLFOS_ELF_TWO_PT_ENTER hardware_cr3=1 root_slot=(\d+) "
@@ -141,7 +162,15 @@ def main() -> int:
             print(f"FAIL: expected clean QEMU debug-exit 33, got {result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if two_pt_mode:
+        if three_load_mode:
+            if ("WOLFOS_ELF_RUN_OK " in output
+                or "WOLFOS_ELF_TWO_PT_RUN_OK " in output
+                or "frames_freed=7" in output or "frames_freed=8" in output):
+                print("FAIL: 3-LOAD acceptance fell back to smaller PMM lease")
+                return 1
+            print("PASS: two genuinely executed RX ELF pages, RW+BSS and NX stack"
+                  " -> CPL3 EXIT -> restored CR3 and nine PMM frames reclaimed")
+        elif two_pt_mode:
             if "WOLFOS_ELF_RUN_OK " in output or "frames_freed=7" in output:
                 print("FAIL: two-PT acceptance fell back to legacy seven-frame runner")
                 return 1

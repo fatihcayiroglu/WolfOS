@@ -86,6 +86,8 @@ jobs:
         run: make user-elf-run-smoke
       - name: P2 relocated two-PT ELF64 actually executes in CPL3, restores CR3 and reaps eight frames
         run: make user-elf-two-pt-run-smoke
+      - name: P2 two independently RX ELF pages execute across three LOAD leaves, two PTs and nine PMM frames
+        run: make user-elf-three-load-run-smoke
       - name: P2 real CPL3 EXIT(42) status-preserving reap and exact 7-frame cleanup
         run: make user-exit-status-smoke
       - name: P2 CPL3 invalid opcode fault safely retires only its process and frees PMM frames

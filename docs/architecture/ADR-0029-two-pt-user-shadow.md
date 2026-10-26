@@ -86,9 +86,19 @@ With interrupts disabled on the single BSP it switches hardware CR3,
 IRETs into CPL3, executes 22 INT80 syscalls, restores boot CR3 on exit,
 and releases all eight owned frames. The live evidence is
 `WOLFOS_ELF_TWO_PT_ENTER` with `derived_pages=1 owned_frames=8` plus the
-existing CPL3 exit/retirement markers. This proof runs the original
-**two-LOAD-leaf** static ELF; the three-LOAD-leaf manifest is host-tested
-and is **not yet exercised by the live QEMU launcher**.
+existing CPL3 exit/retirement markers. The original two-PT runner still executes the two-LOAD-leaf ELF independently.
+A **separate** `user-elf-three-load-run-smoke` hardware gate links two genuine
+executable ELF pages at `0x401000` and `0x402000`, RW data+BSS at
+`0x600000`, and an NX stack at `0x601000`. It allocates NINE distinct
+PMM frames (five tables, four leaf frames), uses the same ELF-derived manifest,
+copies three LOAD leaves, audits each exact byte source and all 2,560 PTEs,
+and enters actual hardware CPL3. The first RX page CALLs a function in the
+second RX page and checks its return value before any syscall; a missing or
+nonexecuting second page cannot reach the successful EXIT path. On completion
+all nine frames are reaped after restoring boot CR3. The separate QEMU
+evidence gates demand `WOLFOS_ELF_THREE_LOAD_ENTER` and
+`WOLFOS_ELF_THREE_LOAD_RUN_OK` with `second_rx_called=1`. This is still a
+fixed fixture, NOT arbitrary runtime ELF admission.
 
 All preexisting one-PT ELF execution / ProcessTable / Shield tests remain
 unchanged and must pass. No physical disk is touched.
@@ -98,10 +108,11 @@ unchanged and must pass. No physical disk is touched.
 The **disconnected** two-PT proof remains a BSP/IF=0 shadow test, but a
 separate dedicated smoke path now executes an admitted image under a real
 relocated two-PT CR3. Neither is a production executable loader or a
-general-purpose multi-address-space process model. Frame lease and
-high-half borrowing are intentionally BSP-scoped; only the fixed two-LOAD
-ELF has been run on hardware. Next steps include executing three-LOAD
-images after generalized per-leaf materialization, guard pages and dynamic
-frame bookkeeping, multiple PD/PT regions, trusted-package and untrusted
+general-purpose multi-address-space process model. Frame leases and
+high-half borrowing are intentionally BSP-scoped; fixed two- and three-LOAD
+ELF fixtures have been run on hardware, with the second RX leaf genuinely
+executed in the latter. Next steps include arbitrary verified ELF admission
+using generalized per-leaf PMM leases, guard pages and dynamic frame
+bookkeeping, multiple PD/PT regions, trusted-package and untrusted
 ELF loading, real process lifecycle integration, device drivers, persistent
 storage, and graphical user-facing permissions.
