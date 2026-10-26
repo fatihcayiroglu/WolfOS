@@ -122,6 +122,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=user/hello.S");
     println!("cargo:rerun-if-changed=user/hello.ld");
+    println!("cargo:rerun-if-changed=user/hello-two-pt.ld");
     if env::var_os("CARGO_FEATURE_USER_ELF_RUN_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_RAMFS_SMOKE").is_none()
@@ -152,8 +153,11 @@ fn main() {
     } else {
         checked("as", &["--64", "-o", obj.to_str().unwrap(), "user/hello.S"]);
     }
+    let linker = if env::var_os("CARGO_FEATURE_USER_ELF_TWO_PT_RUN_SMOKE").is_some() {
+        "user/hello-two-pt.ld"
+    } else { "user/hello.ld" };
     checked("ld", &["-m", "elf_x86_64", "-nostdlib", "-static",
-        "-T", "user/hello.ld", "-o", elf.to_str().unwrap(),
+        "-T", linker, "-o", elf.to_str().unwrap(),
         obj.to_str().unwrap()]);
     let out = Command::new("nm").arg("-n").arg(&elf)
         .output().expect("nm missing");
