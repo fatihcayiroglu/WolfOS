@@ -267,6 +267,8 @@ mod user_fx_smoke;
 mod handoff_preflight_smoke;
 #[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
 mod user_yield_switch_smoke;
+#[cfg(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
+mod user_saved_frame_ledger;
 #[cfg(feature = "p2-ring3-timer-preempt-smoke")]
 mod ring3_round_robin;
 // Generation-safe N-task policy is shared by Ring3 IRQ smoke and standalone
