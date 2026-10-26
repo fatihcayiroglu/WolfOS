@@ -4,6 +4,12 @@ import re
 import subprocess
 import sys
 import tempfile
+
+if __package__:
+    from .elf_launch_evidence import valid_launch_transactions
+else:
+    from elf_launch_evidence import valid_launch_transactions
+
 from pathlib import Path
 
 ENTER = re.compile(
@@ -63,6 +69,9 @@ def main():
             return 2
         output = log.read_text(errors="replace") if log.exists() else ""
         print(output)
+        if not valid_launch_transactions(output, 7, (1,)):
+            print("FAIL: counted launch rollback, CPU ownership or terminal retirement evidence missing")
+            return 1
         enter = ENTER.search(output)
         if not enter or not 1 <= int(enter.group(1)) <= 255:
             print("FAIL: no real sanitized CPL3 entry")

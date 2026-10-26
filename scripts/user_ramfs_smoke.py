@@ -11,6 +11,12 @@ import subprocess
 import sys
 import tempfile
 
+if __package__:
+    from .elf_launch_evidence import valid_launch_transactions
+else:
+    from elf_launch_evidence import valid_launch_transactions
+
+
 READY = re.compile(
     r"WOLFOS_RAMFS_READY slots=2 capacity=32768 "
     r"elf_path=/bin/hello\.elf elf_bytes=(\d+) "
@@ -56,6 +62,9 @@ def main() -> int:
             return 2
         output = log.read_text(errors="replace") if log.exists() else ""
         print(output)
+        if not valid_launch_transactions(output, 7, (1,)):
+            print("FAIL: counted launch rollback, CPU ownership or terminal retirement evidence missing")
+            return 1
         ready = READY.search(output)
         entry = ENTER.search(output)
         if ready is None or entry is None:

@@ -13,6 +13,12 @@ import subprocess
 import sys
 import tempfile
 
+if __package__:
+    from .elf_launch_evidence import valid_launch_transactions
+else:
+    from elf_launch_evidence import valid_launch_transactions
+
+
 ENTER = re.compile(
     r"WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 "
     r"bss_zero=1 cr3_new=1 root_slot=(\d+) user_entry=0x401000"
@@ -52,6 +58,9 @@ def main() -> int:
             return 2
         output = log.read_text(errors="replace") if log.exists() else ""
         print(output)
+        if not valid_launch_transactions(output, 7, (1,)):
+            print("FAIL: counted launch rollback, CPU ownership or terminal retirement evidence missing")
+            return 1
         enter = ENTER.search(output)
         if not enter or not 1 <= int(enter.group(1)) <= 255:
             print("FAIL: missing actual hardware Ring3 sanitized CR3 entry")

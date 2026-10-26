@@ -11,6 +11,12 @@ import subprocess
 import sys
 import tempfile
 
+if __package__:
+    from .elf_launch_evidence import valid_launch_transactions
+else:
+    from elf_launch_evidence import valid_launch_transactions
+
+
 ENTER = re.compile(
     r"WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 "
     r"bss_zero=1 cr3_new=1 root_slot=(\d+) user_entry=0x401000"
@@ -162,6 +168,9 @@ def main() -> int:
         tables, loads, total = ((4, 1, 6) if one_load_mode else
                                (5, 3, 9) if three_load_mode else
                                (5, 2, 8) if two_pt_mode else (4, 2, 7))
+        if not valid_launch_transactions(output, total, (1,)):
+            print("FAIL: counted launch rollback, CPU ownership or terminal retirement evidence missing")
+            return 1
         if not valid_table_plan(output, tables, loads, total, entry.start()):
             print("FAIL: exact ELF-derived table/frame plan and full PTE audit missing")
             return 1

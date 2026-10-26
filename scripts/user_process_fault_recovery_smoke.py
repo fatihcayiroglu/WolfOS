@@ -12,6 +12,12 @@ import subprocess
 import sys
 import tempfile
 
+if __package__:
+    from .elf_launch_evidence import valid_launch_transactions
+else:
+    from elf_launch_evidence import valid_launch_transactions
+
+
 ENTER = re.compile(
     r"WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 "
     r"bss_zero=1 cr3_new=1 root_slot=(\d+) user_entry=0x401000"
@@ -72,6 +78,9 @@ def main() -> int:
             return 2
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
+        if not valid_launch_transactions(output, 7, (1, 2)):
+            print("FAIL: counted launch rollback, CPU ownership or terminal retirement evidence missing")
+            return 1
         entries = list(ENTER.finditer(output))
         if len(entries) != 2 or any(not 1 <= int(m.group(1)) <= 255 for m in entries):
             print("FAIL: two independent hardware ELF/CR3 entries required")

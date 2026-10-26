@@ -2,6 +2,10 @@
 
 Date: 2026-10-26
 
+Status update: ADR-0058 integrates this transaction into the fixed BSP IF=0
+Ring3 launcher and its terminal retirement. The original component's external
+hardware safety obligations remain; other schedulers are not migrated.
+
 ## Problem
 
 The real bounded Ring3 fixtures now share ELF-derived mapping and payload
