@@ -190,7 +190,7 @@ pub fn verify_exit(pid: u64) {
         || state.grants.retire(pid).is_err()
         || state.grants.allows(pid, Permission::FileRead)
         || state.grants.live() != 0
-        || state.grants.grant(pid, Permission::FileRead)
+        || state.grants.grant_file_read_path(pid, PATH)
             != Err(PermissionError::NotRegistered)
     { fail("descriptor_leak_or_permission_retirement") }
     serial::write_line("WOLFOS_SHIELD_RETIRED_OK pid=1 grants=0 stale_denied=1");
