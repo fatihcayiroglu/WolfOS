@@ -3,7 +3,7 @@
 
 Fail-closed QEMU admission: real ELF64 loader and BSS, supervisor-only new
 CR3, genuine serial message from USER CODE via 19 INT80 calls, two register
-result returns, EXIT(0), restored boot CR3, all seven PMM frames reclaimed.
+result returns, EXIT(0), restored boot CR3, an exact 6/7/8/9-frame PMM lease reclaimed by the selected flavor.
 """
 from pathlib import Path
 import re
@@ -15,6 +15,10 @@ ENTER = re.compile(
     r"WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 "
     r"bss_zero=1 cr3_new=1 root_slot=(\d+) user_entry=0x401000"
 )
+ONE_LOAD_ENTER = re.compile(
+    r"WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=1 rx=1 rw_nx=1 "
+    r"bss_zero=1 cr3_new=1 root_slot=(\d+) user_entry=0x401000"
+)
 MARKERS = (
     "WOLFOS_ELF_ID_OK cpl3=1 return_rax=0x574f4c46",
     "WOLFOS_ELF_ADD_OK cpl3=1 return_rax=42",
@@ -24,6 +28,16 @@ MARKERS = (
     "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1",
     "WOLFOS_ELF_RUN_OK linked_elf=1 hardware_cpl3=1 user_console=1 "
     "int80_calls=22 exit=0 resources_released=1 real_process_manager=0",
+)
+
+ONE_LOAD_MARKERS = (
+    "WOLFOS_ELF_ONE_LOAD_ENTER hardware_cr3=1 load_segments=1 "
+    "rx_leaves=1 nx_stack=1 owned_frames=6 root_slot=",
+    *MARKERS[:5],
+    "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=6 pmm_no_leak=1",
+    "WOLFOS_ELF_ONE_LOAD_RUN_OK linked_elf=1 hardware_cpl3=1 one_pt_load=1 "
+    "rx_leaves=1 stack_rw_nx=1 int80_calls=22 exit=0 restored_cr3=1 "
+    "frames_freed=6 pmm_no_leak=1",
 )
 
 TWO_PT_MARKERS = (
@@ -74,15 +88,16 @@ PF_FAULT_MARKERS = (
 
 def main() -> int:
     mode = sys.argv[2] if len(sys.argv) == 3 else None
+    one_load_mode = mode == "--one-load"
     two_pt_mode = mode == "--two-pt"
     three_load_mode = mode == "--three-load"
     status_mode = mode == "--exit-status"
     fault_mode = mode == "--user-ud-fault"
     pf_mode = mode == "--user-pf-fault"
-    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode or two_pt_mode or three_load_mode)) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--two-pt|--three-load|--exit-status|--user-ud-fault|--user-pf-fault]")
+    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode or one_load_mode or two_pt_mode or three_load_mode)) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--one-load|--two-pt|--three-load|--exit-status|--user-ud-fault|--user-pf-fault]")
         return 2
-    markers = THREE_LOAD_MARKERS if three_load_mode else TWO_PT_MARKERS if two_pt_mode else PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
+    markers = ONE_LOAD_MARKERS if one_load_mode else THREE_LOAD_MARKERS if three_load_mode else TWO_PT_MARKERS if two_pt_mode else PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
     with tempfile.TemporaryDirectory(prefix="wolfos-real-elf-run-") as tmp:
         serial = Path(tmp) / "serial.log"
         command = [
@@ -105,10 +120,19 @@ def main() -> int:
         # correctly presented as LF. Still insist on ONE complete line.
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
-        entry = ENTER.search(output)
+        entry = (ONE_LOAD_ENTER if one_load_mode else ENTER).search(output)
         if not entry or not 1 <= int(entry.group(1)) <= 255:
             print("FAIL: genuine ELF64 independent sanitized CR3 entry missing")
             return 1
+        if one_load_mode:
+            live = re.search(
+                r"(?m)^WOLFOS_ELF_ONE_LOAD_ENTER hardware_cr3=1 load_segments=1 "
+                r"rx_leaves=1 nx_stack=1 owned_frames=6 root_slot=(\d+)$",
+                output,
+            )
+            if not live or live.group(1) != entry.group(1):
+                print("FAIL: real one-LOAD, stack protection or six-frame root proof missing")
+                return 1
         if three_load_mode:
             live = re.search(
                 r"(?m)^WOLFOS_ELF_THREE_LOAD_ENTER hardware_cr3=1 root_slot=(\d+) "
@@ -162,7 +186,17 @@ def main() -> int:
             print(f"FAIL: expected clean QEMU debug-exit 33, got {result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if three_load_mode:
+        if one_load_mode:
+            if (any(marker in output for marker in (
+                "WOLFOS_ELF_RUN_OK ", "WOLFOS_ELF_TWO_PT_RUN_OK ",
+                "WOLFOS_ELF_THREE_LOAD_RUN_OK ", "frames_freed=7",
+                "frames_freed=8", "frames_freed=9",
+            ))):
+                print("FAIL: one-LOAD acceptance fell back to larger PMM lease")
+                return 1
+            print("PASS: one genuine RX PT_LOAD and independent RW/NX stack"
+                  " -> hardware CPL3 EXIT -> CR3 restored, six PMM frames freed")
+        elif three_load_mode:
             if ("WOLFOS_ELF_RUN_OK " in output
                 or "WOLFOS_ELF_TWO_PT_RUN_OK " in output
                 or "frames_freed=7" in output or "frames_freed=8" in output):

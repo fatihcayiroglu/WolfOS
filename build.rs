@@ -124,6 +124,7 @@ fn main() {
     println!("cargo:rerun-if-changed=user/hello.ld");
     println!("cargo:rerun-if-changed=user/hello-two-pt.ld");
     println!("cargo:rerun-if-changed=user/hello-three-load.ld");
+    println!("cargo:rerun-if-changed=user/hello-one-load.ld");
     if env::var_os("CARGO_FEATURE_USER_ELF_RUN_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_PROCESS_SMOKE").is_none()
         && env::var_os("CARGO_FEATURE_USER_RAMFS_SMOKE").is_none()
@@ -161,6 +162,8 @@ fn main() {
         "user/hello-three-load.ld"
     } else if env::var_os("CARGO_FEATURE_USER_ELF_TWO_PT_RUN_SMOKE").is_some() {
         "user/hello-two-pt.ld"
+    } else if env::var_os("CARGO_FEATURE_USER_ELF_ONE_LOAD_RUN_SMOKE").is_some() {
+        "user/hello-one-load.ld"
     } else { "user/hello.ld" };
     checked("ld", &["-m", "elf_x86_64", "-nostdlib", "-static",
         "-T", linker, "-o", elf.to_str().unwrap(),

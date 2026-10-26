@@ -84,6 +84,8 @@ jobs:
         run: make user-syscall-smoke
       - name: P2 independently linked ELF64 hello from real CPL3 with physical-frame cleanup
         run: make user-elf-run-smoke
+      - name: P2 real single-LOAD RX ELF executes in CPL3 with NX stack and exact six-frame reap
+        run: make user-elf-one-load-run-smoke
       - name: P2 relocated two-PT ELF64 actually executes in CPL3, restores CR3 and reaps eight frames
         run: make user-elf-two-pt-run-smoke
       - name: P2 two independently RX ELF pages execute across three LOAD leaves, two PTs and nine PMM frames

@@ -4,9 +4,9 @@
 //! and a separate RW+NX stack from checked ELF bytes. No image bytes are
 //! copied, PMM frames allocated, page tables written or CR3/IRET touched.
 //!
-//! The live one-PT Ring3 gate leases seven frames; separate two-PT gates
-//! lease eight or nine, depending on their ELF-derived LOAD pages. The
-//! nonallocating frame budget is checked BEFORE any PMM lease is requested.
+//! Genuine one-PT Ring3 gates now lease six or seven frames depending on
+//! actual independently linked ELF LOAD pages; two-PT gates lease eight or
+//! nine. The nonallocating frame budget is checked before PMM allocation.
 
 use crate::elf64_preflight::{preflight, ElfError, ImagePlan, PAGE_BYTES, USER_END};
 
