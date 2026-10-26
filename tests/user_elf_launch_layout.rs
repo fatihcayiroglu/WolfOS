@@ -5,7 +5,7 @@ mod elf64_preflight;
 mod user_elf_launch_layout;
 
 use elf64_preflight::{ElfError, PAGE_BYTES, USER_END};
-use user_elf_launch_layout::{plan_static_image, LaunchError, LaunchLeaf};
+use user_elf_launch_layout::{plan_static_image, plan_two_pt_image, LaunchError, LaunchLeaf};
 
 fn fixture(text_page: u64, text_pages: u64, data_page: u64, data_pages: u64) -> [u8; 512] {
     let mut elf = [0u8; 512];
@@ -123,4 +123,36 @@ fn malformed_or_writable_executable_elf_is_never_admitted() {
         plan_static_image(&elf),
         Err(LaunchError::Elf(ElfError::InvalidPermissions)),
     );
+}
+
+#[test]
+fn bounded_two_pt_plan_admits_real_boundary_crossing_without_weakening_one_pt() {
+    let bytes = fixture(0x5ff000, 1, 0x600000, 1);
+    assert_eq!(plan_static_image(&bytes), Err(LaunchError::CrossesPageTable));
+    let layout = plan_two_pt_image(&bytes).unwrap();
+    assert_eq!(layout.load_pages(), 2);
+    assert_eq!(layout.stack_page, 0x601000);
+    assert_eq!(layout.leaves[0].unwrap().virtual_address, 0x5ff000);
+    assert_eq!(layout.leaves[1].unwrap().virtual_address, 0x600000);
+    assert_eq!(layout.leaves[2].unwrap().virtual_address, 0x601000);
+    assert_eq!(layout.leaves[2].unwrap().executable, false);
+}
+
+#[test]
+fn two_pt_plan_never_crosses_one_gigabyte_or_adds_a_third_pt() {
+    assert_eq!(
+        plan_two_pt_image(&fixture(0x3ffff000, 1, 0x40000000, 1)),
+        Err(LaunchError::CrossesPageDirectory),
+    );
+    let mut bytes = fixture(0x401000, 1, 0x601000, 1);
+    bytes[56..58].copy_from_slice(&3u16.to_le_bytes());
+    bytes[176..180].copy_from_slice(&1u32.to_le_bytes()); // third PT_LOAD
+    bytes[180..184].copy_from_slice(&6u32.to_le_bytes()); // RW+NX
+    bytes[184..192].copy_from_slice(&0x1c0u64.to_le_bytes());
+    bytes[192..200].copy_from_slice(&0x8011c0u64.to_le_bytes());
+    bytes[208..216].copy_from_slice(&1u64.to_le_bytes());
+    bytes[216..224].copy_from_slice(&0xe40u64.to_le_bytes());
+    bytes[224..232].copy_from_slice(&4096u64.to_le_bytes());
+    bytes[0x1c0] = 3;
+    assert_eq!(plan_two_pt_image(&bytes), Err(LaunchError::TooManyPageTables));
 }

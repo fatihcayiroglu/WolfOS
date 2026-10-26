@@ -40,12 +40,19 @@ def main() -> int:
             "kernel_anchor=1 hhdm_anchor=1 freed=8 "
             "cr3_unchanged=1 ring3=0"
         )
-        if MARKER not in output or multi_marker not in output or "WOLFOS_BOOT_OK" not in output:
+        two_pt_marker = (
+            "WOLFOS_USER_TWO_PT_OK frames=8 tables=5 pt_regions=2 load_pages=2 "
+            "stack_rw_nx=1 elf_bound=1 bss_zero=1 hhdm_provenance=1 "
+            "tamper_denied=1 pte_denied=1 cr3_unchanged=1 freed=8 ring3=0"
+        )
+        if (MARKER not in output or multi_marker not in output
+                or two_pt_marker not in output or "WOLFOS_BOOT_OK" not in output):
             print("FAIL: missing independently verified user page-table root or normal boot")
             return 1
         for bad in (
             "WOLFOS_USER_ROOT_ERROR", "WOLFOS_USER_ROOT_TEST_FAILED",
             "WOLFOS_USER_MULTI_ERROR", "WOLFOS_USER_MULTI_TEST_FAILED",
+            "WOLFOS_USER_TWO_PT_ERROR",
             "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF",
             "WOLFOS_EXCEPTION_DF", "WOLFOS_PANIC",
         ):
@@ -56,7 +63,7 @@ def main() -> int:
             print(f"FAIL: expected clean debug-exit 33, got {run.returncode}")
             print(run.stderr.decode(errors="replace"))
             return 1
-        print("PASS: two independent roots plus one mixed four-leaf ELF/stack root, no CR3 load")
+        print("PASS: two independent roots, single-PT and two-PT PMM-backed ELF/stack roots, no CR3 load")
         return 0
 
 if __name__ == "__main__":

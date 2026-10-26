@@ -101,9 +101,10 @@ mod pci;
 mod paging;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_preflight;
-#[cfg(any(feature = "user-elf-run-smoke", feature = "user-process-smoke",
-          feature = "user-copy-smoke", feature = "user-file-io-smoke",
-          feature = "user-ramfs-smoke", feature = "user-vfs-smoke"))]
+#[cfg(any(feature = "user-vm-shadow-smoke", feature = "user-elf-run-smoke",
+          feature = "user-process-smoke", feature = "user-copy-smoke",
+          feature = "user-file-io-smoke", feature = "user-ramfs-smoke",
+          feature = "user-vfs-smoke"))]
 mod user_elf_launch_layout;
 #[cfg(feature = "elf64-preflight-smoke")]
 mod elf64_preflight_smoke;
@@ -115,6 +116,8 @@ mod user_vm_layout;
 mod user_vm_shadow_smoke;
 #[cfg(feature = "user-vm-shadow-smoke")]
 mod user_vm_multi;
+#[cfg(feature = "user-vm-shadow-smoke")]
+mod user_vm_two_pt;
 #[cfg(any(feature = "user-vm-shadow-smoke", feature = "smp-address-space-retirement-smoke"))]
 mod pmm_frame_batch;
 #[cfg(feature = "user-vm-shadow-smoke")]

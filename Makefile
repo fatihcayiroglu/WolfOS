@@ -525,6 +525,8 @@ test:
 	$(OUT)/user_elf_launch_layout_tests
 	rustc --edition=2024 --test tests/user_vm_layout.rs -o $(OUT)/user_vm_layout_tests
 	$(OUT)/user_vm_layout_tests
+	rustc --edition=2024 --test tests/user_vm_two_pt.rs -o $(OUT)/user_vm_two_pt_tests
+	$(OUT)/user_vm_two_pt_tests
 	rustc --edition=2024 --test kernel/src/kernel_half_shadow.rs -o $(OUT)/kernel_half_shadow_tests
 	$(OUT)/kernel_half_shadow_tests
 	rustc --edition=2024 --test kernel/src/user_ring_entry.rs -o $(OUT)/user_ring_entry_tests

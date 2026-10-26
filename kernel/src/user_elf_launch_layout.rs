@@ -20,6 +20,8 @@ pub enum LaunchError {
     TooManyLoadPages,
     StackOutOfRange,
     CrossesPageTable,
+    CrossesPageDirectory,
+    TooManyPageTables,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +53,20 @@ impl StaticLaunchLayout {
 /// that PT boundary, or needs more than three independently backed LOADs.
 /// Return metadata only; no data or hardware state is changed on error.
 pub fn plan_static_image(input: &[u8]) -> Result<StaticLaunchLayout, LaunchError> {
+    plan_with_table_limit(input, 1)
+}
+
+/// The same byte-derived layout, with a second PMM-owned PT allowed.
+/// LOAD leaves and the fresh RW+NX stack may straddle TWO 2-MiB regions
+/// inside ONE 1-GiB PDPT region; a separate audited two-PT VMM is required.
+/// No page table, process or hardware state is changed here.
+pub fn plan_two_pt_image(input: &[u8]) -> Result<StaticLaunchLayout, LaunchError> {
+    plan_with_table_limit(input, 2)
+}
+
+fn plan_with_table_limit(input: &[u8], table_limit: usize)
+    -> Result<StaticLaunchLayout, LaunchError>
+{
     let image = preflight(input).map_err(LaunchError::Elf)?;
     let mut leaves = [None; MAX_LEAVES];
     let mut count = 0usize;
@@ -83,21 +99,40 @@ pub fn plan_static_image(input: &[u8]) -> Result<StaticLaunchLayout, LaunchError
         return Err(LaunchError::StackOutOfRange);
     }
 
-    // A single four-level PML4/PDPT/PD/PT bank cannot represent pages
-    // spanning different 2-MiB regions. Validate before a frame is owned.
-    let first_region = leaves[0]
-        .ok_or(LaunchError::TooManyLoadPages)?.virtual_address >> 21;
-    if leaves[..count].iter().flatten().any(|leaf|
-        leaf.virtual_address >> 21 != first_region
-    ) || stack_page >> 21 != first_region {
-        return Err(LaunchError::CrossesPageTable);
-    }
-
     leaves[count] = Some(LaunchLeaf {
         virtual_address: stack_page,
         source_segment: None,
         writable: true,
         executable: false,
     });
-    Ok(StaticLaunchLayout { image, leaves, len: count + 1, stack_page })
+    let len = count + 1;
+    // Both paths must fit one PDPT entry (1 GiB); they differ only in the
+    // permitted number of distinct 2-MiB PT regions. The legacy contract
+    // preserves its original CrossesPageTable rejection.
+    let first = leaves[0]
+        .ok_or(LaunchError::TooManyLoadPages)?.virtual_address;
+    let mut regions = [0u64; 2];
+    let mut used = 0usize;
+    for leaf in leaves[..len].iter().flatten() {
+        if leaf.virtual_address >> 30 != first >> 30 {
+            return Err(if table_limit == 1 {
+                LaunchError::CrossesPageTable
+            } else {
+                LaunchError::CrossesPageDirectory
+            });
+        }
+        let region = leaf.virtual_address >> 21;
+        if !regions[..used].contains(&region) {
+            if used == table_limit {
+                return Err(if table_limit == 1 {
+                    LaunchError::CrossesPageTable
+                } else {
+                    LaunchError::TooManyPageTables
+                });
+            }
+            regions[used] = region;
+            used += 1;
+        }
+    }
+    Ok(StaticLaunchLayout { image, leaves, len, stack_page })
 }
