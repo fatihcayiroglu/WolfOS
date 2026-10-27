@@ -393,6 +393,40 @@ pub extern "x86-interrupt" fn interrupt_80(frame: InterruptStackFrame) {
 /// A first failure is terminal/fail-closed: no attempt to disguise partial
 /// reclamation as a clean exit. The AP's kernel TSS.RSP0 is static BSS and
 /// stays mapped in the borrowed high-half during its permanent parked loop.
+// x86-64 hardware may set Accessed in each PRESENT paging level and
+// Dirty on writable leaves during actual CPL3 reads/writes. These are the
+// ONLY guest-generated bit changes tolerated by terminal retirement.
+#[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
+const ACCESSED: u64 = 1 << 5;
+#[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
+const RW_HW_BITS: u64 = ACCESSED | (1 << 6);
+
+/// This root was genuinely active on the target AP. The pre-activation
+/// kernel_half_shadow::audit_kernel_half requires byte-identical entries,
+/// so it must not be reapplied to hardware-dirtied live page tables.
+#[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
+fn audit_high_half_after_ap(
+    source: &[u64; 512], shadow: &[u64; 512], owned: &[u64], expected: usize,
+) -> bool {
+    if expected == 0
+        || source[256..].iter().filter(|entry| **entry != 0).count() != expected
+    { return false; }
+    for (boot_entry, private_entry) in source[256..].iter().zip(shadow[256..].iter()) {
+        if *boot_entry == 0 {
+            if *private_entry != 0 { return false; }
+            continue;
+        }
+        let phys = *boot_entry & kernel_half_shadow::PHYS_MASK;
+        if *boot_entry & PRESENT == 0 || *boot_entry & (1 << 7) != 0
+            || phys == 0 || owned.contains(&phys)
+            || *private_entry & USER != 0
+            || (*private_entry & !ACCESSED)
+                != ((*boot_entry & !USER) & !ACCESSED)
+        { return false; }
+    }
+    true
+}
+
 #[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
 fn reclaim_fail(stage: &str) -> bool {
     serial::write_fmt(format_args!(
@@ -439,18 +473,18 @@ fn reclaim_completed_ap() -> bool {
         let pt = &*pointers[2].cast::<[u64; 512]>();
         let user_entry = lease[0] | PRESENT | WRITE | USER;
         source[slot] == 0
-            && shadow[slot] == user_entry
+            && shadow[slot] & !ACCESSED == user_entry
             && shadow[..256].iter().filter(|entry| **entry != 0).count() == 1
-            && kernel_half_shadow::audit_kernel_half(
-                source, shadow, slot, user_entry, &lease,
-            ) == Ok(KERNEL_GRAFTS.load(Ordering::Acquire))
-            && pdpt[0] == lease[1] | PRESENT | WRITE | USER
+            && audit_high_half_after_ap(
+                source, shadow, &lease, KERNEL_GRAFTS.load(Ordering::Acquire),
+            )
+            && pdpt[0] & !ACCESSED == lease[1] | PRESENT | WRITE | USER
             && pdpt.iter().filter(|e| **e != 0).count() == 1
-            && pd[2] == lease[2] | PRESENT | WRITE | USER
+            && pd[2] & !ACCESSED == lease[2] | PRESENT | WRITE | USER
             && pd.iter().filter(|e| **e != 0).count() == 1
-            && pt[1] == lease[3] | PRESENT | USER
-            && pt[2] == lease[4] | PRESENT | WRITE | USER | NX
-            && pt[3] == lease[5] | PRESENT | WRITE | USER | NX
+            && pt[1] & !ACCESSED == lease[3] | PRESENT | USER
+            && pt[2] & !RW_HW_BITS == lease[4] | PRESENT | WRITE | USER | NX
+            && pt[3] & !RW_HW_BITS == lease[5] | PRESENT | WRITE | USER | NX
             && pt.iter().filter(|e| **e != 0).count() == 3
             && pointers[4] as u64 == DATA_HHDM.load(Ordering::Acquire)
             && pointers[4].read_volatile() == 0x22
@@ -466,17 +500,18 @@ fn reclaim_completed_ap() -> bool {
             let entry = lease[0] | PRESENT | WRITE | USER;
             let mut bits = 0u32;
             if source[slot] != 0 { bits |= 1; }
-            if shadow[slot] != entry { bits |= 2; }
+            if shadow[slot] & !ACCESSED != entry { bits |= 2; }
             if shadow[..256].iter().filter(|e| **e != 0).count() != 1 { bits |= 4; }
-            if kernel_half_shadow::audit_kernel_half(source, shadow, slot, entry, &lease)
-                != Ok(KERNEL_GRAFTS.load(Ordering::Acquire)) { bits |= 8; }
-            if pdpt[0] != lease[1] | PRESENT | WRITE | USER { bits |= 16; }
+            if !audit_high_half_after_ap(
+                source, shadow, &lease, KERNEL_GRAFTS.load(Ordering::Acquire),
+            ) { bits |= 8; }
+            if pdpt[0] & !ACCESSED != lease[1] | PRESENT | WRITE | USER { bits |= 16; }
             if pdpt.iter().filter(|e| **e != 0).count() != 1 { bits |= 32; }
-            if pd[2] != lease[2] | PRESENT | WRITE | USER { bits |= 64; }
+            if pd[2] & !ACCESSED != lease[2] | PRESENT | WRITE | USER { bits |= 64; }
             if pd.iter().filter(|e| **e != 0).count() != 1 { bits |= 128; }
-            if pt[1] != lease[3] | PRESENT | USER { bits |= 256; }
-            if pt[2] != lease[4] | PRESENT | WRITE | USER | NX { bits |= 512; }
-            if pt[3] != lease[5] | PRESENT | WRITE | USER | NX { bits |= 1024; }
+            if pt[1] & !ACCESSED != lease[3] | PRESENT | USER { bits |= 256; }
+            if pt[2] & !RW_HW_BITS != lease[4] | PRESENT | WRITE | USER | NX { bits |= 512; }
+            if pt[3] & !RW_HW_BITS != lease[5] | PRESENT | WRITE | USER | NX { bits |= 1024; }
             if pt.iter().filter(|e| **e != 0).count() != 3 { bits |= 2048; }
             if pointers[4] as u64 != DATA_HHDM.load(Ordering::Acquire) { bits |= 4096; }
             if pointers[4].read_volatile() != 0x22 { bits |= 8192; }
