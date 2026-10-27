@@ -31,6 +31,8 @@ else ifeq ($(FLAVOR),address-space-retirement)
 FEATURES := --features address-space-retirement-smoke
 else ifeq ($(FLAVOR),smp-address-space-retirement)
 FEATURES := --features smp-address-space-retirement-smoke
+else ifeq ($(FLAVOR),smp-retirement-ipi-hardware)
+FEATURES := --features smp-retirement-ipi-hardware-smoke
 else ifeq ($(FLAVOR),paging-fault)
 FEATURES := --features paging-fault-smoke
 else ifeq ($(FLAVOR),timer)
@@ -235,6 +237,11 @@ address-space-retirement-smoke:
 smp-address-space-retirement-smoke:
 	$(MAKE) iso FLAVOR=smp-address-space-retirement
 	python3 scripts/address_space_retirement_smoke.py $(OUT)/wolfos-smp-address-space-retirement.iso --smp
+
+.PHONY: smp-retirement-ipi-hardware-smoke
+smp-retirement-ipi-hardware-smoke:
+	$(MAKE) iso FLAVOR=smp-retirement-ipi-hardware
+	python3 scripts/smp_retirement_ipi_hardware_smoke.py $(OUT)/wolfos-smp-retirement-ipi-hardware.iso
 
 exception-smoke:
 	$(MAKE) iso FLAVOR=exception
@@ -480,6 +487,7 @@ test:
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_ring_prep_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_smp_preempt_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_local_timer_smoke.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_smp_retirement_ipi_hardware_smoke.py' -v
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/ap_preempt_progress_budget.rs -o $(OUT)/ap_preempt_progress_budget_tests
 	$(OUT)/ap_preempt_progress_budget_tests
