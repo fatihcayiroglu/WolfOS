@@ -100,6 +100,16 @@ static AP_GDT: [BootCell<GlobalDescriptorTable>; MAX_BOOT_CPUS] =
 static AP_IDT: [BootCell<InterruptDescriptorTable>; MAX_BOOT_CPUS] =
     [const { BootCell::new() }; MAX_BOOT_CPUS];
 static AP_BREAKPOINTS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "ap-ring3-hardware-smoke")]
+static AP_RING3_RSP0_EXPECTED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "ap-ring3-hardware-smoke")]
+static AP_RING3_CS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "ap-ring3-hardware-smoke")]
+static AP_RING3_DS_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(feature = "ap-ring3-hardware-smoke")]
+static AP_RING3_TR_EXPECTED: AtomicUsize = AtomicUsize::new(0);
+
 
 /// BSP-only observation of the number of APs that completed #BP handlers.
 pub fn ap_breakpoint_count() -> usize {
@@ -124,6 +134,19 @@ pub fn initialize_secondary(index: usize) -> bool {
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
         VirtAddr::new(stack_top as u64);
+    // The FIRST genuine AP CPL3 proof has a separate, statically pinned
+    // target AP RSP0 stack. Neither BSP nor another AP uses this stack.
+    #[cfg(feature = "ap-ring3-hardware-smoke")]
+    let ring3_target = crate::ap_ring3_hardware_smoke::target_index() == index;
+    #[cfg(feature = "ap-ring3-hardware-smoke")]
+    if ring3_target {
+        let (base, top) = crate::ap_ring3_hardware_smoke::rsp0_bounds();
+        if base < 0xffff_8000_0000_0000 || top & 15 != 0
+            || !crate::ap_ring3_hardware_smoke::rsp0_guard_ok()
+        { return false; }
+        tss.privilege_stack_table[0] = VirtAddr::new(top);
+        AP_RING3_RSP0_EXPECTED.store(top, Ordering::Release);
+    }
     // SAFETY: exactly one AP initializes the unique indexed TSS.
     let tss_ref = unsafe { AP_TSS[index].initialize(tss) };
 
@@ -131,6 +154,14 @@ pub fn initialize_secondary(index: usize) -> bool {
     let code = gdt.append(Descriptor::kernel_code_segment());
     let data = gdt.append(Descriptor::kernel_data_segment());
     let tss_selector = gdt.append(Descriptor::tss_segment(tss_ref));
+    #[cfg(feature = "ap-ring3-hardware-smoke")]
+    if ring3_target {
+        let user_ds = gdt.append(Descriptor::user_data_segment());
+        let user_cs = gdt.append(Descriptor::user_code_segment());
+        AP_RING3_DS_EXPECTED.store(usize::from(user_ds.0 | 3), Ordering::Release);
+        AP_RING3_CS_EXPECTED.store(usize::from(user_cs.0 | 3), Ordering::Release);
+        AP_RING3_TR_EXPECTED.store(usize::from(tss_selector.0), Ordering::Release);
+    }
     // SAFETY: each AP writes its private permanent GDT once.
     let gdt_ref = unsafe { AP_GDT[index].initialize(gdt) };
     gdt_ref.load();
@@ -150,6 +181,12 @@ pub fn initialize_secondary(index: usize) -> bool {
     idt.invalid_opcode.set_handler_fn(ap_invalid_opcode);
     idt.general_protection_fault.set_handler_fn(ap_general_protection_fault);
     idt.page_fault.set_handler_fn(ap_page_fault);
+    #[cfg(feature = "ap-ring3-hardware-smoke")]
+    if ring3_target {
+        idt[0x80]
+            .set_handler_fn(crate::ap_ring3_hardware_smoke::interrupt_80)
+            .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+    }
     // The isolated directed-IPI QEMU flavor installs two external vectors
     // only on secondary CPUs. Its handler EOIs the *receiving* local APIC.
     #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "user-elf-smp-ipi-retire-smoke", feature = "ap-local-timer-smoke",
@@ -191,6 +228,37 @@ pub fn initialize_secondary(index: usize) -> bool {
     CS::get_reg().0 == code.0 && SS::get_reg().0 == data.0
 }
 
+
+/// Real target AP's own TR + in-memory loaded TSS.RSP0 and user GDT selectors.
+#[cfg(feature = "ap-ring3-hardware-smoke")]
+pub(crate) fn ap_ring3_cpu_state(index: usize) -> Option<(u16, u16, u64)> {
+    if index >= MAX_BOOT_CPUS
+        || crate::ap_ring3_hardware_smoke::target_index() != index
+    { return None; }
+    let mut actual_tr: u16;
+    // SAFETY: STR only reads this local processor's task register.
+    unsafe {
+        core::arch::asm!("str {0:x}", out(reg) actual_tr,
+                         options(nomem, nostack, preserves_flags));
+    }
+    // SAFETY: only this indexed AP initialized this forever-pinned static
+    // TSS before publishing AP_READY; the TSS is now immutable.
+    let tss = unsafe { (*AP_TSS[index].0.get()).assume_init_ref() };
+    let actual_rsp0 = unsafe {
+        core::ptr::addr_of!(tss.privilege_stack_table[0]).read_unaligned()
+    }.as_u64();
+    let expected_rsp0 = AP_RING3_RSP0_EXPECTED.load(Ordering::Acquire);
+    let cs = AP_RING3_CS_EXPECTED.load(Ordering::Acquire) as u16;
+    let ds = AP_RING3_DS_EXPECTED.load(Ordering::Acquire) as u16;
+    let tr = AP_RING3_TR_EXPECTED.load(Ordering::Acquire) as u16;
+    if expected_rsp0 == 0 || actual_rsp0 != expected_rsp0
+        || actual_tr == 0 || actual_tr != tr
+        || cs & 7 != 3 || ds & 7 != 3 || cs == ds
+        || CS::get_reg().0 != 8
+        || !crate::ap_ring3_hardware_smoke::rsp0_guard_ok()
+    { return None; }
+    Some((cs, ds, actual_rsp0))
+}
 
 pub fn initialize() {
     // Interrupts remain off until an APIC/PIC routing/EOI design exists.
