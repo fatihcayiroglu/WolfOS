@@ -3,7 +3,7 @@
 
 The marker originates from the guest after checking the real AP CR3 in BOTH
 CPL3-originated INT80 traps and restoring boot CR3 before parking. No production ELF
-scheduler, concurrent process isolation, reclaim or untrusted user code.
+scheduler, concurrent SMP retirement or untrusted user code.
 """
 from pathlib import Path
 import re
@@ -55,7 +55,7 @@ def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: ap_ring3_elf_reclaim_smoke.py ISO")
         return 2
-    with tempfile.TemporaryDirectory(prefix="wolfos-ap-private-cr3-") as d:
+    with tempfile.TemporaryDirectory(prefix="wolfos-ap-elf-reclaim-") as d:
         logfile = Path(d) / "serial.log"
         cmd = [
             "qemu-system-x86_64", "-M", "q35", "-m", "512M", "-smp", "4",
