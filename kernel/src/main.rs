@@ -82,7 +82,7 @@ mod address_space_retirement_smoke;
 #[cfg(feature = "smp-address-space-retirement-smoke")]
 mod smp_address_space_retirement_smoke;
 mod interrupts;
-#[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke")), feature = "user-process-smoke")))))]
+#[cfg(any(feature = "ap-ring3-hardware-smoke", any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "p2-handoff-preflight-smoke", any(feature = "user-ring-prep-smoke", feature = "user-ring3-smoke", feature = "user-ring3-isolation-smoke", feature = "user-syscall-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke", feature = "user-file-io-smoke")), feature = "user-process-smoke")))))]
 mod user_ring_entry;
 #[cfg(feature = "user-ring3-smoke")]
 mod user_ring3_smoke;
@@ -185,6 +185,8 @@ mod acpi_layout;
 mod acpi_tables;
 mod acpi_walk;
 mod smp;
+#[cfg(feature = "ap-ring3-hardware-smoke")]
+mod ap_ring3_hardware_smoke;
 #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "user-elf-smp-ipi-retire-smoke", feature = "ap-local-timer-smoke",
            feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
            feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
@@ -614,6 +616,11 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_SMP_ERROR no Limine MP response");
         halt_forever();
     };
+    #[cfg(feature = "ap-ring3-hardware-smoke")]
+    if !ap_ring3_hardware_smoke::prepare_bsp(hhdm.offset, mp.bsp_lapic_id, mp.cpus()) {
+        serial::write_line("WOLFOS_AP_RING3_ERROR prepare_failed");
+        halt_forever();
+    }
     if !lapic_mmio::verify_bsp(mp.bsp_lapic_id, hhdm.offset, entries) {
         serial::write_line("WOLFOS_LAPIC_MMIO_TEST_FAILED");
         halt_forever();
@@ -723,6 +730,11 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(not(feature = "smoke-exit"))]
     serial::write_line("WOLFOS_BOOT_SELFTESTS_SKIPPED mode=non_smoke");
     serial::write_line("WOLFOS_BOOT_OK");
+    #[cfg(feature = "ap-ring3-hardware-smoke")]
+    if !ap_ring3_hardware_smoke::verify_bsp() {
+        serial::write_line("WOLFOS_AP_RING3_TEST_FAILED");
+        halt_forever();
+    }
 
     // Experimental interactive BSP-only COM1 diagnostics, separate from all
     // hardware smoke flavors and deliberately without disk or user processes.
