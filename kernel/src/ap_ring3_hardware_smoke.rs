@@ -3,9 +3,10 @@
 //! Exactly one non-BSP processor executes a fixed, trusted two-INT80 payload
 //! using its OWN GDT, TSS.RSP0 stack and IDT DPL3 gate. BSP exclusively
 //! allocates/publishes three lower-half user leaves in an unused boot PML4
-//! slot BEFORE any AP starts. No ELF process, scheduler, private root,
-//! TLB retirement or complete kernel isolation is claimed. The six PMM
-//! frames stay pinned until QEMU exits, since the boot root is shared.
+//! slot BEFORE any AP starts. The opt-in private-CR3 flavor instead places
+//! all user leaves under a new supervisor-sanitized PML4, leaving the boot
+//! root's low half unchanged. No ELF process, scheduler, TLB retirement or
+//! full production isolation is claimed. All 6/7 PMM frames remain pinned.
 use core::arch::{asm, x86_64::__cpuid};
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64,
                          AtomicUsize, Ordering};
@@ -16,12 +17,12 @@ use x86_64::{
     structures::idt::InterruptStackFrame,
     VirtAddr,
 };
-use crate::{interrupts, pmm, serial, smp::MAX_BOOT_CPUS,
+use crate::{interrupts, kernel_half_shadow, pmm, serial, smp::MAX_BOOT_CPUS,
             user_ring_entry::{self, Ring3Entry}};
 
 const CPUS: usize = 4;
 const SPINS: usize = 400_000_000;
-const FRAMES: usize = 6;
+const FRAMES: usize = if cfg!(feature = "ap-ring3-private-cr3-smoke") { 7 } else { 6 };
 const PAGE: u64 = 4096;
 const PRESENT: u64 = 1;
 const WRITE: u64 = 2;
@@ -55,6 +56,11 @@ static TARGET: AtomicUsize = AtomicUsize::new(MAX_BOOT_CPUS);
 static TARGET_LAPIC: AtomicU32 = AtomicU32::new(u32::MAX);
 static BSP_LAPIC: AtomicU32 = AtomicU32::new(u32::MAX);
 static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
+static PRIVATE_ROOT: AtomicU64 = AtomicU64::new(0);
+static HHDM_BASE: AtomicU64 = AtomicU64::new(0);
+static PRIVATE_RESTORED: AtomicBool = AtomicBool::new(false);
+static USER_SLOT: AtomicUsize = AtomicUsize::new(0);
+static KERNEL_GRAFTS: AtomicUsize = AtomicUsize::new(0);
 static USER_RIP: AtomicU64 = AtomicU64::new(0);
 static USER_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 static DATA_HHDM: AtomicU64 = AtomicU64::new(0);
@@ -150,6 +156,8 @@ pub(crate) fn prepare_bsp(hhdm: u64, bsp_lapic: u32, cpus: &[&MpInfo]) -> bool {
         }
         frames[i] = phys;
     }
+    // Never allow the private root or its leaves to alias the live boot PML4.
+    if frames.contains(&boot) { return false; }
     let mut ptrs = [core::ptr::null_mut::<u8>(); FRAMES];
     for i in 0..FRAMES {
         let Some(ptr) = hhdm_ptr(hhdm, frames[i]) else { return false; };
@@ -176,8 +184,31 @@ pub(crate) fn prepare_bsp(hhdm: u64, bsp_lapic: u32, cpus: &[&MpInfo]) -> bool {
         (rsp0_base as *mut u64).write(RSP0_CANARY);
         (rsp0_base as *mut u64).add(1).write(!RSP0_CANARY);
         if !rsp0_guard_ok() { return false; }
+        // Private root is staged on a fresh PMM frame. In this flavor the
+        // live boot PML4 never acquires a lower-half user entry.
+        let private_root = if cfg!(feature = "ap-ring3-private-cr3-smoke") {
+            let shadow = &mut *ptrs[FRAMES - 1].cast::<[u64; 512]>();
+            let entry = frames[0] | PRESENT | WRITE | USER;
+            shadow[slot] = entry;
+            let graft = kernel_half_shadow::graft_kernel_half(
+                &*pml4, shadow, slot, entry, &frames,
+            );
+            if !matches!(graft, Ok(count) if count >= 1)
+                || kernel_half_shadow::audit_kernel_half(
+                    &*pml4, shadow, slot, entry, &frames,
+                ) != graft
+                || shadow[256..].iter().any(|e| e & USER != 0)
+                || shadow[..256].iter().filter(|e| **e != 0).count() != 1
+                || (*pml4)[slot] != 0
+            { return false; }
+            KERNEL_GRAFTS.store(graft.unwrap_or(0), Ordering::Relaxed);
+            frames[FRAMES - 1]
+        } else { 0 };
         // Publish all software state before exposing this root mapping.
         BOOT_ROOT.store(boot, Ordering::Relaxed);
+        HHDM_BASE.store(hhdm, Ordering::Relaxed);
+        PRIVATE_ROOT.store(private_root, Ordering::Relaxed);
+        USER_SLOT.store(slot, Ordering::Relaxed);
         USER_RIP.store(text, Ordering::Relaxed);
         USER_STACK_TOP.store(stack + PAGE, Ordering::Relaxed);
         DATA_HHDM.store(ptrs[4] as u64, Ordering::Relaxed);
@@ -187,11 +218,13 @@ pub(crate) fn prepare_bsp(hhdm: u64, bsp_lapic: u32, cpus: &[&MpInfo]) -> bool {
         BSP_LAPIC.store(bsp_lapic, Ordering::Relaxed);
         if (*pml4)[slot] != 0 { return false; }
         compiler_fence(Ordering::SeqCst);
-        (*pml4)[slot] = frames[0] | PRESENT | WRITE | USER;
-        // BSP's local TLB is invalidated before releasing any AP.
-        asm!("invlpg [{}]", in(reg) text, options(nostack, preserves_flags));
-        asm!("invlpg [{}]", in(reg) data, options(nostack, preserves_flags));
-        asm!("invlpg [{}]", in(reg) stack, options(nostack, preserves_flags));
+        if !cfg!(feature = "ap-ring3-private-cr3-smoke") {
+            (*pml4)[slot] = frames[0] | PRESENT | WRITE | USER;
+            // Legacy shared-root proof requires invalidating BSP TLB leaves.
+            asm!("invlpg [{}]", in(reg) text, options(nostack, preserves_flags));
+            asm!("invlpg [{}]", in(reg) data, options(nostack, preserves_flags));
+            asm!("invlpg [{}]", in(reg) stack, options(nostack, preserves_flags));
+        }
     }
     if pmm::statistics().allocated_frames != before + FRAMES { return false; }
     PREPARED.store(true, Ordering::Release);
@@ -215,6 +248,19 @@ pub(crate) fn secondary(index: usize) {
             user_cs, user_ss, rflags: 2,
         }).is_err()
     { fail_ap(); }
+    // SAFETY: no PCID, no interruptible Ring3, new audited PML4 shares
+    // supervisor-only high-half tables and holds exclusively owned user PTs.
+    // The AP alone switches roots; BSP remains on unchanged boot CR3.
+    if cfg!(feature = "ap-ring3-private-cr3-smoke") {
+        let private = PRIVATE_ROOT.load(Ordering::Acquire);
+        if private == 0 || private == BOOT_ROOT.load(Ordering::Acquire)
+            || private & (PAGE - 1) != 0
+        { fail_ap(); }
+        unsafe {
+            asm!("mov cr3, {}", in(reg) private, options(nostack, preserves_flags));
+        }
+        if root_phys() != private { fail_ap(); }
+    }
     // SAFETY: target AP alone has the DPL3 INT80 gate and its own verified
     // TSS.RSP0. Only the immutable trusted code page is executable at CPL3.
     // No interruptible Ring3, user threads or untrusted inputs exist here.
@@ -248,11 +294,14 @@ pub extern "x86-interrupt" fn interrupt_80(frame: InterruptStackFrame) {
                 else { 0 };
     let expected_nonce = if phase == 0 { 0x11 } else { 0x22 };
     let expected_rip = text + if phase == 0 { FIRST_NEXT } else { SECOND_NEXT };
+    let expected_root = if cfg!(feature = "ap-ring3-private-cr3-smoke") {
+        PRIVATE_ROOT.load(Ordering::Acquire)
+    } else { BOOT_ROOT.load(Ordering::Acquire) };
     if !PREPARED.load(Ordering::Acquire)
         || index >= MAX_BOOT_CPUS || phase >= 2
         || current_lapic() != TARGET_LAPIC.load(Ordering::Acquire)
         || TARGET_LAPIC.load(Ordering::Acquire) == BSP_LAPIC.load(Ordering::Acquire)
-        || root_phys() != BOOT_ROOT.load(Ordering::Acquire)
+        || expected_root == 0 || root_phys() != expected_root
         || CS::get_reg().0 != 8 || frame.code_segment.0 != cs
         || frame.stack_segment.0 != ss
         || frame.instruction_pointer.as_u64() != expected_rip
@@ -266,9 +315,19 @@ pub extern "x86-interrupt" fn interrupt_80(frame: InterruptStackFrame) {
         return; // compiler ISR ABI performs the first real IRETQ to AP CPL3
     }
     TRAPS.store(2, Ordering::Release);
+    if cfg!(feature = "ap-ring3-private-cr3-smoke") {
+        let boot = BOOT_ROOT.load(Ordering::Acquire);
+        // Terminal syscall is NOT returning to user mode: the AP may
+        // restore its supervisor root while still on its mapped RSP0 stack.
+        unsafe {
+            asm!("mov cr3, {}", in(reg) boot, options(nostack, preserves_flags));
+        }
+        if root_phys() != boot { fail_ap(); }
+        PRIVATE_RESTORED.store(true, Ordering::Release);
+    }
     FINISHED.store(true, Ordering::Release);
-    // No RETURN to a finished user context. AP stays parked; no concurrent
-    // unmap or PMM release while this boot root is shared.
+    // No IRETQ to the completed user context. Physical leases stay pinned
+    // until QEMU exits, including the private inactive root if configured.
     crate::halt_forever();
 }
 
@@ -290,10 +349,33 @@ pub(crate) fn verify_bsp() -> bool {
         || pmm::statistics().allocated_frames
             != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
     { return false; }
-    serial::write_fmt(format_args!(
-        "WOLFOS_AP_RING3_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 rw_nx=2 rx=1 frames_pinned=6\n",
-        index, BSP_LAPIC.load(Ordering::Acquire),
-        TARGET_LAPIC.load(Ordering::Acquire),
-    ));
+    if cfg!(feature = "ap-ring3-private-cr3-smoke") {
+        let slot = USER_SLOT.load(Ordering::Acquire);
+        let boot = BOOT_ROOT.load(Ordering::Acquire);
+        let private = PRIVATE_ROOT.load(Ordering::Acquire);
+        let hhdm = HHDM_BASE.load(Ordering::Acquire);
+        let Some(boot_ptr) = hhdm_ptr(hhdm, boot) else { return false; };
+        let Some(private_ptr) = hhdm_ptr(hhdm, private) else { return false; };
+        let source = unsafe { &*boot_ptr.cast::<[u64; 512]>() };
+        let shadow = unsafe { &*private_ptr.cast::<[u64; 512]>() };
+        if slot == 0 || slot >= 256 || source[slot] != 0
+            || private == 0 || private == boot
+            || !PRIVATE_RESTORED.load(Ordering::Acquire)
+            || KERNEL_GRAFTS.load(Ordering::Acquire) < 1
+            || (shadow[slot] & (PRESENT | USER)) != (PRESENT | USER)
+            || shadow[256..].iter().any(|e| e & USER != 0)
+        { return false; }
+        serial::write_fmt(format_args!(
+            "WOLFOS_AP_RING3_PRIVATE_CR3_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 ap_private_cr3=1 bsp_boot_cr3=1 kernel_supervisor_pml4=1 boot_user_slot_empty=1 ap_restored_boot_cr3=1 rx=1 rw_nx=2 frames_pinned=7\n",
+            index, BSP_LAPIC.load(Ordering::Acquire),
+            TARGET_LAPIC.load(Ordering::Acquire),
+        ));
+    } else {
+        serial::write_fmt(format_args!(
+            "WOLFOS_AP_RING3_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 rw_nx=2 rx=1 frames_pinned=6\n",
+            index, BSP_LAPIC.load(Ordering::Acquire),
+            TARGET_LAPIC.load(Ordering::Acquire),
+        ));
+    }
     true
 }

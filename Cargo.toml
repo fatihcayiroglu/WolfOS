@@ -59,6 +59,9 @@ user-ring3-smoke = ["smoke-exit"]
 # One genuine non-BSP AP CPL3/INT80/IRETQ roundtrip on its own GDT/TSS.RSP0.
 # Trusted static guest and shared BOOT CR3 only; not a multi-CPU user scheduler.
 ap-ring3-hardware-smoke = ["smoke-exit"]
+# One real AP runs fixed CPL3 payload under its own audited PML4/CR3.
+# BSP retains untouched boot lower half; private 7-frame lease stays pinned.
+ap-ring3-private-cr3-smoke = ["ap-ring3-hardware-smoke"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
