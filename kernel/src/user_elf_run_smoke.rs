@@ -1018,7 +1018,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
             != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
     { fail("retire_tlb_bsp_flush_or_close") }
     serial::write_fmt(format_args!(
-        "WOLFOS_ELF_TX_TLB_OK pid={} cpus=1 real_cpl3=1 post_publish_cr3_reload=1 owner_round_complete=1 frames_pinned=1\\n",
+        "WOLFOS_ELF_TX_TLB_OK pid={} cpus=1 real_cpl3=1 post_publish_cr3_reload=1 owner_round_complete=1 frames_pinned=1\n",
         pid,
     ));
     // SAFETY: this authenticated BSP restored boot CR3 with PCID off,
