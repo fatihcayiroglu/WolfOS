@@ -55,6 +55,8 @@ else ifeq ($(FLAVOR),ap-ring3-elf-reclaim)
 FEATURES := --features ap-ring3-elf-reclaim-smoke
 else ifeq ($(FLAVOR),ap-ring3-elf-multi-owner)
 FEATURES := --features ap-ring3-elf-multi-owner-smoke
+else ifeq ($(FLAVOR),ap-ring3-elf-missing-borrower)
+FEATURES := --features ap-ring3-elf-missing-borrower-smoke
 else ifeq ($(FLAVOR),tlb-shootdown-hardware)
 FEATURES := --features tlb-shootdown-hardware-smoke
 else ifeq ($(FLAVOR),ap-local-timer)
@@ -314,6 +316,11 @@ ap-ring3-elf-multi-owner-smoke:
 	$(MAKE) iso FLAVOR=ap-ring3-elf-multi-owner
 	python3 scripts/ap_ring3_elf_multi_owner_smoke.py $(OUT)/wolfos-ap-ring3-elf-multi-owner.iso
 
+.PHONY: ap-ring3-elf-missing-borrower-smoke
+ap-ring3-elf-missing-borrower-smoke:
+	$(MAKE) iso FLAVOR=ap-ring3-elf-missing-borrower
+	python3 scripts/ap_ring3_elf_missing_borrower_smoke.py $(OUT)/wolfos-ap-ring3-elf-missing-borrower.iso
+
 tlb-shootdown-hardware-smoke:
 	$(MAKE) iso FLAVOR=tlb-shootdown-hardware
 	python3 scripts/tlb_shootdown_hardware_smoke.py $(OUT)/wolfos-tlb-shootdown-hardware.iso
@@ -544,6 +551,7 @@ test:
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_ring3_elf_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_ring3_elf_reclaim_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_ring3_elf_multi_owner_smoke.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_ring3_elf_missing_borrower_smoke.py' -v
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/ap_preempt_progress_budget.rs -o $(OUT)/ap_preempt_progress_budget_tests
 	$(OUT)/ap_preempt_progress_budget_tests

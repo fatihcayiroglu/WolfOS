@@ -90,6 +90,10 @@ static BORROWED_ENTERED: AtomicU64 = AtomicU64::new(0);
 static BORROWED_LEFT: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
 static BORROWER_RELEASE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "ap-ring3-elf-missing-borrower-smoke")]
+static BORROWER_WITHHELD: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "ap-ring3-elf-missing-borrower-smoke")]
+static RECLAIM_REFUSED_LIVE_BORROWER: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn target_index() -> usize { TARGET.load(Ordering::Acquire) }
 
@@ -337,8 +341,21 @@ fn borrow_secondary(index: usize) {
     }
     let authorized = BORROWER_RELEASE.load(Ordering::Acquire)
         && !BAD.load(Ordering::Acquire);
-    // Even a timed-out borrower restores its own CR3. It never pretends to
-    // have completed the owner-bound release on an error.
+    // Isolated *negative* hardware proof: one actual AP remains on the
+    // private CR3 after release. It NEVER publishes a fictitious exit ack.
+    // This is safe only in the no-reclaim QEMU diagnostic feature.
+    #[cfg(feature = "ap-ring3-elf-missing-borrower-smoke")]
+    if authorized {
+        let mask = BORROWER_MASK.load(Ordering::Acquire);
+        let held_bit = 1u64 << (63 - mask.leading_zeros());
+        if (1u64 << index) == held_bit {
+            if root_phys() != private { fail_ap(); }
+            BORROWER_WITHHELD.store(true, Ordering::Release);
+            crate::halt_forever();
+        }
+    }
+    // Even a timed-out normal borrower restores its own CR3. It never
+    // pretends to have completed the owner-bound release on an error.
     unsafe { asm!("mov cr3, {}", in(reg) boot, options(nostack, preserves_flags)); }
     if root_phys() != boot || !authorized { fail_ap(); }
     BORROWED_LEFT.fetch_or(1u64 << index, Ordering::Release);
@@ -364,14 +381,35 @@ fn release_borrowers_after_target() -> bool {
         || BORROWED_LEFT.load(Ordering::Acquire) != 0
     { return false; }
     BORROWER_RELEASE.store(true, Ordering::Release);
-    for _ in 0..SPINS {
-        if BAD.load(Ordering::Acquire) { return false; }
-        if BORROWED_LEFT.load(Ordering::Acquire) == mask { break; }
-        core::hint::spin_loop();
+    #[cfg(feature = "ap-ring3-elf-missing-borrower-smoke")]
+    {
+        // The highest-indexed real borrower remains physically in the
+        // private root. The OTHER borrower must actually depart its CR3.
+        let held_bit = 1u64 << (63 - mask.leading_zeros());
+        let expected_left = mask ^ held_bit;
+        for _ in 0..SPINS {
+            if BAD.load(Ordering::Acquire) { return false; }
+            if BORROWER_WITHHELD.load(Ordering::Acquire)
+                && BORROWED_LEFT.load(Ordering::Acquire) == expected_left
+            { break; }
+            core::hint::spin_loop();
+        }
+        return BORROWER_WITHHELD.load(Ordering::Acquire)
+            && BORROWED_ENTERED.load(Ordering::Acquire) == mask
+            && BORROWED_LEFT.load(Ordering::Acquire) == expected_left
+            && !BAD.load(Ordering::Acquire);
     }
-    BORROWED_LEFT.load(Ordering::Acquire) == mask
-        && BORROWED_ENTERED.load(Ordering::Acquire) == mask
-        && !BAD.load(Ordering::Acquire)
+    #[cfg(not(feature = "ap-ring3-elf-missing-borrower-smoke"))]
+    {
+        for _ in 0..SPINS {
+            if BAD.load(Ordering::Acquire) { return false; }
+            if BORROWED_LEFT.load(Ordering::Acquire) == mask { break; }
+            core::hint::spin_loop();
+        }
+        BORROWED_LEFT.load(Ordering::Acquire) == mask
+            && BORROWED_ENTERED.load(Ordering::Acquire) == mask
+            && !BAD.load(Ordering::Acquire)
+    }
 }
 
 /// Executed only by the first non-BSP AP after completing its ordinary
@@ -627,7 +665,11 @@ fn reclaim_completed_ap() -> bool {
         if mask.count_ones() != 2 || !BORROWER_RELEASE.load(Ordering::Acquire)
             || BORROWED_ENTERED.load(Ordering::Acquire) != mask
             || BORROWED_LEFT.load(Ordering::Acquire) != mask
-        { return reclaim_fail("borrowers_still_live"); }
+        {
+            #[cfg(feature = "ap-ring3-elf-missing-borrower-smoke")]
+            RECLAIM_REFUSED_LIVE_BORROWER.store(true, Ordering::Release);
+            return reclaim_fail("borrowers_still_live");
+        }
     }
     // No guest may re-enter: AP has already retired from this root.
     // Revoke all lease references before the FIRST physical-frame free.
@@ -676,6 +718,33 @@ pub(crate) fn verify_bsp() -> bool {
     { return false; }
     #[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
     if !release_borrowers_after_target() { return false; }
+    #[cfg(feature = "ap-ring3-elf-missing-borrower-smoke")]
+    {
+        // Exercise the SAME production candidate reclamation gate while a
+        // known real AP still holds private CR3. All mapping audits must pass;
+        // only the borrower-liveness gate may refuse reclamation.
+        if reclaim_completed_ap() { return false; }
+        let mask = BORROWER_MASK.load(Ordering::Acquire);
+        let held_bit = 1u64 << (63 - mask.leading_zeros());
+        if !RECLAIM_REFUSED_LIVE_BORROWER.load(Ordering::Acquire)
+            || !BORROWER_WITHHELD.load(Ordering::Acquire)
+            || BORROWED_ENTERED.load(Ordering::Acquire) != mask
+            || BORROWED_LEFT.load(Ordering::Acquire) != (mask ^ held_bit)
+            || !PREPARED.load(Ordering::Acquire)
+            || PRIVATE_ROOT.load(Ordering::Acquire) == 0
+            || OWNED.iter().any(|f| f.load(Ordering::Acquire) == 0)
+            || pmm::statistics().allocated_frames
+                != ALLOCATED_BEFORE.load(Ordering::Acquire) + 7
+            || root_phys() != BOOT_ROOT.load(Ordering::Acquire)
+        { return false; }
+        serial::write_fmt(format_args!(
+            "WOLFOS_AP_RING3_ELF_MISSING_BORROWER_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} linked_elf=1 et_exec=1 pt_load=2 ap_cpl3=1 int80=2 iret_to_cpl3=1 ap_private_cr3=1 ap_restored_boot_cr3=1 cpl0_borrowers=2 borrower_cr3_entered=2 borrower_cr3_departed=1 borrower_held_private_cr3=1 all_user_cr3_departed=0 reclaim_refused=1 frames_pinned=7 frames_freed=0 pmm_held_lease=1 bsp_boot_cr3=1\n",
+            index, BSP_LAPIC.load(Ordering::Acquire),
+            TARGET_LAPIC.load(Ordering::Acquire),
+        ));
+        return true;
+    }
+    #[cfg(not(feature = "ap-ring3-elf-missing-borrower-smoke"))]
     if cfg!(feature = "ap-ring3-private-cr3-smoke") {
         let slot = USER_SLOT.load(Ordering::Acquire);
         let boot = BOOT_ROOT.load(Ordering::Acquire);
@@ -728,5 +797,6 @@ pub(crate) fn verify_bsp() -> bool {
             TARGET_LAPIC.load(Ordering::Acquire),
         ));
     }
+    #[cfg(not(feature = "ap-ring3-elf-missing-borrower-smoke"))]
     true
 }

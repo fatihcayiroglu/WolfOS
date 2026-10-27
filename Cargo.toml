@@ -71,6 +71,8 @@ ap-ring3-elf-reclaim-smoke = ["ap-ring3-elf-smoke"]
 # Same trusted AP Ring3 ELF plus two genuine CPL0 AP users of its PML4;
 # no frame free until all three CPUs physically restore supervisor CR3.
 ap-ring3-elf-multi-owner-smoke = ["ap-ring3-elf-reclaim-smoke"]
+# Deliberate held-CR3 negative: refuse PMM reclamation if one real AP never departs.
+ap-ring3-elf-missing-borrower-smoke = ["ap-ring3-elf-multi-owner-smoke"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
