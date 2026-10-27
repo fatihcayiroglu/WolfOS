@@ -24,6 +24,37 @@ fn nm_symbol(output: &str, name: &str) -> u64 {
 }
 
 fn main() {
+    if env::var_os("CARGO_FEATURE_AP_RING3_ELF_SMOKE").is_some() {
+        // Separate, independently linked secondary-CPU Ring3 guest.
+        // Do not silently reuse the BSP's multi-syscall hello workload.
+        println!("cargo:rerun-if-changed=user/ap_ring3.S");
+        println!("cargo:rerun-if-changed=user/ap_ring3.ld");
+        let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+        fs::create_dir_all(&out_dir).expect("create AP ELF output");
+        let obj = out_dir.join("wolfos-ap-ring3.o");
+        let elf = out_dir.join("wolfos-ap-ring3.elf");
+        checked("as", &["--64", "-o", obj.to_str().unwrap(),
+                         "user/ap_ring3.S"]);
+        checked("ld", &["-m", "elf_x86_64", "-nostdlib", "-static",
+                         "-T", "user/ap_ring3.ld", "-o",
+                         elf.to_str().unwrap(), obj.to_str().unwrap()]);
+        let nm = Command::new("nm").arg("-n").arg(&elf).output()
+            .expect("nm required for AP Ring3 ELF");
+        assert!(nm.status.success(), "AP Ring3 ELF nm failed");
+        let map = String::from_utf8(nm.stdout).expect("AP ELF nm not UTF-8");
+        for (name, expected) in [
+            ("_start", 0x401000),
+            ("_after_first_int80", 0x401009),
+            ("_after_second_int80", 0x401012),
+            ("ap_nonce", 0x402000),
+        ] {
+            assert_eq!(nm_symbol(&map, name), expected,
+                       "AP independently linked ELF symbol mismatch: {name}");
+        }
+        assert!(fs::metadata(&elf).unwrap().len() < 16384,
+                "AP ELF unexpectedly large");
+        return;
+    }
     println!("cargo:rerun-if-changed=user/yield.S");
     println!("cargo:rerun-if-changed=user/event_wait.S");
     if env::var_os("CARGO_FEATURE_P2_RING3_YIELD_SMOKE").is_some()
