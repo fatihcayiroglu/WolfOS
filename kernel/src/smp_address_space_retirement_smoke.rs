@@ -518,7 +518,9 @@ pub fn verify_bsp() -> bool {
     let blocked = LEDGER.with_both(|owner, slot| {
         let Some(state) = slot.as_mut() else { return false; };
         let before = state.barrier.snapshot();
-        owner.as_ref().is_some_and(|o| o.snapshot().phase == Phase::Retiring)
+        owner.as_mut().is_some_and(|o|
+                o.snapshot().phase == Phase::Retiring
+                    && o.finish_retirement() == Err(Error::OutstandingShootdown))
             && before.pending == last_bit && !state.barrier.completed(state.round)
             && state.barrier.begin_covering(ALL, ALL) == Err(TlbError::Busy)
             && state.barrier.snapshot() == before
@@ -537,7 +539,11 @@ pub fn verify_bsp() -> bool {
                     o.snapshot().phase == Phase::Retiring
                         && o.context_snapshot().pending == 0)
         }) != Some(true)
-        || with_gate(|gate| gate.finish_retirement()) != Some(Ok(()))
+        || LEDGER.with_both(|owner, slot| {
+            let Some(state) = slot.as_ref() else { return Err(Error::OutstandingShootdown); };
+            let Some(owner) = owner.as_mut() else { return Err(Error::WrongPhase); };
+            owner.finish_retirement_after_shootdown(&state.barrier, state.round)
+        }) != Some(Ok(()))
         || with_gate(|gate| gate.snapshot().phase) != Some(Phase::Retired)
     {
         return false;

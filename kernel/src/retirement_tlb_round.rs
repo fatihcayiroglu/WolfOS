@@ -19,6 +19,8 @@ pub enum Error {
     OutstandingContexts,
     NoReservedCpuHistory,
     WrongGeneration,
+    /// This owner already published a round; do not replace its identity.
+    AlreadyArmed,
     Shootdown(ShootdownError),
 }
 
