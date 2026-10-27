@@ -56,6 +56,9 @@ elf64-preflight-smoke = ["smoke-exit"]
 user-vm-shadow-smoke = ["smoke-exit"]
 user-ring-prep-smoke = ["smoke-exit"]
 user-ring3-smoke = ["smoke-exit"]
+# One genuine non-BSP AP CPL3/INT80/IRETQ roundtrip on its own GDT/TSS.RSP0.
+# Trusted static guest and shared BOOT CR3 only; not a multi-CPU user scheduler.
+ap-ring3-hardware-smoke = ["smoke-exit"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
