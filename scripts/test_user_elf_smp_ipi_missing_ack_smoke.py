@@ -5,7 +5,7 @@ from user_elf_smp_ipi_retire_smoke import ACTIVATION
 from user_elf_smp_ipi_missing_ack_smoke import BLOCKED, EXIT, PROOF, validate
 
 GOOD = (
-    "WOLFOS_SMP_APS_OK total=4 aps=3\n"
+    "WOLFOS_SMP_APS_OK total=4 bsp_lapic=0 ap_acks=3\n"
     + "WOLFOS_BOOT_OK\n" + ACTIVATION + "\n" + EXIT + "\n"
     + BLOCKED + "\n" + PROOF + "\n"
 )
@@ -19,7 +19,14 @@ class MissingAckEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(GOOD, 0))
 
     def test_not_four_cpus(self):
-        self.assertFalse(validate(GOOD.replace("total=4 aps=3", "total=2 aps=1"), 33))
+        self.assertFalse(validate(GOOD.replace("total=4 bsp_lapic=0 ap_acks=3", "total=2 bsp_lapic=0 ap_acks=1"), 33))
+
+    def test_missing_ap_ack(self):
+        self.assertFalse(validate(GOOD.replace("ap_acks=3", "ap_acks=2"), 33))
+
+    def test_duplicate_ap_evidence(self):
+        self.assertFalse(validate(GOOD.replace("WOLFOS_BOOT_OK",
+                                       "WOLFOS_SMP_APS_OK total=4 bsp_lapic=0 ap_acks=3\nWOLFOS_BOOT_OK"), 33))
 
     def test_missing_boot(self):
         self.assertFalse(validate(GOOD.replace("WOLFOS_BOOT_OK", "BOOT"), 33))
