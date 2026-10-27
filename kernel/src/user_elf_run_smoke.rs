@@ -1083,7 +1083,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
     {
         if !crate::user_elf_smp_ipi_retire_smoke::finish_owner_round(
-            &mut live.owner, pid,
+            &mut live.owner, pid, ALLOCATED_BEFORE.load(Ordering::Acquire),
         ) { fail("elf_owner_remote_ipi_retirement_incomplete") }
         serial::write_fmt(format_args!(
             "WOLFOS_ELF_TX_TLB_SMP_OK pid={} cpus=4 real_cpl3_bsp=1 remote_cr3_reload_ipis=3 withheld_last=1 frames_pinned=1\n",

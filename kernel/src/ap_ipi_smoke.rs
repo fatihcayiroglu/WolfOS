@@ -545,6 +545,27 @@ pub(crate) fn stop_retirement_aps(mask: u64) -> bool {
         && BAD.load(Ordering::Acquire) == 0
         && SPURIOUS_COUNT.load(Ordering::Acquire) == 0
 }
+/// QEMU negative owner test: verify the two delivered AP IPIs reached their
+/// real recipient-local EOI, while the deliberately withheld third AP
+/// remains online/IRQ-ready and has received exactly zero fixed IPIs.
+#[cfg(feature = "user-elf-smp-ipi-missing-ack-smoke")]
+pub(crate) fn verify_partial_retirement_aps(sent_mask: u64, held: usize) -> bool {
+    let count = COUNT.load(Ordering::Acquire);
+    if count != 4 || held >= count || sent_mask & (1u64 << held) != 0
+        || sent_mask.count_ones() != 2 || STOP.load(Ordering::Acquire)
+        || local_id() != BSP_ID.load(Ordering::Acquire)
+    { return false; }
+    wait(|| (0..count).all(|i| {
+        let expected = if sent_mask & (1u64 << i) != 0 { 1 } else { 0 };
+        SEEN[i].load(Ordering::Acquire) == expected
+            && EOIS[i].load(Ordering::Acquire) == expected
+    }), WAIT_SPINS)
+        && READY[held].load(Ordering::Acquire)
+        && !OFFLINE[held].load(Ordering::Acquire)
+        && BAD.load(Ordering::Acquire) == 0
+        && SPURIOUS_COUNT.load(Ordering::Acquire) == 0
+}
+
 /// Three genuine four-CPU IPI epochs. The last AP is deliberately withheld
 /// in epoch 3 to prove the barrier cannot complete or begin a new epoch.
 /// Every actual acknowledgement follows recipient-local INVLPG.
