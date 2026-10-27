@@ -2,10 +2,11 @@
 //!
 //! The BSP publishes a generation/epoch-tagged round and sends hardware fixed
 //! IPIs. The *receiving* AP, identified by local xAPIC ID in the IRQ handler,
-//! checks its CR3, invalidates a still-present shared supervisor MMIO alias,
-//! and only then acknowledges its own bit under one non-allocating lock.
-//! This tests an instruction/ack ordering boundary, NOT Ring3 unmap, PCID,
-//! global invalidation, retired-context exclusion, or permission to free frames.
+//! checks its CR3, invalidates the still-present supervisor MMIO alias AND
+//! the independently remapped pinned test page, then reads the expected
+//! backing-frame marker before acknowledging under one non-allocating lock.
+//! This tests a real PTE A->B->A transition, not Ring3 unmap, PCID, global
+//! invalidation, retired-context exclusion, or permission to free frames.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +16,9 @@ use crate::tlb_shootdown::{Round, ShootdownBarrier};
 const CPUS: usize = 4;
 const GENERATION: u64 = 51;
 const MMIO_ALIAS_VA: u64 = crate::ap_ipi_smoke::VA;
+const PROBE_VA: u64 = crate::ap_ipi_smoke::PROBE_VA;
+const MARKER_A: u64 = crate::ap_ipi_smoke::PROBE_A_MARKER;
+const MARKER_B: u64 = crate::ap_ipi_smoke::PROBE_B_MARKER;
 
 struct ActiveRound {
     barrier: ShootdownBarrier<CPUS>,
@@ -23,6 +27,8 @@ struct ActiveRound {
     targets: u64,
     acks: u64,
     invlpg: u64,
+    probe_invlpg: u64,
+    probe_reads: u64,
     per_cpu: [u64; CPUS],
     bad: bool,
 }
@@ -78,6 +84,7 @@ pub(crate) fn arm(targets: u64, root: u64) -> bool {
         let Ok(round) = barrier.begin(targets) else { return false; };
         *slot = Some(ActiveRound {
             barrier, round, root, targets, acks: 0, invlpg: 0,
+            probe_invlpg: 0, probe_reads: 0,
             per_cpu: [0; CPUS], bad: false,
         });
         true
@@ -97,25 +104,43 @@ pub(crate) fn on_ipi(cpu: usize) {
             return;
         }
         // SAFETY: This code runs on the authenticated recipient AP with
-        // interrupts disabled. The fixed UC supervisor APIC MMIO alias is
-        // mapped before AP launch and remains mapped through QEMU exit.
-        // INVLPG invalidates the recipient's local translation for this
-        // particular 4-KiB page; it cannot flush arbitrary PCID/global data.
+        // interrupts disabled. The UC supervisor xAPIC alias stays mapped.
+        // The independent 4-KiB PMM probe mapping is present again after
+        // each BSP-only A->B->A PTE transition. Both physical frames remain
+        // pinned even if some CPU retains a stale translation.
         unsafe {
             core::arch::asm!(
                 "invlpg [{address}]",
                 address = in(reg) MMIO_ALIAS_VA,
                 options(nostack, preserves_flags),
             );
+            core::arch::asm!(
+                "invlpg [{address}]",
+                address = in(reg) PROBE_VA,
+                options(nostack, preserves_flags),
+            );
         }
-        // SAFETY: This exact AP executed the architectural local INVLPG,
-        // with PCID off and its expected CR3 loaded. The same lock exposes
+        let epoch = run.barrier.snapshot().epoch;
+        let expected = if epoch == 2 { MARKER_B } else { MARKER_A };
+        // SAFETY: the probe PTE is present and supervisor-readable. The AP
+        // reads it ONLY after its recipient-local invalidation, under the
+        // round lock, and the BSP remaps only between completed epochs.
+        let observed = unsafe { (PROBE_VA as *const u64).read_volatile() };
+        if observed != expected {
+            run.bad = true;
+            return;
+        }
+        // SAFETY: This exact AP executed both local INVLPG instructions and
+        // observed the correct live backing frame with PCID disabled.
+        // The same lock exposes
         // the current published generation/epoch and serializes each ack.
         if unsafe { run.barrier.acknowledge_after_local_flush(run.round, cpu) }.is_err() {
             run.bad = true;
             return;
         }
         run.invlpg += 1;
+        run.probe_invlpg += 1;
+        run.probe_reads += 1;
         run.acks += 1;
         run.per_cpu[cpu] += 1;
     });
@@ -146,6 +171,8 @@ pub(crate) struct Evidence {
     pub(crate) pending: u64,
     pub(crate) acks: u64,
     pub(crate) invlpg: u64,
+    pub(crate) probe_invlpg: u64,
+    pub(crate) probe_reads: u64,
     pub(crate) per_cpu: [u64; CPUS],
     pub(crate) bad: bool,
     pub(crate) completed: bool,
@@ -160,6 +187,8 @@ pub(crate) fn evidence() -> Option<Evidence> {
             pending: snapshot.pending,
             acks: run.acks,
             invlpg: run.invlpg,
+            probe_invlpg: run.probe_invlpg,
+            probe_reads: run.probe_reads,
             per_cpu: run.per_cpu,
             bad: run.bad,
             completed: run.barrier.completed(run.round),
