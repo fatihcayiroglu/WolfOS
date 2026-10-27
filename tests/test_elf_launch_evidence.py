@@ -9,12 +9,12 @@ from scripts.elf_launch_evidence import (
 def transcript(frames=7, pids=(1,)):
     rows = ["WOLFOS_BOOT_OK"]
     for pid in pids:
-        rollback, active, blocked, reclaim = transaction_rows(pid, frames)
+        rollback, active, blocked, tlb, reclaim = transaction_rows(pid, frames)
         rows += [rollback]
         if pid == 2:
             rows += [RELAUNCH_STACK_PROOF]
         rows += [active, "WOLFOS_ELF_RUN_ENTER elf64=1",
-                 "GUEST_EXIT_OR_AUTHENTICATED_FAULT", blocked, reclaim,
+                 "GUEST_EXIT_OR_AUTHENTICATED_FAULT", blocked, tlb, reclaim,
                  f"WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed={frames} pmm_no_leak=1"]
     return "\n".join(rows)
 
@@ -40,7 +40,8 @@ class ElfLaunchEvidenceTests(unittest.TestCase):
         fields = ["rejected", "bytes_unchanged", "pid_unpublished", "pmm_no_leak",
                   "transferred_before_cr3", "cpu_reserved", "actual_cr3", "full_bytes",
                   "pcid_off", "bsp_only", "cpu_outstanding", "active_ack_denied",
-                  "frames_pinned", "actual_boot_cr3", "cpu_drained", "pid_revoked",
+                  "frames_pinned", "cpus", "real_cpl3", "post_publish_cr3_reload",
+                  "owner_round_complete", "actual_boot_cr3", "cpu_drained", "pid_revoked",
                   "returns_revoked"]
         for field in fields:
             self.assertFalse(valid_launch_transactions(output.replace(field + "=1", field + "=0"), 7, (1,)), field)
@@ -49,7 +50,8 @@ class ElfLaunchEvidenceTests(unittest.TestCase):
 
     def test_entry_reclamation_cleanup_and_next_generation_are_ordered(self):
         rows = transcript(pids=(1, 2)).splitlines()
-        for a, b in [(0, 1), (1, 2), (2, 3), (3, 5), (5, 6), (6, 7), (7, 8)]:
+        for a, b in [(0, 1), (1, 2), (2, 3), (3, 5), (5, 6),
+                     (6, 7), (7, 8), (8, 9), (9, 10), (10, 11)]:
             changed = rows.copy()
             changed[a], changed[b] = changed[b], changed[a]
             self.assertFalse(valid_launch_transactions("\n".join(changed), 7, (1, 2)), (a, b))
