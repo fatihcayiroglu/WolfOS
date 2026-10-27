@@ -74,6 +74,12 @@ impl<const CPUS: usize> ShootdownBarrier<CPUS> {
         })
     }
 
+    /// Compare an independently minted address-space generation before
+    /// using this barrier to certify that address space's shootdown round.
+    pub fn matches_generation(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             phase: self.phase,
