@@ -34,6 +34,9 @@ ps2-graphics-overflow-smoke = ["ps2-graphics-irq-smoke"]
 framebuffer-console-smoke = ["smoke-exit"]
 address-space-retirement-smoke = ["smoke-exit"]
 smp-address-space-retirement-smoke = ["smoke-exit"]
+# Genuine four-vCPU CPL0 owner-bound retirement: recipient-local CR3 flush on directed xAPIC IPI.
+# Not a multicore Ring3 process; uses the existing bounded SMP owner and held-root test.
+smp-retirement-ipi-hardware-smoke = ["smp-address-space-retirement-smoke"]
 exception-smoke = ["smoke-exit"]
 paging-fault-smoke = ["smoke-exit"]
 timer-smoke = ["smoke-exit"]

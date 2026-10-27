@@ -199,6 +199,8 @@ pub extern "x86-interrupt" fn irq(_frame: InterruptStackFrame) {
     if let Some(i) = slot {
         #[cfg(feature = "tlb-shootdown-hardware-smoke")]
         crate::tlb_shootdown_hardware_smoke::on_ipi(i);
+        #[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+        crate::smp_address_space_retirement_smoke::on_retirement_ipi(i);
         #[cfg(feature = "ap-remote-work-smoke")]
         crate::ap_remote_work_smoke::on_ipi(i);
         #[cfg(feature = "ap-handoff-smoke")]
@@ -507,6 +509,40 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
     }
 }
 
+/// The CPL0 owner-bound smoke uses exactly one genuine directed IPI per AP.
+/// Ready is published only after this AP installs its local SVR and enables IF.
+#[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+pub(crate) fn retirement_aps_ready(mask: u64) -> bool {
+    (0..COUNT.load(Ordering::Acquire)).all(|i| {
+        mask & (1u64 << i) == 0 || (READY[i].load(Ordering::Acquire)
+            && !OFFLINE[i].load(Ordering::Acquire))
+    })
+}
+#[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+pub(crate) fn send_retirement_ipi(index: usize) -> bool {
+    if index >= COUNT.load(Ordering::Acquire)
+        || !READY[index].load(Ordering::Acquire)
+        || OFFLINE[index].load(Ordering::Acquire)
+        || local_id() != BSP_ID.load(Ordering::Acquire)
+    { return false; }
+    send(BSP_ID.load(Ordering::Relaxed), IDS[index].load(Ordering::Relaxed))
+}
+/// Shut down the AP IPI gates before root reclamation and check all IRQs
+/// reached exactly one real remote EOI. The owner already disallows re-entry.
+#[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+pub(crate) fn stop_retirement_aps(mask: u64) -> bool {
+    STOP.store(true, Ordering::Release);
+    wait(|| (0..COUNT.load(Ordering::Acquire)).all(|i| {
+        mask & (1u64 << i) == 0 || OFFLINE[i].load(Ordering::Acquire)
+    }), WAIT_SPINS)
+        && (0..COUNT.load(Ordering::Acquire)).all(|i| {
+            let expected = if mask & (1u64 << i) != 0 { 1 } else { 0 };
+            SEEN[i].load(Ordering::Acquire) == expected
+                && EOIS[i].load(Ordering::Acquire) == expected
+        })
+        && BAD.load(Ordering::Acquire) == 0
+        && SPURIOUS_COUNT.load(Ordering::Acquire) == 0
+}
 /// Three genuine four-CPU IPI epochs. The last AP is deliberately withheld
 /// in epoch 3 to prove the barrier cannot complete or begin a new epoch.
 /// Every actual acknowledgement follows recipient-local INVLPG.

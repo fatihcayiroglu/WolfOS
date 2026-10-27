@@ -1,9 +1,10 @@
 //! Isolated four-CPU CPL0 quiescence proof. All CPUs borrow one cloned
 //! kernel PML4, restore the registered supervisor root, then acknowledge
 //! their own observation. Explicit active ownership pins the root throughout.
-//! No Ring3, PCID, private globals or IPI shootdown. After genuine
-//! CR3 departures, each CPU reloads its own supervisor CR3 and acknowledges
-//! a generation-tagged retirement TLB round before PMM reclaim.
+//! No Ring3, PCID or private globals. After genuine CR3 departures,
+//! the legacy flavor uses AP-local CR3 reloads; the isolated hardware flavor
+//! sends genuine directed IPIs whose AP interrupt handlers reload supervisor
+//! CR3 and ack the same owner-bound TLB round before PMM reclaim.
 use crate::{
     active_address_space::ActiveAddressSpace,
     address_space_retirement::{Error, Phase},
@@ -144,6 +145,32 @@ fn acknowledge_local_flush(cpu: usize, supervisor: u64) -> bool {
         // CR3 after publication, and the same lock guards the exact round.
         unsafe { state.barrier.acknowledge_after_local_flush(state.round, cpu) }.is_ok()
     }) == Some(true)
+}
+/// Runs inside the authenticated recipient's fixed-IPI IRQ with IF=0.
+/// Do not allocate, touch serial, or release frames in this interrupt context.
+#[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+pub(crate) fn on_retirement_ipi(cpu: usize) {
+    let bsp = BSP.load(Ordering::Relaxed);
+    let supervisor = SUPERVISOR.load(Ordering::Relaxed);
+    if cpu >= CPUS || cpu == bsp || !PREPARED.load(Ordering::Acquire)
+        || ACKS.load(Ordering::Acquire) & (1u64 << cpu) == 0
+        || !supported() || actual_root() != supervisor
+    {
+        BAD.store(true, Ordering::Release);
+        return;
+    }
+    let (original, flags) = Cr3::read();
+    // SAFETY: the recipient actually departed its private root before
+    // entering the APIC IPI wait. Supervisor PML4 is pinned, PCID is off,
+    // and this handler runs on the AP's permanently resident kernel stack.
+    unsafe { Cr3::write(original, flags); }
+    if !acknowledge_local_flush(cpu, supervisor) {
+        BAD.store(true, Ordering::Release);
+        return;
+    }
+    // Acknowledgement occurs ONLY after this CPU physically executes CR3
+    // reload and records it in the exact owner-controlled barrier round.
+    FLUSH_ACKS.fetch_or(1u64 << cpu, Ordering::Release);
 }
 fn supported() -> bool {
     !x86_64::instructions::interrupts::are_enabled() && !Cr4::read().contains(Cr4Flags::PCID)
@@ -341,22 +368,26 @@ pub fn secondary(index: usize) -> bool {
     // Release publishes the actual post-switch observation. This AP performs
     // no later private CR3 load and returns directly to its permanent halt.
     ACKS.fetch_or(1 << index, Ordering::Release);
-    // The real private CR3 has already departed; no new private activation
-    // is permitted after retirement. Await a post-publication flush round.
-    if !wait_for(&FLUSH_RELEASE, 1u64 << index) {
-        BAD.store(true, Ordering::Release);
-        return false;
+    // The real private CR3 has already departed. The IPI hardware flavor
+    // now enters AP-local interrupt wait through smp.rs; the later IRQ must
+    // authenticate this AP and do the CR3 reload before owner-bound ack.
+    #[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+    { true }
+    #[cfg(not(feature = "smp-retirement-ipi-hardware-smoke"))]
+    {
+        if !wait_for(&FLUSH_RELEASE, 1u64 << index) {
+            BAD.store(true, Ordering::Release);
+            return false;
+        }
+        // SAFETY: authenticated AP stack is permanently mapped; PCID off.
+        unsafe { Cr3::write(original, flags); }
+        if !acknowledge_local_flush(index, supervisor) {
+            BAD.store(true, Ordering::Release);
+            return false;
+        }
+        FLUSH_ACKS.fetch_or(1u64 << index, Ordering::Release);
+        true
     }
-    // SAFETY: authenticated AP still owns its permanent supervisor stack;
-    // a local supervisor CR3 reload flushes non-global translations with
-    // PCID disabled, without touching any physical frame owner.
-    unsafe { Cr3::write(original, flags); }
-    if !acknowledge_local_flush(index, supervisor) {
-        BAD.store(true, Ordering::Release);
-        return false;
-    }
-    FLUSH_ACKS.fetch_or(1u64 << index, Ordering::Release);
-    true
 }
 
 fn bsp_roundtrip(index: usize, root: u64, supervisor: u64) -> bool {
@@ -499,8 +530,23 @@ pub fn verify_bsp() -> bool {
     });
     if armed != Some(true) { return false; }
 
-    // Release two APs while withholding the last. The BSP also performs
-    // and acknowledges a real *post-publication* local CR3 reload.
+    // Release two AP IPIs while withholding the last, or retain the
+    // baseline AP polling path when the hardware feature is absent.
+    // Owner round was already published; AP handlers verify that same round.
+    #[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+    {
+        for _ in 0..SPINS {
+            if crate::ap_ipi_smoke::retirement_aps_ready(aps) { break; }
+            core::hint::spin_loop();
+        }
+        if !crate::ap_ipi_smoke::retirement_aps_ready(aps) { return false; }
+        for cpu in 0..CPUS {
+            if aps & !last_bit & (1u64 << cpu) != 0
+                && !crate::ap_ipi_smoke::send_retirement_ipi(cpu)
+            { return false; }
+        }
+    }
+    #[cfg(not(feature = "smp-retirement-ipi-hardware-smoke"))]
     FLUSH_RELEASE.store(ALL ^ last_bit, Ordering::Release);
     let (original, flags) = Cr3::read();
     if original.start_address().as_u64() != supervisor { return false; }
@@ -527,6 +573,9 @@ pub fn verify_bsp() -> bool {
     });
     if blocked != Some(true) { return false; }
 
+    #[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+    if !crate::ap_ipi_smoke::send_retirement_ipi(last) { return false; }
+    #[cfg(not(feature = "smp-retirement-ipi-hardware-smoke"))]
     FLUSH_RELEASE.fetch_or(last_bit, Ordering::Release);
     if !wait_for(&FLUSH_ACKS, ALL)
         || BAD.load(Ordering::Acquire)
@@ -548,6 +597,10 @@ pub fn verify_bsp() -> bool {
     {
         return false;
     }
+    // The hardware flavor also proves each AP fully returned from its
+    // IPI, executed local EOI, disabled IF and parked before frame free.
+    #[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+    if !crate::ap_ipi_smoke::stop_retirement_aps(aps) { return false; }
     // Independently established on all four CPUs: original root restored,
     // PCID off, no private/global mappings or pending future loads. Only the
     // PML4 is owned; none of its borrowed child tables are released.
@@ -579,11 +632,18 @@ pub fn verify_bsp() -> bool {
     {
         return false;
     }
+    #[cfg(not(feature = "smp-retirement-ipi-hardware-smoke"))]
+    {
+        serial::write_line(
+            "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0 local_cr3_flush_acks=4 withheld_last_flush=1",
+        );
+        serial::write_line(
+            "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0 local_cr3_flush_acks=4 withheld_last_flush=1",
+        );
+    }
+    #[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
     serial::write_line(
-        "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0 local_cr3_flush_acks=4 withheld_last_flush=1",
-    );
-    serial::write_line(
-        "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0 local_cr3_flush_acks=4 withheld_last_flush=1",
+        "WOLFOS_SMP_RETIRE_IPI_OK cpus=4 ring3=0 owner_bound=1 ipis=3 eois=3 local_cr3_flush_acks=4 withheld_last_flush=1 premature_reclaim=0 frames_freed=1 pmm_no_leak=1 offline=3",
     );
     true
 }

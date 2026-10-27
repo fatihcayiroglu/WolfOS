@@ -74,6 +74,8 @@ jobs:
         run: make address-space-retirement-smoke
       - name: Active frame ownership, safe Drop and four real CPU CR3 departures, including withheld last AP
         run: make smp-address-space-retirement-smoke
+      - name: Four-vCPU CPL0 owner-bound retirement with real directed IPIs and recipient CR3 flushes
+        run: make smp-retirement-ipi-hardware-smoke
       - name: P2 user descriptor and TSS.RSP0 / TR preflight (CPL0-only QEMU)
         run: make user-ring-prep-smoke
       - name: P2 REAL CPL3 / INT80 / IRETQ roundtrip (single-vCPU QEMU)

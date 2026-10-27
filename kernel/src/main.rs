@@ -185,11 +185,11 @@ mod acpi_layout;
 mod acpi_tables;
 mod acpi_walk;
 mod smp;
-#[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke",
+#[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "ap-local-timer-smoke",
            feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
            feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod ipi_layout;
-#[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke",
+#[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "ap-local-timer-smoke",
            feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
            feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod ap_ipi_smoke;
@@ -249,7 +249,7 @@ mod lapic_mmio;
 mod lapic_timer_plan;
 #[cfg(any(any(feature = "apic-timer-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")), feature = "apic-calibration-smoke",
            feature = "apic-preempt-smoke", feature = "ap-ipi-smoke",
-           feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
+           feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "ap-local-timer-smoke", feature = "ap-smp-preempt-smoke",
            feature = "ap-remote-work-smoke", feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
 mod lapic_irq_layout;
 #[cfg(any(any(feature = "apic-timer-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")), feature = "apic-calibration-smoke",
@@ -618,7 +618,7 @@ pub extern "C" fn kmain() -> ! {
     }
     // Feature-isolated BSP mapping exists BEFORE AP startup: APs inherit
     // a writable UC local-APIC alias for private IRQ acknowledgement.
-    #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke",
+    #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
                feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
     if !ap_ipi_smoke::prepare_bsp(mp.bsp_lapic_id, hhdm.offset, entries, mp.cpus()) {
