@@ -7,6 +7,30 @@ import sys
 import tempfile
 
 
+def check_pmm_irq_if1_evidence(output: str, timer_end: int, ticks: int) -> str | None:
+    """Reject absent, forged, duplicated, misordered or inconsistent real AP PMM evidence."""
+    marker = "WOLFOS_PMM_IRQ_IF1_OK"
+    # Count marker occurrences independently of the strict full-line regex so
+    # an extra truncated, embedded or payload-extended marker cannot hide.
+    if output.count(marker) != 1:
+        return "expected exactly one PMM IF=1 proof marker"
+    match = re.search(
+        r"(?m)^WOLFOS_PMM_IRQ_IF1_OK aps=([0-9]+) probes=([0-9]+) timer_ticks=([0-9]+)\r?$",
+        output,
+    )
+    if match is None:
+        return "malformed PMM IF=1 proof line"
+    if match.start() < timer_end:
+        return "PMM IF=1 proof preceded successful AP timer verification"
+    aps, probes, timer_ticks = map(int, match.groups())
+    if aps != 3 or probes != 3 * 64 or timer_ticks != ticks:
+        return (
+            f"PMM IF=1 proof mismatch: aps={aps}, probes={probes}, "
+            f"timer_ticks={timer_ticks}, AP timer ticks={ticks}"
+        )
+    return None
+
+
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: ap_local_timer_smoke.py ISO")
@@ -54,6 +78,10 @@ def main() -> int:
             or spurious != 0 or unexpected_ipi != 0
             or vector != 0xe2 or bsp_if != 0):
             print(f"FAIL: mismatched per-AP hardware timer evidence: {match.groups()}")
+            return 1
+        pmm_error = check_pmm_irq_if1_evidence(output, match.end(), ticks)
+        if pmm_error is not None:
+            print(f"FAIL: {pmm_error}")
             return 1
         if "WOLFOS_AP_IPI_OK" in output:
             print("FAIL: AP local timer flavor unexpectedly used BSP-directed IPIs")
