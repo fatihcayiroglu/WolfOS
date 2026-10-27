@@ -1016,6 +1016,23 @@ fn armed_owner_cannot_retire_before_its_exact_round_completes() {
         owner.finish_retirement_after_shootdown(&foreign, round),
         Err(Error::OutstandingShootdown),
     );
+    // Even an independent same-generation barrier at the exact same epoch
+    // has a distinct instance identity and cannot impersonate the owner round.
+    let mut lookalike = ShootdownBarrier::<4>::new(7).unwrap();
+    let lookalike_round = lookalike.begin(0b1101).unwrap();
+    for cpu in [0, 2, 3] {
+        unsafe { lookalike.acknowledge_after_local_flush(lookalike_round, cpu).unwrap() };
+    }
+    assert!(lookalike.completed(lookalike_round));
+    assert_ne!(round, lookalike_round);
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&lookalike, round),
+        Err(Error::OutstandingShootdown),
+    );
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&lookalike, lookalike_round),
+        Err(Error::OutstandingShootdown),
+    );
     // An unrelated same-generation barrier with a *different epoch* cannot
     // replace the round previously minted through this physical owner.
     let mut other = ShootdownBarrier::<4>::new(7).unwrap();
