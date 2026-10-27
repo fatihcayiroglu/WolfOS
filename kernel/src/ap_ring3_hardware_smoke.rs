@@ -510,6 +510,7 @@ pub(crate) fn verify_bsp() -> bool {
             || shadow[256..].iter().any(|e| e & USER != 0)
         { return false; }
         if cfg!(feature = "ap-ring3-elf-reclaim-smoke") {
+            #[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
             if !reclaim_completed_ap() { return false; }
             serial::write_fmt(format_args!(
                 "WOLFOS_AP_RING3_ELF_REAP_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} linked_elf=1 et_exec=1 pt_load=2 ap_cpl3=1 int80=2 iret_to_cpl3=1 ap_private_cr3=1 ap_restored_boot_cr3=1 bsp_boot_cr3=1 root_exclusive=1 cr3_flush=1 high_half_supervisor=1 boot_user_slot_empty=1 scrubbed=7 frames_freed=7 pmm_no_leak=1 stale_root_revoked=1 double_free_denied=1\n",
