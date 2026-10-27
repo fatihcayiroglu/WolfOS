@@ -49,6 +49,8 @@ else ifeq ($(FLAVOR),ap-ring3-hardware)
 FEATURES := --features ap-ring3-hardware-smoke
 else ifeq ($(FLAVOR),ap-ring3-private-cr3)
 FEATURES := --features ap-ring3-private-cr3-smoke
+else ifeq ($(FLAVOR),ap-ring3-elf)
+FEATURES := --features ap-ring3-elf-smoke
 else ifeq ($(FLAVOR),tlb-shootdown-hardware)
 FEATURES := --features tlb-shootdown-hardware-smoke
 else ifeq ($(FLAVOR),ap-local-timer)
@@ -293,6 +295,11 @@ ap-ring3-private-cr3-smoke:
 	$(MAKE) iso FLAVOR=ap-ring3-private-cr3
 	python3 scripts/ap_ring3_private_cr3_smoke.py $(OUT)/wolfos-ap-ring3-private-cr3.iso
 
+.PHONY: ap-ring3-elf-smoke
+ap-ring3-elf-smoke:
+	$(MAKE) iso FLAVOR=ap-ring3-elf
+	python3 scripts/ap_ring3_elf_smoke.py $(OUT)/wolfos-ap-ring3-elf.iso
+
 tlb-shootdown-hardware-smoke:
 	$(MAKE) iso FLAVOR=tlb-shootdown-hardware
 	python3 scripts/tlb_shootdown_hardware_smoke.py $(OUT)/wolfos-tlb-shootdown-hardware.iso
@@ -520,6 +527,7 @@ test:
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_elf_smp_ipi_missing_ack_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_ring3_hardware_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_ring3_private_cr3_smoke.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_ring3_elf_smoke.py' -v
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/ap_preempt_progress_budget.rs -o $(OUT)/ap_preempt_progress_budget_tests
 	$(OUT)/ap_preempt_progress_budget_tests

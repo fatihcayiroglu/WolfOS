@@ -62,6 +62,9 @@ ap-ring3-hardware-smoke = ["smoke-exit"]
 # One real AP runs fixed CPL3 payload under its own audited PML4/CR3.
 # BSP retains untouched boot lower half; private 7-frame lease stays pinned.
 ap-ring3-private-cr3-smoke = ["ap-ring3-hardware-smoke"]
+# Independently assembled and linked AP ELF64, derived RX/RW PT_LOAD
+# leaves under private AP CR3; no production AP scheduler or PMM reclaim.
+ap-ring3-elf-smoke = ["ap-ring3-private-cr3-smoke"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
