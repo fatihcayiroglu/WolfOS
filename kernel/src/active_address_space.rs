@@ -12,6 +12,8 @@ use crate::{
     saved_context_retirement::{
         ContextTicket, Error as ContextError, SavedContextGate, Snapshot as ContextSnapshot,
     },
+    retirement_tlb_round::{begin_retirement_shootdown, Error as RoundError},
+    tlb_shootdown::{Round, ShootdownBarrier},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +181,28 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
 
     pub fn acknowledge_quiescent(&mut self, ticket: Ticket, actual_cr3: u64) -> Result<(), Error> {
         self.gate.acknowledge_quiescent(ticket, actual_cr3)
+    }
+
+    /// Arm a conservative TLB round through the actual move-only PMM owner,
+    /// not a caller-supplied lookalike retirement ledger. The owner must be
+    /// Retiring, all CPU reservations must have drained, and every saved
+    /// resumable context must have been revoked before publishing the round.
+    ///
+    /// This is serialized METADATA ONLY. The caller holds the common external
+    /// coordinator lock; remote CPUs still need authenticated local flushes,
+    /// and completion is never by itself permission to reclaim frames.
+    pub fn begin_retirement_shootdown(
+        &mut self,
+        barrier: &mut ShootdownBarrier<CPUS>,
+        targets: u64,
+    ) -> Result<Round, RoundError> {
+        if self.gate.snapshot().phase != Phase::Retiring {
+            return Err(RoundError::NotRetiring);
+        }
+        if self.contexts.snapshot().pending != 0 {
+            return Err(RoundError::OutstandingContexts);
+        }
+        begin_retirement_shootdown(&self.gate, barrier, targets)
     }
 
     /// Metadata only; does not reclaim or certify external references.
