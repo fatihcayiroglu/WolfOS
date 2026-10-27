@@ -4,13 +4,16 @@
 //! Metadata is backed by usable RAM, NOT by unbounded kernel BSS.
 //!
 //! IMPORTANT LIMITS: up to 256 usable regions in the bootstrap directory,
-//! no memory hot-plug or NUMA awareness yet; no interrupt-safe reentry.
+//! no memory hot-plug or NUMA awareness yet. Maskable same-CPU IRQ
+//! reentry is excluded while locked, but NMI and synchronous recursive
+//! allocator calls remain unsupported.
 //! Pointers require Limine's HHDM mapping to remain installed.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use limine::memmap::{Entry, MEMMAP_USABLE};
 
+use crate::pmm_bitmap_scan::first_clear_bit;
 use crate::pmm_layout::{bitmap_bytes_for_frames, metadata_pages_for_frames, PAGE_SIZE};
 
 const MAX_REGIONS: usize = 256;
@@ -147,14 +150,23 @@ impl FrameState {
         }
         let pivot = self.next;
         for (begin, end) in [(pivot, self.total), (0, pivot)] {
-            for index in begin..end {
-                if !self.is_used(index) {
-                    let addr = self.physical_address(index)?;
-                    self.mark(index, true);
-                    self.used += 1;
-                    self.next = (index + 1) % self.total;
-                    return Some(addr);
-                }
+            // SAFETY: init reserved an HHDM-backed bitmap of exactly this
+            // length. The allocator lock excludes all other PMM mutations.
+            // This temporary shared slice ends before mark() writes the bit.
+            let free = {
+                let bitmap = unsafe {
+                    core::slice::from_raw_parts(
+                        self.bitmap_addr as *const u8, self.bitmap_bytes,
+                    )
+                };
+                first_clear_bit(bitmap, begin, end)
+            };
+            if let Some(index) = free {
+                let addr = self.physical_address(index)?;
+                self.mark(index, true);
+                self.used += 1;
+                self.next = (index + 1) % self.total;
+                return Some(addr);
             }
         }
         None
@@ -179,7 +191,9 @@ impl FrameState {
     }
 }
 
-/// Bootstrap exclusive lock. Not reentrant from interrupts.
+/// Bootstrap exclusive lock. Local maskable IRQs must be disabled before
+/// acquisition, otherwise an interrupt on the holder CPU can deadlock while
+/// spinning for the same lock. NMI and synchronous recursion are unsupported.
 struct LockedState {
     held: AtomicBool,
     inner: UnsafeCell<FrameState>,
@@ -194,18 +208,23 @@ impl LockedState {
     }
 
     fn with<R>(&self, operation: impl FnOnce(&mut FrameState) -> R) -> R {
-        while self.held.compare_exchange_weak(
-            false, true, Ordering::Acquire, Ordering::Relaxed
-        ).is_err() {
-            core::hint::spin_loop();
-        }
-        struct Release<'a>(&'a AtomicBool);
-        impl Drop for Release<'_> {
-            fn drop(&mut self) { self.0.store(false, Ordering::Release); }
-        }
-        let _release = Release(&self.held);
-        // SAFETY: the lock excludes all other mutable accesses to FrameState.
-        operation(unsafe { &mut *self.inner.get() })
+        // Save IF and mask local interrupts *before* taking the lock. The
+        // release guard drops before without_interrupts restores the caller's
+        // original IF state. Another CPU may still contend normally.
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            while self.held.compare_exchange_weak(
+                false, true, Ordering::Acquire, Ordering::Relaxed
+            ).is_err() {
+                core::hint::spin_loop();
+            }
+            struct Release<'a>(&'a AtomicBool);
+            impl Drop for Release<'_> {
+                fn drop(&mut self) { self.0.store(false, Ordering::Release); }
+            }
+            let _release = Release(&self.held);
+            // SAFETY: the lock excludes all other mutable accesses to FrameState.
+            operation(unsafe { &mut *self.inner.get() })
+        })
     }
 }
 
@@ -301,6 +320,7 @@ pub fn statistics() -> Statistics {
 /// Verify bitmap address reservation, unique pages, double-free guards and
 /// 10,000 allocation/free cycles inside real QEMU boot.
 pub fn self_test() -> bool {
+    let interrupt_state_before = x86_64::instructions::interrupts::are_enabled();
     let before = statistics();
     if before.free_frames() < 128 { return false; }
 
@@ -327,4 +347,5 @@ pub fn self_test() -> bool {
     let after = statistics();
     after.allocated_frames == before.allocated_frames
         && after.free_frames() == before.free_frames()
+        && x86_64::instructions::interrupts::are_enabled() == interrupt_state_before
 }
