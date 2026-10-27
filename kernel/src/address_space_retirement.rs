@@ -73,6 +73,9 @@ pub struct RetirementGate<const CPUS: usize> {
     supervisor_root: u64,
     phase: Phase,
     last_epoch: u64,
+    /// Conservative history of every CPU that was ever granted a private
+    /// CR3 reservation, including loads racing retirement confirmation.
+    ever_reserved: u64,
     cpus: [Cpu; CPUS],
 }
 
@@ -99,6 +102,7 @@ impl<const CPUS: usize> RetirementGate<CPUS> {
             supervisor_root,
             phase: Phase::Staged,
             last_epoch: 0,
+            ever_reserved: 0,
             cpus: [Cpu::Idle; CPUS],
         })
     }
@@ -118,6 +122,18 @@ impl<const CPUS: usize> RetirementGate<CPUS> {
             }
         }
         result
+    }
+
+    /// Conservative per-generation target set for a future TLB shootdown.
+    /// Unlike `snapshot().active | snapshot().reserved`, this never forgets
+    /// CPUs after a normal deactivation, failed confirmation or retirement.
+    /// Every private CR3 load MUST have an earlier reservation through this
+    /// ledger under the shared coordinator lock; bypasses break coverage.
+    /// The result is metadata, not authenticated hardware invalidation or
+    /// permission to reclaim frames. A caller must account for CPU hotplug,
+    /// cached global/PCID translations and a complete IPI/flush protocol.
+    pub fn potential_tlb_users(&self) -> u64 {
+        self.ever_reserved
     }
 
     /// Compare the registry-minted process generation and private CR3 root
@@ -153,6 +169,7 @@ impl<const CPUS: usize> RetirementGate<CPUS> {
             .ok_or(Error::EpochExhausted)?;
         self.cpus[cpu] = Cpu::Reserved(epoch);
         self.last_epoch = epoch;
+        self.ever_reserved |= 1u64 << cpu;
         Ok(Ticket {
             generation: self.generation,
             root: self.root,
@@ -425,6 +442,77 @@ mod tests {
             );
         }
         assert_eq!(gate.snapshot(), active);
+    }
+
+    #[test]
+    fn historical_tlb_targets_survive_deactivation_and_retirement() {
+        let mut gate = live::<4>();
+        assert_eq!(gate.potential_tlb_users(), 0);
+
+        // Even an unconfirmed reservation is a potential private CR3 load:
+        // hardware may race a later retirement before software confirms it.
+        let first = gate.reserve_cpu(3).unwrap();
+        assert_eq!(gate.potential_tlb_users(), 0b1000);
+        gate.acknowledge_quiescent(first, 0x9000).unwrap();
+        assert_eq!(gate.snapshot().active | gate.snapshot().reserved, 0);
+        assert_eq!(gate.potential_tlb_users(), 0b1000);
+
+        let second = gate.reserve_cpu(1).unwrap();
+        gate.confirm_active(second, 0x1000).unwrap();
+        let third = gate.reserve_cpu(3).unwrap();
+        gate.confirm_active(third, 0x1000).unwrap();
+        assert_eq!(gate.potential_tlb_users(), 0b1010);
+        gate.acknowledge_quiescent(second, 0x9000).unwrap();
+        gate.acknowledge_quiescent(third, 0x9000).unwrap();
+        assert_eq!(gate.snapshot().reserved | gate.snapshot().active, 0);
+        assert_eq!(gate.potential_tlb_users(), 0b1010);
+
+        let racing = gate.reserve_cpu(0).unwrap();
+        gate.begin_retirement().unwrap();
+        assert_eq!(gate.confirm_active(racing, 0x1000), Err(Error::WrongPhase));
+        assert_eq!(gate.potential_tlb_users(), 0b1011);
+        assert_eq!(gate.finish_retirement(), Err(Error::OutstandingCpus));
+        gate.acknowledge_quiescent(racing, 0x9000).unwrap();
+        gate.finish_retirement().unwrap();
+        assert_eq!(gate.snapshot().phase, Phase::Retired);
+        assert_eq!(gate.snapshot().reserved | gate.snapshot().active, 0);
+        assert_eq!(gate.potential_tlb_users(), 0b1011);
+    }
+
+    #[test]
+    fn rejected_reservations_and_stale_acks_never_erase_cpu_history() {
+        let mut gate = live::<2>();
+        assert_eq!(gate.reserve_cpu(2), Err(Error::InvalidCpu));
+        assert_eq!(gate.potential_tlb_users(), 0);
+        let old = gate.reserve_cpu(0).unwrap();
+        assert_eq!(gate.potential_tlb_users(), 1);
+        assert_eq!(gate.reserve_cpu(0), Err(Error::CpuBusy));
+        assert_eq!(gate.confirm_active(old, 0x9000), Err(Error::WrongCr3));
+        gate.acknowledge_quiescent(old, 0x9000).unwrap();
+        let next = gate.reserve_cpu(0).unwrap();
+        assert_eq!(gate.acknowledge_quiescent(old, 0x9000), Err(Error::StaleTicket));
+        assert_eq!(gate.potential_tlb_users(), 1);
+        gate.acknowledge_quiescent(next, 0x9000).unwrap();
+
+        gate.last_epoch = u64::MAX;
+        assert_eq!(gate.reserve_cpu(1), Err(Error::EpochExhausted));
+        assert_eq!(gate.potential_tlb_users(), 1);
+        assert_eq!(gate.snapshot().reserved | gate.snapshot().active, 0);
+    }
+
+    #[test]
+    fn highest_cpu_history_bit_is_preserved_without_shift_overflow() {
+        let mut gate = live::<64>();
+        let far = gate.reserve_cpu(63).unwrap();
+        assert_eq!(gate.potential_tlb_users(), 1u64 << 63);
+        gate.confirm_active(far, 0x1000).unwrap();
+        gate.acknowledge_quiescent(far, 0x9000).unwrap();
+        let near = gate.reserve_cpu(0).unwrap();
+        assert_eq!(gate.potential_tlb_users(), (1u64 << 63) | 1);
+        gate.acknowledge_quiescent(near, 0x9000).unwrap();
+        gate.begin_retirement().unwrap();
+        gate.finish_retirement().unwrap();
+        assert_eq!(gate.potential_tlb_users(), (1u64 << 63) | 1);
     }
 
     #[test]
