@@ -8,7 +8,9 @@
 //! root's low half unchanged. No ELF process, scheduler, TLB retirement or
 //! full production isolation is claimed. The ELF flavor builds independent
 //! ELF64 bytes and materializes two derived PT_LOAD pages, with the same
-//! real AP CR3/INT80/IRETQ checks. All 6/7 PMM frames remain pinned.
+//! real AP CR3/INT80/IRETQ checks. An opt-in one-owner terminal flavor
+//! proves AP CR3 departure before BSP scrubs/releases all seven pages.
+//! Other flavors deliberately leave their 6/7 PMM pages pinned.
 use core::arch::{asm, x86_64::__cpuid};
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64,
                          AtomicUsize, Ordering};
@@ -73,6 +75,8 @@ static DATA_HHDM: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BEFORE: AtomicUsize = AtomicUsize::new(0);
 static TRAPS: AtomicUsize = AtomicUsize::new(0);
 static FINISHED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
+static OWNED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 pub(crate) fn target_index() -> usize { TARGET.load(Ordering::Acquire) }
 
@@ -271,6 +275,10 @@ pub(crate) fn prepare_bsp(hhdm: u64, bsp_lapic: u32, cpus: &[&MpInfo]) -> bool {
         }
     }
     if pmm::statistics().allocated_frames != before + FRAMES { return false; }
+    #[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
+    for (i, frame) in frames.iter().copied().enumerate() {
+        OWNED[i].store(frame, Ordering::Release);
+    }
     PREPARED.store(true, Ordering::Release);
     true
 }
@@ -375,6 +383,98 @@ pub extern "x86-interrupt" fn interrupt_80(frame: InterruptStackFrame) {
     crate::halt_forever();
 }
 
+
+/// BSP-only, AFTER terminal AP hardware CR3 restoration and completion
+/// acknowledgment. No CPU is permitted to be executing/borrowing this root:
+/// only target AP ever loaded it, BSP stayed on boot, other APs never
+/// received the private CR3. Its final MOV CR3 flushed non-global user TLB
+/// translations. This is a SINGLE-OWNER proof, not general SMP shootdown.
+///
+/// A first failure is terminal/fail-closed: no attempt to disguise partial
+/// reclamation as a clean exit. The AP's kernel TSS.RSP0 is static BSS and
+/// stays mapped in the borrowed high-half during its permanent parked loop.
+#[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
+fn reclaim_completed_ap() -> bool {
+    if !local_ok() || !PREPARED.load(Ordering::Acquire)
+        || !FINISHED.load(Ordering::Acquire)
+        || TRAPS.load(Ordering::Acquire) != 2
+        || BAD.load(Ordering::Acquire)
+        || !PRIVATE_RESTORED.load(Ordering::Acquire)
+        || current_lapic() != BSP_LAPIC.load(Ordering::Acquire)
+    { return false; }
+    let boot = BOOT_ROOT.load(Ordering::Acquire);
+    let private = PRIVATE_ROOT.load(Ordering::Acquire);
+    let hhdm = HHDM_BASE.load(Ordering::Acquire);
+    let slot = USER_SLOT.load(Ordering::Acquire);
+    let lease: [u64; 7] = core::array::from_fn(|i| OWNED[i].load(Ordering::Acquire));
+    if root_phys() != boot || private == 0 || private == boot
+        || slot == 0 || slot >= 256 || lease[6] != private
+        || pmm::statistics().allocated_frames
+            != ALLOCATED_BEFORE.load(Ordering::Acquire) + 7
+        || lease.iter().enumerate().any(|(i, frame)|
+            *frame == 0 || (*frame & (PAGE - 1)) != 0
+            || *frame >= (1u64 << 52) || *frame == boot
+            || lease[..i].contains(frame))
+    { return false; }
+    let Some(boot_ptr) = hhdm_ptr(hhdm, boot) else { return false; };
+    let mut pointers = [core::ptr::null_mut::<u8>(); 7];
+    for (i, frame) in lease.iter().copied().enumerate() {
+        let Some(ptr) = hhdm_ptr(hhdm, frame) else { return false; };
+        pointers[i] = ptr;
+    }
+    // All page-table and final nonce observations happen BEFORE any free.
+    let mapping_ok = unsafe {
+        let source = &*boot_ptr.cast::<[u64; 512]>();
+        let shadow = &*pointers[6].cast::<[u64; 512]>();
+        let pdpt = &*pointers[0].cast::<[u64; 512]>();
+        let pd = &*pointers[1].cast::<[u64; 512]>();
+        let pt = &*pointers[2].cast::<[u64; 512]>();
+        let user_entry = lease[0] | PRESENT | WRITE | USER;
+        source[slot] == 0
+            && shadow[slot] == user_entry
+            && shadow[..256].iter().filter(|entry| **entry != 0).count() == 1
+            && kernel_half_shadow::audit_kernel_half(
+                source, shadow, slot, user_entry, &lease,
+            ) == Ok(KERNEL_GRAFTS.load(Ordering::Acquire))
+            && pdpt[0] == lease[1] | PRESENT | WRITE | USER
+            && pdpt.iter().filter(|e| **e != 0).count() == 1
+            && pd[2] == lease[2] | PRESENT | WRITE | USER
+            && pd.iter().filter(|e| **e != 0).count() == 1
+            && pt[1] == lease[3] | PRESENT | USER
+            && pt[2] == lease[4] | PRESENT | WRITE | USER | NX
+            && pt[3] == lease[5] | PRESENT | WRITE | USER | NX
+            && pt.iter().filter(|e| **e != 0).count() == 3
+            && pointers[4] as u64 == DATA_HHDM.load(Ordering::Acquire)
+            && pointers[4].read_volatile() == 0x22
+    };
+    if !mapping_ok { return false; }
+    // No guest may re-enter: AP has already retired from this root.
+    // Revoke all lease references before the FIRST physical-frame free.
+    PREPARED.store(false, Ordering::SeqCst);
+    USER_RIP.store(0, Ordering::SeqCst);
+    USER_STACK_TOP.store(0, Ordering::SeqCst);
+    DATA_HHDM.store(0, Ordering::SeqCst);
+    PRIVATE_ROOT.store(0, Ordering::SeqCst);
+    compiler_fence(Ordering::SeqCst);
+    for i in (0..7).rev() {
+        // SAFETY: exclusive PMM lease, authenticated pages and no CPU
+        // referencing the private CR3. HHDM remains supervisor-mapped.
+        unsafe { core::ptr::write_bytes(pointers[i], 0, PAGE as usize); }
+        if pmm::free_frame(lease[i]).is_err() { return false; }
+        OWNED[i].store(0, Ordering::Release);
+    }
+    if pmm::free_frame(lease[0]) != Err(pmm::FreeError::DoubleFree)
+        || pmm::statistics().allocated_frames
+            != ALLOCATED_BEFORE.load(Ordering::Acquire)
+        || OWNED.iter().any(|p| p.load(Ordering::Acquire) != 0)
+        || PREPARED.load(Ordering::Acquire)
+        || PRIVATE_ROOT.load(Ordering::Acquire) != 0
+        || DATA_HHDM.load(Ordering::Acquire) != 0
+        || root_phys() != boot
+    { return false; }
+    true
+}
+
 /// BSP-only result attestation; no AP prints serial logs or manipulates PMM.
 pub(crate) fn verify_bsp() -> bool {
     if !PREPARED.load(Ordering::Acquire) || !local_ok()
@@ -409,7 +509,14 @@ pub(crate) fn verify_bsp() -> bool {
             || (shadow[slot] & (PRESENT | USER)) != (PRESENT | USER)
             || shadow[256..].iter().any(|e| e & USER != 0)
         { return false; }
-        if cfg!(feature = "ap-ring3-elf-smoke") {
+        if cfg!(feature = "ap-ring3-elf-reclaim-smoke") {
+            if !reclaim_completed_ap() { return false; }
+            serial::write_fmt(format_args!(
+                "WOLFOS_AP_RING3_ELF_REAP_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} linked_elf=1 et_exec=1 pt_load=2 ap_cpl3=1 int80=2 iret_to_cpl3=1 ap_private_cr3=1 ap_restored_boot_cr3=1 bsp_boot_cr3=1 root_exclusive=1 cr3_flush=1 high_half_supervisor=1 boot_user_slot_empty=1 scrubbed=7 frames_freed=7 pmm_no_leak=1 stale_root_revoked=1 double_free_denied=1\n",
+                index, BSP_LAPIC.load(Ordering::Acquire),
+                TARGET_LAPIC.load(Ordering::Acquire),
+            ));
+        } else if cfg!(feature = "ap-ring3-elf-smoke") {
             serial::write_fmt(format_args!(
                 "WOLFOS_AP_RING3_ELF_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 linked_elf=1 et_exec=1 pt_load=2 derived_pages=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 ap_private_cr3=1 bsp_boot_cr3=1 kernel_supervisor_pml4=1 boot_user_slot_empty=1 ap_restored_boot_cr3=1 rx=1 rw_nx=2 frames_pinned=7\n",
                 index, BSP_LAPIC.load(Ordering::Acquire),
