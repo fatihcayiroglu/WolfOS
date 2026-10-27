@@ -10,6 +10,8 @@
 //! ELF64 bytes and materializes two derived PT_LOAD pages, with the same
 //! real AP CR3/INT80/IRETQ checks. An opt-in one-owner terminal flavor
 //! proves AP CR3 departure before BSP scrubs/releases all seven pages.
+//! The multi-owner flavor additionally requires two other APs to load the
+//! same root in CPL0 and physically depart before ANY frame is freed.
 //! Other flavors deliberately leave their 6/7 PMM pages pinned.
 use core::arch::{asm, x86_64::__cpuid};
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64,
@@ -77,6 +79,17 @@ static TRAPS: AtomicUsize = AtomicUsize::new(0);
 static FINISHED: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
 static OWNED: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+#[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+static BORROWER_MASK: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+static BORROWER_LAPICS: [AtomicU32; CPUS] = [const { AtomicU32::new(u32::MAX) }; CPUS];
+#[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+static BORROWED_ENTERED: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+static BORROWED_LEFT: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+static BORROWER_RELEASE: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn target_index() -> usize { TARGET.load(Ordering::Acquire) }
 
@@ -279,14 +292,100 @@ pub(crate) fn prepare_bsp(hhdm: u64, bsp_lapic: u32, cpus: &[&MpInfo]) -> bool {
     for (i, frame) in frames.iter().copied().enumerate() {
         OWNED[i].store(frame, Ordering::Release);
     }
+    #[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+    {
+        let mask = cpus.iter().enumerate().filter(|(i, cpu)|
+            *i != target && cpu.lapic_id != bsp_lapic
+        ).fold(0u64, |mask, (i, _)| mask | (1u64 << i));
+        if mask.count_ones() != 2 || mask & (1u64 << target) != 0
+            || BORROWER_MASK.load(Ordering::Relaxed) != 0
+        { return false; }
+        for (i, cpu) in cpus.iter().enumerate() {
+            BORROWER_LAPICS[i].store(cpu.lapic_id, Ordering::Relaxed);
+        }
+        BORROWER_MASK.store(mask, Ordering::Release);
+    }
     PREPARED.store(true, Ordering::Release);
     true
+}
+
+/// Two additional APs borrow the same REAL private root in CPL0. Both
+/// independently load and later depart CR3; neither executes user ELF, and
+/// neither may free PMM frames or issue a coordinator-side fake ack.
+#[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+fn borrow_secondary(index: usize) {
+    if index >= CPUS || BORROWER_MASK.load(Ordering::Acquire) & (1u64 << index) == 0
+        || !PREPARED.load(Ordering::Acquire) || BAD.load(Ordering::Acquire)
+        || !local_ok() || current_lapic() != BORROWER_LAPICS[index].load(Ordering::Acquire)
+    { fail_ap(); }
+    let boot = BOOT_ROOT.load(Ordering::Acquire);
+    let private = PRIVATE_ROOT.load(Ordering::Acquire);
+    if boot == 0 || private == 0 || boot == private
+        || private & (PAGE - 1) != 0 || root_phys() != boot
+    { fail_ap(); }
+    // SAFETY: shared HIGH-HALF supervisor mappings were audited by BSP
+    // before AP launch; these APs run only trusted CPL0 code on pinned
+    // kernel stacks and cannot modify PMM or user leaves.
+    unsafe { asm!("mov cr3, {}", in(reg) private, options(nostack, preserves_flags)); }
+    if root_phys() != private { fail_ap(); }
+    BORROWED_ENTERED.fetch_or(1u64 << index, Ordering::Release);
+
+    for _ in 0..SPINS {
+        if BORROWER_RELEASE.load(Ordering::Acquire) { break; }
+        if BAD.load(Ordering::Acquire) { break; }
+        core::hint::spin_loop();
+    }
+    let authorized = BORROWER_RELEASE.load(Ordering::Acquire)
+        && !BAD.load(Ordering::Acquire);
+    // Even a timed-out borrower restores its own CR3. It never pretends to
+    // have completed the owner-bound release on an error.
+    unsafe { asm!("mov cr3, {}", in(reg) boot, options(nostack, preserves_flags)); }
+    if root_phys() != boot || !authorized { fail_ap(); }
+    BORROWED_LEFT.fetch_or(1u64 << index, Ordering::Release);
+}
+
+/// BSP never releases or scrubs leases until BOTH other APs have published
+/// real private CR3 observations, then both have switched back themselves.
+#[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+fn release_borrowers_after_target() -> bool {
+    let mask = BORROWER_MASK.load(Ordering::Acquire);
+    if mask.count_ones() != 2 || BAD.load(Ordering::Acquire)
+        || !FINISHED.load(Ordering::Acquire) || !PRIVATE_RESTORED.load(Ordering::Acquire)
+        || BORROWER_RELEASE.load(Ordering::Acquire)
+        || current_lapic() != BSP_LAPIC.load(Ordering::Acquire)
+        || root_phys() != BOOT_ROOT.load(Ordering::Acquire)
+    { return false; }
+    for _ in 0..SPINS {
+        if BAD.load(Ordering::Acquire) { return false; }
+        if BORROWED_ENTERED.load(Ordering::Acquire) == mask { break; }
+        core::hint::spin_loop();
+    }
+    if BORROWED_ENTERED.load(Ordering::Acquire) != mask
+        || BORROWED_LEFT.load(Ordering::Acquire) != 0
+    { return false; }
+    BORROWER_RELEASE.store(true, Ordering::Release);
+    for _ in 0..SPINS {
+        if BAD.load(Ordering::Acquire) { return false; }
+        if BORROWED_LEFT.load(Ordering::Acquire) == mask { break; }
+        core::hint::spin_loop();
+    }
+    BORROWED_LEFT.load(Ordering::Acquire) == mask
+        && BORROWED_ENTERED.load(Ordering::Acquire) == mask
+        && !BAD.load(Ordering::Acquire)
 }
 
 /// Executed only by the first non-BSP AP after completing its ordinary
 /// boot context/scheduler work. On success this never returns.
 pub(crate) fn secondary(index: usize) {
-    if index != target_index() { return; }
+    if index != target_index() {
+        #[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+        if index < CPUS
+            && BORROWER_MASK.load(Ordering::Acquire) & (1u64 << index) != 0
+        {
+            borrow_secondary(index);
+        }
+        return;
+    }
     let Some((user_cs, user_ss, rsp0)) =
         interrupts::ap_ring3_cpu_state(index) else { fail_ap(); };
     let text = USER_RIP.load(Ordering::Acquire);
@@ -522,6 +621,14 @@ fn reclaim_completed_ap() -> bool {
         ));
         return false;
     }
+    #[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+    {
+        let mask = BORROWER_MASK.load(Ordering::Acquire);
+        if mask.count_ones() != 2 || !BORROWER_RELEASE.load(Ordering::Acquire)
+            || BORROWED_ENTERED.load(Ordering::Acquire) != mask
+            || BORROWED_LEFT.load(Ordering::Acquire) != mask
+        { return reclaim_fail("borrowers_still_live"); }
+    }
     // No guest may re-enter: AP has already retired from this root.
     // Revoke all lease references before the FIRST physical-frame free.
     PREPARED.store(false, Ordering::SeqCst);
@@ -567,6 +674,8 @@ pub(crate) fn verify_bsp() -> bool {
         || pmm::statistics().allocated_frames
             != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
     { return false; }
+    #[cfg(feature = "ap-ring3-elf-multi-owner-smoke")]
+    if !release_borrowers_after_target() { return false; }
     if cfg!(feature = "ap-ring3-private-cr3-smoke") {
         let slot = USER_SLOT.load(Ordering::Acquire);
         let boot = BOOT_ROOT.load(Ordering::Acquire);
@@ -586,11 +695,19 @@ pub(crate) fn verify_bsp() -> bool {
         if cfg!(feature = "ap-ring3-elf-reclaim-smoke") {
             #[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
             if !reclaim_completed_ap() { return false; }
-            serial::write_fmt(format_args!(
-                "WOLFOS_AP_RING3_ELF_REAP_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} linked_elf=1 et_exec=1 pt_load=2 ap_cpl3=1 int80=2 iret_to_cpl3=1 ap_private_cr3=1 ap_restored_boot_cr3=1 bsp_boot_cr3=1 root_exclusive=1 cr3_flush=1 high_half_supervisor=1 boot_user_slot_empty=1 scrubbed=7 frames_freed=7 pmm_no_leak=1 stale_root_revoked=1 double_free_denied=1\n",
-                index, BSP_LAPIC.load(Ordering::Acquire),
-                TARGET_LAPIC.load(Ordering::Acquire),
-            ));
+            if cfg!(feature = "ap-ring3-elf-multi-owner-smoke") {
+                serial::write_fmt(format_args!(
+                    "WOLFOS_AP_RING3_ELF_MULTI_REAP_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} linked_elf=1 et_exec=1 pt_load=2 ap_cpl3=1 int80=2 iret_to_cpl3=1 ap_private_cr3=1 ap_restored_boot_cr3=1 cpl0_borrowers=2 borrower_cr3_entered=2 borrower_cr3_departed=2 all_user_cr3_departed=1 cr3_flushes=3 bsp_boot_cr3=1 root_exclusive_after_departure=1 high_half_supervisor=1 boot_user_slot_empty=1 scrubbed=7 frames_freed=7 pmm_no_leak=1 stale_root_revoked=1 double_free_denied=1\n",
+                    index, BSP_LAPIC.load(Ordering::Acquire),
+                    TARGET_LAPIC.load(Ordering::Acquire),
+                ));
+            } else {
+                serial::write_fmt(format_args!(
+                    "WOLFOS_AP_RING3_ELF_REAP_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} linked_elf=1 et_exec=1 pt_load=2 ap_cpl3=1 int80=2 iret_to_cpl3=1 ap_private_cr3=1 ap_restored_boot_cr3=1 bsp_boot_cr3=1 root_exclusive=1 cr3_flush=1 high_half_supervisor=1 boot_user_slot_empty=1 scrubbed=7 frames_freed=7 pmm_no_leak=1 stale_root_revoked=1 double_free_denied=1\n",
+                    index, BSP_LAPIC.load(Ordering::Acquire),
+                    TARGET_LAPIC.load(Ordering::Acquire),
+                ));
+            }
         } else if cfg!(feature = "ap-ring3-elf-smoke") {
             serial::write_fmt(format_args!(
                 "WOLFOS_AP_RING3_ELF_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 linked_elf=1 et_exec=1 pt_load=2 derived_pages=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 ap_private_cr3=1 bsp_boot_cr3=1 kernel_supervisor_pml4=1 boot_user_slot_empty=1 ap_restored_boot_cr3=1 rx=1 rw_nx=2 frames_pinned=7\n",
