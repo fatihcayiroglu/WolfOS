@@ -154,11 +154,14 @@ struct SourceCell(UnsafeCell<PmmSource>);
 unsafe impl Sync for SourceCell {}
 static SOURCE: SourceCell = SourceCell(UnsafeCell::new(PmmSource));
 static SOURCE_BUSY: AtomicBool = AtomicBool::new(false);
+const USER_CPUS: usize = if cfg!(feature = "user-elf-smp-ipi-retire-smoke") { 4 } else { 1 };
 type ActiveElf =
-    crate::active_address_space::ActiveAddressSpace<'static, PmmSource, PROCESS_FRAME_CAPACITY, 1>;
+    crate::active_address_space::ActiveAddressSpace<'static, PmmSource, PROCESS_FRAME_CAPACITY, USER_CPUS>;
 struct LiveElf {
     owner: ActiveElf,
     ticket: crate::address_space_retirement::Ticket,
+    #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+    ap_tickets: [Option<crate::address_space_retirement::Ticket>; 4],
 }
 struct OwnerCell(UnsafeCell<Option<LiveElf>>);
 // SAFETY: only this BSP IF=0 launch/terminal-exit path accesses the slot.
@@ -741,7 +744,7 @@ pub extern "C" fn enter(hhdm: u64) -> ! {
         // kernel graft audits above precede the FIRST exposure to a CPU.
         // All private leaves are non-global; PCID and interrupts are off.
         // Borrowed kernel tables remain pinned under Limine's boot root.
-        let mut owner = match tx.publish::<1>(pid, boot_cr3) {
+        let mut owner = match tx.publish::<USER_CPUS>(pid, boot_cr3) {
             Ok(owner) => owner,
             Err((tx, _)) => {
                 // Revoke the unpublished READY registry before rollback.
@@ -761,8 +764,40 @@ pub extern "C" fn enter(hhdm: u64) -> ! {
                 fail("counted_launch_publish_refused")
             }
         };
-        let ticket = owner.reserve_cpu(0).unwrap_or_else(|_| fail("launch_cpu_reservation"));
-        *LIVE_ELF.0.get() = Some(LiveElf { owner, ticket });
+        #[cfg(not(feature = "user-elf-smp-ipi-retire-smoke"))]
+        let bsp = 0;
+        #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+        let bsp = crate::user_elf_smp_ipi_retire_smoke::bsp_index();
+        let ticket = owner.reserve_cpu(bsp)
+            .unwrap_or_else(|_| fail("launch_cpu_reservation"));
+        #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+        let mut ap_tickets = [None; 4];
+        #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+        {
+            for cpu in 0..4 {
+                if cpu == bsp { continue; }
+                ap_tickets[cpu] = Some(owner.reserve_cpu(cpu)
+                    .unwrap_or_else(|_| fail("remote_ap_reservation")));
+            }
+            // No AP gets this ACTUAL ELF PML4 before its own reservation.
+            // APs verify their physical CR3 locally; BSP then confirms
+            // exactly those admitted tickets before exposing real Ring3.
+            if !crate::user_elf_smp_ipi_retire_smoke::publish_real_user_root(
+                frames[0], boot_cr3,
+            ) { fail("remote_ap_real_elf_cr3_load") }
+            for cpu in 0..4 {
+                if let Some(remote) = ap_tickets[cpu] {
+                    if owner.confirm_active(remote, frames[0]).is_err() {
+                        fail("remote_ap_real_elf_reservation_confirmation")
+                    }
+                }
+            }
+        }
+        *LIVE_ELF.0.get() = Some(LiveElf {
+            owner, ticket,
+            #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+            ap_tickets,
+        });
         compiler_fence(Ordering::SeqCst);
         asm!("mov cr3, {}", in(reg) frames[0],
             options(nostack, preserves_flags));
@@ -772,8 +807,14 @@ pub extern "C" fn enter(hhdm: u64) -> ! {
         if actual != frames[0] || live.owner.confirm_active(live.ticket, actual).is_err()
             || !live.owner.matches_process_lease_counted(pid, actual, &frames[..FRAMES])
         { fail("new_cr3_not_active_or_owned") }
+        #[cfg(not(feature = "user-elf-smp-ipi-retire-smoke"))]
         serial::write_fmt(format_args!(
             "WOLFOS_ELF_TX_ACTIVE_OK pid={} frames={} transferred_before_cr3=1 cpu_reserved=1 actual_cr3=1 full_bytes=1 pcid_off=1 bsp_only=1\n",
+            pid, FRAMES,
+        ));
+        #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_TX_ACTIVE_SMP_OK pid={} frames={} cpl3_bsp=1 ap_root_users=3 owner_reserved=4 local_cr3_observed=4\n",
             pid, FRAMES,
         ));
         if !matches!(PROCESS_TABLE.with(|t| t.mark_running(pid, frames[0])), Ok(Ok(()))) {
@@ -949,6 +990,21 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     if now.start_address().as_u64() != boot
         || live.owner.acknowledge_quiescent(live.ticket, now.start_address().as_u64()).is_err()
     { fail("boot_cr3_not_restored_or_acknowledged") }
+    #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+    {
+        if !crate::user_elf_smp_ipi_retire_smoke::release_real_user_root() {
+            fail("remote_ap_real_elf_root_still_live")
+        }
+        for cpu in 0..4 {
+            if let Some(remote) = live.ap_tickets[cpu] {
+                // Each AP has independently restored supervisor CR3 and
+                // published that observation on its permanent kernel stack.
+                if live.owner.acknowledge_quiescent(remote, boot).is_err() {
+                    fail("remote_ap_terminal_quiescent_ack")
+                }
+            }
+        }
+    }
     // The audited PID ledger authorizes release ONLY after CR3
     // restoration, only for this exact owning PID, exactly once.
     let owned_by_pid = match PROCESS_TABLE.with(|t| t.reap_with_status_counted(pid, boot)) {
@@ -985,44 +1041,60 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     // and cannot be resumed: its PID, cached user pointers and IRET path
     // were revoked above. A mere prior CR3 switch is not a post-publication
     // TLB acknowledgment.
-    let mut barrier = ShootdownBarrier::<1>::new(pid)
-        .unwrap_or_else(|_| fail("retire_tlb_barrier_identity"));
-    let round = live.owner.begin_retirement_shootdown(&mut barrier, 1)
-        .unwrap_or_else(|_| fail("retire_tlb_owner_publication"));
-    if barrier.completed(round)
-        || barrier.snapshot().pending != 1
-        || live.owner.finish_retirement()
-            != Err(crate::address_space_retirement::Error::OutstandingShootdown)
-        || pmm::statistics().allocated_frames
-            != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
-    { fail("retire_tlb_pending_must_pin_all_frames") }
-
-    let (supervisor_frame, flags) = Cr3::read();
-    if supervisor_frame.start_address().as_u64() != boot {
-        fail("retire_tlb_supervisor_root_mismatch")
+    #[cfg(not(feature = "user-elf-smp-ipi-retire-smoke"))]
+    {
+        let mut barrier = ShootdownBarrier::<1>::new(pid)
+            .unwrap_or_else(|_| fail("retire_tlb_barrier_identity"));
+        let round = live.owner.begin_retirement_shootdown(&mut barrier, 1)
+            .unwrap_or_else(|_| fail("retire_tlb_owner_publication"));
+        if barrier.completed(round)
+            || barrier.snapshot().pending != 1
+            || live.owner.finish_retirement()
+                != Err(crate::address_space_retirement::Error::OutstandingShootdown)
+            || pmm::statistics().allocated_frames
+                != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
+        { fail("retire_tlb_pending_must_pin_all_frames") }
+    
+        let (supervisor_frame, flags) = Cr3::read();
+        if supervisor_frame.start_address().as_u64() != boot {
+            fail("retire_tlb_supervisor_root_mismatch")
+        }
+        // SAFETY: actual BSP only, IF=0, PCID=0; this resident trusted boot
+        // frame is still active. All former private pages are non-global and
+        // no AP, DMA device or future Ring3 dispatch can use this root.
+        // Re-loading the boot root *after* publishing the shootdown round
+        // invalidates the BSP's non-global private translations.
+        unsafe { Cr3::write(supervisor_frame, flags); }
+        compiler_fence(Ordering::SeqCst);
+        if Cr3::read().0.start_address().as_u64() != boot
+            // SAFETY: authenticated BSP just completed its post-publication
+            // local CR3 reload for this exact opaque round and CPU index.
+            || unsafe { barrier.acknowledge_after_local_flush(round, 0) }.is_err()
+            || !barrier.completed(round)
+            || live.owner.finish_retirement_after_shootdown(&barrier, round).is_err()
+            || pmm::statistics().allocated_frames
+                != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
+        { fail("retire_tlb_bsp_flush_or_close") }
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_TX_TLB_OK pid={} cpus=1 real_cpl3=1 post_publish_cr3_reload=1 owner_round_complete=1 frames_pinned=1\n",
+            pid,
+        ));
     }
-    // SAFETY: actual BSP only, IF=0, PCID=0; this resident trusted boot
-    // frame is still active. All former private pages are non-global and
-    // no AP, DMA device or future Ring3 dispatch can use this root.
-    // Re-loading the boot root *after* publishing the shootdown round
-    // invalidates the BSP's non-global private translations.
-    unsafe { Cr3::write(supervisor_frame, flags); }
-    compiler_fence(Ordering::SeqCst);
-    if Cr3::read().0.start_address().as_u64() != boot
-        // SAFETY: authenticated BSP just completed its post-publication
-        // local CR3 reload for this exact opaque round and CPU index.
-        || unsafe { barrier.acknowledge_after_local_flush(round, 0) }.is_err()
-        || !barrier.completed(round)
-        || live.owner.finish_retirement_after_shootdown(&barrier, round).is_err()
-        || pmm::statistics().allocated_frames
-            != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
-    { fail("retire_tlb_bsp_flush_or_close") }
-    serial::write_fmt(format_args!(
-        "WOLFOS_ELF_TX_TLB_OK pid={} cpus=1 real_cpl3=1 post_publish_cr3_reload=1 owner_round_complete=1 frames_pinned=1\n",
-        pid,
-    ));
-    // SAFETY: this authenticated BSP restored boot CR3 with PCID off,
-    // completing local non-global invalidation. No AP ever received this root.
+    #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+    {
+        if !crate::user_elf_smp_ipi_retire_smoke::finish_owner_round(
+            &mut live.owner, pid,
+        ) { fail("elf_owner_remote_ipi_retirement_incomplete") }
+        serial::write_fmt(format_args!(
+            "WOLFOS_ELF_TX_TLB_SMP_OK pid={} cpus=4 real_cpl3_bsp=1 remote_cr3_reload_ipis=3 withheld_last=1 frames_pinned=1\n",
+            pid,
+        ));
+    }
+    // SAFETY: BSP restored boot CR3 with PCID off. The isolated SMP flavor
+    // also authenticated three AP private-root loads, their terminal
+    // departures, owner-bound remote IPI CR3 flushes, EOIs and offline state.
+    // All four CPUs completed the exact retirement round BEFORE reclaim;
+    // the default ELF flavor still uses only BSP and no AP receives its root.
     // Terminal EXIT/#UD/#PF never IRET to the old TSS-stack trap frame; this
     // path has no saved scheduler contexts, queued resumes, walkers or DMA.
     // The PID record and user-copy/return caches are revoked above. All raw
@@ -1048,6 +1120,10 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     }
     if pmm::statistics().allocated_frames != ALLOCATED_BEFORE.load(Ordering::Acquire)
     { fail("pmm_frame_leak") }
+    #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+    serial::write_line(
+        "WOLFOS_ELF_SMP_IPI_REAP_OK cpus=4 real_cpl3_bsp=1 ap_cpl0_root_borrowers=3 owner_bound=1 remote_ipis=3 eois=3 remote_cr3_flushes=3 bsp_cr3_flush=1 last_ap_withheld=1 premature_free=0 frames_freed=7 pmm_no_leak=1 offline=3",
+    );
     serial::write_fmt(format_args!(
         "WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed={} pmm_no_leak=1\n",
         FRAMES,
