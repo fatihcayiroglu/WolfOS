@@ -35,6 +35,7 @@ use crate::{
     user_syscall_abi::{self,UserSyscallFrame},
     user_ring_entry::{self,Ring3Entry},
     user_fx_bank::{FxImage,FxHandle,UserFxBank},
+    user_saved_frame_ledger::{Binding as SavedBinding,SavedFrameLedger},
     fx_state,kernel_half_shadow,interrupts,pmm,serial,
 };
 #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
@@ -162,6 +163,7 @@ struct Runtime{
     fx_tokens:[FxHandle;COUNT],
     control:fx_state::OriginalControl,
     frames:[u64;COUNT],
+    saved:SavedFrameLedger<COUNT>,
     current:usize,
     yields:[u64;COUNT],
     exits:[bool;COUNT],
@@ -373,9 +375,11 @@ pub extern "C" fn observe_timer_irq(
             fail("four_live_quantum_selected_wrong_user")
         }
         s.frames[i]=raw as u64;
+        capture_saved_trap(s,i,raw);
         if s.processes.park_running(pid,s.leases[i][0]).is_err() {
             fail("involuntary_park_running_pid")
         }
+        verify_saved_resume(s,next);
         if unsafe{s.fx.switch_to(s.fx_tokens[next])}.is_err()
             || s.fx.image_xmm0(s.fx_tokens[i])!=Ok(USER_ID[i]) {
             fail("involuntary_fx_state_save_restore")
@@ -494,9 +498,11 @@ fn irq_wake_blocked_user(
         1,s.leases[0][0],&s.leases[0]
     ).is_err(){fail("real_IRQ_woken_pid_lease_mismatch")}
     s.frames[1]=raw as u64;
+    capture_saved_trap(s,1,raw);
     if s.processes.park_running(2,outgoing_root).is_err(){
         fail("real_IRQ_source_process_not_parked")
     }
+    verify_saved_resume(s,0);
     if unsafe{s.fx.switch_to(s.fx_tokens[0])}.is_err()
         || s.fx.image_xmm0(s.fx_tokens[1])!=Ok(USER_ID[1]){
         fail("real_IRQ_fx_state_not_saved")
@@ -549,6 +555,55 @@ fn acknowledge_validated_timer_irq(s:&mut Runtime, i:usize){
 
 fn active()->&'static mut Runtime{
     unsafe{(*RUNTIME.0.get()).as_mut().unwrap_or_else(||fail("not_started"))}
+}
+
+/// The same generation-tagged guarded stack must retain the exact IRET
+/// slot for this PID across every real IRQ/INT80 scheduling handoff.
+fn saved_binding(s:&Runtime, i:usize)->SavedBinding{
+    let st=s.stacks[i];
+    SavedBinding {
+        pid:(i+1) as u64,
+        stack_generation:st.handle.generation,
+        root:s.leases[i][0],
+        stack_bottom:st.bottom,
+        stack_top:st.top,
+        frame_at:st.top-user_syscall_abi::FRAME_BYTES as u64,
+    }
+}
+
+/// Read-only gate BEFORE any target CR3/TSS/FX operation. No stale frame,
+/// wrong stack generation or altered GPR/IRET word may be resumed, even if
+/// its pointer happens to be at the expected high-half stack address.
+fn verify_saved_resume(s:&Runtime, next:usize){
+    let st=s.stacks[next];
+    let expected=saved_binding(s,next);
+    let address=s.frames[next];
+    if s.exits[next] || address!=expected.frame_at
+        || s.arena.inspect(st.handle)!=Ok(st)
+        || s.processes.snapshot(expected.pid).is_none_or(|p|
+            p.state!=ProcessState::Ready
+            ||p.cr3_root!=expected.root
+            ||p.owned_frames()!=&s.leases[next][..]) {
+        fail("saved_resume_owner_stack_or_frame_address")
+    }
+    // SAFETY: the exact supervisor-only stack mapping is still leased by
+    // the guarded arena, visible in all private CR3 roots, and the address
+    // was checked BEFORE dereference. All accesses are BSP-only with IF=0.
+    let observed=unsafe{&*(address as *const UserSyscallFrame)};
+    if s.saved.verify_resume(next,expected,observed).is_err(){
+        fail("saved_resume_gpr_iret_snapshot_diverged")
+    }
+}
+
+fn capture_saved_trap(s:&mut Runtime, i:usize, raw:*const UserSyscallFrame){
+    let expected=saved_binding(s,i);
+    if raw as u64!=expected.frame_at {fail("saved_capture_wrong_stack_frame")}
+    // SAFETY: real INT80/timer entry authenticated the live PID, hardware
+    // CPL3 IRET frame, CR3, TSS and FX ownership before reaching this helper.
+    let frame=unsafe{*raw};
+    if s.saved.capture_authenticated_trap(i,expected,frame).is_err(){
+        fail("saved_capture_stale_stack_generation")
+    }
 }
 
 fn entry(pid:usize)->u64{
@@ -1129,6 +1184,7 @@ pub fn enter(hhdm:u64)->!{
     #[cfg(not(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))))]
     let entry_flags=2u64;
     let mut saved_frames=[0u64;COUNT];
+    let mut saved=SavedFrameLedger::<COUNT>::new();
     for i in 1..COUNT {
         let st=stacks[i].unwrap_or_else(||fail("missing_user_stack"));
         let bootstrap=UserSyscallFrame{
@@ -1143,6 +1199,14 @@ pub fn enter(hhdm:u64)->!{
         // No other CPU/user process can access this pre-IRET frame.
         unsafe{(frame as *mut UserSyscallFrame).write(bootstrap);}
         saved_frames[i]=frame;
+        saved.record_bootstrap(i,SavedBinding {
+            pid:(i+1) as u64,
+            stack_generation:st.handle.generation,
+            root:leases[i][0],
+            stack_bottom:st.bottom,
+            stack_top:st.top,
+            frame_at:frame,
+        },bootstrap).unwrap_or_else(|_|fail("bootstrap_frame_identity"));
     }
     #[cfg(any(feature = "p2-ring3-timer-preempt-smoke",
               feature = "p3-ring3-event-wait-hardware-smoke"))]
@@ -1161,7 +1225,7 @@ pub fn enter(hhdm:u64)->!{
         leases,stacks:stacks.map(|x|x.unwrap_or_else(||fail("missing_runtime_stack"))),
         arena,processes,fx,
         fx_tokens:tokens.map(|x|x.unwrap_or_else(||fail("missing_fx_image"))),
-        control,frames:saved_frames,current:0,
+        control,frames:saved_frames,saved,current:0,
         yields:[0;COUNT],exits:[false;COUNT],hardware_traps:0,
         #[cfg(any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke")))]
         pic_before,
@@ -1521,7 +1585,23 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         }
         s.exits[i]=true;
     }
+    let previously_saved=s.frames[i]!=0;
     s.frames[i]=raw as u64;
+    if s.exits[i] {
+        // PID1's first assembly-created frame may EXIT without ever having
+        // been suspended or published in the saved-frame ledger. Every
+        // seeded peer and every previously parked PID must be revoked.
+        if previously_saved {
+            let binding=saved_binding(s,i);
+            if s.saved.revoke(i,binding).is_err(){
+                fail("exited_saved_frame_not_revoked")
+            }
+        }else if i!=0 {
+            fail("unregistered_peer_frame_at_exit")
+        }
+    }else{
+        capture_saved_trap(s,i,raw);
+    }
     s.hardware_traps+=1;
     if s.hardware_traps>TRAPS{fail("extra_user_trap")}
     #[cfg(feature="p3-ring3-event-wait-hardware-smoke")]
@@ -1793,6 +1873,7 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         ).is_err(){
         fail("next_trap_frame_not_owned")
     }
+    verify_saved_resume(s,next);
     // The target frame was either synthesized in its own kernel stack
     // before initial Ring3 entry, or captured from that PID's genuine
     // hardware INT80 on the same independently protected stack.
@@ -1846,6 +1927,7 @@ extern "C" fn finalize()->! {
         !s.exits.iter().all(|x|*x)||s.processes.running()!=0{
         fail("unsafe_cleanup_hardware_ownership")
     }
+    if s.saved.occupied()!=0 {fail("unrevoked_saved_iret_at_cleanup")}
     for i in 0..COUNT{
         let pid=i as u64+1;
         let p=s.processes.reap(pid,s.boot)
