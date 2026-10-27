@@ -86,6 +86,8 @@ jobs:
         run: make user-syscall-smoke
       - name: P2 independently linked ELF64 hello from real CPL3 with physical-frame cleanup
         run: make user-elf-run-smoke
+      - name: Real Ring3 ELF owner with 3 genuine CPL0 AP users and owner-bound remote IPI retirement
+        run: make user-elf-smp-ipi-retire-smoke
       - name: P2 real single-LOAD RX ELF executes in CPL3 with NX stack and exact six-frame reap
         run: make user-elf-one-load-run-smoke
       - name: P2 relocated two-PT ELF64 actually executes in CPL3, restores CR3 and reaps eight frames

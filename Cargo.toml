@@ -59,6 +59,9 @@ user-ring3-smoke = ["smoke-exit"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
+# BSP executes a genuine ELF64 CPL3 process while 3 APs briefly borrow its
+# audited PML4 in CPL0; terminal exit requires owner-bound remote IPI flushing.
+user-elf-smp-ipi-retire-smoke = ["user-elf-run-smoke"]
 # Genuine single RX PT_LOAD + isolated RW/NX stack in hardware CPL3, six PMM frames.
 user-elf-one-load-run-smoke = ["user-elf-run-smoke"]
 # Genuine relocated two-PT ELF64 in hardware CPL3, eight PMM frames; isolated QEMU gate.
