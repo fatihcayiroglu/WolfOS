@@ -394,6 +394,14 @@ pub extern "x86-interrupt" fn interrupt_80(frame: InterruptStackFrame) {
 /// reclamation as a clean exit. The AP's kernel TSS.RSP0 is static BSS and
 /// stays mapped in the borrowed high-half during its permanent parked loop.
 #[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
+fn reclaim_fail(stage: &str) -> bool {
+    serial::write_fmt(format_args!(
+        "WOLFOS_AP_RING3_RECLAIM_FAIL stage={}\n", stage,
+    ));
+    false
+}
+
+#[cfg(feature = "ap-ring3-elf-reclaim-smoke")]
 fn reclaim_completed_ap() -> bool {
     if !local_ok() || !PREPARED.load(Ordering::Acquire)
         || !FINISHED.load(Ordering::Acquire)
@@ -401,7 +409,7 @@ fn reclaim_completed_ap() -> bool {
         || BAD.load(Ordering::Acquire)
         || !PRIVATE_RESTORED.load(Ordering::Acquire)
         || current_lapic() != BSP_LAPIC.load(Ordering::Acquire)
-    { return false; }
+    { return reclaim_fail("state"); }
     let boot = BOOT_ROOT.load(Ordering::Acquire);
     let private = PRIVATE_ROOT.load(Ordering::Acquire);
     let hhdm = HHDM_BASE.load(Ordering::Acquire);
@@ -415,11 +423,11 @@ fn reclaim_completed_ap() -> bool {
             *frame == 0 || (*frame & (PAGE - 1)) != 0
             || *frame >= (1u64 << 52) || *frame == boot
             || lease[..i].contains(frame))
-    { return false; }
-    let Some(boot_ptr) = hhdm_ptr(hhdm, boot) else { return false; };
+    { return reclaim_fail("lease"); }
+    let Some(boot_ptr) = hhdm_ptr(hhdm, boot) else { return reclaim_fail("boot_hhdm"); };
     let mut pointers = [core::ptr::null_mut::<u8>(); 7];
     for (i, frame) in lease.iter().copied().enumerate() {
-        let Some(ptr) = hhdm_ptr(hhdm, frame) else { return false; };
+        let Some(ptr) = hhdm_ptr(hhdm, frame) else { return reclaim_fail("frame_hhdm"); };
         pointers[i] = ptr;
     }
     // All page-table and final nonce observations happen BEFORE any free.
@@ -447,7 +455,38 @@ fn reclaim_completed_ap() -> bool {
             && pointers[4] as u64 == DATA_HHDM.load(Ordering::Acquire)
             && pointers[4].read_volatile() == 0x22
     };
-    if !mapping_ok { return false; }
+    if !mapping_ok {
+        // Fail-only bitmask: root, page-table and post-trap nonce audit.
+        let faults = unsafe {
+            let source = &*boot_ptr.cast::<[u64; 512]>();
+            let shadow = &*pointers[6].cast::<[u64; 512]>();
+            let pdpt = &*pointers[0].cast::<[u64; 512]>();
+            let pd = &*pointers[1].cast::<[u64; 512]>();
+            let pt = &*pointers[2].cast::<[u64; 512]>();
+            let entry = lease[0] | PRESENT | WRITE | USER;
+            let mut bits = 0u32;
+            if source[slot] != 0 { bits |= 1; }
+            if shadow[slot] != entry { bits |= 2; }
+            if shadow[..256].iter().filter(|e| **e != 0).count() != 1 { bits |= 4; }
+            if kernel_half_shadow::audit_kernel_half(source, shadow, slot, entry, &lease)
+                != Ok(KERNEL_GRAFTS.load(Ordering::Acquire)) { bits |= 8; }
+            if pdpt[0] != lease[1] | PRESENT | WRITE | USER { bits |= 16; }
+            if pdpt.iter().filter(|e| **e != 0).count() != 1 { bits |= 32; }
+            if pd[2] != lease[2] | PRESENT | WRITE | USER { bits |= 64; }
+            if pd.iter().filter(|e| **e != 0).count() != 1 { bits |= 128; }
+            if pt[1] != lease[3] | PRESENT | USER { bits |= 256; }
+            if pt[2] != lease[4] | PRESENT | WRITE | USER | NX { bits |= 512; }
+            if pt[3] != lease[5] | PRESENT | WRITE | USER | NX { bits |= 1024; }
+            if pt.iter().filter(|e| **e != 0).count() != 3 { bits |= 2048; }
+            if pointers[4] as u64 != DATA_HHDM.load(Ordering::Acquire) { bits |= 4096; }
+            if pointers[4].read_volatile() != 0x22 { bits |= 8192; }
+            bits
+        };
+        serial::write_fmt(format_args!(
+            "WOLFOS_AP_RING3_RECLAIM_FAIL stage=mapping fault_mask={}\n", faults,
+        ));
+        return false;
+    }
     // No guest may re-enter: AP has already retired from this root.
     // Revoke all lease references before the FIRST physical-frame free.
     PREPARED.store(false, Ordering::SeqCst);
@@ -460,7 +499,7 @@ fn reclaim_completed_ap() -> bool {
         // SAFETY: exclusive PMM lease, authenticated pages and no CPU
         // referencing the private CR3. HHDM remains supervisor-mapped.
         unsafe { core::ptr::write_bytes(pointers[i], 0, PAGE as usize); }
-        if pmm::free_frame(lease[i]).is_err() { return false; }
+        if pmm::free_frame(lease[i]).is_err() { return reclaim_fail("pmm_free"); }
         OWNED[i].store(0, Ordering::Release);
     }
     if pmm::free_frame(lease[0]) != Err(pmm::FreeError::DoubleFree)
@@ -471,7 +510,7 @@ fn reclaim_completed_ap() -> bool {
         || PRIVATE_ROOT.load(Ordering::Acquire) != 0
         || DATA_HHDM.load(Ordering::Acquire) != 0
         || root_phys() != boot
-    { return false; }
+    { return reclaim_fail("final"); }
     true
 }
 
