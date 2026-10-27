@@ -152,7 +152,7 @@ pub fn initialize_secondary(index: usize) -> bool {
     idt.page_fault.set_handler_fn(ap_page_fault);
     // The isolated directed-IPI QEMU flavor installs two external vectors
     // only on secondary CPUs. Its handler EOIs the *receiving* local APIC.
-    #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "ap-local-timer-smoke",
+    #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
                feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
     {
