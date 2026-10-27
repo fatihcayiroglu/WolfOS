@@ -20,6 +20,7 @@ pub enum Error {
     InvalidCpuCount,
     InvalidGeneration,
     InvalidTargets,
+    MissingRequiredTargets,
     Busy,
     InvalidCpu,
     UnexpectedCpu,
@@ -82,10 +83,23 @@ impl<const CPUS: usize> ShootdownBarrier<CPUS> {
         }
     }
 
-    /// Called under the coordinator lock after unsafe address-space
-    /// reuse is blocked. Publish the returned round to its complete target
-    /// set before accepting any participant acknowledgement. No zero-target round may authorize cleanup.
+    /// Legacy round start: every requested CPU is mandatory, but callers
+    /// are responsible for deriving a complete, authenticated target set.
+    /// See begin_covering() when a separate required target mask is known.
     pub fn begin(&mut self, targets: u64) -> Result<Round, Error> {
+        self.begin_covering(targets, targets)
+    }
+
+    /// Fail closed if an independently established required CPU mask would
+    /// be omitted from the new round. The required set must be a nonempty,
+    /// authenticated *conservative* superset of possible stale TLB users;
+    /// derive it under the same coordinator lock as publication/retirement.
+    ///
+    /// This only validates metadata, not CPU participation, IPI delivery or
+    /// hardware invalidation. A missing/offline required CPU must remain
+    /// pending until an independent quiescence protocol proves it safe.
+    /// Rejection never advances the epoch or mutates a completed round.
+    pub fn begin_covering(&mut self, targets: u64, required: u64) -> Result<Round, Error> {
         if self.phase == Phase::Pending {
             return Err(Error::Busy);
         }
@@ -94,8 +108,13 @@ impl<const CPUS: usize> ShootdownBarrier<CPUS> {
         } else {
             (1u64 << CPUS) - 1
         };
-        if targets == 0 || targets & !allowed != 0 {
+        if targets == 0 || targets & !allowed != 0
+            || required == 0 || required & !allowed != 0
+        {
             return Err(Error::InvalidTargets);
+        }
+        if targets & required != required {
+            return Err(Error::MissingRequiredTargets);
         }
         let next = self.epoch.checked_add(1).ok_or(Error::EpochExhausted)?;
         self.epoch = next;
@@ -256,6 +275,66 @@ mod tests {
         assert!(!barrier.completed(second));
         ack(&mut barrier, second, 0).unwrap();
         assert!(barrier.completed(second));
+    }
+
+    #[test]
+    fn omitted_required_tlb_users_fail_closed_without_consuming_an_epoch() {
+        let mut barrier = ShootdownBarrier::<4>::new(7).unwrap();
+        let before = barrier.snapshot();
+        for (targets, required, expected) in [
+            (0b0011, 0b0101, Error::MissingRequiredTargets),
+            (0b0001, 0b0101, Error::MissingRequiredTargets),
+            (0b1111, 0, Error::InvalidTargets),
+            (0b1111, 1u64 << 4, Error::InvalidTargets),
+            (0, 0b0011, Error::InvalidTargets),
+            (1u64 << 4, 0b0011, Error::InvalidTargets),
+        ] {
+            assert_eq!(barrier.begin_covering(targets, required), Err(expected));
+            assert_eq!(barrier.snapshot(), before);
+        }
+        let round = barrier.begin_covering(0b1111, 0b0101).unwrap();
+        assert_eq!(barrier.snapshot().targets, 0b1111);
+        for cpu in [0, 1, 2] {
+            ack(&mut barrier, round, cpu).unwrap();
+            assert!(!barrier.completed(round));
+        }
+        assert_eq!(barrier.snapshot().pending, 0b1000);
+        let pending = barrier.snapshot();
+        assert_eq!(barrier.begin_covering(0b1111, 0b1111), Err(Error::Busy));
+        assert_eq!(barrier.snapshot(), pending);
+        ack(&mut barrier, round, 3).unwrap();
+        assert!(barrier.completed(round));
+
+        let completed = barrier.snapshot();
+        assert_eq!(
+            barrier.begin_covering(0b0011, 0b0111),
+            Err(Error::MissingRequiredTargets)
+        );
+        assert_eq!(barrier.snapshot(), completed);
+        let next = barrier.begin_covering(0b0111, 0b0111).unwrap();
+        assert!(!barrier.completed(round));
+        assert_eq!(barrier.snapshot().epoch, completed.epoch + 1);
+        for cpu in [0, 1, 2] {
+            ack(&mut barrier, next, cpu).unwrap();
+        }
+        assert!(barrier.completed(next));
+    }
+
+    #[test]
+    fn mandatory_high_cpu_63_cannot_be_silently_omitted() {
+        let mut barrier = ShootdownBarrier::<64>::new(11).unwrap();
+        assert_eq!(
+            barrier.begin_covering(0b0011, 1u64 << 63),
+            Err(Error::MissingRequiredTargets)
+        );
+        assert_eq!(barrier.snapshot().epoch, 0);
+        let round = barrier.begin_covering((1u64 << 63) | 0b0011, 1u64 << 63).unwrap();
+        ack(&mut barrier, round, 0).unwrap();
+        ack(&mut barrier, round, 1).unwrap();
+        assert!(!barrier.completed(round));
+        assert_eq!(barrier.snapshot().pending, 1u64 << 63);
+        ack(&mut barrier, round, 63).unwrap();
+        assert!(barrier.completed(round));
     }
 
     #[test]
