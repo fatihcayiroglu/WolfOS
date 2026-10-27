@@ -35,7 +35,11 @@ safe against a fault handler that itself calls PMM while the same thread
 holds the lock. It does not implement a complete interrupt-capable
 allocator or a general Ring3 process retirement protocol.
 
-The existing boot self-test normally begins with IF=0; that check is
-an invariant regression, **not** proof of IF=1 preemption. Future QEMU
-coverage should exercise an actual IRQ-enabled caller and timer pressure.
+The existing boot self-test normally begins with IF=0. Additionally the
+4-vCPU AP-local xAPIC timer QEMU smoke exercises 64 real PMM allocate/free
+roundtrips on each of three APs while each AP's timer is armed and IF=1.
+Every operation verifies IF was restored and the frame was released, and
+the coordinator checks exactly 192 successful probes alongside real timer
+IRQ delivery. This proves the IF=1 call path, but **does not** deterministically
+force an IRQ in the middle of a PMM critical section or bound lock latency.
 No real disks or hardware are accessed.
