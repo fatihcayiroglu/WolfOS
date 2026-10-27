@@ -10,10 +10,11 @@ PROOF = re.compile(
     r"^WOLFOS_TLB_SHOOTDOWN_HW_OK cpus=(\d+) aps=(\d+) rounds=(\d+) "
     r"sends=(\d+) invlpg=(\d+) acks=(\d+) eois=(\d+) bad=(\d+) "
     r"spurious=(\d+) offline=(\d+) epoch=(\d+) pending=(\d+) "
-    r"withheld=(\d+) blocked=(\d+) pcid=(\d+) freed=(\d+)$",
+    r"withheld=(\d+) blocked=(\d+) pcid=(\d+) freed=(\d+) "
+    r"remaps=(\d+) probe_invlpg=(\d+) probe_reads=(\d+)$",
     re.MULTILINE,
 )
-EXPECTED = (4, 3, 3, 9, 9, 9, 9, 0, 0, 3, 3, 0, 1, 1, 0, 0)
+EXPECTED = (4, 3, 3, 9, 9, 9, 9, 0, 0, 3, 3, 0, 1, 1, 0, 0, 2, 9, 9)
 FAILURES = (
     "WOLFOS_TLB_SHOOTDOWN_HW_ERROR",
     "WOLFOS_TLB_SHOOTDOWN_HW_TEST_FAILED",
@@ -73,7 +74,8 @@ def main() -> int:
         print("PASS: 4 genuine CPUs, 3 epochs, 9 hardware IPIs, "
               "9 recipient-local INVLPG instructions and serialized acks; "
               "withheld last IPI left barrier pending, blocked a new epoch, "
-              "then recovered; zero early reclamation")
+              "then recovered; zero early reclamation; 2 real PTE remaps and "
+              "9 recipient-local probe invalidations/verified marker reads")
         return 0
 
 

@@ -19,6 +19,16 @@ use crate::{ipi_layout, lapic_irq_layout, lapic_mmio, lapic_probe, pmm, serial,
 pub const VECTOR: u8 = ipi_layout::AP_IPI_VECTOR;
 pub const SPURIOUS: u8 = ipi_layout::SPURIOUS_VECTOR;
 pub(crate) const VA: u64 = 0x0000_4000_0000_3000;
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+pub(crate) const PROBE_VA: u64 = VA + 4096;
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+pub(crate) const PROBE_A_MARKER: u64 = 0x574f_4c46_4f53_4131;
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+pub(crate) const PROBE_B_MARKER: u64 = 0x574f_4c46_4f53_4232;
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+static PROBE_A_FRAME: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+static PROBE_B_FRAME: AtomicU64 = AtomicU64::new(0);
 const TIMER_LVT: usize = 0x320;
 const TIMER_MASK: u32 = 1 << 16;
 const PER_AP: u64 = 3;
@@ -49,6 +59,88 @@ unsafe impl FrameAllocator<Size4KiB> for TableAllocator {
         Some(PhysFrame::containing_address(PhysAddr::new(pmm::allocate_frame()?)))
     }
 }
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+struct NoTableAllocator;
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+unsafe impl FrameAllocator<Size4KiB> for NoTableAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> { None }
+}
+
+/// Two real PMM frames remain pinned for the entire isolated QEMU proof.
+/// No AP exists yet, so the BSP can install the first probe PTE exclusively.
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+fn prepare_probe_page(mapper: &mut OffsetPageTable<'_>, hhdm: u64) -> bool {
+    let Some(a) = pmm::allocate_frame() else { return false; };
+    let Some(b) = pmm::allocate_frame() else { return false; };
+    if a == b || a == 0 || b == 0 { return false; }
+    let Some(a_virtual) = hhdm.checked_add(a).and_then(|v| VirtAddr::try_new(v).ok())
+    else { return false; };
+    let Some(b_virtual) = hhdm.checked_add(b).and_then(|v| VirtAddr::try_new(v).ok())
+    else { return false; };
+    // SAFETY: exclusive allocated 4-KiB RAM frames; the HHDM gives a
+    // supervisor-only mapping of each and these two words fit in one page.
+    unsafe {
+        a_virtual.as_mut_ptr::<u64>().write_volatile(PROBE_A_MARKER);
+        b_virtual.as_mut_ptr::<u64>().write_volatile(PROBE_B_MARKER);
+    }
+    let va = VirtAddr::new(PROBE_VA);
+    if mapper.translate_addr(va).is_some() { return false; }
+    let page = Page::<Size4KiB>::containing_address(va);
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_EXECUTE;
+    // SAFETY: fresh unused supervisor-only test VA and an exclusive PMM
+    // frame. Newly allocated page-table frames stay pinned for this boot.
+    let Ok(flush) = (unsafe { mapper.map_to(
+        page, PhysFrame::containing_address(PhysAddr::new(a)),
+        flags, &mut TableAllocator,
+    ) }) else { return false; };
+    flush.flush();
+    if mapper.translate_addr(va).map(|p| p.as_u64()) != Some(a) {
+        return false;
+    }
+    PROBE_A_FRAME.store(a, Ordering::Release);
+    PROBE_B_FRAME.store(b, Ordering::Release);
+    true
+}
+
+/// BSP-only between completed IPI epochs; each AP previously observed the
+/// old PTE, and may retain its stale TLB entry until its next local INVLPG.
+/// Both old and new frames stay allocated; NO hardware quiescence is inferred.
+#[cfg(feature = "tlb-shootdown-hardware-smoke")]
+fn remap_probe_page(hhdm: u64, target: u64) -> bool {
+    if x86_64::instructions::interrupts::are_enabled() { return false; }
+    let a = PROBE_A_FRAME.load(Ordering::Acquire);
+    let b = PROBE_B_FRAME.load(Ordering::Acquire);
+    if a == 0 || b == 0 || a == b || (target != a && target != b) {
+        return false;
+    }
+    let expected_old = if target == b { a } else { b };
+    let (cr3, _) = Cr3::read();
+    let Some(pml4_virtual) = hhdm.checked_add(cr3.start_address().as_u64())
+        .and_then(|v| VirtAddr::try_new(v).ok()) else { return false; };
+    let Ok(hhdm_virtual) = VirtAddr::try_new(hhdm) else { return false; };
+    // SAFETY: only the BSP modifies this single test PTE, with IF=0.
+    // APs are alive but do not access the probe except inside directed IPI
+    // handlers; no IPI is sent until this remap is fully published.
+    let table = unsafe { &mut *pml4_virtual.as_mut_ptr::<PageTable>() };
+    let mut mapper = unsafe { OffsetPageTable::new(table, hhdm_virtual) };
+    let va = VirtAddr::new(PROBE_VA);
+    let page = Page::<Size4KiB>::containing_address(va);
+    let Ok((old, flush)) = mapper.unmap(page) else { return false; };
+    flush.flush();
+    if old.start_address().as_u64() != expected_old { return false; }
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE
+        | PageTableFlags::NO_EXECUTE;
+    // SAFETY: exact formerly-owned test VA, target is the other pinned
+    // unique PMM frame. No new paging hierarchy may be allocated.
+    let Ok(flush) = (unsafe { mapper.map_to(
+        page, PhysFrame::containing_address(PhysAddr::new(target)),
+        flags, &mut NoTableAllocator,
+    ) }) else { return false; };
+    flush.flush();
+    mapper.translate_addr(va).map(|p| p.as_u64()) == Some(target)
+}
+
 #[inline]
 pub(crate) unsafe fn read(offset: usize) -> u32 {
     unsafe { ((VA as usize + offset) as *const u32).read_volatile() }
@@ -171,6 +263,8 @@ pub fn prepare_bsp(bsp_id: u32, hhdm: u64, entries: &[&Entry], cpus: &[&MpInfo])
     flush.flush();
     if mapper.translate_addr(address).map(|a| a.as_u64()) != Some(base)
         || local_id() != bsp_id { return false; }
+    #[cfg(feature = "tlb-shootdown-hardware-smoke")]
+    if !prepare_probe_page(&mut mapper, hhdm) { return false; }
     for (i, cpu) in cpus.iter().enumerate() {
         IDS[i].store(cpu.lapic_id, Ordering::Relaxed);
         READY[i].store(false, Ordering::Relaxed);
@@ -417,7 +511,7 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
 /// in epoch 3 to prove the barrier cannot complete or begin a new epoch.
 /// Every actual acknowledgement follows recipient-local INVLPG.
 #[cfg(feature = "tlb-shootdown-hardware-smoke")]
-pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
+pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo], hhdm: u64) -> bool {
     use x86_64::registers::control::{Cr4, Cr4Flags};
     use crate::tlb_shootdown_hardware_smoke as hw;
 
@@ -469,7 +563,8 @@ pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
                 let missing = 1u64 << i;
                 if before.epoch != 3 || before.pending != missing
                     || before.completed || before.acks != 8
-                    || before.invlpg != 8 || before.per_cpu[i] != 2
+                    || before.invlpg != 8 || before.probe_invlpg != 8
+                    || before.probe_reads != 8 || before.per_cpu[i] != 2
                     || hw::begin_next() || hw::completed()
                 {
                     good = false;
@@ -503,7 +598,17 @@ pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
             }
         }
         if !hw::completed() { good = false; break; }
-        if round < 3 && !hw::begin_next() { good = false; break; }
+        if round < 3 {
+            let target = if round == 1 {
+                PROBE_B_FRAME.load(Ordering::Acquire)
+            } else {
+                PROBE_A_FRAME.load(Ordering::Acquire)
+            };
+            if !remap_probe_page(hhdm, target) || !hw::begin_next() {
+                good = false;
+                break;
+            }
+        }
     }
     unsafe { write(lapic_irq_layout::SPURIOUS_VECTOR_OFFSET, old_svr); }
     STOP.store(true, Ordering::Release);
@@ -530,19 +635,20 @@ pub fn verify_tlb_shootdown_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
     if good && offline && per_ap_ok && flush_ok && withheld_verified
         && sends == 9 && received == 9 && eois == 9
         && e.acks == 9 && e.invlpg == 9
+        && e.probe_invlpg == 9 && e.probe_reads == 9
         && e.epoch == 3 && e.targets == targets && e.pending == 0
         && e.completed && !e.bad && bad == 0 && spurious == 0
     {
         serial::write_fmt(format_args!(
-            "WOLFOS_TLB_SHOOTDOWN_HW_OK cpus=4 aps=3 rounds=3 sends=9 invlpg=9 acks=9 eois=9 bad=0 spurious=0 offline=3 epoch=3 pending=0 withheld=1 blocked=1 pcid=0 freed=0\n"
+            "WOLFOS_TLB_SHOOTDOWN_HW_OK cpus=4 aps=3 rounds=3 sends=9 invlpg=9 acks=9 eois=9 bad=0 spurious=0 offline=3 epoch=3 pending=0 withheld=1 blocked=1 pcid=0 freed=0 remaps=2 probe_invlpg=9 probe_reads=9\n"
         ));
         true
     } else {
         serial::write_fmt(format_args!(
-            "WOLFOS_TLB_SHOOTDOWN_HW_ERROR good={} offline={} per_ap={} flush_ok={} withheld={} sends={} seen={} eois={} acks={} invlpg={} epoch={} pending={} completed={} bad={} gate_bad={} spurious={}\n",
+            "WOLFOS_TLB_SHOOTDOWN_HW_ERROR good={} offline={} per_ap={} flush_ok={} withheld={} sends={} seen={} eois={} acks={} invlpg={} probe_invlpg={} probe_reads={} epoch={} pending={} completed={} bad={} gate_bad={} spurious={}\n",
             good, offline, per_ap_ok, flush_ok, withheld_verified, sends, received, eois,
-            e.acks, e.invlpg, e.epoch, e.pending, e.completed, bad, e.bad,
-            spurious,
+            e.acks, e.invlpg, e.probe_invlpg, e.probe_reads, e.epoch,
+            e.pending, e.completed, bad, e.bad, spurious,
         ));
         false
     }
