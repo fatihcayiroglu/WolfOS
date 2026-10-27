@@ -220,7 +220,18 @@ fn every_four_cpu_ack_order_pins_the_entire_batch_until_explicit_reclaim() {
                         assert_eq!(trace.borrow().owned.len(), 4);
                         owner.acknowledge_quiescent(tickets[cpu], 0x9000).unwrap();
                     }
-                    owner.finish_retirement().unwrap();
+                    // This is a host-only metadata simulation: the CPUs
+                    // above did not execute real CR3 writes or TLB flushes.
+                    // Multi-CPU history cannot use the legacy close path.
+                    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingShootdown));
+                    assert_eq!(owner.snapshot().phase, Phase::Retiring);
+                    assert!(trace.borrow().releases.is_empty());
+                    let mut barrier = ShootdownBarrier::<4>::new(7).unwrap();
+                    let round = owner.begin_retirement_shootdown(&mut barrier, 0b1111).unwrap();
+                    for cpu in order {
+                        unsafe { barrier.acknowledge_after_local_flush(round, cpu).unwrap() };
+                    }
+                    assert_eq!(owner.finish_retirement_after_shootdown(&barrier, round), Ok(()));
                     assert_eq!(owner.snapshot().phase, Phase::Retired);
                     assert!(trace.borrow().releases.is_empty());
                     assert_eq!(
@@ -264,7 +275,26 @@ fn retirement_racing_a_load_and_stale_ack_cannot_unpin_frames() {
     assert_eq!(owner.finish_retirement(), Err(Error::OutstandingCpus));
     assert!(trace.borrow().releases.is_empty());
     owner.acknowledge_quiescent(late, 0x9000).unwrap();
-    owner.finish_retirement().unwrap();
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingShootdown));
+    assert_eq!(owner.snapshot().phase, Phase::Retiring);
+    assert!(trace.borrow().releases.is_empty());
+    let mut barrier = ShootdownBarrier::<2>::new(7).unwrap();
+    // Even the unconfirmed, racing load's CPU must be in the target set.
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b10),
+        Err(RoundError::Shootdown(BarrierError::MissingRequiredTargets)),
+    );
+    let round = owner.begin_retirement_shootdown(&mut barrier, 0b11).unwrap();
+    // Simulated host acknowledgements; actual per-CPU TLB flushes are the
+    // separate responsibility of the QEMU hardware path.
+    unsafe { barrier.acknowledge_after_local_flush(round, 1).unwrap() };
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&barrier, round),
+        Err(Error::OutstandingShootdown),
+    );
+    assert!(trace.borrow().releases.is_empty());
+    unsafe { barrier.acknowledge_after_local_flush(round, 0).unwrap() };
+    assert_eq!(owner.finish_retirement_after_shootdown(&barrier, round), Ok(()));
     assert_eq!(
         reclaim(owner).ok(),
         Some(ReleaseReport {
@@ -272,6 +302,24 @@ fn retirement_racing_a_load_and_stale_ack_cannot_unpin_frames() {
             failed: 0
         })
     );
+}
+
+#[test]
+fn a_reused_single_cpu_remains_one_historical_target() {
+    // Host-only ledger validation. Reuse by the same CPU is not multicore
+    // history; it still requires separate hardware proof for unsafe reclaim.
+    let mut source = Source::new(&[0x1000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<1, 4>(&mut source, 0x1000);
+    for _ in 0..3 {
+        let ticket = owner.reserve_cpu(3).unwrap();
+        owner.confirm_active(ticket, 0x1000).unwrap();
+        owner.acknowledge_quiescent(ticket, 0x9000).unwrap();
+    }
+    owner.begin_retirement().unwrap();
+    assert_eq!(owner.finish_retirement(), Ok(()));
+    assert_eq!(reclaim(owner).ok(), Some(ReleaseReport { released: 1, failed: 0 }));
+    assert_eq!(trace.borrow().releases, [0x1000]);
 }
 
 #[test]

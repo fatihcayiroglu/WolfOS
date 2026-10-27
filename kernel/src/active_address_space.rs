@@ -214,11 +214,24 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         Ok(round)
     }
 
-    /// Legacy metadata close for owners that never published a TLB round.
-    /// Once a round has been published, this path permanently refuses to
-    /// bypass it, even when the caller separately sees zero active CPUs.
+    /// Legacy metadata close for an owner with no more than ONE historical
+    /// CPU user. Multi-CPU CR3 histories must publish and complete an owner-
+    /// bound retirement TLB round, even after all CPU tickets have drained.
+    /// This remains metadata only; a one-CPU caller still owes hardware proof
+    /// before invoking unsafe reclaim.
     pub fn finish_retirement(&mut self) -> Result<(), Error> {
         if self.retirement_round.is_some() {
+            return Err(Error::OutstandingShootdown);
+        }
+        // Preserve WrongPhase / OutstandingCpus / OutstandingContexts for
+        // earlier stages. Once otherwise finishable, refuse a multi-CPU
+        // legacy close rather than losing the chance to publish a TLB round.
+        let cpus = self.gate.snapshot();
+        if cpus.phase == Phase::Retiring
+            && cpus.reserved == 0 && cpus.active == 0
+            && self.contexts.snapshot().pending == 0
+            && self.gate.potential_tlb_users().count_ones() > 1
+        {
             return Err(Error::OutstandingShootdown);
         }
         self.finish_retirement_inner()
