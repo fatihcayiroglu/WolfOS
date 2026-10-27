@@ -77,6 +77,8 @@ else ifeq ($(FLAVOR),user-elf-run)
 FEATURES := --features user-elf-run-smoke
 else ifeq ($(FLAVOR),user-elf-smp-ipi-retire)
 FEATURES := --features user-elf-smp-ipi-retire-smoke
+else ifeq ($(FLAVOR),user-elf-smp-ipi-missing-ack)
+FEATURES := --features user-elf-smp-ipi-missing-ack-smoke
 else ifeq ($(FLAVOR),user-elf-one-load-run)
 FEATURES := --features user-elf-one-load-run-smoke
 else ifeq ($(FLAVOR),user-elf-two-pt-run)
@@ -342,6 +344,11 @@ user-elf-smp-ipi-retire-smoke:
 	$(MAKE) iso FLAVOR=user-elf-smp-ipi-retire
 	python3 scripts/user_elf_smp_ipi_retire_smoke.py $(OUT)/wolfos-user-elf-smp-ipi-retire.iso
 
+.PHONY: user-elf-smp-ipi-missing-ack-smoke
+user-elf-smp-ipi-missing-ack-smoke:
+	$(MAKE) iso FLAVOR=user-elf-smp-ipi-missing-ack
+	python3 scripts/user_elf_smp_ipi_missing_ack_smoke.py $(OUT)/wolfos-user-elf-smp-ipi-missing-ack.iso
+
 user-elf-two-pt-run-smoke:
 	$(MAKE) iso FLAVOR=user-elf-two-pt-run
 	python3 scripts/user_elf_run_smoke.py $(OUT)/wolfos-user-elf-two-pt-run.iso --two-pt
@@ -496,6 +503,7 @@ test:
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_local_timer_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_smp_retirement_ipi_hardware_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_elf_smp_ipi_retire_smoke.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_elf_smp_ipi_missing_ack_smoke.py' -v
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/ap_preempt_progress_budget.rs -o $(OUT)/ap_preempt_progress_budget_tests
 	$(OUT)/ap_preempt_progress_budget_tests
