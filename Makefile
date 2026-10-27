@@ -570,6 +570,8 @@ test:
 	$(OUT)/ring3_irq_eoi_ledger_tests
 	rustc --edition=2024 --test kernel/src/user_irq_preempt_contract.rs -o $(OUT)/user_irq_preempt_contract_tests
 	$(OUT)/user_irq_preempt_contract_tests
+	rustc --edition=2024 --test kernel/src/user_saved_frame_ledger.rs -o $(OUT)/user_saved_frame_ledger_tests
+	$(OUT)/user_saved_frame_ledger_tests
 	rustc --edition=2024 --test kernel/src/user_fx_bank.rs -o $(OUT)/user_fx_bank_tests
 	$(OUT)/user_fx_bank_tests
 	rustc --edition=2024 --test kernel/src/high_half_stack_arena.rs -o $(OUT)/high_half_stack_arena_tests
