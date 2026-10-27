@@ -6,6 +6,7 @@ an IPI. The owner must refuse retirement and the QEMU must exit WITHOUT
 PMM free/cleanup. This is an intentionally terminal isolated test flavor.
 """
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,10 @@ def validate(output: str, code: int) -> bool:
             < rows.index(required[2]) < rows.index(required[3])
             < rows.index(required[4])):
         return False
-    if "WOLFOS_SMP_APS_OK total=4 aps=3" not in output:
+    ap_rows = [row for row in rows if row.startswith("WOLFOS_SMP_APS_OK ")]
+    if len(ap_rows) != 1 or re.fullmatch(
+        r"WOLFOS_SMP_APS_OK total=4 bsp_lapic=[0-9]+ ap_acks=3", ap_rows[0]
+    ) is None:
         return False
     for expected in required[1:]:
         prefix = expected.split()[0]
