@@ -44,6 +44,17 @@ mod pmm_layout;
 mod address_space_retirement;
 mod tlb_shootdown;
 #[cfg(any(
+    feature = "address-space-retirement-smoke",
+    feature = "smp-address-space-retirement-smoke",
+    feature = "user-elf-run-smoke",
+    feature = "user-process-smoke",
+    feature = "user-copy-smoke",
+    feature = "user-file-io-smoke",
+    feature = "user-ramfs-smoke",
+    feature = "user-vfs-smoke",
+))]
+mod retirement_tlb_round;
+#[cfg(any(
     feature = "smp-address-space-retirement-smoke",
     feature = "user-elf-run-smoke",
     feature = "user-process-smoke",
