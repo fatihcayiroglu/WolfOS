@@ -201,6 +201,8 @@ pub extern "x86-interrupt" fn irq(_frame: InterruptStackFrame) {
         crate::tlb_shootdown_hardware_smoke::on_ipi(i);
         #[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
         crate::smp_address_space_retirement_smoke::on_retirement_ipi(i);
+        #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+        crate::user_elf_smp_ipi_retire_smoke::on_ipi(i);
         #[cfg(feature = "ap-remote-work-smoke")]
         crate::ap_remote_work_smoke::on_ipi(i);
         #[cfg(feature = "ap-handoff-smoke")]
@@ -511,14 +513,14 @@ pub fn verify_bsp(bsp_id: u32, cpus: &[&MpInfo]) -> bool {
 
 /// The CPL0 owner-bound smoke uses exactly one genuine directed IPI per AP.
 /// Ready is published only after this AP installs its local SVR and enables IF.
-#[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+#[cfg(any(feature = "smp-retirement-ipi-hardware-smoke", feature = "user-elf-smp-ipi-retire-smoke"))]
 pub(crate) fn retirement_aps_ready(mask: u64) -> bool {
     (0..COUNT.load(Ordering::Acquire)).all(|i| {
         mask & (1u64 << i) == 0 || (READY[i].load(Ordering::Acquire)
             && !OFFLINE[i].load(Ordering::Acquire))
     })
 }
-#[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+#[cfg(any(feature = "smp-retirement-ipi-hardware-smoke", feature = "user-elf-smp-ipi-retire-smoke"))]
 pub(crate) fn send_retirement_ipi(index: usize) -> bool {
     if index >= COUNT.load(Ordering::Acquire)
         || !READY[index].load(Ordering::Acquire)
@@ -529,7 +531,7 @@ pub(crate) fn send_retirement_ipi(index: usize) -> bool {
 }
 /// Shut down the AP IPI gates before root reclamation and check all IRQs
 /// reached exactly one real remote EOI. The owner already disallows re-entry.
-#[cfg(feature = "smp-retirement-ipi-hardware-smoke")]
+#[cfg(any(feature = "smp-retirement-ipi-hardware-smoke", feature = "user-elf-smp-ipi-retire-smoke"))]
 pub(crate) fn stop_retirement_aps(mask: u64) -> bool {
     STOP.store(true, Ordering::Release);
     wait(|| (0..COUNT.load(Ordering::Acquire)).all(|i| {
