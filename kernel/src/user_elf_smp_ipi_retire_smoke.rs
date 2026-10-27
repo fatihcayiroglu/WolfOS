@@ -195,6 +195,7 @@ pub(crate) fn on_ipi(cpu: usize) {
 pub(crate) fn finish_owner_round<S: FrameSource, const N: usize>(
     owner: &mut ActiveAddressSpace<'_, S, N, CPUS>,
     pid: u64,
+    _allocated_before: usize,
 ) -> bool {
     let bsp = bsp_index();
     let aps = ap_mask();
@@ -242,6 +243,32 @@ pub(crate) fn finish_owner_round<S: FrameSource, const N: usize>(
                 && active.barrier.begin_covering(ALL, ALL) == Err(TlbError::Busy)
         })) != Some(true)
     { return false; }
+    // Dedicated negative hardware witness. The last AP never receives its
+    // IPI, keeps its TLB owner bit outstanding and stays online. The guest
+    // terminates without a reclaim; a success marker requires exact PMM
+    // accounting plus TWO actual remote EOI completions, not a fake ack.
+    #[cfg(feature = "user-elf-smp-ipi-missing-ack-smoke")]
+    {
+        if FLUSHED.load(Ordering::Acquire) != ALL ^ last_bit
+            || owner.leased_frames().len() != 7
+            || crate::pmm::statistics().allocated_frames
+                != _allocated_before + owner.leased_frames().len()
+            || owner.finish_retirement() != Err(OwnerError::OutstandingShootdown)
+            || with_state(|slot| slot.as_ref().is_some_and(|active| {
+                active.barrier.snapshot().pending == last_bit
+                    && !active.barrier.completed(active.round)
+            })) != Some(true)
+            || !crate::ap_ipi_smoke::verify_partial_retirement_aps(aps ^ last_bit, last)
+        { return false; }
+        crate::serial::write_line(
+            "WOLFOS_ELF_SMP_IPI_MISSING_ACK_OK pid=1 cpus=4 real_cpl3_bsp=1 ap_cpl0_root_borrowers=3 remote_ipis_sent=2 remote_eois=2 last_ipi_sent=0 pending_mask_one=1 owner_refused=1 frames_pinned=7 premature_free=0 last_ap_online=1",
+        );
+        // QEMU-only deliberate abort: no CR3 owner/PMM Drop or free is
+        // allowed after an unacknowledged hardware shootdown. The hypervisor
+        // stops ALL four CPUs; this is not an OS shutdown implementation.
+        crate::serial::qemu_exit_success();
+        crate::halt_forever();
+    }
     if !crate::ap_ipi_smoke::send_retirement_ipi(last)
         || !wait_mask(&FLUSHED, ALL)
         || !crate::ap_ipi_smoke::stop_retirement_aps(aps) { return false; }
