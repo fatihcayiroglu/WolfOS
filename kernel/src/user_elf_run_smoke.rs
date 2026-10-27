@@ -33,6 +33,7 @@ use crate::{
     user_elf_page_tables::TableBuffers,
     interrupts, kernel_half_shadow, pmm, serial,
     process_lifecycle::ProcessState,
+    tlb_shootdown::ShootdownBarrier,
     process_table::{ProcessTableCell, TableError},
     user_ring_entry::{self, Ring3Entry},
     user_syscall_abi::{self, Outcome, UserSyscallFrame},
@@ -977,8 +978,49 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     CR3_PHYS.store(0, Ordering::Release);
     if live.owner.leased_frames() != owned_by_pid.as_slice()
         || live.owner.context_snapshot().pending != 0
-        || live.owner.finish_retirement().is_err()
     { fail("retire_live_reference_or_lease_mismatch") }
+
+    // Bind *real* terminal CPL3 retirement to the exact owner's historical
+    // BSP CPU mask. This IF=0 process had one authenticated private CR3 user
+    // and cannot be resumed: its PID, cached user pointers and IRET path
+    // were revoked above. A mere prior CR3 switch is not a post-publication
+    // TLB acknowledgment.
+    let mut barrier = ShootdownBarrier::<1>::new(pid)
+        .unwrap_or_else(|_| fail("retire_tlb_barrier_identity"));
+    let round = live.owner.begin_retirement_shootdown(&mut barrier, 1)
+        .unwrap_or_else(|_| fail("retire_tlb_owner_publication"));
+    if barrier.completed(round)
+        || barrier.snapshot().pending != 1
+        || live.owner.finish_retirement()
+            != Err(crate::address_space_retirement::Error::OutstandingShootdown)
+        || pmm::statistics().allocated_frames
+            != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
+    { fail("retire_tlb_pending_must_pin_all_frames") }
+
+    let (supervisor_frame, flags) = Cr3::read();
+    if supervisor_frame.start_address().as_u64() != boot {
+        fail("retire_tlb_supervisor_root_mismatch")
+    }
+    // SAFETY: actual BSP only, IF=0, PCID=0; this resident trusted boot
+    // frame is still active. All former private pages are non-global and
+    // no AP, DMA device or future Ring3 dispatch can use this root.
+    // Re-loading the boot root *after* publishing the shootdown round
+    // invalidates the BSP's non-global private translations.
+    unsafe { Cr3::write(supervisor_frame, flags); }
+    compiler_fence(Ordering::SeqCst);
+    if Cr3::read().0.start_address().as_u64() != boot
+        // SAFETY: authenticated BSP just completed its post-publication
+        // local CR3 reload for this exact opaque round and CPU index.
+        || unsafe { barrier.acknowledge_after_local_flush(round, 0) }.is_err()
+        || !barrier.completed(round)
+        || live.owner.finish_retirement_after_shootdown(&barrier, round).is_err()
+        || pmm::statistics().allocated_frames
+            != ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
+    { fail("retire_tlb_bsp_flush_or_close") }
+    serial::write_fmt(format_args!(
+        "WOLFOS_ELF_TX_TLB_OK pid={} cpus=1 real_cpl3=1 post_publish_cr3_reload=1 owner_round_complete=1 frames_pinned=1\\n",
+        pid,
+    ));
     // SAFETY: this authenticated BSP restored boot CR3 with PCID off,
     // completing local non-global invalidation. No AP ever received this root.
     // Terminal EXIT/#UD/#PF never IRET to the old TSS-stack trap frame; this
