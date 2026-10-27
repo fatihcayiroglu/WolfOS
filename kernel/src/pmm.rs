@@ -11,6 +11,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use limine::memmap::{Entry, MEMMAP_USABLE};
 
+use crate::pmm_bitmap_scan::first_clear_bit;
 use crate::pmm_layout::{bitmap_bytes_for_frames, metadata_pages_for_frames, PAGE_SIZE};
 
 const MAX_REGIONS: usize = 256;
@@ -147,14 +148,23 @@ impl FrameState {
         }
         let pivot = self.next;
         for (begin, end) in [(pivot, self.total), (0, pivot)] {
-            for index in begin..end {
-                if !self.is_used(index) {
-                    let addr = self.physical_address(index)?;
-                    self.mark(index, true);
-                    self.used += 1;
-                    self.next = (index + 1) % self.total;
-                    return Some(addr);
-                }
+            // SAFETY: init reserved an HHDM-backed bitmap of exactly this
+            // length. The allocator lock excludes all other PMM mutations.
+            // This temporary shared slice ends before mark() writes the bit.
+            let free = {
+                let bitmap = unsafe {
+                    core::slice::from_raw_parts(
+                        self.bitmap_addr as *const u8, self.bitmap_bytes,
+                    )
+                };
+                first_clear_bit(bitmap, begin, end)
+            };
+            if let Some(index) = free {
+                let addr = self.physical_address(index)?;
+                self.mark(index, true);
+                self.used += 1;
+                self.next = (index + 1) % self.total;
+                return Some(addr);
             }
         }
         None

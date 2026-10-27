@@ -482,6 +482,8 @@ test:
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/ap_preempt_progress_budget.rs -o $(OUT)/ap_preempt_progress_budget_tests
 	$(OUT)/ap_preempt_progress_budget_tests
+	rustc --edition=2024 --test kernel/src/pmm_bitmap_scan.rs -o $(OUT)/pmm_bitmap_scan_tests
+	$(OUT)/pmm_bitmap_scan_tests
 	rustc --edition=2024 --test kernel/src/pmm_layout.rs -o $(OUT)/pmm_layout_tests
 	rustc --edition=2024 --test tests/pmm_frame_batch.rs -o $(OUT)/pmm_frame_batch_tests
 	$(OUT)/pmm_frame_batch_tests

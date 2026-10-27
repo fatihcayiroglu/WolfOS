@@ -30,6 +30,7 @@ mod ps2_irq;
 mod serial_shell;
 mod cpu;
 mod pmm;
+mod pmm_bitmap_scan;
 mod pmm_layout;
 #[cfg(any(
     feature = "address-space-retirement-smoke",
