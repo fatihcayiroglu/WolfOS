@@ -1,7 +1,9 @@
 //! Isolated four-CPU CPL0 quiescence proof. All CPUs borrow one cloned
 //! kernel PML4, restore the registered supervisor root, then acknowledge
 //! their own observation. Explicit active ownership pins the root throughout.
-//! No Ring3, PCID, private globals or IPI shootdown.
+//! No Ring3, PCID, private globals or IPI shootdown. After genuine
+//! CR3 departures, each CPU reloads its own supervisor CR3 and acknowledges
+//! a generation-tagged retirement TLB round before PMM reclaim.
 use crate::{
     active_address_space::ActiveAddressSpace,
     address_space_retirement::{Error, Phase},
@@ -10,6 +12,7 @@ use crate::{
     process_table::ProcessTable,
     user_context_bank::{ContextError as FrameError, UserContextBank},
     saved_context_retirement::Error as ContextError,
+    tlb_shootdown::{Error as TlbError, Round, ShootdownBarrier},
     pmm,
     pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport},
     serial,
@@ -34,6 +37,8 @@ static BSP: AtomicUsize = AtomicUsize::new(CPUS);
 static ACTIVE: AtomicU64 = AtomicU64::new(0);
 static RELEASE: AtomicU64 = AtomicU64::new(0);
 static ACKS: AtomicU64 = AtomicU64::new(0);
+static FLUSH_RELEASE: AtomicU64 = AtomicU64::new(0);
+static FLUSH_ACKS: AtomicU64 = AtomicU64::new(0);
 static BAD: AtomicBool = AtomicBool::new(false);
 static ENTERED: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
 static LEFT: [AtomicU64; CPUS] = [const { AtomicU64::new(0) }; CPUS];
@@ -70,9 +75,14 @@ type Owner = ActiveAddressSpace<'static, PmmFrames, 1, CPUS>;
 // before AP startup. Thereafter only the locked Owner can use this provider.
 static mut FRAME_SOURCE: PmmFrames = PmmFrames;
 
+struct RoundState {
+    barrier: ShootdownBarrier<CPUS>,
+    round: Round,
+}
 struct Ledger {
     held: AtomicBool,
     value: UnsafeCell<Option<Owner>>,
+    round: UnsafeCell<Option<RoundState>>,
 }
 // SAFETY: initialization and every access hold held exclusively. No borrowed
 // ledger reference escapes with(); the guard unlocks on every ordinary exit.
@@ -80,6 +90,7 @@ unsafe impl Sync for Ledger {}
 static LEDGER: Ledger = Ledger {
     held: AtomicBool::new(false),
     value: UnsafeCell::new(None),
+    round: UnsafeCell::new(None),
 };
 struct Unlock<'a>(&'a AtomicBool);
 impl Drop for Unlock<'_> {
@@ -89,6 +100,12 @@ impl Drop for Unlock<'_> {
 }
 impl Ledger {
     fn with<R>(&self, operation: impl FnOnce(&mut Option<Owner>) -> R) -> Option<R> {
+        self.with_both(|owner, _round| operation(owner))
+    }
+    fn with_both<R>(
+        &self,
+        operation: impl FnOnce(&mut Option<Owner>, &mut Option<RoundState>) -> R,
+    ) -> Option<R> {
         for _ in 0..SPINS {
             if self
                 .held
@@ -96,8 +113,11 @@ impl Ledger {
                 .is_ok()
             {
                 let _unlock = Unlock(&self.held);
-                // SAFETY: exclusive guard held for this entire closure.
-                return Some(operation(unsafe { &mut *self.value.get() }));
+                // SAFETY: the ONE shared lock guards both ledgers; neither
+                // mutable reference escapes the closure.
+                return Some(unsafe {
+                    operation(&mut *self.value.get(), &mut *self.round.get())
+                });
             }
             core::hint::spin_loop();
         }
@@ -109,6 +129,21 @@ fn with_gate<R>(operation: impl FnOnce(&mut Owner) -> R) -> Option<R> {
 }
 fn actual_root() -> u64 {
     Cr3::read().0.start_address().as_u64()
+}
+
+/// Called by the authenticated local CPU only after its actual supervisor
+/// CR3 reload. PCID is disabled and no private global mappings are allowed.
+fn acknowledge_local_flush(cpu: usize, supervisor: u64) -> bool {
+    if cpu >= CPUS || !supported() || actual_root() != supervisor { return false; }
+    LEDGER.with_both(|owner, slot| {
+        if !matches!(owner.as_ref().map(|o| o.snapshot().phase), Some(Phase::Retiring)) {
+            return false;
+        }
+        let Some(state) = slot.as_mut() else { return false; };
+        // SAFETY: this CPU actually reloaded the authenticated supervisor
+        // CR3 after publication, and the same lock guards the exact round.
+        unsafe { state.barrier.acknowledge_after_local_flush(state.round, cpu) }.is_ok()
+    }) == Some(true)
 }
 fn supported() -> bool {
     !x86_64::instructions::interrupts::are_enabled() && !Cr4::read().contains(Cr4Flags::PCID)
@@ -306,6 +341,21 @@ pub fn secondary(index: usize) -> bool {
     // Release publishes the actual post-switch observation. This AP performs
     // no later private CR3 load and returns directly to its permanent halt.
     ACKS.fetch_or(1 << index, Ordering::Release);
+    // The real private CR3 has already departed; no new private activation
+    // is permitted after retirement. Await a post-publication flush round.
+    if !wait_for(&FLUSH_RELEASE, 1u64 << index) {
+        BAD.store(true, Ordering::Release);
+        return false;
+    }
+    // SAFETY: authenticated AP still owns its permanent supervisor stack;
+    // a local supervisor CR3 reload flushes non-global translations with
+    // PCID disabled, without touching any physical frame owner.
+    unsafe { Cr3::write(original, flags); }
+    if !acknowledge_local_flush(index, supervisor) {
+        BAD.store(true, Ordering::Release);
+        return false;
+    }
+    FLUSH_ACKS.fetch_or(1u64 << index, Ordering::Release);
     true
 }
 
@@ -432,9 +482,63 @@ pub fn verify_bsp() -> bool {
     if with_gate(|gate| unsafe { binding.cancel(&mut queue, gate) }) != Some(Ok(()))
         || queue.wake_for_event(wait, 0xa11) != Err(QueueError::WrongState)
         || with_gate(|gate| gate.context_snapshot().pending) != Some(0)
+        || pmm::statistics().allocated_frames != resident
+    {
+        return false;
+    }
+    // The actual owner recorded all four CPUs BEFORE their real private
+    // CR3 loads. Only the owner can arm its own retired-generation round.
+    let armed = LEDGER.with_both(|owner, slot| {
+        if slot.is_some() { return false; }
+        let Ok(mut barrier) = ShootdownBarrier::<CPUS>::new(3) else { return false; };
+        let Some(owner) = owner.as_mut() else { return false; };
+        let Ok(round) = owner.begin_retirement_shootdown(&mut barrier, ALL)
+        else { return false; };
+        *slot = Some(RoundState { barrier, round });
+        true
+    });
+    if armed != Some(true) { return false; }
+
+    // Release two APs while withholding the last. The BSP also performs
+    // and acknowledges a real *post-publication* local CR3 reload.
+    FLUSH_RELEASE.store(ALL ^ last_bit, Ordering::Release);
+    let (original, flags) = Cr3::read();
+    if original.start_address().as_u64() != supervisor { return false; }
+    // SAFETY: original supervisor CR3 is resident and PCID disabled.
+    unsafe { Cr3::write(original, flags); }
+    if !acknowledge_local_flush(bsp, supervisor) { return false; }
+    FLUSH_ACKS.fetch_or(1u64 << bsp, Ordering::Release);
+
+    if !wait_for(&FLUSH_ACKS, ALL ^ last_bit)
+        || BAD.load(Ordering::Acquire)
+        || pmm::statistics().allocated_frames != resident
+    {
+        return false;
+    }
+    let blocked = LEDGER.with_both(|owner, slot| {
+        let Some(state) = slot.as_mut() else { return false; };
+        let before = state.barrier.snapshot();
+        owner.as_ref().is_some_and(|o| o.snapshot().phase == Phase::Retiring)
+            && before.pending == last_bit && !state.barrier.completed(state.round)
+            && state.barrier.begin_covering(ALL, ALL) == Err(TlbError::Busy)
+            && state.barrier.snapshot() == before
+    });
+    if blocked != Some(true) { return false; }
+
+    FLUSH_RELEASE.fetch_or(last_bit, Ordering::Release);
+    if !wait_for(&FLUSH_ACKS, ALL)
+        || BAD.load(Ordering::Acquire)
+        || pmm::statistics().allocated_frames != resident
+        || LEDGER.with_both(|owner, slot| {
+            let Some(state) = slot.as_ref() else { return false; };
+            state.barrier.completed(state.round)
+                && state.barrier.snapshot().pending == 0
+                && owner.as_ref().is_some_and(|o|
+                    o.snapshot().phase == Phase::Retiring
+                        && o.context_snapshot().pending == 0)
+        }) != Some(true)
         || with_gate(|gate| gate.finish_retirement()) != Some(Ok(()))
         || with_gate(|gate| gate.snapshot().phase) != Some(Phase::Retired)
-        || pmm::statistics().allocated_frames != resident
     {
         return false;
     }
@@ -470,10 +574,10 @@ pub fn verify_bsp() -> bool {
         return false;
     }
     serial::write_line(
-        "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0",
+        "WOLFOS_ACTIVE_SPACE_OWNERSHIP_OK staged_transfer=1 active_drop_retained=1 cpus=4 last_ap_pinned=1 drop_probe_freed=1 retired_owner_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0 local_cr3_flush_acks=4 withheld_last_flush=1",
     );
     serial::write_line(
-        "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0",
+        "WOLFOS_SMP_RETIRE_OK cpus=4 real_cr3_loads=4 per_cpu_restored=4 bsp_alone_rejected=1 last_ap_rejected=1 frames_freed=1 pmm_no_leak=1 saved_context_pinned=1 runqueue_cancel=1 late_wake_rejected=1 ring3=0 ipi_shootdown=0 local_cr3_flush_acks=4 withheld_last_flush=1",
     );
     true
 }
