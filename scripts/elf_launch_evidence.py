@@ -15,13 +15,15 @@ def transaction_rows(pid: int, frames: int) -> list[str]:
         "cpu_reserved=1 actual_cr3=1 full_bytes=1 pcid_off=1 bsp_only=1",
         f"WOLFOS_ELF_TX_RETIRE_BLOCKED_OK pid={pid} cpu_outstanding=1 "
         "active_ack_denied=1 frames_pinned=1",
+        f"WOLFOS_ELF_TX_TLB_OK pid={pid} cpus=1 real_cpl3=1 "
+        "post_publish_cr3_reload=1 owner_round_complete=1 frames_pinned=1",
         f"WOLFOS_ELF_TX_RECLAIM_OK pid={pid} frames={frames} actual_boot_cr3=1 "
         "cpu_drained=1 pid_revoked=1 returns_revoked=1 failed=0",
     ]
 
 
 def valid_launch_transactions(output: str, frames: int, pids: tuple[int, ...]) -> bool:
-    """Each rollback precedes activation; CPU refusal precedes exact reclamation.
+    """Each rollback precedes activation; a real TLB round gates reclamation.
 
     This validates mandatory observations, not their truth in isolation. The
     caller also requires actual guest syscalls/faults and QEMU debug-exit 33.
@@ -52,7 +54,7 @@ def valid_launch_transactions(output: str, frames: int, pids: tuple[int, ...]) -
             places.append(place)
             cursor = place + len(row)
         if not (places[0] < places[1] < entries[i].start()
-                < places[2] < places[3] < cleanups[i].start()):
+                < places[2] < places[3] < places[4] < cleanups[i].start()):
             return False
         if i == 1 and not places[0] < output.find(RELAUNCH_STACK_PROOF) < places[1]:
             return False

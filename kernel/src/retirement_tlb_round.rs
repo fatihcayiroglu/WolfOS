@@ -15,8 +15,12 @@ use crate::{
 pub enum Error {
     NotRetiring,
     OutstandingCpus,
+    /// An ActiveAddressSpace still owns saved resumable context tickets.
+    OutstandingContexts,
     NoReservedCpuHistory,
     WrongGeneration,
+    /// This owner already published a round; do not replace its identity.
+    AlreadyArmed,
     Shootdown(ShootdownError),
 }
 

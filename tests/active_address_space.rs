@@ -11,6 +11,10 @@ mod process_table;
 mod saved_context_retirement;
 #[path = "../kernel/src/address_space_retirement.rs"]
 mod address_space_retirement;
+#[path = "../kernel/src/tlb_shootdown.rs"]
+mod tlb_shootdown;
+#[path = "../kernel/src/retirement_tlb_round.rs"]
+mod retirement_tlb_round;
 #[path = "../kernel/src/pmm_frame_batch.rs"]
 mod pmm_frame_batch;
 
@@ -21,6 +25,8 @@ use ring3_runqueue::{Error as QueueError, Ring3RunQueue, State as QueueState};
 use address_space_retirement::{Error, Phase};
 use pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport};
 use process_table::ProcessTable;
+use retirement_tlb_round::Error as RoundError;
+use tlb_shootdown::{Error as BarrierError, Phase as BarrierPhase, ShootdownBarrier};
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
 #[derive(Default)]
@@ -881,4 +887,196 @@ fn counted_publish_failure_preserves_exact_partial_lease_for_rollback() {
         [addresses[5], addresses[4], addresses[3],
          addresses[2], addresses[1], addresses[0]]);
     assert!(trace.borrow().owned.is_empty());
+}
+
+#[test]
+fn owned_retirement_round_refuses_saved_contexts_and_missing_historical_cpus() {
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<2, 4>(&mut source, 0x1000);
+    for cpu in [1, 3] {
+        let ticket = owner.reserve_cpu(cpu).unwrap();
+        owner.confirm_active(ticket, 0x1000).unwrap();
+        owner.acknowledge_quiescent(ticket, 0x9000).unwrap();
+    }
+    let saved = owner.register_saved_context(7).unwrap();
+    owner.begin_retirement().unwrap();
+    let mut barrier = ShootdownBarrier::<4>::new(7).unwrap();
+
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b1010),
+        Err(RoundError::OutstandingContexts),
+    );
+    assert_eq!(barrier.snapshot().phase, BarrierPhase::Ready);
+    assert_eq!(barrier.snapshot().epoch, 0);
+    // SAFETY: no actual CPU/FX/IRET frame or wakeup exists in this host fixture.
+    unsafe { owner.revoke_saved_context(saved).unwrap() };
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b1000),
+        Err(RoundError::Shootdown(BarrierError::MissingRequiredTargets)),
+    );
+    assert_eq!(barrier.snapshot().epoch, 0);
+    let round = owner.begin_retirement_shootdown(&mut barrier, 0b1011).unwrap();
+    assert_eq!(barrier.snapshot().pending, 0b1011);
+    // Simulated acknowledgements only; they do NOT prove hardware invalidation.
+    unsafe { barrier.acknowledge_after_local_flush(round, 0).unwrap() };
+    unsafe { barrier.acknowledge_after_local_flush(round, 3).unwrap() };
+    assert!(!barrier.completed(round));
+    assert_eq!(barrier.snapshot().pending, 0b0010);
+    assert_eq!(trace.borrow().releases.len(), 0);
+    unsafe { barrier.acknowledge_after_local_flush(round, 1).unwrap() };
+    assert!(barrier.completed(round));
+    // Never turn simulated acknowledgements into permission to reclaim PMM.
+    drop(owner);
+    assert!(trace.borrow().releases.is_empty());
+    assert_eq!(trace.borrow().owned.len(), 2);
+}
+
+#[test]
+fn owned_round_refuses_outstanding_cpu_and_wrong_generation_without_mutation() {
+    let mut source = Source::new(&[0x1000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<1, 2>(&mut source, 0x1000);
+    let ticket = owner.reserve_cpu(1).unwrap();
+    let mut barrier = ShootdownBarrier::<2>::new(7).unwrap();
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b10),
+        Err(RoundError::NotRetiring),
+    );
+    owner.begin_retirement().unwrap();
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b10),
+        Err(RoundError::OutstandingCpus),
+    );
+    owner.acknowledge_quiescent(ticket, 0x9000).unwrap();
+    let mut foreign = ShootdownBarrier::<2>::new(8).unwrap();
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut foreign, 0b10),
+        Err(RoundError::WrongGeneration),
+    );
+    assert_eq!(foreign.snapshot().epoch, 0);
+    assert_eq!(barrier.snapshot().epoch, 0);
+    let round = owner.begin_retirement_shootdown(&mut barrier, 0b10).unwrap();
+    assert!(!barrier.completed(round));
+    drop(owner);
+    assert!(trace.borrow().releases.is_empty());
+    assert_eq!(trace.borrow().owned.len(), 1);
+}
+
+#[test]
+fn owned_round_cannot_start_for_never_used_or_already_retired_owner() {
+    let mut source = Source::new(&[0x1000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<1, 2>(&mut source, 0x1000);
+    let mut barrier = ShootdownBarrier::<2>::new(7).unwrap();
+    owner.begin_retirement().unwrap();
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b11),
+        Err(RoundError::NoReservedCpuHistory),
+    );
+    owner.finish_retirement().unwrap();
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b11),
+        Err(RoundError::NotRetiring),
+    );
+    assert_eq!(barrier.snapshot().epoch, 0);
+    drop(owner);
+    assert!(trace.borrow().releases.is_empty());
+    assert_eq!(trace.borrow().owned.len(), 1);
+}
+
+#[test]
+fn armed_owner_cannot_retire_before_its_exact_round_completes() {
+    // Host-only synthetic acknowledgements exercise the production metadata
+    // guards. They are NOT evidence of real hardware TLB invalidation.
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<2, 4>(&mut source, 0x1000);
+    for cpu in [0, 2, 3] {
+        let ticket = owner.reserve_cpu(cpu).unwrap();
+        owner.confirm_active(ticket, 0x1000).unwrap();
+        owner.acknowledge_quiescent(ticket, 0x9000).unwrap();
+    }
+    owner.begin_retirement().unwrap();
+    let mut barrier = ShootdownBarrier::<4>::new(7).unwrap();
+    let round = owner.begin_retirement_shootdown(&mut barrier, 0b1101).unwrap();
+    let first = barrier.snapshot();
+
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b1111),
+        Err(RoundError::AlreadyArmed),
+    );
+    assert_eq!(barrier.snapshot(), first);
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingShootdown));
+    assert_eq!(owner.snapshot().phase, Phase::Retiring);
+    assert_eq!(trace.borrow().releases.len(), 0);
+
+    let foreign = ShootdownBarrier::<4>::new(8).unwrap();
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&foreign, round),
+        Err(Error::OutstandingShootdown),
+    );
+    // Even an independent same-generation barrier at the exact same epoch
+    // has a distinct instance identity and cannot impersonate the owner round.
+    let mut lookalike = ShootdownBarrier::<4>::new(7).unwrap();
+    let lookalike_round = lookalike.begin(0b1101).unwrap();
+    for cpu in [0, 2, 3] {
+        unsafe { lookalike.acknowledge_after_local_flush(lookalike_round, cpu).unwrap() };
+    }
+    assert!(lookalike.completed(lookalike_round));
+    assert_ne!(round, lookalike_round);
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&lookalike, round),
+        Err(Error::OutstandingShootdown),
+    );
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&lookalike, lookalike_round),
+        Err(Error::OutstandingShootdown),
+    );
+    // An unrelated same-generation barrier with a *different epoch* cannot
+    // replace the round previously minted through this physical owner.
+    let mut other = ShootdownBarrier::<4>::new(7).unwrap();
+    let old = other.begin(0b1101).unwrap();
+    for cpu in [0, 2, 3] {
+        unsafe { other.acknowledge_after_local_flush(old, cpu).unwrap() };
+    }
+    let other_round = other.begin(0b1101).unwrap();
+    for cpu in [0, 2, 3] {
+        unsafe { other.acknowledge_after_local_flush(other_round, cpu).unwrap() };
+    }
+    assert!(other.completed(other_round));
+    assert_ne!(other_round, round);
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&other, other_round),
+        Err(Error::OutstandingShootdown),
+    );
+
+    // Even the owner's *correct* round refuses retirement until the final
+    // independent participant has completed.
+    for cpu in [0, 2] {
+        unsafe { barrier.acknowledge_after_local_flush(round, cpu).unwrap() };
+    }
+    assert_eq!(barrier.snapshot().pending, 0b1000);
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&barrier, round),
+        Err(Error::OutstandingShootdown),
+    );
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingShootdown));
+    assert_eq!(owner.snapshot().phase, Phase::Retiring);
+    assert!(trace.borrow().releases.is_empty());
+
+    unsafe { barrier.acknowledge_after_local_flush(round, 3).unwrap() };
+    assert!(barrier.completed(round));
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&barrier, round),
+        Ok(()),
+    );
+    assert_eq!(owner.snapshot().phase, Phase::Retired);
+    assert!(trace.borrow().releases.is_empty());
+    // SAFETY: host fixture never loaded a private CR3 or created real users.
+    assert_eq!(
+        unsafe { owner.reclaim() }.ok(),
+        Some(ReleaseReport { released: 2, failed: 0 }),
+    );
+    assert_eq!(trace.borrow().releases, [0x2000, 0x1000]);
 }

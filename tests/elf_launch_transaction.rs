@@ -3,6 +3,10 @@
 mod active_address_space;
 #[path = "../kernel/src/address_space_retirement.rs"]
 mod address_space_retirement;
+#[path = "../kernel/src/tlb_shootdown.rs"]
+mod tlb_shootdown;
+#[path = "../kernel/src/retirement_tlb_round.rs"]
+mod retirement_tlb_round;
 #[path = "../kernel/src/elf64_page_image.rs"]
 mod elf64_page_image;
 #[path = "../kernel/src/elf64_preflight.rs"]
