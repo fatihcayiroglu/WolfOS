@@ -984,3 +984,82 @@ fn owned_round_cannot_start_for_never_used_or_already_retired_owner() {
     assert!(trace.borrow().releases.is_empty());
     assert_eq!(trace.borrow().owned.len(), 1);
 }
+
+#[test]
+fn armed_owner_cannot_retire_before_its_exact_round_completes() {
+    // Host-only synthetic acknowledgements exercise the production metadata
+    // guards. They are NOT evidence of real hardware TLB invalidation.
+    let mut source = Source::new(&[0x1000, 0x2000]);
+    let trace = source.trace.clone();
+    let mut owner = publish::<2, 4>(&mut source, 0x1000);
+    for cpu in [0, 2, 3] {
+        let ticket = owner.reserve_cpu(cpu).unwrap();
+        owner.confirm_active(ticket, 0x1000).unwrap();
+        owner.acknowledge_quiescent(ticket, 0x9000).unwrap();
+    }
+    owner.begin_retirement().unwrap();
+    let mut barrier = ShootdownBarrier::<4>::new(7).unwrap();
+    let round = owner.begin_retirement_shootdown(&mut barrier, 0b1101).unwrap();
+    let first = barrier.snapshot();
+
+    assert_eq!(
+        owner.begin_retirement_shootdown(&mut barrier, 0b1111),
+        Err(RoundError::AlreadyArmed),
+    );
+    assert_eq!(barrier.snapshot(), first);
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingShootdown));
+    assert_eq!(owner.snapshot().phase, Phase::Retiring);
+    assert_eq!(trace.borrow().releases.len(), 0);
+
+    let foreign = ShootdownBarrier::<4>::new(8).unwrap();
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&foreign, round),
+        Err(Error::OutstandingShootdown),
+    );
+    // An unrelated same-generation barrier with a *different epoch* cannot
+    // replace the round previously minted through this physical owner.
+    let mut other = ShootdownBarrier::<4>::new(7).unwrap();
+    let old = other.begin(0b1101).unwrap();
+    for cpu in [0, 2, 3] {
+        unsafe { other.acknowledge_after_local_flush(old, cpu).unwrap() };
+    }
+    let other_round = other.begin(0b1101).unwrap();
+    for cpu in [0, 2, 3] {
+        unsafe { other.acknowledge_after_local_flush(other_round, cpu).unwrap() };
+    }
+    assert!(other.completed(other_round));
+    assert_ne!(other_round, round);
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&other, other_round),
+        Err(Error::OutstandingShootdown),
+    );
+
+    // Even the owner's *correct* round refuses retirement until the final
+    // independent participant has completed.
+    for cpu in [0, 2] {
+        unsafe { barrier.acknowledge_after_local_flush(round, cpu).unwrap() };
+    }
+    assert_eq!(barrier.snapshot().pending, 0b1000);
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&barrier, round),
+        Err(Error::OutstandingShootdown),
+    );
+    assert_eq!(owner.finish_retirement(), Err(Error::OutstandingShootdown));
+    assert_eq!(owner.snapshot().phase, Phase::Retiring);
+    assert!(trace.borrow().releases.is_empty());
+
+    unsafe { barrier.acknowledge_after_local_flush(round, 3).unwrap() };
+    assert!(barrier.completed(round));
+    assert_eq!(
+        owner.finish_retirement_after_shootdown(&barrier, round),
+        Ok(()),
+    );
+    assert_eq!(owner.snapshot().phase, Phase::Retired);
+    assert!(trace.borrow().releases.is_empty());
+    // SAFETY: host fixture never loaded a private CR3 or created real users.
+    assert_eq!(
+        unsafe { owner.reclaim() }.ok(),
+        Some(ReleaseReport { released: 2, failed: 0 }),
+    );
+    assert_eq!(trace.borrow().releases, [0x2000, 0x1000]);
+}
