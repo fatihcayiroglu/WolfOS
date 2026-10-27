@@ -121,9 +121,13 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
     if !crate::smp_address_space_retirement_smoke::secondary(index) {
         crate::halt_forever();
     }
+    #[cfg(feature = "user-elf-smp-ipi-retire-smoke")]
+    if !crate::user_elf_smp_ipi_retire_smoke::secondary(index) {
+        crate::halt_forever();
+    }
     // Dedicated QEMU IPI proof only: AP installs its own SVR, enables IF
     // briefly, accepts directed fixed IPIs, EOI-acks and reparks with IF=0.
-    #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "ap-local-timer-smoke",
+    #[cfg(any(feature = "ap-ipi-smoke", feature = "tlb-shootdown-hardware-smoke", feature = "smp-retirement-ipi-hardware-smoke", feature = "user-elf-smp-ipi-retire-smoke", feature = "ap-local-timer-smoke",
                feature = "ap-smp-preempt-smoke", feature = "ap-remote-work-smoke",
                feature = "ap-handoff-smoke", feature = "ap-stack-migrate-smoke", feature = "ap-irq-migrate-smoke", feature = "ap-runqueue-smoke"))]
     if !crate::ap_ipi_smoke::secondary_wait(index, info.lapic_id) {
