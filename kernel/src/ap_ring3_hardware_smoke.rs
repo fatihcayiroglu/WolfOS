@@ -6,7 +6,9 @@
 //! slot BEFORE any AP starts. The opt-in private-CR3 flavor instead places
 //! all user leaves under a new supervisor-sanitized PML4, leaving the boot
 //! root's low half unchanged. No ELF process, scheduler, TLB retirement or
-//! full production isolation is claimed. All 6/7 PMM frames remain pinned.
+//! full production isolation is claimed. The ELF flavor builds independent
+//! ELF64 bytes and materializes two derived PT_LOAD pages, with the same
+//! real AP CR3/INT80/IRETQ checks. All 6/7 PMM frames remain pinned.
 use core::arch::{asm, x86_64::__cpuid};
 use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU32, AtomicU64,
                          AtomicUsize, Ordering};
@@ -38,6 +40,7 @@ const RSP0_CANARY: u64 = 0x574f_4c46_4150_5253;
 
 // RIP-relative stores both address the private user data byte 0.
 // Two hardware INT80s prove IRETQ returned to genuine AP CPL3.
+#[cfg(not(feature = "ap-ring3-elf-smoke"))]
 const CODE: [u8; 20] = [
     0xc6, 0x05, 0xf9, 0x0f, 0x00, 0x00, 0x11,
     0xcd, 0x80,
@@ -45,6 +48,9 @@ const CODE: [u8; 20] = [
     0xcd, 0x80,
     0x0f, 0x0b,
 ];
+
+#[cfg(feature = "ap-ring3-elf-smoke")]
+const ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wolfos-ap-ring3.elf"));
 
 #[repr(C, align(16))]
 struct ApRsp0([u8; RSP0_BYTES]);
@@ -167,6 +173,44 @@ pub(crate) fn prepare_bsp(hhdm: u64, bsp_lapic: u32, cpus: &[&MpInfo]) -> bool {
     // accessible in HHDM and exclusively writable by this BSP.
     unsafe {
         for ptr in ptrs { core::ptr::write_bytes(ptr, 0, PAGE as usize); }
+        #[cfg(feature = "ap-ring3-elf-smoke")]
+        {
+            // Do not interpret ELF bytes as structs or execute the text
+            // before strict ET_EXEC PT_LOAD preflight and complete audit.
+            let Ok(plan) = crate::elf64_preflight::preflight(ELF)
+                else { return false; };
+            if plan.len != 2 || plan.entry != CODE_OFF
+                || plan.segments[0].is_none()
+                || plan.segments[1].is_none()
+            { return false; }
+            let rx = plan.segments[0].unwrap();
+            let rw = plan.segments[1].unwrap();
+            if !rx.executable || rx.writable || rw.executable || !rw.writable
+                || rx.page_start != CODE_OFF || rx.page_end != CODE_OFF + PAGE
+                || rw.page_start != DATA_OFF || rw.page_end != DATA_OFF + PAGE
+                || rx.file_size != 20 || rx.memory_size != 20
+                || rw.file_size != 1 || rw.memory_size != 1
+                || rx.virtual_address != CODE_OFF
+                || rw.virtual_address != DATA_OFF
+            { return false; }
+            let text_leaf = &mut *ptrs[3].cast::<[u8; 4096]>();
+            let data_leaf = &mut *ptrs[4].cast::<[u8; 4096]>();
+            let Ok(outcomes) = crate::elf64_page_image::materialize_batch(
+                ELF, [(&rx, CODE_OFF), (&rw, DATA_OFF)],
+                [&mut *text_leaf, &mut *data_leaf],
+            ) else { return false; };
+            if !outcomes[0].executable || outcomes[0].writable
+                || outcomes[0].copied != 20
+                || outcomes[1].executable || !outcomes[1].writable
+                || outcomes[1].copied != 1
+                || crate::elf64_page_image::audit_materialized_batch(
+                    ELF, [(&rx, CODE_OFF), (&rw, DATA_OFF)],
+                    [&*text_leaf, &*data_leaf],
+                ) != Ok(outcomes)
+                || data_leaf[0] != 0
+            { return false; }
+        }
+        #[cfg(not(feature = "ap-ring3-elf-smoke"))]
         core::ptr::copy_nonoverlapping(CODE.as_ptr(), ptrs[3], CODE.len());
         let pdpt = &mut *ptrs[0].cast::<[u64; 512]>();
         let pd = &mut *ptrs[1].cast::<[u64; 512]>();
@@ -365,11 +409,19 @@ pub(crate) fn verify_bsp() -> bool {
             || (shadow[slot] & (PRESENT | USER)) != (PRESENT | USER)
             || shadow[256..].iter().any(|e| e & USER != 0)
         { return false; }
-        serial::write_fmt(format_args!(
-            "WOLFOS_AP_RING3_PRIVATE_CR3_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 ap_private_cr3=1 bsp_boot_cr3=1 kernel_supervisor_pml4=1 boot_user_slot_empty=1 ap_restored_boot_cr3=1 rx=1 rw_nx=2 frames_pinned=7\n",
-            index, BSP_LAPIC.load(Ordering::Acquire),
-            TARGET_LAPIC.load(Ordering::Acquire),
-        ));
+        if cfg!(feature = "ap-ring3-elf-smoke") {
+            serial::write_fmt(format_args!(
+                "WOLFOS_AP_RING3_ELF_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 linked_elf=1 et_exec=1 pt_load=2 derived_pages=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 ap_private_cr3=1 bsp_boot_cr3=1 kernel_supervisor_pml4=1 boot_user_slot_empty=1 ap_restored_boot_cr3=1 rx=1 rw_nx=2 frames_pinned=7\n",
+                index, BSP_LAPIC.load(Ordering::Acquire),
+                TARGET_LAPIC.load(Ordering::Acquire),
+            ));
+        } else {
+            serial::write_fmt(format_args!(
+                "WOLFOS_AP_RING3_PRIVATE_CR3_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 ap_private_cr3=1 bsp_boot_cr3=1 kernel_supervisor_pml4=1 boot_user_slot_empty=1 ap_restored_boot_cr3=1 rx=1 rw_nx=2 frames_pinned=7\n",
+                index, BSP_LAPIC.load(Ordering::Acquire),
+                TARGET_LAPIC.load(Ordering::Acquire),
+            ));
+        }
     } else {
         serial::write_fmt(format_args!(
             "WOLFOS_AP_RING3_OK cpus=4 target_index={} bsp_lapic={} ap_lapic={} ap_cpl3=1 int80=2 iret_to_cpl3=1 private_tss_rsp0=1 actual_tr=1 rw_nx=2 rx=1 frames_pinned=6\n",
