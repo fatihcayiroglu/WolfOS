@@ -16,6 +16,10 @@ contract remained separate.
 - A move-only `ActiveAddressSpace` stores the single generation-tagged
   `Round` it successfully published through `begin_retirement_shootdown`.
   A second publication is rejected without mutating the original barrier.
+- Each barrier instance gets a monotonic non-reused identity, embedded in its
+  opaque `Round`. A distinct barrier of the same generation and epoch cannot
+  acknowledge or complete the owner's published round. Identity exhaustion
+  refuses construction rather than wrapping.
 - Once a round is armed, legacy `finish_retirement()` refuses with
   `OutstandingShootdown`, even if all CPU reservations and saved contexts have
   already drained.
