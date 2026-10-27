@@ -65,6 +65,9 @@ ap-ring3-private-cr3-smoke = ["ap-ring3-hardware-smoke"]
 # Independently assembled and linked AP ELF64, derived RX/RW PT_LOAD
 # leaves under private AP CR3; no production AP scheduler or PMM reclaim.
 ap-ring3-elf-smoke = ["ap-ring3-private-cr3-smoke"]
+# Terminal one-owner AP ELF root retirement: actual AP CR3 departure,
+# BSP lease revocation, physical scrub, seven-frame PMM release and audit.
+ap-ring3-elf-reclaim-smoke = ["ap-ring3-elf-smoke"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
