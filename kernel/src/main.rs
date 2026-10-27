@@ -663,7 +663,7 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     #[cfg(feature = "tlb-shootdown-hardware-smoke")]
-    if !ap_ipi_smoke::verify_tlb_shootdown_bsp(mp.bsp_lapic_id, mp.cpus()) {
+    if !ap_ipi_smoke::verify_tlb_shootdown_bsp(mp.bsp_lapic_id, mp.cpus(), hhdm.offset) {
         serial::write_line("WOLFOS_TLB_SHOOTDOWN_HW_TEST_FAILED");
         halt_forever();
     }
