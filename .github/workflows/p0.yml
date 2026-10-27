@@ -86,6 +86,8 @@ jobs:
         run: make ap-ring3-elf-reclaim-smoke
       - name: Real non-BSP CPL3 ELF plus two CPL0 AP borrowers, all CR3 departures before seven-frame reclaim
         run: make ap-ring3-elf-multi-owner-smoke
+      - name: Withhold one real AP private CR3 departure and prove seven-frame PMM reclaim is refused
+        run: make ap-ring3-elf-missing-borrower-smoke
       - name: P2 user descriptor and TSS.RSP0 / TR preflight (CPL0-only QEMU)
         run: make user-ring-prep-smoke
       - name: P2 REAL CPL3 / INT80 / IRETQ roundtrip (single-vCPU QEMU)
