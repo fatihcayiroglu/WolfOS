@@ -39,6 +39,9 @@ pub struct ActiveAddressSpace<'a, S: FrameSource, const N: usize, const CPUS: us
     batch: ManuallyDrop<FrameBatch<'a, S, N>>,
     gate: RetirementGate<CPUS>,
     contexts: SavedContextGate<64>,
+    // The only round minted through this owner. Once armed, legacy finish
+    // cannot bypass its outstanding per-CPU flush acknowledgements.
+    retirement_round: Option<Round>,
 }
 
 impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'a, S, N, CPUS> {
@@ -84,6 +87,7 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
             batch: ManuallyDrop::new(batch),
             gate,
             contexts,
+            retirement_round: None,
         })
     }
 
@@ -202,11 +206,51 @@ impl<'a, S: FrameSource, const N: usize, const CPUS: usize> ActiveAddressSpace<'
         if self.contexts.snapshot().pending != 0 {
             return Err(RoundError::OutstandingContexts);
         }
-        begin_retirement_shootdown(&self.gate, barrier, targets)
+        if self.retirement_round.is_some() {
+            return Err(RoundError::AlreadyArmed);
+        }
+        let round = begin_retirement_shootdown(&self.gate, barrier, targets)?;
+        self.retirement_round = Some(round);
+        Ok(round)
     }
 
-    /// Metadata only; does not reclaim or certify external references.
+    /// Legacy metadata close for owners that never published a TLB round.
+    /// Once a round has been published, this path permanently refuses to
+    /// bypass it, even when the caller separately sees zero active CPUs.
     pub fn finish_retirement(&mut self) -> Result<(), Error> {
+        if self.retirement_round.is_some() {
+            return Err(Error::OutstandingShootdown);
+        }
+        self.finish_retirement_inner()
+    }
+
+    /// Close the owner only after its exact published generation-tagged
+    /// shootdown round is complete and covers every historical CPU user.
+    /// The caller still authenticates real CPU-local invalidations and all
+    /// other references; barrier metadata alone never permits unsafe reclaim.
+    pub fn finish_retirement_after_shootdown(
+        &mut self,
+        barrier: &ShootdownBarrier<CPUS>,
+        round: Round,
+    ) -> Result<(), Error> {
+        if self.gate.snapshot().phase != Phase::Retiring {
+            return Err(Error::WrongPhase);
+        }
+        let required = self.gate.potential_tlb_users();
+        if self.retirement_round != Some(round)
+            || !barrier.matches_generation(self.gate.generation())
+            || required == 0
+            || barrier.snapshot().targets & required != required
+            || !barrier.completed(round)
+        {
+            return Err(Error::OutstandingShootdown);
+        }
+        self.finish_retirement_inner()?;
+        self.retirement_round = None;
+        Ok(())
+    }
+
+    fn finish_retirement_inner(&mut self) -> Result<(), Error> {
         let cpus = self.gate.snapshot();
         if cpus.phase != Phase::Retiring {
             return Err(Error::WrongPhase);

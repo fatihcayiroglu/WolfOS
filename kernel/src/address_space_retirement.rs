@@ -39,6 +39,8 @@ pub enum Error {
     EpochExhausted,
     OutstandingCpus,
     OutstandingContexts,
+    /// An owner-bound shootdown round exists but has not been certified closed.
+    OutstandingShootdown,
 }
 
 /// Opaque identity of one CPU reservation, not a hardware quiescence proof.

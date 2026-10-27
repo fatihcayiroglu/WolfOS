@@ -8,6 +8,13 @@
 //! All mutations require one exclusive coordinator lock. Never wait for remote
 //! acknowledgements while holding a lock needed by their handlers.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+// Each constructed barrier receives a distinct identity, even when a caller
+// incorrectly creates two barriers for the same address-space generation.
+// Exhaustion fails closed: fetch_update never wraps or reuses an identity.
+static NEXT_BARRIER_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Ready,
@@ -28,6 +35,7 @@ pub enum Error {
     StaleRound,
     WrongPhase,
     EpochExhausted,
+    InstanceExhausted,
 }
 
 /// Opaque generation-tagged round. An old acknowledgement must never drain
@@ -36,6 +44,7 @@ pub enum Error {
 pub struct Round {
     generation: u64,
     epoch: u64,
+    instance: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +60,7 @@ pub struct Snapshot {
 #[must_use = "discarding a pending barrier is not evidence of quiescence"]
 pub struct ShootdownBarrier<const CPUS: usize> {
     generation: u64,
+    instance: u64,
     epoch: u64,
     phase: Phase,
     targets: u64,
@@ -65,8 +75,14 @@ impl<const CPUS: usize> ShootdownBarrier<CPUS> {
         if generation == 0 {
             return Err(Error::InvalidGeneration);
         }
+        let instance = NEXT_BARRIER_INSTANCE
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| Error::InstanceExhausted)?;
         Ok(Self {
             generation,
+            instance,
             epoch: 0,
             phase: Phase::Ready,
             targets: 0,
@@ -130,6 +146,7 @@ impl<const CPUS: usize> ShootdownBarrier<CPUS> {
         Ok(Round {
             generation: self.generation,
             epoch: next,
+            instance: self.instance,
         })
     }
 
@@ -151,7 +168,9 @@ impl<const CPUS: usize> ShootdownBarrier<CPUS> {
         if self.phase != Phase::Pending {
             return Err(Error::WrongPhase);
         }
-        if round.generation != self.generation || round.epoch != self.epoch {
+        if round.generation != self.generation || round.epoch != self.epoch
+            || round.instance != self.instance
+        {
             return Err(Error::StaleRound);
         }
         if cpu >= CPUS {
@@ -177,6 +196,7 @@ impl<const CPUS: usize> ShootdownBarrier<CPUS> {
         self.phase == Phase::Complete
             && round.generation == self.generation
             && round.epoch == self.epoch
+            && round.instance == self.instance
     }
 }
 
@@ -354,6 +374,24 @@ mod tests {
         let before = barrier.snapshot();
         assert_eq!(barrier.begin(1), Err(Error::EpochExhausted));
         assert_eq!(barrier.snapshot(), before);
+    }
+
+    #[test]
+    fn separate_same_generation_barriers_cannot_cross_acknowledge() {
+        let mut first = ShootdownBarrier::<2>::new(7).unwrap();
+        let mut second = ShootdownBarrier::<2>::new(7).unwrap();
+        let first_round = first.begin(0b11).unwrap();
+        let second_round = second.begin(0b11).unwrap();
+        assert_ne!(first_round, second_round);
+        assert_eq!(ack(&mut first, second_round, 0), Err(Error::StaleRound));
+        assert_eq!(ack(&mut second, first_round, 0), Err(Error::StaleRound));
+        assert_eq!(first.snapshot().pending, 0b11);
+        assert_eq!(second.snapshot().pending, 0b11);
+        ack(&mut second, second_round, 0).unwrap();
+        ack(&mut second, second_round, 1).unwrap();
+        assert!(second.completed(second_round));
+        assert!(!first.completed(second_round));
+        assert!(!first.completed(first_round));
     }
 
     #[test]
