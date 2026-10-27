@@ -117,6 +117,8 @@ extern "C" fn wolfos_ap_stack_rust(info_ptr: *const MpInfo, index: usize) -> ! {
     }
     AP_RESULT[index].store(result, Ordering::Release);
     AP_DONE[index].store(expected_ack(info), Ordering::Release);
+    #[cfg(feature = "ap-ring3-hardware-smoke")]
+    crate::ap_ring3_hardware_smoke::secondary(index);
     #[cfg(feature = "smp-address-space-retirement-smoke")]
     if !crate::smp_address_space_retirement_smoke::secondary(index) {
         crate::halt_forever();
