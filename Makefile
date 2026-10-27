@@ -479,6 +479,7 @@ test:
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_event_irq_wake_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_ring_prep_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_smp_preempt_evidence.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_ap_local_timer_smoke.py' -v
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/ap_preempt_progress_budget.rs -o $(OUT)/ap_preempt_progress_budget_tests
 	$(OUT)/ap_preempt_progress_budget_tests
