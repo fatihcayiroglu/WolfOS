@@ -9,6 +9,8 @@ LIMINE_BRANCH := v10.x-binary
 
 ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
+else ifeq ($(FLAVOR),qemu-stdvga-dispi)
+FEATURES := --features qemu-stdvga-dispi-smoke
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
 else ifeq ($(FLAVOR),ps2-graphics-overflow)
@@ -225,6 +227,11 @@ run-uefi: iso
 smoke:
 	$(MAKE) iso FLAVOR=smoke
 	python3 scripts/smoke.py $(OUT)/wolfos-smoke.iso
+
+.PHONY: qemu-stdvga-dispi-smoke
+qemu-stdvga-dispi-smoke:
+	$(MAKE) iso FLAVOR=qemu-stdvga-dispi
+	python3 scripts/qemu_stdvga_dispi_smoke.py $(OUT)/wolfos-qemu-stdvga-dispi.iso
 
 .PHONY: address-space-retirement-smoke
 address-space-retirement-smoke:
@@ -460,6 +467,8 @@ test:
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/display_driver_policy.rs -o $(OUT)/display_driver_policy_tests
 	$(OUT)/display_driver_policy_tests
+	rustc --edition=2024 --test kernel/src/qemu_dispi_contract.rs -o $(OUT)/qemu_dispi_contract_tests
+	$(OUT)/qemu_dispi_contract_tests
 	rustc --edition=2024 --test kernel/src/ps2_scancode_queue.rs -o $(OUT)/ps2_scancode_queue_tests
 	$(OUT)/ps2_scancode_queue_tests
 	rustc --edition=2024 --test kernel/src/ps2_keyboard.rs -o $(OUT)/ps2_keyboard_tests
@@ -476,6 +485,7 @@ test:
 	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_display_driver_evidence.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_stdvga_dispi_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_four_live_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_event_wait_evidence.py' -v

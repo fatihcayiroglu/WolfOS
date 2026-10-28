@@ -18,6 +18,8 @@ pub struct PciSummary {
     pub displays: usize,
     pub networks: usize,
     pub storage: usize,
+    /// Read-only count of exact QEMU PCI Standard VGA 1234:1111 functions.
+    pub qemu_stdvga: usize,
 }
 
 /// Read an aligned u32 from a function's first 256 PCI config bytes.
@@ -73,6 +75,9 @@ fn record(
         0x02 => summary.networks += 1,
         0x03 => {
             summary.displays += 1;
+            if vendor == 0x1234 && device == 0x1111 {
+                summary.qemu_stdvga += 1;
+            }
             serial::write_fmt(format_args!(
                 "WOLFOS_GPU_DETECTED vendor={:04x} device={:04x} bus={:02x} slot={:02x}\n",
                 vendor, device, bus, slot
@@ -94,7 +99,7 @@ fn record(
 /// Legacy access is deliberately serialized by the single-CPU startup phase.
 pub fn discover() -> PciSummary {
     let mut summary = PciSummary {
-        devices: 0, displays: 0, networks: 0, storage: 0,
+        devices: 0, displays: 0, networks: 0, storage: 0, qemu_stdvga: 0,
     };
     for bus in 0u16..=255 {
         for slot in 0u8..32 {

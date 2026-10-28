@@ -124,6 +124,10 @@ mod vfs_smoke;
 mod ramfs_smoke;
 mod pci;
 mod display_driver_policy;
+#[cfg(feature = "qemu-stdvga-dispi-smoke")]
+mod qemu_dispi_contract;
+#[cfg(feature = "qemu-stdvga-dispi-smoke")]
+mod qemu_stdvga_dispi_smoke;
 mod paging;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_preflight;
@@ -409,6 +413,11 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     }
     serial::write_line("WOLFOS_PCI_TEST_OK");
+    #[cfg(feature = "qemu-stdvga-dispi-smoke")]
+    if !qemu_stdvga_dispi_smoke::prove(pci_summary.qemu_stdvga) {
+        serial::write_line("WOLFOS_QEMU_DISPI_TEST_FAILED");
+        halt_forever();
+    }
     let Some(rsdp_response) = RSDP_REQUEST.response() else {
         serial::write_line("WOLFOS_ACPI_ERROR no Limine RSDP response");
         halt_forever();
