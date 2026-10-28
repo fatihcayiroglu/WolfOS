@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn device_error_reserved_header_or_stale_fence_never_looks_successful() {
         let fence=0x123456789abcdef0;
-        let mut r=response(fence);r[0]=0x00;
+        let mut r=response(fence);r[0]^=1; // 0x1100 -> 0x1101, actually corrupts type
         assert_eq!(validate_completion(3,3,0,24,&r,fence),Err(Error::WrongResponseType));
         let mut r=response(fence);r[4]=0;
         assert_eq!(validate_completion(3,3,0,24,&r,fence),Err(Error::WrongResponseHeader));
