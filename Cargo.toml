@@ -19,6 +19,8 @@ smoke-exit = []
 # Feature-isolated QEMU stdvga 1234:1111 Bochs-VBE port observation;
 # only index selector is changed/restored, NEVER video mode/data writes.
 qemu-stdvga-dispi-smoke = ["smoke-exit"]
+# QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
+qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Opt-in BSP polling diagnostics; does not write disks or launch applications.
 serial-shell = []
 # QEMU-only polling of PS/2 set-1 keyboard into bounded framebuffer cells.

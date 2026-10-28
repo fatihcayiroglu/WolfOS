@@ -4,3 +4,6 @@
 mod qemu_dispi_contract;
 #[path = "qemu_display_attestation.rs"]
 mod qemu_display_attestation;
+
+#[path = "qemu_vbe_transaction_contract.rs"]
+mod qemu_vbe_transaction_contract;
