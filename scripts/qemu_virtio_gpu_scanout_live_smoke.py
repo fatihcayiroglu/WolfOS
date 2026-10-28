@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Real QEMU VirtIO-GPU SET_SCANOUT/FLUSH pixel screenshot and rollback gate.
+"""Real QEMU VirtIO-GPU SET_SCANOUT/FLUSH pixel and disable evidence.
 
 QMP screenshots are taken only on guest COM1 stage handshakes. The guest
-cannot finish unless the host captures baseline, active and restored screens.
+cannot finish unless the host captures baseline, active and disabled screens.
 No physical GPU, guest disk image writes or GUI backend.
 """
 from pathlib import Path
@@ -28,8 +28,8 @@ MARKER = (
     "pmm_leak=0 qemu_only=1"
 )
 PREFIX="WOLFOS_VIRTIO_GPU_SCANOUT_CAPTURE stage="
-STAGES=("baseline","active","restored")
-RELEASE={"baseline":b"B","active":b"A","restored":b"R"}
+STAGES=("baseline","active","disabled")
+RELEASE={"baseline":b"B","active":b"A","disabled":b"D"}
 TEST_OK="WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 
 class ProofError(Exception):
@@ -148,12 +148,25 @@ def verify_active(image:tuple[int,int,bytes])->None:
                     f"Host QMP pixel mismatch at ({x},{y}): {got} != {expected}"
                 )
 
-def verify_rollback(before:tuple[int,int,bytes],after:tuple[int,int,bytes])->None:
-    if before!=after:
-        raise ProofError(
-            f"QMP rollback differs from baseline: "
-            f"{before[:2]} vs {after[:2]} pixels_equal={before[2]==after[2]}"
-        )
+def verify_disabled(active:tuple[int,int,bytes],disabled:tuple[int,int,bytes])->None:
+    # VirtIO resource_id=0 detaches output but does NOT restore the
+    # original pre-driver (often 1024x768) console geometry in QEMU.
+    # Require a fresh 64x64 screenshot and near-total disappearance of
+    # the 4096 known transferred pixels. No rollback-to-baseline claim.
+    if active[:2]!=(64,64) or disabled[:2]!=(64,64):
+        raise ProofError("Unexpected scanout-disable geometry")
+    if active==disabled:
+        raise ProofError("Disabled scanout still shows all active pixels")
+    rgb=disabled[2]
+    matches=0
+    for y in range(64):
+        for x in range(64):
+            at=3*(y*64+x)
+            if tuple(rgb[at:at+3])==expected_rgb(x,y):
+                matches+=1
+    if matches>8:
+        raise ProofError(f"Disabled QEMU screen retains {matches}/4096 active pixels")
+
 
 def run(iso:Path)->int:
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-scanout-") as work:
@@ -208,8 +221,8 @@ def run(iso:Path)->int:
                                     images[name]=ppm(target)
                                     if name=="active":
                                         verify_active(images[name])
-                                    elif name=="restored":
-                                        verify_rollback(images["baseline"],images["restored"])
+                                    elif name=="disabled":
+                                        verify_disabled(images["active"],images["disabled"])
                                     ser.sendall(RELEASE[name])
                                     stages+=1
                         if proc.poll() is not None and not chunk:
@@ -227,8 +240,11 @@ def run(iso:Path)->int:
                 raise ProofError(f"Transport/display proof or QEMU exit failed: {proc.returncode}")
             if not validate_serial(output):
                 raise ProofError("Genuine ten-command/rollback serial proof invalid")
-            print("PASS: QMP 4096 RGB pixels match the guest pattern, "
-                  "baseline equals restored PPM, 8 fenced replies and reset")
+            print("PASS: QMP 4096 RGB pixels match the guest pattern; "
+                  "disabled screenshot loses the pattern; 8 fenced replies and reset")
+            print(f"Baseline geometry={images['baseline'][0]}x{images['baseline'][1]}, "
+                  f"disabled geometry={images['disabled'][0]}x{images['disabled'][1]}; "
+                  "original screen geometry rollback NOT proven")
             return 0
         except (ProofError,FileNotFoundError,ConnectionError,OSError,ValueError,
                 json.JSONDecodeError,subprocess.TimeoutExpired) as exc:

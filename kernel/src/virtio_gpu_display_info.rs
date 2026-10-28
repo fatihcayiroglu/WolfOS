@@ -313,8 +313,9 @@ fn query_resource2d(
                 .map_err(|_|"scanout_disable_wire")?;
             send_resource_command(vas,frames,notify_port,selected,8,
                 &clear.bytes,clear.fence)?;
-            // Host verifies baseline/restored QMP PPM equality.
-            await_host_capture("restored",b'R')?;
+            // Host verifies the scanout pattern disappears. Original console
+            // geometry is NOT restored by resource_id=0 in this QEMU model.
+            await_host_capture("disabled",b'D')?;
         }
         let detach=backing::detach(resource::RESOURCE_ID,true,DETACH_FENCE)
             .map_err(|_|"detach_wire")?;

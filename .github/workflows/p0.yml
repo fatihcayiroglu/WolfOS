@@ -80,7 +80,7 @@ jobs:
         run: make qemu-virtio-gpu-attach-backing-smoke
       - name: Real QEMU VirtIO-GPU bounded 16KiB transfer-to-host, fenced cleanup and reset
         run: make qemu-virtio-gpu-transfer2d-smoke
-      - name: Real QEMU VirtIO-GPU scanout pixel screendump and reversible rollback, headless only
+      - name: Real QEMU VirtIO-GPU 4096 host RGB pixels and explicit scanout disable, headless only
         run: make qemu-virtio-gpu-scanout-live-smoke
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke

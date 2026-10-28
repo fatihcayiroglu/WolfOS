@@ -6,13 +6,13 @@ from pathlib import Path
 
 from qemu_virtio_gpu_scanout_live_smoke import (
     MARKER,PREFIX,TEST_OK,ProofError,validate_serial,
-    expected_rgb,ppm,verify_active,verify_rollback,
+    expected_rgb,ppm,verify_active,verify_disabled,
 )
 from test_qemu_virtio_gpu_attach_backing_smoke import DISPLAY9,EDID9
 
 CAPTURE0=PREFIX+"baseline"
 CAPTURE1=PREFIX+"active"
-CAPTURE2=PREFIX+"restored"
+CAPTURE2=PREFIX+"disabled"
 DISPLAY_ACK="WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK"
 EDID_ACK="WOLFOS_VIRTIO_GPU_EDID_LIVE_TEST_OK"
 TEXT="\n".join((CAPTURE0,CAPTURE1,CAPTURE2,DISPLAY9,EDID9,MARKER,
@@ -97,14 +97,18 @@ class ScanoutProofTests(unittest.TestCase):
             file.write_bytes(b"P6\n64 64\n255\n"+pixels[:-1])
             with self.assertRaises(ProofError):
                 ppm(file)
-    def test_restore_requires_exact_pixel_and_geometry_equality(self):
-        baseline=(640,480,bytes([1,2,3])*640*480)
-        verify_rollback(baseline,baseline)
-        other=(640,480,bytes([1,2,4])*640*480)
+    def test_disable_screenshot_rejects_stale_active_pixels(self):
+        active=image()
+        blank=(64,64,bytes(64*64*3))
+        verify_disabled(active,blank)
         with self.assertRaises(ProofError):
-            verify_rollback(baseline,other)
+            verify_disabled(active,active)
         with self.assertRaises(ProofError):
-            verify_rollback(baseline,(64,64,b""))
+            verify_disabled(active,(1024,768,bytes(1024*768*3)))
+        stale=bytearray(active[2])
+        stale[0]=0
+        with self.assertRaises(ProofError):
+            verify_disabled(active,(64,64,bytes(stale)))
 
 if __name__=="__main__":
     unittest.main()
