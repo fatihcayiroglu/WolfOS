@@ -30,6 +30,10 @@ scanout0 with nonzero fence, and switch the two descriptor lengths. Publish
 avail head0 in slot1, advance available index to2, write the bounded queue
 notify register exactly once more and await a bounded second used entry.
 Require used index2, id0, bytes1056 and an exactly echoed response fence.
+The CTA-861 parser supports QEMU's explicitly identified 50 Hz video codes
+89, 96, 101 and 125 with pixel clocks and totals verified against upstream
+Linux DRM; unknown codes still fail closed. No synthetic Hz selection occurs.
+
 The full EDID response must pass strict length, header, version, checksums,
 extension parsing and nonzero timed modes. Some QEMU guests advertise a
 1024-byte response array while the EDID base declares fewer actual 128-byte
