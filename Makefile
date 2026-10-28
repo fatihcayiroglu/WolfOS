@@ -21,6 +21,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-common-mmio)
 FEATURES := --features qemu-virtio-gpu-common-mmio-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-device-mmio)
 FEATURES := --features qemu-virtio-gpu-device-mmio-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-transport-preflight)
+FEATURES := --features qemu-virtio-gpu-transport-preflight-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -270,6 +272,11 @@ qemu-virtio-gpu-common-mmio-smoke:
 qemu-virtio-gpu-device-mmio-smoke:
 	$(MAKE) iso FLAVOR=qemu-virtio-gpu-device-mmio
 	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-device-mmio.iso --device
+
+.PHONY: qemu-virtio-gpu-transport-preflight-smoke
+qemu-virtio-gpu-transport-preflight-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-transport-preflight
+	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-transport-preflight.iso --preflight
 
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:
@@ -538,6 +545,8 @@ test:
 	$(OUT)/virtio_gpu_mmio_contract_tests
 	rustc --edition=2024 --test kernel/src/virtio_gpu_device_mmio_contract.rs -o $(OUT)/virtio_gpu_device_mmio_contract_tests
 	$(OUT)/virtio_gpu_device_mmio_contract_tests
+	rustc --edition=2024 --test kernel/src/virtio_gpu_transport_preflight_contract.rs -o $(OUT)/virtio_gpu_transport_preflight_contract_tests
+	$(OUT)/virtio_gpu_transport_preflight_contract_tests
 	rustc --edition=2024 --test kernel/src/display_driver_policy.rs -o $(OUT)/display_driver_policy_tests
 	$(OUT)/display_driver_policy_tests
 	rustc --edition=2024 --test kernel/src/display_edid_host.rs -o $(OUT)/display_edid_policy_tests
