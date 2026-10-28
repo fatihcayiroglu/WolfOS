@@ -19,7 +19,14 @@ PROOF = re.compile(
     r"enabled=(\d+) vram64k=(\d+) "
     r"selector_restored=1 mode_writes=0 native_accel=0"
 )
+ATTEST = re.compile(
+    r"WOLFOS_QEMU_DISPLAY_ATTEST_OK width=(\d+) height=(\d+) "
+    r"pitch=(\d+) bpp=(\d+) vram64k=(\d+) "
+    r"rgb=1 mode_writes=0"
+)
 FORBIDDEN = (
+    "WOLFOS_QEMU_DISPLAY_ATTEST_FAILED",
+    "WOLFOS_FB_TEXT_FAILED",
     "WOLFOS_QEMU_DISPI_PROBE_FAIL", "WOLFOS_QEMU_DISPI_TEST_FAILED",
     "WOLFOS_PANIC", "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF",
     "WOLFOS_EXCEPTION_DF", "WOLFOS_GPU_DRIVER_LOADED",
@@ -34,12 +41,21 @@ def validate(output: str, exit_code: int) -> bool:
     proofs = [(i, PROOF.fullmatch(s)) for i, s in enumerate(rows)
               if s.startswith("WOLFOS_QEMU_DISPI_PROBE_OK ")]
     pci_ok = [i for i, s in enumerate(rows) if s == "WOLFOS_PCI_TEST_OK"]
-    if len(gpu) != 1 or len(proofs) != 1 or len(pci_ok) != 1:
+    attest = [(i, ATTEST.fullmatch(s)) for i, s in enumerate(rows)
+              if s.startswith("WOLFOS_QEMU_DISPLAY_ATTEST_OK ")]
+    text_ok = [i for i, s in enumerate(rows) if s.startswith("WOLFOS_FB_TEXT_OK ")]
+    fb_ok = [i for i, s in enumerate(rows) if s.startswith("WOLFOS_FRAMEBUFFER_OK ")]
+    if (len(gpu) != 1 or len(proofs) != 1 or len(pci_ok) != 1
+            or len(attest) != 1 or len(text_ok) != 1 or len(fb_ok) != 1):
         return False
     index, evidence = proofs[0]
     if evidence is None or any(token in output for token in FORBIDDEN):
         return False
-    if not (gpu[0] < pci_ok[0] < index < rows.index("WOLFOS_BOOT_OK")):
+    att_index, att_evidence = attest[0]
+    if att_evidence is None:
+        return False
+    if not (gpu[0] < pci_ok[0] < index < att_index < text_ok[0]
+            < fb_ok[0] < rows.index("WOLFOS_BOOT_OK")):
         return False
     ident, xres, yres, bpp, enabled, vram64k = evidence.groups()
     if not (0xb0c0 <= int(ident, 16) <= 0xb0c5):
@@ -47,12 +63,18 @@ def validate(output: str, exit_code: int) -> bool:
     xres, yres, bpp, enabled, vram64k = map(int, (xres, yres, bpp, enabled, vram64k))
     if vram64k == 0 or vram64k > 65535:
         return False
-    if enabled & 1:
-        if not (0 < xres <= 8192 and 0 < yres <= 8192):
-            return False
-        bpp_bytes = {4: 1, 8: 1, 15: 2, 16: 2, 24: 3, 32: 4}.get(bpp)
-        if bpp_bytes is None or xres * yres * bpp_bytes > vram64k * 65536:
-            return False
+    if not (enabled & 1) or not (0 < xres <= 8192 and 0 < yres <= 8192):
+        return False
+    bpp_bytes = {4: 1, 8: 1, 15: 2, 16: 2, 24: 3, 32: 4}.get(bpp)
+    if bpp_bytes is None or xres * yres * bpp_bytes > vram64k * 65536:
+        return False
+    aw, ah, pitch, abpp, avram = map(int, att_evidence.groups())
+    if (aw != xres or ah != yres or abpp != bpp or bpp != 32
+            or avram != vram64k or pitch < aw * 4 or pitch % 4
+            or pitch * ah > vram64k * 65536):
+        return False
+    if rows[fb_ok[0]] != f"WOLFOS_FRAMEBUFFER_OK {aw}x{ah}":
+        return False
     return True
 
 def main() -> int:
