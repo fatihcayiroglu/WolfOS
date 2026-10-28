@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(r.modes()[2].refresh_millihz,50_000);
     }
     #[test]
-    fn 4k30_supported_independently_of_4k60() {
+    fn vic_4k30_supported_independently_of_4k60() {
         let mut c=extension();c[5]=95;c[6]=97;checksum(&mut c);
         let r=parse_complete(&joined(base(),c)).unwrap();
         assert_eq!(r.len(),3);
