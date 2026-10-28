@@ -37,6 +37,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-notify-ro)
 FEATURES := --features qemu-virtio-gpu-notify-ro-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-display-info)
 FEATURES := --features qemu-virtio-gpu-display-info-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-edid-live)
+FEATURES := --features qemu-virtio-gpu-edid-live-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -326,6 +328,14 @@ qemu-virtio-gpu-notify-ro-smoke:
 qemu-virtio-gpu-display-info-smoke:
 	$(MAKE) iso FLAVOR=qemu-virtio-gpu-display-info
 	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-display-info.iso --display-info
+
+.PHONY: qemu-virtio-gpu-edid-live-smoke
+qemu-virtio-gpu-edid-live-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-edid-live
+	rustc --edition=2021 --test kernel/src/virtio_gpu_edid_live_contract.rs -o $(OUT)/edid_live_contract_test
+	$(OUT)/edid_live_contract_test
+	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_edid_live_smoke.py
+	python3 scripts/qemu_virtio_gpu_edid_live_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-edid-live.iso
 
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:

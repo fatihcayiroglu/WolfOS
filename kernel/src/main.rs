@@ -128,6 +128,8 @@ mod display_mode_policy;
 mod display_edid_base;
 mod display_edid_cta;
 mod virtio_gpu_edid_wire;
+#[cfg(feature = "qemu-virtio-gpu-edid-live-smoke")]
+mod virtio_gpu_edid_live_contract;
 #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
 mod virtio_gpu_pci_caps;
 #[cfg(feature = "qemu-virtio-gpu-bars-smoke")]
@@ -603,6 +605,8 @@ pub extern "C" fn kmain() -> ! {
                             halt_forever();
                         }
                         serial::write_line("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK");
+                        #[cfg(feature = "qemu-virtio-gpu-edid-live-smoke")]
+                        serial::write_line("WOLFOS_VIRTIO_GPU_EDID_LIVE_TEST_OK");
                     }
                 }
             }
