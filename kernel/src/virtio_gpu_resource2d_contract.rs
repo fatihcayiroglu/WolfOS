@@ -171,7 +171,6 @@ mod tests {
         assert_eq!(validate_completion(6,6,0,24,&response(fence),fence),Ok(()));
         assert_eq!(validate_completion(7,7,0,24,&response(fence),fence),Ok(()));
         assert_eq!(validate_completion(8,8,0,24,&response(fence),fence),Err(Error::MissingCompletion));
-        assert_eq!(validate_completion(7,7,0,24,&response(fence),fence),Err(Error::MissingCompletion));
         assert_eq!(validate_completion(3,2,0,24,&response(fence),fence),
                    Err(Error::MissingCompletion));
         assert_eq!(validate_completion(4,3,0,24,&response(fence),fence),
