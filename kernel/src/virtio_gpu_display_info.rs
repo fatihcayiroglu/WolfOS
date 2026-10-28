@@ -256,11 +256,26 @@ fn query_resource2d(
     const FLUSH_FENCE:u64=0x574f_4c46_3244_464c;
     #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
     const CLEAR_FENCE:u64=0x574f_4c46_3244_434c;
-    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+    const SHRINK_SET_FENCE:u64=0x574f_4c46_4e53_5431;
+    #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+    const SHRINK_FLUSH_FENCE:u64=0x574f_4c46_4e46_4c31;
+    #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+    const EXPAND_SET_FENCE:u64=0x574f_4c46_4e53_5432;
+    #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+    const EXPAND_FLUSH_FENCE:u64=0x574f_4c46_4e46_4c32;
+    #[cfg(all(feature="qemu-virtio-gpu-scanout-live-smoke",
+              not(feature="qemu-virtio-gpu-native-rollback-smoke")))]
     scanout::unique_fences([
         CREATE_FENCE,ATTACH_FENCE,TRANSFER_FENCE,SET_FENCE,FLUSH_FENCE,
         CLEAR_FENCE,DETACH_FENCE,UNREF_FENCE
     ]).map_err(|_|"scanout_fence_reused")?;
+    #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+    scanout::unique_fences([
+        CREATE_FENCE,ATTACH_FENCE,TRANSFER_FENCE,SET_FENCE,FLUSH_FENCE,
+        SHRINK_SET_FENCE,SHRINK_FLUSH_FENCE,EXPAND_SET_FENCE,
+        EXPAND_FLUSH_FENCE,CLEAR_FENCE,DETACH_FENCE,UNREF_FENCE
+    ]).map_err(|_|"native_rollback_fence_reused")?;
     #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
     transfer::distinct_fences([
         CREATE_FENCE,ATTACH_FENCE,TRANSFER_FENCE,DETACH_FENCE,UNREF_FENCE
@@ -309,9 +324,40 @@ fn query_resource2d(
                 &flush.bytes,flush.fence)?;
             // Host captures a QMP PPM; kernel only observes the host ACK.
             await_host_capture("active",b'A')?;
+            #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+            {
+                // Native VirtIO rectangle change: same pinned 64x64 resource,
+                // no reset, DMA replacement, detach or extra PMM allocations.
+                let shrink=scanout::set_32(
+                    resource::RESOURCE_ID,true,SHRINK_SET_FENCE
+                ).map_err(|_|"native_shrink_wire")?;
+                send_resource_command(vas,frames,notify_port,selected,8,
+                    &shrink.bytes,shrink.fence)?;
+                let shrunk_flush=scanout::flush_32(
+                    resource::RESOURCE_ID,true,SHRINK_FLUSH_FENCE
+                ).map_err(|_|"native_shrink_flush_wire")?;
+                send_resource_command(vas,frames,notify_port,selected,9,
+                    &shrunk_flush.bytes,shrunk_flush.fence)?;
+                await_host_capture("reduced",b'M')?;
+                let expand=scanout::set(resource::RESOURCE_ID,true,
+                    0,0,64,64,EXPAND_SET_FENCE
+                ).map_err(|_|"native_expand_wire")?;
+                send_resource_command(vas,frames,notify_port,selected,10,
+                    &expand.bytes,expand.fence)?;
+                let expanded_flush=scanout::flush(resource::RESOURCE_ID,true,
+                    0,0,64,64,EXPAND_FLUSH_FENCE
+                ).map_err(|_|"native_expand_flush_wire")?;
+                send_resource_command(vas,frames,notify_port,selected,11,
+                    &expanded_flush.bytes,expanded_flush.fence)?;
+                await_host_capture("reexpanded",b'E')?;
+            }
             let clear=scanout::disable(true,CLEAR_FENCE)
                 .map_err(|_|"scanout_disable_wire")?;
-            send_resource_command(vas,frames,notify_port,selected,8,
+            #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+            let clear_index=12;
+            #[cfg(not(feature="qemu-virtio-gpu-native-rollback-smoke"))]
+            let clear_index=8;
+            send_resource_command(vas,frames,notify_port,selected,clear_index,
                 &clear.bytes,clear.fence)?;
             // Host verifies the scanout pattern disappears. Original console
             // geometry is NOT restored by resource_id=0 in this QEMU model.
@@ -319,7 +365,10 @@ fn query_resource2d(
         }
         let detach=backing::detach(resource::RESOURCE_ID,true,DETACH_FENCE)
             .map_err(|_|"detach_wire")?;
-        #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+        #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+        let detach_index=13;
+        #[cfg(all(feature="qemu-virtio-gpu-scanout-live-smoke",
+                  not(feature="qemu-virtio-gpu-native-rollback-smoke")))]
         let detach_index=9;
         #[cfg(all(feature="qemu-virtio-gpu-transfer2d-smoke",
                   not(feature="qemu-virtio-gpu-scanout-live-smoke")))]
@@ -332,7 +381,10 @@ fn query_resource2d(
     // Acknowledged explicit host-resource destruction is mandatory.
     let unref=resource::unref(resource::RESOURCE_ID,true,UNREF_FENCE)
         .map_err(|_|"unref_wire")?;
-    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+    let unref_index=14;
+    #[cfg(all(feature="qemu-virtio-gpu-scanout-live-smoke",
+              not(feature="qemu-virtio-gpu-native-rollback-smoke")))]
     let unref_index=10;
     #[cfg(all(feature="qemu-virtio-gpu-transfer2d-smoke",
               not(feature="qemu-virtio-gpu-scanout-live-smoke")))]
@@ -828,16 +880,24 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
             "WOLFOS_VIRTIO_GPU_TRANSFER2D_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 transfer_type=261 detach_type=263 unref_type=258 response_type=4352 used_idx=7 used_head=0 used_len=24 fences_verified=5 notify_writes=7 backing_entries=4 backing_bytes=16384 pattern_nonzero_bytes=16384 guest_pattern_verified=2 transfer_ack=1 detach_ack=1 unref_ack=1 host_readback=0 scanout_writes=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
-    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    #[cfg(all(feature="qemu-virtio-gpu-scanout-live-smoke",
+              not(feature="qemu-virtio-gpu-native-rollback-smoke")))]
     if resource_done {
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_SCANOUT_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 transfer_type=261 set_type=259 flush_type=260 clear_type=259 detach_type=263 unref_type=258 response_type=4352 used_idx=10 used_head=0 used_len=24 fences_verified=8 notify_writes=10 backing_entries=4 backing_bytes=16384 guest_pattern_verified=2 set_ack=1 flush_ack=1 clear_ack=1 detach_ack=1 unref_ack=1 capture_acks=3 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
-    #[cfg(feature="qemu-virtio-gpu-scanout-reset-smoke")]
+    #[cfg(all(feature="qemu-virtio-gpu-scanout-reset-smoke",
+              not(feature="qemu-virtio-gpu-native-rollback-smoke")))]
     if resource_done&&reset_capture_ok{
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK reset_to_vga_ack=1 capture_acks=4 geometry_and_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+    if resource_done&&reset_capture_ok{
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK resource_id=1 width_before=64 width_changed=32 width_restored=64 height_before=64 height_changed=32 height_restored=64 set_type=259 flush_type=260 response_type=4352 used_idx=14 used_head=0 used_len=24 fences_verified=12 notify_writes=14 guest_pattern_verified=2 native_switch_acks=4 reset_to_vga_ack=1 capture_acks=6 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
     true

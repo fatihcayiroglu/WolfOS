@@ -93,7 +93,7 @@ pub fn validate_completion(
     expected_index: u16, used_index: u16, used_id: u32, used_len: u32,
     response: &[u8], expected_fence: u64,
 ) -> Result<(), Error> {
-    if !(3..=10).contains(&expected_index) { return Err(Error::MissingCompletion); }
+    if !(3..=14).contains(&expected_index) { return Err(Error::MissingCompletion); }
     if used_index != expected_index { return Err(Error::MissingCompletion); }
     if used_id != 0 { return Err(Error::WrongHead); }
     if used_len != RESPONSE_BYTES as u32 || response.len() != RESPONSE_BYTES {
@@ -173,7 +173,17 @@ mod tests {
         assert_eq!(validate_completion(8,8,0,24,&response(fence),fence),Ok(()));
         assert_eq!(validate_completion(9,9,0,24,&response(fence),fence),Ok(()));
         assert_eq!(validate_completion(10,10,0,24,&response(fence),fence),Ok(()));
-        assert_eq!(validate_completion(11,11,0,24,&response(fence),fence),Err(Error::MissingCompletion));
+        // Four additional native SET/FLUSH changes permit indices 11..14,
+        // but every one still requires an exact used entry and fenced reply.
+        for idx in 11..=14 {
+            assert_eq!(validate_completion(idx,idx,0,24,&response(fence),fence),Ok(()));
+        }
+        assert_eq!(validate_completion(15,15,0,24,&response(fence),fence),
+                   Err(Error::MissingCompletion));
+        assert_eq!(validate_completion(14,13,0,24,&response(fence),fence),
+                   Err(Error::MissingCompletion));
+        assert_eq!(validate_completion(14,14,0,24,&response(fence),fence+1),
+                   Err(Error::WrongFence));
         assert_eq!(validate_completion(3,2,0,24,&response(fence),fence),
                    Err(Error::MissingCompletion));
         assert_eq!(validate_completion(4,3,0,24,&response(fence),fence),
