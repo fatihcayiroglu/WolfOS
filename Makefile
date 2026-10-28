@@ -49,6 +49,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-scanout-live)
 FEATURES := --features qemu-virtio-gpu-scanout-live-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-scanout-reset)
 FEATURES := --features qemu-virtio-gpu-scanout-reset-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-native-rollback)
+FEATURES := --features qemu-virtio-gpu-native-rollback-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -384,6 +386,14 @@ qemu-virtio-gpu-scanout-reset-smoke:
 	$(MAKE) iso FLAVOR=qemu-virtio-gpu-scanout-reset
 	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_scanout_reset_smoke.py
 	python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py --reset-restore $(OUT)/wolfos-qemu-virtio-gpu-scanout-reset.iso
+
+.PHONY: qemu-virtio-gpu-native-rollback-smoke
+qemu-virtio-gpu-native-rollback-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-native-rollback
+	rustc --edition=2024 --test kernel/src/virtio_gpu_scanout_contract.rs -o $(OUT)/virtio_gpu_native_rollback_contract_tests
+	$(OUT)/virtio_gpu_native_rollback_contract_tests
+	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_native_rollback_smoke.py
+	python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py --native-rollback $(OUT)/wolfos-qemu-virtio-gpu-native-rollback.iso
 
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:

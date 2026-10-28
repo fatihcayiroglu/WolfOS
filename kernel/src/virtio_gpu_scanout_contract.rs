@@ -20,7 +20,7 @@ fn header(cmd:u32,fence:u64)->Result<[u8;REQUEST_BYTES],Error>{
     b[8..16].copy_from_slice(&fence.to_le_bytes());
     Ok(b)
 }
-pub fn unique_fences(f:[u64;8])->Result<(),Error>{
+pub fn unique_fences<const N:usize>(f:[u64;N])->Result<(),Error>{
     for i in 0..f.len(){
         if f[i]==0{return Err(Error::InvalidFence);}
         for j in 0..i{if f[i]==f[j]{return Err(Error::ReusedFence);}}
@@ -47,6 +47,27 @@ pub fn flush(resource:u32,set_ack:bool,x:u32,y:u32,w:u32,h:u32,
     let mut b=header(CMD_RESOURCE_FLUSH,fence)?;
     b[32..36].copy_from_slice(&w.to_le_bytes());
     b[36..40].copy_from_slice(&h.to_le_bytes());
+    b[40..44].copy_from_slice(&resource.to_le_bytes());
+    Ok(Request{bytes:b,fence})
+}
+// QEMU-only native scanout rectangle change. A 32x32 view is fully covered
+// by the one pinned 64x64 resource; no new DMA mapping or backing lifetime.
+pub fn set_32(resource:u32,transfer_ack:bool,fence:u64)->Result<Request,Error>{
+    if !transfer_ack{return Err(Error::NoTransferAck);}
+    if resource==0{return Err(Error::InvalidResource);}
+    let mut b=header(CMD_SET_SCANOUT,fence)?;
+    b[32..36].copy_from_slice(&32u32.to_le_bytes());
+    b[36..40].copy_from_slice(&32u32.to_le_bytes());
+    b[40..44].copy_from_slice(&SCANOUT_ID.to_le_bytes());
+    b[44..48].copy_from_slice(&resource.to_le_bytes());
+    Ok(Request{bytes:b,fence})
+}
+pub fn flush_32(resource:u32,set_ack:bool,fence:u64)->Result<Request,Error>{
+    if !set_ack{return Err(Error::NoSetAck);}
+    if resource==0{return Err(Error::InvalidResource);}
+    let mut b=header(CMD_RESOURCE_FLUSH,fence)?;
+    b[32..36].copy_from_slice(&32u32.to_le_bytes());
+    b[36..40].copy_from_slice(&32u32.to_le_bytes());
     b[40..44].copy_from_slice(&resource.to_le_bytes());
     Ok(Request{bytes:b,fence})
 }
@@ -92,6 +113,28 @@ mod tests{
         assert_eq!(flush(1,true,0,0,64,63,1),Err(Error::WrongRectangle));
         assert_eq!(disable(false,1),Err(Error::NoFlushAck));
         assert_eq!(disable(true,0),Err(Error::InvalidFence));
+    }
+    #[test]fn strict_native_resize_wire_and_ack_gate(){
+        let a=set_32(1,true,41).unwrap();
+        assert_eq!(get32(&a.bytes,0),CMD_SET_SCANOUT);
+        assert_eq!(get32(&a.bytes,32),32);
+        assert_eq!(get32(&a.bytes,36),32);
+        assert_eq!(get32(&a.bytes,40),0);
+        assert_eq!(get32(&a.bytes,44),1);
+        let f=flush_32(1,true,42).unwrap();
+        assert_eq!(get32(&f.bytes,0),CMD_RESOURCE_FLUSH);
+        assert_eq!(get32(&f.bytes,32),32);
+        assert_eq!(get32(&f.bytes,36),32);
+        assert_eq!(get32(&f.bytes,40),1);
+        assert_eq!(set_32(1,false,41),Err(Error::NoTransferAck));
+        assert_eq!(set_32(0,true,41),Err(Error::InvalidResource));
+        assert_eq!(flush_32(1,false,42),Err(Error::NoSetAck));
+        assert_eq!(flush_32(0,true,42),Err(Error::InvalidResource));
+        assert_eq!(set_32(1,true,0),Err(Error::InvalidFence));
+        assert_eq!(flush_32(1,true,0),Err(Error::InvalidFence));
+        assert_eq!(unique_fences([1,2,3,4,5,6,7,8,9,10,11,12]),Ok(()));
+        assert_eq!(unique_fences([1,2,3,4,5,6,7,8,9,10,11,2]),
+                   Err(Error::ReusedFence));
     }
     #[test]fn all_eight_fences_unique_and_nonzero(){
         assert_eq!(unique_fences([1,2,3,4,5,6,7,8]),Ok(()));

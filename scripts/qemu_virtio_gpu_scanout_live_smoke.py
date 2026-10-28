@@ -32,6 +32,18 @@ STAGES=("baseline","active","disabled")
 RELEASE={"baseline":b"B","active":b"A","disabled":b"D"}
 RESTORE_STAGES=STAGES+("restored",)
 RESTORE_RELEASE={**RELEASE,"restored":b"R"}
+NATIVE_STAGES=("baseline","active","reduced","reexpanded","disabled","restored")
+NATIVE_RELEASE={**RESTORE_RELEASE,"reduced":b"M","reexpanded":b"E"}
+NATIVE_MARKER=(
+    "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK resource_id=1 "
+    "width_before=64 width_changed=32 width_restored=64 "
+    "height_before=64 height_changed=32 height_restored=64 "
+    "set_type=259 flush_type=260 response_type=4352 "
+    "used_idx=14 used_head=0 used_len=24 fences_verified=12 notify_writes=14 "
+    "guest_pattern_verified=2 native_switch_acks=4 reset_to_vga_ack=1 "
+    "capture_acks=6 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 "
+    "frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+)
 RESET_MARKER=(
     "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK reset_to_vga_ack=1 capture_acks=4 "
     "geometry_and_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 "
@@ -42,10 +54,14 @@ TEST_OK="WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 class ProofError(Exception):
     pass
 
-def validate_serial(output: str, reset_restore:bool=False) -> bool:
+def validate_serial(output: str, reset_restore:bool=False,
+                    native_rollback:bool=False) -> bool:
+    if native_rollback:
+        reset_restore=True
     lines=output.splitlines()
     if any("WOLFOS_VIRTIO_GPU_SCANOUT_FAIL" in l
            or "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_FAIL" in l
+           or "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_FAIL" in l
            or "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL" in l
            or "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL" in l for l in lines):
         return False
@@ -55,11 +71,22 @@ def validate_serial(output: str, reset_restore:bool=False) -> bool:
               if l.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
     if len(displays)!=1 or displays[0] is None:
         return False
-    marker=[i for i,l in enumerate(lines) if l.startswith("WOLFOS_VIRTIO_GPU_SCANOUT_OK ")]
-    if len(marker)!=1 or lines[marker[0]]!=MARKER or lines.count(TEST_OK)!=1:
+    wanted=NATIVE_MARKER if native_rollback else MARKER
+    marker=[i for i,l in enumerate(lines) if l.startswith(
+        "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK " if native_rollback
+        else "WOLFOS_VIRTIO_GPU_SCANOUT_OK "
+    )]
+    if len(marker)!=1 or lines[marker[0]]!=wanted or lines.count(TEST_OK)!=1:
+        return False
+    if any(l.startswith(
+        "WOLFOS_VIRTIO_GPU_SCANOUT_OK " if native_rollback
+        else "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK "
+    ) for l in lines):
         return False
     stages=[(i,l[len(PREFIX):]) for i,l in enumerate(lines) if l.startswith(PREFIX)]
-    if [x[1] for x in stages]!=list(RESTORE_STAGES if reset_restore else STAGES):
+    expected_stages=(NATIVE_STAGES if native_rollback else
+                     RESTORE_STAGES if reset_restore else STAGES)
+    if [x[1] for x in stages]!=list(expected_stages):
         return False
     edid=[i for i,l in enumerate(lines)
           if l.startswith("WOLFOS_VIRTIO_GPU_EDID_LIVE_OK ")]
@@ -79,17 +106,17 @@ def validate_serial(output: str, reset_restore:bool=False) -> bool:
         return False
     reset_marker=[i for i,l in enumerate(lines)
                   if l.startswith("WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK ")]
-    if reset_restore:
+    if reset_restore and not native_rollback:
         if len(reset_marker)!=1 or lines[reset_marker[0]]!=RESET_MARKER:
             return False
     elif reset_marker:
         return False
-    return (stages[0][0]<stages[1][0]<stages[2][0]<
-            (stages[3][0] if reset_restore else len(lines)) and
+    return (all(stages[i][0]<stages[i+1][0] for i in range(len(stages)-1)) and
             stages[-1][0]<
             lines.index(next(l for l in lines if l.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")))<
             edid[0]<marker[0]<display_ack[0]<edid_ack[0]<lines.index(TEST_OK) and
-            (not reset_restore or marker[0]<reset_marker[0]<display_ack[0]))
+            (not reset_restore or native_rollback or
+             marker[0]<reset_marker[0]<display_ack[0]))
 
 def connect_unix(path:Path,proc:subprocess.Popen,deadline:float)->socket.socket:
     while time.monotonic()<deadline:
@@ -166,6 +193,21 @@ def verify_active(image:tuple[int,int,bytes])->None:
                     f"Host QMP pixel mismatch at ({x},{y}): {got} != {expected}"
                 )
 
+def verify_reduced(image:tuple[int,int,bytes])->None:
+    width,height,rgb=image
+    if (width,height)!=(32,32):
+        raise ProofError(f"QMP reduced screen geometry {width}x{height}, expected 32x32")
+    for y in range(32):
+        for x in range(32):
+            at=(y*32+x)*3
+            if tuple(rgb[at:at+3])!=expected_rgb(x,y):
+                raise ProofError(f"Reduced QMP pixel mismatch at ({x},{y})")
+
+def verify_reexpanded(active:tuple[int,int,bytes],reexpanded:tuple[int,int,bytes])->None:
+    verify_active(reexpanded)
+    if reexpanded!=active:
+        raise ProofError("Native 64x64 scanout rollback differs from original active image")
+
 def verify_disabled(active:tuple[int,int,bytes],disabled:tuple[int,int,bytes])->None:
     # VirtIO resource_id=0 detaches output but does NOT restore the
     # original pre-driver (often 1024x768) console geometry in QEMU.
@@ -204,7 +246,7 @@ def verify_restored(baseline:tuple[int,int,bytes],active:tuple[int,int,bytes],
             f"baseline={baseline[2][first]} restored={restored[2][first]}"
         )
 
-def run(iso:Path, reset_restore:bool=False)->int:
+def run(iso:Path, reset_restore:bool=False, native_rollback:bool=False)->int:
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-scanout-") as work:
         root=Path(work)
         serial_path=root/"com1.sock"
@@ -219,8 +261,12 @@ def run(iso:Path, reset_restore:bool=False)->int:
             "-display","none","-no-reboot",
             "-device","isa-debug-exit,iobase=0xf4,iosize=0x04",
         ]
-        stages_expected=RESTORE_STAGES if reset_restore else STAGES
-        releases=RESTORE_RELEASE if reset_restore else RELEASE
+        if native_rollback:
+            reset_restore=True
+        stages_expected=(NATIVE_STAGES if native_rollback else
+                         RESTORE_STAGES if reset_restore else STAGES)
+        releases=(NATIVE_RELEASE if native_rollback else
+                  RESTORE_RELEASE if reset_restore else RELEASE)
         proc=None
         received=bytearray()
         images={}
@@ -259,6 +305,10 @@ def run(iso:Path, reset_restore:bool=False)->int:
                                     images[name]=ppm(target)
                                     if name=="active":
                                         verify_active(images[name])
+                                    elif name=="reduced":
+                                        verify_reduced(images[name])
+                                    elif name=="reexpanded":
+                                        verify_reexpanded(images["active"],images[name])
                                     elif name=="disabled":
                                         verify_disabled(images["active"],images["disabled"])
                                     elif name=="restored":
@@ -279,10 +329,15 @@ def run(iso:Path, reset_restore:bool=False)->int:
             if not validate_gpu(output,proc.returncode,require_display_info=True,
                                 display_frames=9):
                 raise ProofError(f"Transport/display proof or QEMU exit failed: {proc.returncode}")
-            if not validate_serial(output,reset_restore=reset_restore):
-                raise ProofError("Genuine ten-command/scanout-reset serial proof invalid")
-            print("PASS: QMP 4096 RGB pixels match the guest pattern; "
-                  "disabled screenshot loses the pattern; 8 fenced replies and reset")
+            if not validate_serial(output,reset_restore=reset_restore,
+                                   native_rollback=native_rollback):
+                raise ProofError("Genuine GPU command or reset serial proof invalid")
+            count=12 if native_rollback else 8
+            print(f"PASS: QMP 4096 RGB pixels match the guest pattern; "
+                  f"disabled screenshot loses the pattern; {count} fenced replies and reset")
+            if native_rollback:
+                print("PASS: QEMU native 64x64 -> 32x32 -> 64x64, "
+                      "every pixel restored WITHOUT device reset during the transition")
             if reset_restore:
                 print("PASS: post-reset VGA geometry and EVERY baseline RGB pixel restored")
                 print(f"Restored geometry={images['restored'][0]}x{images['restored'][1]}; "
@@ -311,17 +366,20 @@ def run(iso:Path, reset_restore:bool=False)->int:
 
 def main()->int:
     reset_restore=len(sys.argv)==3 and sys.argv[1]=="--reset-restore"
-    if reset_restore:
+    native_rollback=len(sys.argv)==3 and sys.argv[1]=="--native-rollback"
+    if reset_restore or native_rollback:
         target=sys.argv[2]
     elif len(sys.argv)==2:
         target=sys.argv[1]
     else:
-        print("Usage: qemu_virtio_gpu_scanout_live_smoke.py [--reset-restore] ISO")
+        print("Usage: qemu_virtio_gpu_scanout_live_smoke.py "
+              "[--reset-restore|--native-rollback] ISO")
         return 2
     if not Path(target).is_file():
         print("ISO file missing")
         return 2
-    return run(Path(target),reset_restore=reset_restore)
+    return run(Path(target),reset_restore=reset_restore,
+               native_rollback=native_rollback)
 
 if __name__=="__main__":
     sys.exit(main())
