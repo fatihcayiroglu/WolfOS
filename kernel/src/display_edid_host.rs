@@ -4,3 +4,5 @@
 mod display_mode_policy;
 #[path = "display_edid_base.rs"]
 mod display_edid_base;
+#[path = "display_edid_cta.rs"]
+mod display_edid_cta;
