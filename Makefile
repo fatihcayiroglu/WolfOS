@@ -495,8 +495,8 @@ test:
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/display_driver_policy.rs -o $(OUT)/display_driver_policy_tests
 	$(OUT)/display_driver_policy_tests
-	rustc --edition=2024 --test kernel/src/display_mode_policy.rs -o $(OUT)/display_mode_policy_tests
-	$(OUT)/display_mode_policy_tests
+	rustc --edition=2024 --test kernel/src/display_edid_host.rs -o $(OUT)/display_edid_policy_tests
+	$(OUT)/display_edid_policy_tests
 	rustc --edition=2024 --test kernel/src/gpu_sw_queue_contract.rs -o $(OUT)/gpu_sw_queue_contract_tests
 	$(OUT)/gpu_sw_queue_contract_tests
 	rustc --edition=2024 --test kernel/src/qemu_dispi_contract.rs -o $(OUT)/qemu_dispi_contract_tests
