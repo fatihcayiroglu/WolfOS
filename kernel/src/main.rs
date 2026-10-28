@@ -164,6 +164,10 @@ mod virtio_gpu_controlq_pmm;
 mod virtio_gpu_controlq_tx_contract;
 #[cfg(feature = "qemu-virtio-gpu-controlq-tx-smoke")]
 mod virtio_gpu_controlq_tx;
+#[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
+mod virtio_gpu_notify_contract;
+#[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
+mod virtio_gpu_notify_ro;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
@@ -573,6 +577,20 @@ pub extern "C" fn kmain() -> ! {
                     halt_forever();
                 }
                 serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK");
+                #[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
+                {
+                    let Some(notify_window)=pci_summary.notify_window else{
+                        serial::write_line("WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_FAILED missing_notify_cap");
+                        halt_forever();
+                    };
+                    if !virtio_gpu_notify_ro::verify(
+                        hhdm.offset,entries,window,notify_window
+                    ){
+                        serial::write_line("WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_FAILED");
+                        halt_forever();
+                    }
+                    serial::write_line("WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK");
+                }
             }
         }
         #[cfg(not(feature = "qemu-virtio-gpu-controlq-pmm-smoke"))]
