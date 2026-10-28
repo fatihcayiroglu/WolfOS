@@ -67,7 +67,7 @@ fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8) -> bool {
             .copy_from_slice(&read_u32(bus, slot, function, offset).to_le_bytes());
     }
     match virtio_gpu_pci_caps::inspect(&cfg) {
-        Ok(caps) if caps.vendor_caps == 4 => {
+        Ok(caps) if caps.vendor_caps >= 4 => {
             serial::write_fmt(format_args!(
                 "WOLFOS_VIRTIO_GPU_PCI_CAPS_OK vendor=1af4 device=1050 common={} notify={} isr={} device={} multiplier={} cap_reads=64 cfg_writes=0 dma=0 accel=0\n",
                 caps.common_bar,caps.notify_bar,caps.isr_bar,caps.device_bar,
