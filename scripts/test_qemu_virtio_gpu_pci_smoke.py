@@ -515,7 +515,8 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
             ("writes=0 dma=0","writes=1 dma=0"),
         ]:
             self.assertFalse(validate(WITH_NOTIFY.replace(
-                before,after),33,require_notify_ro=True))
+                NOTIFY_LINE, NOTIFY_LINE.replace(before,after)),
+                33,require_notify_ro=True))
 
     def test_notify_rejects_duplicate_failure_and_missing_check(self):
         self.assertFalse(validate(WITH_NOTIFY+"\n"+NOTIFY_LINE,
