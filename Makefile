@@ -458,6 +458,8 @@ p3-ring3-four-live-smoke:
 
 test:
 	mkdir -p $(OUT)
+	rustc --edition=2024 --test kernel/src/display_driver_policy.rs -o $(OUT)/display_driver_policy_tests
+	$(OUT)/display_driver_policy_tests
 	rustc --edition=2024 --test kernel/src/ps2_scancode_queue.rs -o $(OUT)/ps2_scancode_queue_tests
 	$(OUT)/ps2_scancode_queue_tests
 	rustc --edition=2024 --test kernel/src/ps2_keyboard.rs -o $(OUT)/ps2_keyboard_tests
@@ -473,6 +475,7 @@ test:
 	rustc --edition=2024 --test tests/serial_shell.rs -o $(OUT)/serial_shell_tests
 	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_display_driver_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_four_live_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_event_wait_evidence.py' -v

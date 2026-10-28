@@ -6,7 +6,7 @@
 //! We never write to device configuration registers.
 
 use core::arch::asm;
-use crate::serial;
+use crate::{display_driver_policy::DisplayIdentity, serial};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -77,6 +77,14 @@ fn record(
                 "WOLFOS_GPU_DETECTED vendor={:04x} device={:04x} bus={:02x} slot={:02x}\n",
                 vendor, device, bus, slot
             ));
+            // Identification is NOT permission to bind any accelerated
+            // driver. This stage neither configures BARs nor touches DMA.
+            if let Some(identity) = DisplayIdentity::from_pci(vendor, device, class) {
+                serial::write_fmt(format_args!(
+                    "WOLFOS_GPU_DRIVER_POLICY vendor={:04x} device={:04x} family={} native=none cfg_write=0\n",
+                    vendor, device, identity.family.label(),
+                ));
+            }
         }
         _ => {}
     }

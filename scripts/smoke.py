@@ -5,6 +5,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+from display_driver_evidence import validate_display_evidence
 
 MARKERS = (
     "WOLFOS: Rust kernel entered",
@@ -78,6 +79,9 @@ def main() -> int:
         if missing:
             print(f"FAIL: missing boot markers: {missing}")
             print(run.stderr.decode(errors="replace"))
+            return 1
+        if not validate_display_evidence(output):
+            print("FAIL: display policy evidence missing or invalid")
             return 1
         if run.returncode != 33:
             print(f"FAIL: expected QEMU debug-exit 33, got {run.returncode}")

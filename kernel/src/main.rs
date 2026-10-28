@@ -123,6 +123,7 @@ mod vfs_smoke;
 #[cfg(any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke"))]
 mod ramfs_smoke;
 mod pci;
+mod display_driver_policy;
 mod paging;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_preflight;
@@ -595,6 +596,15 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_FB_CONSOLE_SCROLL_OK rows=2 scrolls=1 pixels=verified");
     }
 
+    // The bootloader has supplied a validated RGB framebuffer. This is
+    // a safe early display fallback, NOT a vendor GPU driver or acceleration.
+    let display_plan = display_driver_policy::early_boot_plan(true);
+    serial::write_fmt(format_args!(
+        "WOLFOS_DISPLAY_BOOT_POLICY backend={} native_accel={} driver_loaded={}\n",
+        display_plan.backend.label(),
+        u8::from(display_plan.native_acceleration),
+        u8::from(display_plan.native_driver_loaded),
+    ));
     serial::write_fmt(format_args!("WOLFOS_FRAMEBUFFER_OK {}x{}\n", fb.width, fb.height));
     let Some(mp) = MP_REQUEST.response() else {
         serial::write_line("WOLFOS_SMP_ERROR no Limine MP response");
