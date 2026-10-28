@@ -10,7 +10,7 @@ use limine::memmap::{
 };
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
-    FrameAllocator,Mapper,OffsetPageTable,Page,PageTableFlags,
+    FrameAllocator,Mapper,OffsetPageTable,Page,PageTable,PageTableFlags,
     PhysFrame,Size4KiB,Translate,
 };
 use x86_64::{PhysAddr,VirtAddr};
