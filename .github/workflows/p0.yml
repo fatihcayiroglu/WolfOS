@@ -60,6 +60,8 @@ jobs:
         run: make qemu-virtio-gpu-transport-preflight-smoke
       - name: QEMU-only VirtIO feature bank1 selector transaction and exact rollback
         run: make qemu-virtio-gpu-bank1-tx-smoke
+      - name: QEMU-only VirtIO 1.2 feature negotiation and mandatory device reset, no queues
+        run: make qemu-virtio-gpu-negotiate-smoke
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke
       - name: Controlled QEMU VGA ENABLE register writes, restored mode and preserved VRAM pixel

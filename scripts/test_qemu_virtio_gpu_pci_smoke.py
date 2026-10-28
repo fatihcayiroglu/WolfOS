@@ -74,6 +74,17 @@ WITH_BANK1 = WITH_PREFLIGHT.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+NEGOTIATION_LINE = (
+    "WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_OK accepted_version1=1 "
+    "ack=1 driver=3 features_ok=11 status_writes=5 feature_writes=1 "
+    "selector_writes=2 reset=0 queue_enabled=0 dma=0"
+)
+WITH_NEGOTIATION = WITH_BANK1.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    NEGOTIATION_LINE + "\nWOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -288,6 +299,39 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(
             WITH_BANK1 + "\nWOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_FAIL restore",
             33, require_bank1=True))
+
+    def test_negotiation_requires_every_real_qemu_gate(self):
+        self.assertTrue(validate(WITH_NEGOTIATION,33,require_negotiation=True))
+        self.assertFalse(validate(WITH_BANK1,33,require_negotiation=True))
+        self.assertFalse(validate(WITH_NEGOTIATION,33,require_bank1=True))
+        self.assertFalse(validate(WITH_NEGOTIATION,33,require_preflight=True))
+
+    def test_negotiation_rejects_status_or_restore_lies(self):
+        for old, replacement in [
+            ("accepted_version1=1","accepted_version1=0"),
+            ("ack=1","ack=0"),
+            ("driver=3","driver=1"),
+            ("features_ok=11","features_ok=3"),
+            ("status_writes=5","status_writes=4"),
+            ("feature_writes=1","feature_writes=0"),
+            ("selector_writes=2","selector_writes=1"),
+            ("reset=0","reset=11"),
+            ("queue_enabled=0","queue_enabled=1"),
+        ]:
+            self.assertFalse(validate(WITH_NEGOTIATION.replace(old,replacement),
+                                      33,require_negotiation=True))
+
+    def test_negotiation_rejects_duplicate_and_missing_proof(self):
+        self.assertFalse(validate(WITH_NEGOTIATION+"\n"+NEGOTIATION_LINE,
+                                  33,require_negotiation=True))
+        self.assertFalse(validate(WITH_NEGOTIATION.replace(
+            "WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_TEST_OK",""),
+            33,require_negotiation=True))
+
+    def test_negotiation_rejects_failure_marker(self):
+        self.assertFalse(validate(WITH_NEGOTIATION+
+            "\nWOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_FAIL reset",
+            33,require_negotiation=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
