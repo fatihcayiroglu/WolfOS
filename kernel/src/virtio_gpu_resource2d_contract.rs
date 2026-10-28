@@ -68,7 +68,7 @@ pub fn unref(resource: u32, created_acknowledged: bool, fence: u64)
     Ok(Request { bytes, len: UNREF_BYTES, fence })
 }
 
-/// The third/fourth command must use the correct split-ring slot even if
+/// The resource lifecycle commands must use the correct split-ring slot even if
 /// the device selected only two queue entries (wrap slots 0/1).
 pub fn ring_slot(next_index: u16, selected: u16) -> Result<u16, Error> {
     if selected < 2 || selected > 256 || !selected.is_power_of_two() || next_index == 0 {
@@ -93,7 +93,7 @@ pub fn validate_completion(
     expected_index: u16, used_index: u16, used_id: u32, used_len: u32,
     response: &[u8], expected_fence: u64,
 ) -> Result<(), Error> {
-    if expected_index != 3 && expected_index != 4 { return Err(Error::MissingCompletion); }
+    if !(3..=6).contains(&expected_index) { return Err(Error::MissingCompletion); }
     if used_index != expected_index { return Err(Error::MissingCompletion); }
     if used_id != 0 { return Err(Error::WrongHead); }
     if used_len != RESPONSE_BYTES as u32 || response.len() != RESPONSE_BYTES {
@@ -167,6 +167,9 @@ mod tests {
         let fence=0x123456789abcdef0;
         assert_eq!(validate_completion(3,3,0,24,&response(fence),fence),Ok(()));
         assert_eq!(validate_completion(4,4,0,24,&response(fence),fence),Ok(()));
+        assert_eq!(validate_completion(5,5,0,24,&response(fence),fence),Ok(()));
+        assert_eq!(validate_completion(6,6,0,24,&response(fence),fence),Ok(()));
+        assert_eq!(validate_completion(7,7,0,24,&response(fence),fence),Err(Error::MissingCompletion));
         assert_eq!(validate_completion(3,2,0,24,&response(fence),fence),
                    Err(Error::MissingCompletion));
         assert_eq!(validate_completion(4,3,0,24,&response(fence),fence),

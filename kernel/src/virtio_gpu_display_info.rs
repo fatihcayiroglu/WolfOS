@@ -30,6 +30,8 @@ use crate::{
 };
 #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
 use crate::virtio_gpu_resource2d_contract as resource;
+#[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+use crate::virtio_gpu_backing_contract as backing;
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
 #[derive(Clone,Copy)]
 struct EdidProof{size:u32,modes:usize,width:u32,height:u32,refresh_millihz:u32}
@@ -123,8 +125,11 @@ fn query_edid(vas:&[u64;FRAMES],frames:&[u64;FRAMES],port:u64)
 #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
 fn send_resource_command(
     vas:&[u64;FRAMES], frames:&[u64;FRAMES], notify_port:u64,
-    selected:u16, next_idx:u16, request:resource::Request,
+    selected:u16, next_idx:u16, request:&[u8], request_fence:u64,
 ) -> Result<(),&'static str> {
+    if request.is_empty() || request.len()>queue::PAGE_BYTES as usize {
+        return Err("request_length");
+    }
     let slot=resource::ring_slot(next_idx,selected).map_err(|_|"queue_slot")?;
     let request_ptr=vas[3] as *mut u8;
     let response_ptr=vas[4] as *mut u8;
@@ -132,20 +137,20 @@ fn send_resource_command(
     // exposing this same PMM-owned page to a new 24B response.
     unsafe {
         core::ptr::write_bytes(response_ptr,0,edid::RESPONSE_LEN);
-        core::ptr::write_bytes(request_ptr,0,resource::CREATE_BYTES);
+        core::ptr::write_bytes(request_ptr,0,queue::PAGE_BYTES as usize);
     }
     for n in 0..edid::RESPONSE_LEN {
         if unsafe { response_ptr.add(n).read_volatile() } != 0 {
             return Err("response_not_zero");
         }
     }
-    for (i,b) in request.bytes[..request.len].iter().copied().enumerate() {
+    for (i,b) in request.iter().copied().enumerate() {
         unsafe { request_ptr.add(i).write_volatile(b); }
     }
     let desc=vas[0] as *mut Desc;
     unsafe {
         desc.write_volatile(Desc {
-            addr:frames[3].to_le(),len:(request.len as u32).to_le(),
+            addr:frames[3].to_le(),len:(request.len() as u32).to_le(),
             flags:1u16.to_le(),next:1u16.to_le(),
         });
         desc.add(1).write_volatile(Desc {
@@ -176,7 +181,7 @@ fn send_resource_command(
         }
     }
     if let Err(e)=resource::validate_completion(
-        next_idx,idx,head,len,&response,request.fence
+        next_idx,idx,head,len,&response,request_fence
     ) {
         serial::write_fmt(format_args!(
             "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL command_idx={next_idx} used={idx} head={head} len={len} response={e:?}\n"
@@ -192,18 +197,47 @@ fn query_resource2d(
 ) -> Result<(),&'static str> {
     const CREATE_FENCE:u64=0x574f_4c46_3244_4352;
     const UNREF_FENCE:u64=0x574f_4c46_3244_5552;
+    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    const ATTACH_FENCE:u64=0x574f_4c46_3244_4154;
+    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    const DETACH_FENCE:u64=0x574f_4c46_3244_4454;
+    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    backing::distinct_fences([CREATE_FENCE,ATTACH_FENCE,DETACH_FENCE,UNREF_FENCE])
+        .map_err(|_|"fence_reused")?;
     let create=resource::create(resource::RESOURCE_ID,64,64,CREATE_FENCE)
         .map_err(|_|"create_wire")?;
-    send_resource_command(vas,frames,notify_port,selected,3,create)?;
-    // No backing pages or scanout association were ever exposed.
-    // The acknowledged host-only resource must be explicitly destroyed.
+    send_resource_command(vas,frames,notify_port,selected,3,
+        &create.bytes[..create.len],create.fence)?;
+    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    {
+        // Four zeroed, PMM-owned 4KiB pages are disjoint from controlq pages,
+        // and remain pinned until detach acknowledgement AND device reset.
+        let pages=[frames[5],frames[6],frames[7],frames[8]];
+        let attach=backing::attach(resource::RESOURCE_ID,true,pages,ATTACH_FENCE)
+            .map_err(|_|"attach_wire")?;
+        send_resource_command(vas,frames,notify_port,selected,4,
+            &attach.bytes[..attach.len],attach.fence)?;
+        let detach=backing::detach(resource::RESOURCE_ID,true,DETACH_FENCE)
+            .map_err(|_|"detach_wire")?;
+        send_resource_command(vas,frames,notify_port,selected,5,
+            &detach.bytes[..detach.len],detach.fence)?;
+    }
+    // Acknowledged explicit host-resource destruction is mandatory.
     let unref=resource::unref(resource::RESOURCE_ID,true,UNREF_FENCE)
         .map_err(|_|"unref_wire")?;
-    send_resource_command(vas,frames,notify_port,selected,4,unref)?;
+    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    let unref_index=6;
+    #[cfg(not(feature="qemu-virtio-gpu-attach-backing-smoke"))]
+    let unref_index=4;
+    send_resource_command(vas,frames,notify_port,selected,unref_index,
+        &unref.bytes[..unref.len],unref.fence)?;
     Ok(())
 }
 
 const SLOT:u64=0x0000_4000_0000_b000;
+#[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+const FRAMES:usize=9;
+#[cfg(not(feature="qemu-virtio-gpu-attach-backing-smoke"))]
 const FRAMES:usize=5;
 #[repr(C)]
 #[derive(Clone,Copy)]
@@ -246,8 +280,10 @@ fn owned_frames_valid(l:queue::Layout,f:&[u64;FRAMES])->bool{
 pub fn verify(hhdm:u64,entries:&[&Entry],
     common:pci::QemuBarWindow,
     cap:pci::QemuNotifyWindow, layout:queue::Layout)->bool{
+    let mut witness=[0u64;FRAMES];
+    for (i,f) in witness.iter_mut().enumerate(){*f=(i as u64+1)*4096;}
     if x86_64::instructions::interrupts::are_enabled()||
-       !owned_frames_valid(layout,&[0x1000,0x2000,0x3000,0x4000,0x5000]) {
+       !owned_frames_valid(layout,&witness) {
         serial::write_line("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL layout_or_irq");
         return false;
     }
@@ -392,7 +428,7 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                 zeroed=false;break;
             };
             vas[i]=va.as_u64();
-            // SAFETY: these are five exclusively PMM-owned, 4KiB
+            // SAFETY: these are FRAMES exclusively PMM-owned, 4KiB
             // HHDM-mapped usable-RAM frames in a single-vCPU QEMU guest.
             let ptr=va.as_mut_ptr::<u8>();
             unsafe{core::ptr::write_bytes(ptr,0,queue::PAGE_BYTES as usize);}
@@ -586,7 +622,7 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
         mapper.translate_addr(target).is_none();
 
     // If queue addresses were exposed and reset is unproven, quarantine all
-    // five PMM frames until QEMU teardown; never risk reuse while DMA live.
+    // FRAMES PMM frames until QEMU teardown; never risk reuse while DMA live.
     let may_free=!exposed||reset_confirmed;
     let mut released=0usize;
     let mut errors=0usize;
@@ -619,20 +655,27 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
         return false;
     };
     serial::write_fmt(format_args!(
-        "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK req=256 resp=4353 used_idx=1 used_head=0 used_len=408 scanout0_enabled={} width={} height={} notify_writes=1 driver_ok=15 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 response_dma_verified=1 pmm_leak=0 qemu_only=1\n",
-        mode.enabled,mode.width,mode.height
+        "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK req=256 resp=4353 used_idx=1 used_head=0 used_len=408 scanout0_enabled={} width={} height={} notify_writes=1 driver_ok=15 reset=0 queue_disabled=1 frames_allocated={} frames_released={} response_dma_verified=1 pmm_leak=0 qemu_only=1\n",
+        mode.enabled,mode.width,mode.height,FRAMES,FRAMES
     ));
     #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
     if let Some(edid)=edid_info{
         serial::write_fmt(format_args!(
-            "WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size={} modes={} preferred_width={} preferred_height={} refresh_millihz={} gpu_timing_proof_required=1 mode_writes=0 used_idx=2 used_head=0 used_len=1056 fence_verified=1 negotiated_edid=1 notify_writes=2 driver_ok=15 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 pmm_leak=0 qemu_only=1\n",
-            edid.size,edid.modes,edid.width,edid.height,edid.refresh_millihz
+            "WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size={} modes={} preferred_width={} preferred_height={} refresh_millihz={} gpu_timing_proof_required=1 mode_writes=0 used_idx=2 used_head=0 used_len=1056 fence_verified=1 negotiated_edid=1 notify_writes=2 driver_ok=15 reset=0 queue_disabled=1 frames_allocated={} frames_released={} pmm_leak=0 qemu_only=1\n",
+            edid.size,edid.modes,edid.width,edid.height,edid.refresh_millihz,FRAMES,FRAMES
         ));
     }
-    #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+    #[cfg(all(feature="qemu-virtio-gpu-resource2d-smoke",
+              not(feature="qemu-virtio-gpu-attach-backing-smoke")))]
     if resource_done {
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_RESOURCE2D_OK resource_id=1 format=2 width=64 height=64 create_type=257 unref_type=258 response_type=4352 used_idx=4 used_head=0 used_len=24 fences_verified=2 notify_writes=4 scanout_writes=0 attach_backing=0 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 pmm_leak=0 qemu_only=1"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    if resource_done {
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_ATTACH_BACKING_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 detach_type=263 unref_type=258 response_type=4352 used_idx=6 used_head=0 used_len=24 fences_verified=4 notify_writes=6 backing_entries=4 backing_bytes=16384 pages_zeroed=4 attach_ack=1 detach_ack=1 unref_ack=1 transfer_writes=0 scanout_writes=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
     true

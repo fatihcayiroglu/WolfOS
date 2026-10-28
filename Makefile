@@ -41,6 +41,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-edid-live)
 FEATURES := --features qemu-virtio-gpu-edid-live-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-resource2d)
 FEATURES := --features qemu-virtio-gpu-resource2d-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-attach-backing)
+FEATURES := --features qemu-virtio-gpu-attach-backing-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -346,6 +348,14 @@ qemu-virtio-gpu-resource2d-smoke:
 	$(OUT)/virtio_gpu_resource2d_contract_tests
 	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_resource2d_smoke.py
 	python3 scripts/qemu_virtio_gpu_resource2d_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-resource2d.iso
+
+.PHONY: qemu-virtio-gpu-attach-backing-smoke
+qemu-virtio-gpu-attach-backing-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-attach-backing
+	rustc --edition=2024 --test kernel/src/virtio_gpu_backing_contract.rs -o $(OUT)/virtio_gpu_backing_contract_tests
+	$(OUT)/virtio_gpu_backing_contract_tests
+	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_attach_backing_smoke.py
+	python3 scripts/qemu_virtio_gpu_attach_backing_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-attach-backing.iso
 
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:
