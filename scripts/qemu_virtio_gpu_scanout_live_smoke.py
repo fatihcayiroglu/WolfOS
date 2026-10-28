@@ -30,12 +30,19 @@ MARKER = (
 PREFIX="WOLFOS_VIRTIO_GPU_SCANOUT_CAPTURE stage="
 STAGES=("baseline","active","disabled")
 RELEASE={"baseline":b"B","active":b"A","disabled":b"D"}
+RESTORE_STAGES=STAGES+("restored",)
+RESTORE_RELEASE={**RELEASE,"restored":b"R"}
+RESET_MARKER=(
+    "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK reset_to_vga_ack=1 capture_acks=4 "
+    "geometry_and_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 "
+    "frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+)
 TEST_OK="WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 
 class ProofError(Exception):
     pass
 
-def validate_serial(output: str) -> bool:
+def validate_serial(output: str, reset_restore:bool=False) -> bool:
     lines=output.splitlines()
     if any("WOLFOS_VIRTIO_GPU_SCANOUT_FAIL" in l
            or "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL" in l
@@ -51,7 +58,7 @@ def validate_serial(output: str) -> bool:
     if len(marker)!=1 or lines[marker[0]]!=MARKER or lines.count(TEST_OK)!=1:
         return False
     stages=[(i,l[len(PREFIX):]) for i,l in enumerate(lines) if l.startswith(PREFIX)]
-    if [x[1] for x in stages]!=list(STAGES):
+    if [x[1] for x in stages]!=list(RESTORE_STAGES if reset_restore else STAGES):
         return False
     edid=[i for i,l in enumerate(lines)
           if l.startswith("WOLFOS_VIRTIO_GPU_EDID_LIVE_OK ")]
@@ -69,9 +76,19 @@ def validate_serial(output: str) -> bool:
         "WOLFOS_VIRTIO_GPU_ATTACH_BACKING_TEST_OK",
         "WOLFOS_VIRTIO_GPU_TRANSFER2D_TEST_OK") for l in lines):
         return False
+    reset_marker=[i for i,l in enumerate(lines)
+                  if l.startswith("WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK ")]
+    if reset_restore:
+        if len(reset_marker)!=1 or lines[reset_marker[0]]!=RESET_MARKER:
+            return False
+    elif reset_marker:
+        return False
     return (stages[0][0]<stages[1][0]<stages[2][0]<
+            (stages[3][0] if reset_restore else len(lines)) and
+            stages[-1][0]<
             lines.index(next(l for l in lines if l.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")))<
-            edid[0]<marker[0]<display_ack[0]<edid_ack[0]<lines.index(TEST_OK))
+            edid[0]<marker[0]<display_ack[0]<edid_ack[0]<lines.index(TEST_OK) and
+            (not reset_restore or marker[0]<reset_marker[0]<display_ack[0]))
 
 def connect_unix(path:Path,proc:subprocess.Popen,deadline:float)->socket.socket:
     while time.monotonic()<deadline:
@@ -168,7 +185,25 @@ def verify_disabled(active:tuple[int,int,bytes],disabled:tuple[int,int,bytes])->
         raise ProofError(f"Disabled QEMU screen retains {matches}/4096 active pixels")
 
 
-def run(iso:Path)->int:
+def verify_restored(baseline:tuple[int,int,bytes],active:tuple[int,int,bytes],
+                    disabled:tuple[int,int,bytes],restored:tuple[int,int,bytes])->None:
+    # This is host-visible pixel equality, not a guest-supplied success claim.
+    if baseline[:2] in (active[:2],disabled[:2]):
+        raise ProofError("VGA baseline was never a distinct geometry")
+    if restored[:2]!=baseline[:2]:
+        raise ProofError(
+            f"VGA reset geometry {restored[0]}x{restored[1]} "
+            f"does not match baseline {baseline[0]}x{baseline[1]}"
+        )
+    if restored[2]!=baseline[2]:
+        first=next(i for i,(a,b) in enumerate(zip(baseline[2],restored[2])) if a!=b)
+        raise ProofError(
+            f"VGA reset pixel mismatch at ({first//3%baseline[0]},"
+            f"{first//3//baseline[0]}) channel={first%3} "
+            f"baseline={baseline[2][first]} restored={restored[2][first]}"
+        )
+
+def run(iso:Path, reset_restore:bool=False)->int:
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-scanout-") as work:
         root=Path(work)
         serial_path=root/"com1.sock"
@@ -183,6 +218,8 @@ def run(iso:Path)->int:
             "-display","none","-no-reboot",
             "-device","isa-debug-exit,iobase=0xf4,iosize=0x04",
         ]
+        stages_expected=RESTORE_STAGES if reset_restore else STAGES
+        releases=RESTORE_RELEASE if reset_restore else RELEASE
         proc=None
         received=bytearray()
         images={}
@@ -214,7 +251,7 @@ def run(iso:Path)->int:
                                 clean=line.decode("ascii",errors="replace").strip()
                                 if clean.startswith(PREFIX):
                                     name=clean[len(PREFIX):]
-                                    if stages>=3 or name!=STAGES[stages]:
+                                    if stages>=len(stages_expected) or name!=stages_expected[stages]:
                                         raise ProofError("Unexpected QEMU scanout capture stage")
                                     target=root/(name+".ppm")
                                     qmp_call(qmp,qmp_reader,"screendump",{"filename":str(target)})
@@ -223,12 +260,15 @@ def run(iso:Path)->int:
                                         verify_active(images[name])
                                     elif name=="disabled":
                                         verify_disabled(images["active"],images["disabled"])
-                                    ser.sendall(RELEASE[name])
+                                    elif name=="restored":
+                                        verify_restored(images["baseline"],images["active"],
+                                                        images["disabled"],images["restored"])
+                                    ser.sendall(releases[name])
                                     stages+=1
                         if proc.poll() is not None and not chunk:
                             break
-                    if stages!=3:
-                        raise ProofError(f"Only {stages}/3 QMP screenshots captured")
+                    if stages!=len(stages_expected):
+                        raise ProofError(f"Only {stages}/{len(stages_expected)} QMP screenshots captured")
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -238,13 +278,18 @@ def run(iso:Path)->int:
             if not validate_gpu(output,proc.returncode,require_display_info=True,
                                 display_frames=9):
                 raise ProofError(f"Transport/display proof or QEMU exit failed: {proc.returncode}")
-            if not validate_serial(output):
-                raise ProofError("Genuine ten-command/rollback serial proof invalid")
+            if not validate_serial(output,reset_restore=reset_restore):
+                raise ProofError("Genuine ten-command/scanout-reset serial proof invalid")
             print("PASS: QMP 4096 RGB pixels match the guest pattern; "
                   "disabled screenshot loses the pattern; 8 fenced replies and reset")
-            print(f"Baseline geometry={images['baseline'][0]}x{images['baseline'][1]}, "
-                  f"disabled geometry={images['disabled'][0]}x{images['disabled'][1]}; "
-                  "original screen geometry rollback NOT proven")
+            if reset_restore:
+                print("PASS: post-reset VGA geometry and EVERY baseline RGB pixel restored")
+                print(f"Restored geometry={images['restored'][0]}x{images['restored'][1]}; "
+                      "host QMP baseline and restored images identical")
+            else:
+                print(f"Baseline geometry={images['baseline'][0]}x{images['baseline'][1]}, "
+                      f"disabled geometry={images['disabled'][0]}x{images['disabled'][1]}; "
+                      "original screen geometry rollback NOT proven")
             return 0
         except (ProofError,FileNotFoundError,ConnectionError,OSError,ValueError,
                 json.JSONDecodeError,subprocess.TimeoutExpired) as exc:
@@ -264,10 +309,18 @@ def run(iso:Path)->int:
                     proc.communicate()
 
 def main()->int:
-    if len(sys.argv)!=2 or not Path(sys.argv[1]).is_file():
-        print("Usage: qemu_virtio_gpu_scanout_live_smoke.py ISO")
+    reset_restore=len(sys.argv)==3 and sys.argv[1]=="--reset-restore"
+    if reset_restore:
+        target=sys.argv[2]
+    elif len(sys.argv)==2:
+        target=sys.argv[1]
+    else:
+        print("Usage: qemu_virtio_gpu_scanout_live_smoke.py [--reset-restore] ISO")
         return 2
-    return run(Path(sys.argv[1]))
+    if not Path(target).is_file():
+        print("ISO file missing")
+        return 2
+    return run(Path(target),reset_restore=reset_restore)
 
 if __name__=="__main__":
     sys.exit(main())
