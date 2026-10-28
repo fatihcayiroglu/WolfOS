@@ -54,6 +54,8 @@ qemu-virtio-gpu-notify-ro-smoke = ["qemu-virtio-gpu-controlq-tx-smoke"]
 # QEMU-only first real single-descriptor-chain GET_DISPLAY_INFO request:
 # sends one notify, verifies used response and resets before PMM free.
 qemu-virtio-gpu-display-info-smoke = ["qemu-virtio-gpu-notify-ro-smoke"]
+# QEMU-only second real controlq command with EDID feature negotiated, strict response and reset.
+qemu-virtio-gpu-edid-live-smoke = ["qemu-virtio-gpu-display-info-smoke"]
 # QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.

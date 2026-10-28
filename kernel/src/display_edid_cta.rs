@@ -68,8 +68,12 @@ fn nominal_vic(vic: u8, preferred: bool) -> Result<DisplayMode, FullEdidError> {
         4 => (1280,720,74_250,1650,750),   // 60 Hz
         16 => (1920,1080,148_500,2200,1125), // 60 Hz
         31 => (1920,1080,148_500,2640,1125), // 50 Hz
+        89 => (2560,1080,185_625,3300,1125), // 50 Hz, CTA-861 64:27
         95 => (3840,2160,297_000,4400,2250), // 30 Hz
+        96 => (3840,2160,594_000,5280,2250), // 50 Hz
         97 => (3840,2160,594_000,4400,2250), // 60 Hz
+        101 => (4096,2160,594_000,5280,2250), // 50 Hz, 256:135
+        125 => (5120,2160,742_500,6600,2250), // 50 Hz, 64:27
         _ => return Err(FullEdidError::UnsupportedVic),
     };
     let frame_pixels = u64::from(htotal) * u64::from(vtotal);
@@ -181,6 +185,37 @@ mod tests {
     use crate::display_mode_policy::{
         choose, ModeError, PipelineLimits, RefreshChoice, ResolutionChoice, UserChoice,
     };
+
+    #[test]
+    fn qemu_generated_cta_vics_use_official_exact_pixel_timings() {
+        // QEMU's EDID generator enumerates these 50 Hz DTA timings.
+        // Values are from upstream Linux DRM edid_cea_modes_1, not guessed.
+        for (vic,w,h,clock) in [
+            (89,2560,1080,185_625),
+            (96,3840,2160,594_000),
+            (101,4096,2160,594_000),
+            (125,5120,2160,742_500),
+        ] {
+            let m=nominal_vic(vic,false).unwrap();
+            assert_eq!((m.width,m.height,m.pixel_clock_khz,m.refresh_millihz),
+                       (w,h,clock,50_000));
+        }
+        assert_eq!(nominal_vic(127,false),Err(FullEdidError::UnsupportedVic));
+    }
+    #[test]
+    fn all_qemu_generated_cta_modes_are_bounded_and_parseable() {
+        let mut c=[0u8;128];
+        c[0]=2;c[1]=3;c[2]=11;
+        c[4]=0x46; // Six real video identification codes.
+        c[5..11].copy_from_slice(&[125,101,96,89,31,97]);
+        checksum(&mut c);
+        let out=parse_complete(&joined(base(),c)).unwrap();
+        assert_eq!(out.len(),7); // 1 base preferred + 6 distinct CTA modes
+        assert!(out.modes().iter().any(|m|m.width==5120 && m.height==2160 &&
+                                   m.refresh_millihz==50_000));
+        assert!(out.modes().iter().any(|m|m.width==3840 && m.height==2160 &&
+                                   m.refresh_millihz==60_000));
+    }
 
     fn checksum(e: &mut [u8]) {
         e[127]=0;
