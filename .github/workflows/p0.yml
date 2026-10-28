@@ -52,6 +52,8 @@ jobs:
         run: make qemu-virtio-gpu-bars-smoke
       - name: QEMU-only reversible VirtIO BAR sizing with decode disabled, exact restore, no MMIO
         run: make qemu-virtio-gpu-bar-size-smoke
+      - name: QEMU-only VirtIO common config register reads through transient uncached RO page
+        run: make qemu-virtio-gpu-common-mmio-smoke
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke
       - name: Controlled QEMU VGA ENABLE register writes, restored mode and preserved VRAM pixel

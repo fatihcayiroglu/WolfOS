@@ -31,6 +31,8 @@ pub struct PciSummary {
     pub virtio_gpu_caps_verified: usize,
     #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
     pub virtio_gpu_bar_size_verified: usize,
+    #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
+    pub common_window: Option<QemuBarWindow>,
 }
 
 /// Read an aligned u32 from a function's first 256 PCI config bytes.
@@ -90,11 +92,21 @@ fn write_command_u16(bus:u8,slot:u8,function:u8,value:u16) {
 }
 
 #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QemuBarWindow {
+    pub physical_base: u64,
+    pub aperture_bytes: u64,
+    pub common_offset: u32,
+    pub common_length: u32,
+    pub is_memory: bool,
+}
+
+#[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
 fn prove_qemu_common_bar_aperture(
     bus:u8,slot:u8,function:u8,bar:u8,
     bar_kind:virtio_gpu_pci_bars::BarKind,
     region_offset:u32,region_length:u32,
-) -> bool {
+) -> Option<QemuBarWindow> {
     use crate::virtio_gpu_bar_size_contract::{BarKind, aperture_size, validate_window};
 
     let kind=match bar_kind {
@@ -105,7 +117,7 @@ fn prove_qemu_common_bar_aperture(
     let wide=kind==BarKind::Memory64;
     if bar>=6 || (wide && bar==5) {
         serial::write_line("WOLFOS_VIRTIO_GPU_BAR_SIZE_FAIL bar_index");
-        return false;
+        return None;
     }
     let low_reg=0x10u8+4*bar;
     let hi_reg=low_reg+4;
@@ -123,7 +135,7 @@ fn prove_qemu_common_bar_aperture(
     if !disabled_ok {
         write_command_u16(bus,slot,function,original_command);
         serial::write_line("WOLFOS_VIRTIO_GPU_BAR_SIZE_FAIL decode_not_disabled");
-        return false;
+        return None;
     }
 
     write_config_u32(bus,slot,function,low_reg,u32::MAX);
@@ -139,7 +151,7 @@ fn prove_qemu_common_bar_aperture(
         && (!wide || read_u32(bus,slot,function,hi_reg)==original_high);
     if !restored {
         serial::write_line("WOLFOS_VIRTIO_GPU_BAR_SIZE_FAIL restore_mismatch");
-        return false;
+        return None;
     }
 
     let base=match kind {
@@ -149,18 +161,24 @@ fn prove_qemu_common_bar_aperture(
     };
     let Ok(bytes)=aperture_size(kind,mask_low,mask_high) else {
         serial::write_line("WOLFOS_VIRTIO_GPU_BAR_SIZE_FAIL invalid_mask");
-        return false;
+        return None;
     };
     if validate_window(base,bytes,region_offset,region_length).is_err() {
         serial::write_line("WOLFOS_VIRTIO_GPU_BAR_SIZE_FAIL region_outside");
-        return false;
+        return None;
     }
     let bar_writes=if wide {4}else{2};
     serial::write_fmt(format_args!(
         "WOLFOS_VIRTIO_GPU_BAR_SIZE_OK kind={} bytes={} common_offset={} common_length={} command_writes=2 bar_writes={} restored=1 decode_stopped=1 mmio=0 dma=0\n",
         kind.label(),bytes,region_offset,region_length,bar_writes,
     ));
-    true
+    Some(QemuBarWindow {
+        physical_base: base,
+        aperture_bytes: bytes,
+        common_offset: region_offset,
+        common_length: region_length,
+        is_memory: kind != BarKind::Io,
+    })
 }
 
 fn probe(bus: u8, slot: u8, function: u8) -> Option<(u16, u16)> {
@@ -171,7 +189,7 @@ fn probe(bus: u8, slot: u8, function: u8) -> Option<(u16, u16)> {
 }
 
 #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
-fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8) -> bool {
+fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8, summary: &mut PciSummary) -> bool {
     // Exactly 64 read-only PCI configuration dwords. CF8 selector writes
     // are NOT writes to any PCI device configuration register.
     let mut cfg = [0u8; 256];
@@ -200,11 +218,12 @@ fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8) -> bool {
                             bars.isr.label(), bars.device.label(),
                         ));
                         #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
-                        if !prove_qemu_common_bar_aperture(
-                            bus,slot,function,caps.common_bar,bars.common,
-                            caps.common_offset,caps.common_length,
-                        ) {
-                            return false;
+                        {
+                            let Some(window) = prove_qemu_common_bar_aperture(
+                                bus,slot,function,caps.common_bar,bars.common,
+                                caps.common_offset,caps.common_length,
+                            ) else { return false; };
+                            summary.common_window = Some(window);
                         }
                     },
                     Err(error) => {
@@ -274,7 +293,7 @@ fn record(
             if vendor == virtio_gpu_pci_caps::VIRTIO_VENDOR
                 && device == virtio_gpu_pci_caps::VIRTIO_GPU_DEVICE
                 && subclass == 0x00
-                && inspect_qemu_virtio_gpu(bus,slot,function)
+                && inspect_qemu_virtio_gpu(bus,slot,function,summary)
             {
                 summary.virtio_gpu_caps_verified += 1;
                 #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
@@ -294,6 +313,8 @@ pub fn discover() -> PciSummary {
         virtio_gpu_caps_verified: 0,
         #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
         virtio_gpu_bar_size_verified: 0,
+        #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
+        common_window: None,
     };
     for bus in 0u16..=255 {
         for slot in 0u8..32 {
