@@ -42,6 +42,16 @@ WITH_MMIO = WITH_SIZE.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+DEVICE_LINE = (
+    "WOLFOS_VIRTIO_GPU_DEVICE_MMIO_OK scanouts=1 capsets=0 events=0 "
+    "ro=1 uc=1 pages=1 writes=0 dma=0"
+)
+WITH_DEVICE = WITH_MMIO.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    DEVICE_LINE + "\nWOLFOS_VIRTIO_GPU_DEVICE_MMIO_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -144,6 +154,42 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
             WITH_MMIO.replace("WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK",
                               "WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK"),
             33, require_mmio=True))
+
+    def test_device_proof_requires_earlier_common_mmio_and_real_gate(self):
+        self.assertTrue(validate(WITH_DEVICE, 33, require_device=True))
+        self.assertFalse(validate(WITH_MMIO, 33, require_device=True))
+        self.assertFalse(validate(WITH_DEVICE, 33, require_mmio=True))
+        self.assertFalse(validate(WITH_DEVICE, 33, require_size=True))
+
+    def test_device_proof_rejects_invalid_scanout_and_event_values(self):
+        for field in ("scanouts=0", "scanouts=17", "events=2",
+                      "events=4294967296", "capsets=4294967296"):
+            old = ("scanouts=1" if field.startswith("scanouts") else
+                   "events=0" if field.startswith("events") else
+                   "capsets=0")
+            self.assertFalse(validate(WITH_DEVICE.replace(old, field),
+                                      33, require_device=True))
+
+    def test_device_proof_rejects_invalid_flags_and_duplicate(self):
+        self.assertFalse(validate(WITH_DEVICE.replace("ro=1", "ro=0"),
+                                  33, require_device=True))
+        self.assertFalse(validate(WITH_DEVICE.replace("uc=1", "uc=0"),
+                                  33, require_device=True))
+        self.assertFalse(validate(WITH_DEVICE.replace("writes=0", "writes=1"),
+                                  33, require_device=True))
+        self.assertFalse(validate(WITH_DEVICE + "\n" + DEVICE_LINE,
+                                  33, require_device=True))
+
+    def test_device_proof_rejects_missing_gate_and_failure(self):
+        self.assertFalse(validate(
+            WITH_DEVICE.replace("WOLFOS_VIRTIO_GPU_DEVICE_MMIO_TEST_OK", ""),
+            33, require_device=True))
+        self.assertFalse(validate(
+            WITH_DEVICE + "\nWOLFOS_VIRTIO_GPU_DEVICE_MMIO_FAIL map",
+            33, require_device=True))
+        self.assertFalse(validate(
+            WITH_DEVICE.replace("WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK", ""),
+            33, require_device=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
