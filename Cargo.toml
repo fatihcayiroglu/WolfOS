@@ -39,6 +39,9 @@ qemu-virtio-gpu-bank1-tx-smoke = ["qemu-virtio-gpu-transport-preflight-smoke"]
 # Isolated QEMU only: ACK/DRIVER, VERSION_1, FEATURES_OK, mandatory reset.
 # Never sets DRIVER_OK, DMA or queues; never available on physical GPUs.
 qemu-virtio-gpu-negotiate-smoke = ["qemu-virtio-gpu-bank1-tx-smoke"]
+# QEMU-only read-only post-reset controlq address and split-ring layout gate.
+# No queue writes, physical DMA, notifications or actual driver binding.
+qemu-virtio-gpu-controlq-ro-smoke = ["qemu-virtio-gpu-negotiate-smoke"]
 # QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.

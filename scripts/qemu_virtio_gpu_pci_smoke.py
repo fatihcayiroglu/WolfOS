@@ -60,6 +60,13 @@ NEGOTIATION = re.compile(
     r"ack=1 driver=3 features_ok=11 status_writes=5 feature_writes=1 "
     r"selector_writes=2 reset=0 queue_enabled=0 dma=0"
 )
+CONTROLQ = re.compile(
+    r"WOLFOS_VIRTIO_GPU_CONTROLQ_RO_OK queues=([1-9][0-9]*) selected=0 "
+    r"size=([1-9][0-9]*) notify_off=([0-9]+) "
+    r"desc=0 driver=0 device=0 enabled=0 layout_n=([1-9][0-9]*) "
+    r"desc_bytes=([1-9][0-9]*) avail_bytes=([1-9][0-9]*) "
+    r"used_bytes=([1-9][0-9]*) ro=1 uc=1 pages=1 writes=0 dma=0"
+)
 FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL",
     "WOLFOS_VIRTIO_GPU_BARS_FAIL", "bar_probe_writes=1", "mmio=1",
@@ -75,6 +82,8 @@ FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_FAIL",
     "WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_TEST_FAILED",
+    "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL",
+    "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_PCI_TEST_FAILED",
     "WOLFOS_GPU_DRIVER_LOADED", "WOLFOS_PANIC",
     "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_DF",
@@ -88,7 +97,9 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
              require_device: bool = False,
              require_preflight: bool = False,
              require_bank1: bool = False,
-             require_negotiation: bool = False) -> bool:
+             require_negotiation: bool = False,
+             require_controlq: bool = False) -> bool:
+    require_negotiation = require_negotiation or require_controlq
     require_bank1 = require_bank1 or require_negotiation
     require_preflight = require_preflight or require_bank1
     require_device = require_device or require_preflight
@@ -130,6 +141,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                    if row.startswith("WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_OK ")]
     negotiation_test = [i for i, row in enumerate(rows)
                         if row == "WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_TEST_OK"]
+    controlq = [(i, CONTROLQ.fullmatch(row)) for i, row in enumerate(rows)
+                if row.startswith("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_OK ")]
+    controlq_test = [i for i, row in enumerate(rows)
+                     if row == "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_OK"]
     pci = [i for i, row in enumerate(rows) if row == "WOLFOS_PCI_TEST_OK"]
     proof = [i for i, row in enumerate(rows)
              if row == "WOLFOS_VIRTIO_GPU_PCI_TEST_OK"]
@@ -169,6 +184,11 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                                 or len(negotiation_test) != 1):
         return False
     if not require_negotiation and (negotiation or negotiation_test):
+        return False
+    if require_controlq and (len(controlq) != 1 or controlq[0][1] is None
+                             or len(controlq_test) != 1):
+        return False
+    if not require_controlq and (controlq or controlq_test):
         return False
     if not (gpu[0] < policy[0] < caps[0][0] < pci[0] < proof[0]
             < fb[0] < rows.index("WOLFOS_BOOT_OK")):
@@ -228,6 +248,24 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                                 return False
                             if negotiation[0][1].group(1) != "1":
                                 return False
+                            if require_controlq:
+                                if not (negotiation_test[0] < controlq[0][0]
+                                        < controlq_test[0] < fb[0]):
+                                    return False
+                                (nqueues, advertised, notify_offset, selected,
+                                 desc_bytes, avail_bytes, used_bytes) = map(
+                                    int, controlq[0][1].groups())
+                                chosen = min(advertised, 256)
+                                if not (nqueues == queues and nqueues >= 2 and
+                                        advertised == queue_size and
+                                        advertised <= 32768 and
+                                        advertised & (advertised-1) == 0 and
+                                        0 <= notify_offset <= 65535 and
+                                        selected == chosen and
+                                        desc_bytes == 16*chosen and
+                                        avail_bytes == 6+2*chosen and
+                                        used_bytes == 6+8*chosen):
+                                    return False
     # Capability BAR indices and nonzero notification multiplier are
     # validated by the genuine kernel parser. No driver binding claimed.
     return True
@@ -235,16 +273,17 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
 
 def main() -> int:
     if (len(sys.argv) not in (2, 3) or
-            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate")) or
+            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")) or
             not Path(sys.argv[1]).is_file()):
-        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight|--bank1|--negotiate]")
+        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight|--bank1|--negotiate|--controlq-ro]")
         return 2
-    require_negotiation = len(sys.argv) == 3 and sys.argv[2] == "--negotiate"
-    require_bank1 = len(sys.argv) == 3 and sys.argv[2] in ("--bank1", "--negotiate")
-    require_preflight = len(sys.argv) == 3 and sys.argv[2] in ("--preflight", "--bank1", "--negotiate")
-    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight", "--bank1", "--negotiate")
-    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight", "--bank1", "--negotiate")
-    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate")
+    require_controlq = len(sys.argv) == 3 and sys.argv[2] == "--controlq-ro"
+    require_negotiation = len(sys.argv) == 3 and sys.argv[2] in ("--negotiate", "--controlq-ro")
+    require_bank1 = len(sys.argv) == 3 and sys.argv[2] in ("--bank1", "--negotiate", "--controlq-ro")
+    require_preflight = len(sys.argv) == 3 and sys.argv[2] in ("--preflight", "--bank1", "--negotiate", "--controlq-ro")
+    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")
+    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")
+    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")
     require_bars = len(sys.argv) == 3
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-pci-") as directory:
         serial_log = Path(directory) / "serial.log"
@@ -270,11 +309,15 @@ def main() -> int:
                         require_device=require_device,
                         require_preflight=require_preflight,
                         require_bank1=require_bank1,
-                        require_negotiation=require_negotiation):
+                        require_negotiation=require_negotiation,
+                        require_controlq=require_controlq):
             print(f"FAIL: no trustworthy virtio-vga PCI capability proof; exit={result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if require_negotiation:
+        if require_controlq:
+            print("PASS: QEMU controlq split-ring addresses read as zero, "
+                  "bounded layout checked, one RO mapping unmapped; no DMA.")
+        elif require_negotiation:
             print("PASS: genuine QEMU VirtIO feature handshake accepted, "
                   "mandatory reset completed, queues untouched, no DMA.")
         elif require_bank1:

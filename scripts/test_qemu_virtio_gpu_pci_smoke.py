@@ -85,6 +85,18 @@ WITH_NEGOTIATION = WITH_BANK1.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+CONTROLQ_LINE = (
+    "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_OK queues=2 selected=0 size=256 "
+    "notify_off=0 desc=0 driver=0 device=0 enabled=0 layout_n=256 "
+    "desc_bytes=4096 avail_bytes=518 used_bytes=2054 "
+    "ro=1 uc=1 pages=1 writes=0 dma=0"
+)
+WITH_CONTROLQ = WITH_NEGOTIATION.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    CONTROLQ_LINE + "\nWOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -332,6 +344,44 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(WITH_NEGOTIATION+
             "\nWOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_FAIL reset",
             33,require_negotiation=True))
+
+    def test_controlq_requires_all_prior_genuine_qemu_proofs(self):
+        self.assertTrue(validate(WITH_CONTROLQ,33,require_controlq=True))
+        self.assertFalse(validate(WITH_NEGOTIATION,33,require_controlq=True))
+        self.assertFalse(validate(WITH_CONTROLQ,33,require_negotiation=True))
+        self.assertFalse(validate(WITH_CONTROLQ,33,require_bank1=True))
+
+    def test_controlq_rejects_addresses_or_writes_and_missing_marker(self):
+        for old, replacement in [
+            ("desc=0", "desc=4096"), ("driver=0", "driver=8192"),
+            ("device=0", "device=12288"), ("enabled=0", "enabled=1"),
+            ("ro=1", "ro=0"), ("writes=0", "writes=1"),
+            ("dma=0", "dma=1"), ("selected=0", "selected=1"),
+        ]:
+            self.assertFalse(validate(
+                WITH_CONTROLQ.replace(old, replacement),33,require_controlq=True))
+        self.assertFalse(validate(
+            WITH_CONTROLQ.replace("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_OK", ""),
+            33,require_controlq=True))
+
+    def test_controlq_rejects_faked_split_layout(self):
+        for old, replacement in [
+            ("queues=2", "queues=1"), ("size=256", "size=255"),
+            ("layout_n=256", "layout_n=128"),
+            ("desc_bytes=4096", "desc_bytes=4097"),
+            ("avail_bytes=518", "avail_bytes=517"),
+            ("used_bytes=2054", "used_bytes=2055"),
+            ("notify_off=0", "notify_off=65536"),
+        ]:
+            self.assertFalse(validate(
+                WITH_CONTROLQ.replace(old, replacement),33,require_controlq=True))
+
+    def test_controlq_rejects_duplicate_and_failure(self):
+        self.assertFalse(validate(WITH_CONTROLQ+"\n"+CONTROLQ_LINE,
+                                  33,require_controlq=True))
+        self.assertFalse(validate(WITH_CONTROLQ+
+            "\nWOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL bad_queue",
+            33,require_controlq=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))

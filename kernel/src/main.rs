@@ -154,6 +154,10 @@ mod virtio_gpu_bank1_tx;
 mod virtio_gpu_feature_neg_contract;
 #[cfg(feature = "qemu-virtio-gpu-negotiate-smoke")]
 mod virtio_gpu_feature_neg;
+#[cfg(feature = "qemu-virtio-gpu-controlq-ro-smoke")]
+mod virtio_gpu_controlq_ro_contract;
+#[cfg(feature = "qemu-virtio-gpu-controlq-ro-smoke")]
+mod virtio_gpu_controlq_ro;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
@@ -533,6 +537,18 @@ pub extern "C" fn kmain() -> ! {
             halt_forever();
         }
         serial::write_line("WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_TEST_OK");
+    }
+    #[cfg(feature = "qemu-virtio-gpu-controlq-ro-smoke")]
+    {
+        let Some(window) = pci_summary.common_window else {
+            serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_FAILED no_common_window");
+            halt_forever();
+        };
+        if !virtio_gpu_controlq_ro::verify(hhdm.offset, entries, window) {
+            serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_FAILED");
+            halt_forever();
+        }
+        serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_OK");
     }
     #[cfg(feature = "qemu-stdvga-dispi-smoke")]
     let Some(dispi_snapshot) = qemu_stdvga_dispi_smoke::prove(pci_summary.qemu_stdvga) else {
