@@ -204,9 +204,9 @@ def verify_reduced(image:tuple[int,int,bytes])->None:
                 raise ProofError(f"Reduced QMP pixel mismatch at ({x},{y})")
 
 def verify_reexpanded(active:tuple[int,int,bytes],reexpanded:tuple[int,int,bytes])->None:
-    verify_active(reexpanded)
     if reexpanded!=active:
         raise ProofError("Native 64x64 scanout rollback differs from original active image")
+    verify_active(reexpanded)
 
 def verify_disabled(active:tuple[int,int,bytes],disabled:tuple[int,int,bytes])->None:
     # VirtIO resource_id=0 detaches output but does NOT restore the
