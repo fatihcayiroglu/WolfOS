@@ -134,6 +134,10 @@ mod qemu_stdvga_dispi_smoke;
 mod qemu_vbe_transaction_contract;
 #[cfg(feature = "qemu-stdvga-enable-tx-smoke")]
 mod qemu_vbe_enable_tx;
+#[cfg(feature = "qemu-stdvga-full-state-smoke")]
+mod qemu_vbe_full_state_contract;
+#[cfg(feature = "qemu-stdvga-full-state-smoke")]
+mod qemu_vbe_full_state_smoke;
 mod paging;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_preflight;
@@ -519,9 +523,19 @@ pub extern "C" fn kmain() -> ! {
             "WOLFOS_QEMU_DISPLAY_ATTEST_OK width={} height={} pitch={} bpp={} vram64k={} rgb=1 mode_writes=0\n",
             fb.width, fb.height, fb.pitch, fb.bpp, dispi_snapshot.vram64k,
         ));
+        #[cfg(feature = "qemu-stdvga-full-state-smoke")]
+        let Some(full_before) = qemu_vbe_full_state_smoke::capture(dispi_snapshot) else {
+            serial::write_line("WOLFOS_QEMU_VBE_FULL_TEST_FAILED stage=before");
+            halt_forever();
+        };
         #[cfg(feature = "qemu-stdvga-enable-tx-smoke")]
         if !qemu_vbe_enable_tx::prove(dispi_snapshot, fb.address().cast::<u32>()) {
             serial::write_line("WOLFOS_QEMU_VBE_ENABLE_TX_TEST_FAILED");
+            halt_forever();
+        }
+        #[cfg(feature = "qemu-stdvga-full-state-smoke")]
+        if !qemu_vbe_full_state_smoke::verify_after(full_before, dispi_snapshot) {
+            serial::write_line("WOLFOS_QEMU_VBE_FULL_TEST_FAILED stage=after");
             halt_forever();
         }
     }
