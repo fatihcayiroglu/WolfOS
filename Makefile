@@ -27,6 +27,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-bank1-tx)
 FEATURES := --features qemu-virtio-gpu-bank1-tx-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-negotiate)
 FEATURES := --features qemu-virtio-gpu-negotiate-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-controlq-ro)
+FEATURES := --features qemu-virtio-gpu-controlq-ro-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -291,6 +293,11 @@ qemu-virtio-gpu-bank1-tx-smoke:
 qemu-virtio-gpu-negotiate-smoke:
 	$(MAKE) iso FLAVOR=qemu-virtio-gpu-negotiate
 	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-negotiate.iso --negotiate
+
+.PHONY: qemu-virtio-gpu-controlq-ro-smoke
+qemu-virtio-gpu-controlq-ro-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-controlq-ro
+	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-controlq-ro.iso --controlq-ro
 
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:
@@ -565,6 +572,8 @@ test:
 	$(OUT)/virtio_gpu_bank1_tx_contract_tests
 	rustc --edition=2024 --test kernel/src/virtio_gpu_feature_neg_contract.rs -o $(OUT)/virtio_gpu_feature_neg_contract_tests
 	$(OUT)/virtio_gpu_feature_neg_contract_tests
+	rustc --edition=2024 --test kernel/src/virtio_gpu_controlq_ro_contract.rs -o $(OUT)/virtio_gpu_controlq_ro_contract_tests
+	$(OUT)/virtio_gpu_controlq_ro_contract_tests
 	rustc --edition=2024 --test kernel/src/display_driver_policy.rs -o $(OUT)/display_driver_policy_tests
 	$(OUT)/display_driver_policy_tests
 	rustc --edition=2024 --test kernel/src/display_edid_host.rs -o $(OUT)/display_edid_policy_tests
