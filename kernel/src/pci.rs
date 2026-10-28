@@ -195,7 +195,7 @@ fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8) -> bool {
                 ]) {
                     Ok(bars) => {
                         serial::write_fmt(format_args!(
-                            "WOLFOS_VIRTIO_GPU_BARS_OK common={} notify={} isr={} device={} cfg_writes=0 bar_probe_writes=0 mmio=0\n",
+                            "WOLFOS_VIRTIO_GPU_BARS_OK common={} notify={} isr={} device={} cfg_writes=0 bar_probe_writes=0 mmio=0 dma=0\n",
                             bars.common.label(), bars.notify.label(),
                             bars.isr.label(), bars.device.label(),
                         ));
