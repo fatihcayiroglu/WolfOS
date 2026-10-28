@@ -7,6 +7,8 @@
 
 use core::arch::asm;
 use crate::{display_driver_policy::DisplayIdentity, serial};
+#[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
+use crate::virtio_gpu_pci_caps;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -20,6 +22,8 @@ pub struct PciSummary {
     pub storage: usize,
     /// Read-only count of exact QEMU PCI Standard VGA 1234:1111 functions.
     pub qemu_stdvga: usize,
+    #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
+    pub virtio_gpu_caps_verified: usize,
 }
 
 /// Read an aligned u32 from a function's first 256 PCI config bytes.
@@ -48,6 +52,38 @@ fn probe(bus: u8, slot: u8, function: u8) -> Option<(u16, u16)> {
     let vendor = ids as u16;
     if vendor == 0xffff { return None; }
     Some((vendor, (ids >> 16) as u16))
+}
+
+#[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
+fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8) -> bool {
+    // Exactly 64 read-only PCI configuration dwords. CF8 selector writes
+    // are NOT writes to any PCI device configuration register.
+    let mut cfg = [0u8; 256];
+    for dword in 0..64usize {
+        let offset = (dword * 4) as u8;
+        cfg[dword*4..dword*4+4]
+            .copy_from_slice(&read_u32(bus, slot, function, offset).to_le_bytes());
+    }
+    match virtio_gpu_pci_caps::inspect(&cfg) {
+        Ok(caps) if caps.vendor_caps == 4 => {
+            serial::write_fmt(format_args!(
+                "WOLFOS_VIRTIO_GPU_PCI_CAPS_OK vendor=1af4 device=1050 common={} notify={} isr={} device={} multiplier={} cap_reads=64 cfg_writes=0 dma=0 accel=0\n",
+                caps.common_bar,caps.notify_bar,caps.isr_bar,caps.device_bar,
+                caps.notify_multiplier
+            ));
+            true
+        }
+        Ok(_) => {
+            serial::write_line("WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL insufficient_caps");
+            false
+        }
+        Err(error) => {
+            serial::write_fmt(format_args!(
+                "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL {error:?}\n"
+            ));
+            false
+        }
+    }
 }
 
 fn record(
@@ -90,6 +126,14 @@ fn record(
                     vendor, device, identity.family.label(),
                 ));
             }
+            #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
+            if vendor == virtio_gpu_pci_caps::VIRTIO_VENDOR
+                && device == virtio_gpu_pci_caps::VIRTIO_GPU_DEVICE
+                && subclass == 0x00
+                && inspect_qemu_virtio_gpu(bus,slot,function)
+            {
+                summary.virtio_gpu_caps_verified += 1;
+            }
         }
         _ => {}
     }
@@ -100,6 +144,8 @@ fn record(
 pub fn discover() -> PciSummary {
     let mut summary = PciSummary {
         devices: 0, displays: 0, networks: 0, storage: 0, qemu_stdvga: 0,
+        #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
+        virtio_gpu_caps_verified: 0,
     };
     for bus in 0u16..=255 {
         for slot in 0u8..32 {

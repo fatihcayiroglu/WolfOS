@@ -19,6 +19,8 @@ smoke-exit = []
 # Feature-isolated QEMU stdvga 1234:1111 Bochs-VBE port observation;
 # only index selector is changed/restored, NEVER video mode/data writes.
 qemu-stdvga-dispi-smoke = ["smoke-exit"]
+# QEMU virtio-vga only: read PCI config capabilities without BAR/MMIO/DMA writes.
+qemu-virtio-gpu-pci-smoke = ["smoke-exit"]
 # QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.
