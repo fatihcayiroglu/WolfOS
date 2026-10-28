@@ -160,6 +160,10 @@ mod virtio_gpu_controlq_ro_contract;
 mod virtio_gpu_controlq_ro;
 #[cfg(feature = "qemu-virtio-gpu-controlq-pmm-smoke")]
 mod virtio_gpu_controlq_pmm;
+#[cfg(feature = "qemu-virtio-gpu-controlq-tx-smoke")]
+mod virtio_gpu_controlq_tx_contract;
+#[cfg(feature = "qemu-virtio-gpu-controlq-tx-smoke")]
+mod virtio_gpu_controlq_tx;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
@@ -560,6 +564,16 @@ pub extern "C" fn kmain() -> ! {
                 halt_forever();
             }
             serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK");
+            #[cfg(feature = "qemu-virtio-gpu-controlq-tx-smoke")]
+            {
+                if !virtio_gpu_controlq_tx::verify(
+                    hhdm.offset, entries, window, controlq_layout
+                ) {
+                    serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_FAILED");
+                    halt_forever();
+                }
+                serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK");
+            }
         }
         #[cfg(not(feature = "qemu-virtio-gpu-controlq-pmm-smoke"))]
         let _ = controlq_layout;
