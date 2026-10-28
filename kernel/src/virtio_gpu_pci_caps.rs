@@ -177,6 +177,9 @@ mod tests {
         let mut c=example();c[0xa1]=0x40;
         assert_eq!(inspect(&c),Err(CapabilityError::CapabilityLoop));
         let mut c=example();c[0xa3]=1;
+        // Keep the payload range valid so duplicate detection is the first
+        // violated contract. Otherwise InvalidRange correctly wins.
+        c[0xac..0xb0].copy_from_slice(&64u32.to_le_bytes());
         assert_eq!(inspect(&c),Err(CapabilityError::DuplicateType));
     }
     #[test]
