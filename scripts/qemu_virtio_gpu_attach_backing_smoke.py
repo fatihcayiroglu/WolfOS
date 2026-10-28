@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 
-from qemu_virtio_gpu_pci_smoke import validate as validate_gpu
+from qemu_virtio_gpu_pci_smoke import validate as validate_gpu, DISPLAY_INFO_NINE
 from qemu_virtio_gpu_edid_live_smoke import validate_edid_marker
 
 BACKING = re.compile(
@@ -28,6 +28,10 @@ def validate_backing_marker(output: str) -> bool:
            for row in rows):
         return False
     if not validate_edid_marker(output, frame_count=9):
+        return False
+    display = [DISPLAY_INFO_NINE.fullmatch(row) for row in rows
+               if row.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
+    if len(display)!=1 or display[0] is None:
         return False
     found = [(i, BACKING.fullmatch(row)) for i,row in enumerate(rows)
              if row.startswith("WOLFOS_VIRTIO_GPU_ATTACH_BACKING_OK ")]
