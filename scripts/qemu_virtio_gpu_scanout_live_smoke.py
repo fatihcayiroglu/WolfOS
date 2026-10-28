@@ -45,6 +45,7 @@ class ProofError(Exception):
 def validate_serial(output: str, reset_restore:bool=False) -> bool:
     lines=output.splitlines()
     if any("WOLFOS_VIRTIO_GPU_SCANOUT_FAIL" in l
+           or "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_FAIL" in l
            or "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL" in l
            or "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL" in l for l in lines):
         return False
