@@ -373,7 +373,7 @@ mod tests {
     fn reject_claimed_extensions_not_supplied_in_virtio_edid_size() {
         let mut b=base();b[126]=1;checksum(&mut b);
         assert_eq!(decode_get_edid(request(),9,&response(&b)),
-                   Err(VirtioEdidError::ParsedEdid(FullEdidError::WrongLength)));
+                   Err(VirtioEdidError::IncompleteEdidBlocks));
     }
     #[test]
     fn reject_displayid_extension_not_silently_ignored() {
