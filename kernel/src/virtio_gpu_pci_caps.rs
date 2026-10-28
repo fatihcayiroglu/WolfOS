@@ -27,6 +27,8 @@ pub struct VirtioGpuCapabilities {
     pub common_offset: u32,
     pub common_length: u32,
     pub notify_bar: u8,
+    pub notify_offset: u32,
+    pub notify_length: u32,
     pub isr_bar: u8,
     pub device_bar: u8,
     pub device_offset: u32,
@@ -136,12 +138,13 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
         }
         pointer=next;
     }
-    let [Some((common_bar,common_offset,common_length)),Some((notify_bar,_,_)),
+    let [Some((common_bar,common_offset,common_length)),Some((notify_bar,notify_offset,notify_length)),
          Some((isr_bar,_,_)),Some((device_bar,device_offset,device_length))]=kinds else {
         return Err(CapabilityError::IncompleteTypes);
     };
     Ok(VirtioGpuCapabilities {
-        common_bar,common_offset,common_length,notify_bar,isr_bar,device_bar,
+        common_bar,common_offset,common_length,
+        notify_bar,notify_offset,notify_length,isr_bar,device_bar,
         device_offset,device_length,
         notify_multiplier:multiplier,vendor_caps,alternative_caps,
     })
@@ -178,6 +181,7 @@ mod tests {
         assert_eq!((s.vendor_caps,s.common_bar,s.notify_bar,s.isr_bar,s.device_bar),
                    (4,4,4,4,4));
         assert_eq!(s.notify_multiplier,4);
+        assert_eq!((s.notify_offset,s.notify_length),(0x100,2));
         assert_eq!((s.common_offset,s.common_length),(0x100,64));
         assert_eq!(s.alternative_caps,0);
     }
@@ -209,6 +213,7 @@ mod tests {
         c[0xd0..0xd4].copy_from_slice(&8u32.to_le_bytes());
         let got=inspect(&c).unwrap();
         assert_eq!((got.notify_bar,got.notify_multiplier),(4,4));
+        assert_eq!((got.notify_offset,got.notify_length),(0x100,2));
         assert_eq!((got.vendor_caps,got.alternative_caps),(5,1));
     }
     #[test]

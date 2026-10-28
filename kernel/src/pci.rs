@@ -33,6 +33,8 @@ pub struct PciSummary {
     pub virtio_gpu_bar_size_verified: usize,
     #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
     pub common_window: Option<QemuBarWindow>,
+    #[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
+    pub notify_window: Option<QemuNotifyWindow>,
     #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
     pub device_window: Option<QemuDeviceWindow>,
 }
@@ -103,6 +105,16 @@ pub(crate) struct QemuBarWindow {
     pub is_memory: bool,
 }
 
+#[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QemuNotifyWindow {
+    pub physical_base: u64,
+    pub aperture_bytes: u64,
+    pub notify_offset: u32,
+    pub notify_length: u32,
+    pub notify_multiplier: u32,
+    pub same_measured_bar: bool,
+}
 #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct QemuDeviceWindow {
@@ -236,6 +248,20 @@ fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8, summary: &mut PciSum
                                 caps.common_offset,caps.common_length,
                             ) else { return false; };
                             summary.common_window = Some(window);
+                            #[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
+                            {
+                                // The existing BAR-size proof covers only
+                                // common_bar. A separate notify BAR must be
+                                // independently sized before any access.
+                                summary.notify_window = Some(QemuNotifyWindow {
+                                    physical_base:window.physical_base,
+                                    aperture_bytes:window.aperture_bytes,
+                                    notify_offset:caps.notify_offset,
+                                    notify_length:caps.notify_length,
+                                    notify_multiplier:caps.notify_multiplier,
+                                    same_measured_bar:caps.notify_bar==caps.common_bar,
+                                });
+                            }
                             #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
                             {
                                 // Only this QEMU layout is safe with the one
@@ -344,6 +370,8 @@ pub fn discover() -> PciSummary {
         virtio_gpu_bar_size_verified: 0,
         #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
         common_window: None,
+        #[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
+        notify_window: None,
         #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
         device_window: None,
     };

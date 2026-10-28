@@ -120,6 +120,17 @@ WITH_QUEUE_TX = WITH_PMM.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+NOTIFY_LINE = (
+    "WOLFOS_VIRTIO_GPU_NOTIFY_RO_OK queue=0 notify_off=0 "
+    "multiplier=4 cap_offset=768 cap_length=16 "
+    "physical_bounded=1 ro=1 notify_reads=0 writes=0 dma=0"
+)
+WITH_NOTIFY = WITH_QUEUE_TX.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    NOTIFY_LINE + "\nWOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -484,6 +495,43 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(WITH_QUEUE_TX.replace(
             "CONTROLQ_TX_OK layout_n=256","CONTROLQ_TX_OK layout_n=128"),
             33,require_queue_tx=True))
+
+    def test_notify_real_chain_and_no_backwards_compat_fake_green(self):
+        self.assertTrue(validate(WITH_NOTIFY,33,require_notify_ro=True))
+        self.assertFalse(validate(WITH_QUEUE_TX,33,require_notify_ro=True))
+        self.assertFalse(validate(WITH_NOTIFY,33,require_queue_tx=True))
+        self.assertFalse(validate(WITH_NOTIFY,33,require_pmm=True))
+
+    def test_notify_rejects_misaligned_outside_or_mismatched_cap(self):
+        for before,after in [
+            ("notify_off=0","notify_off=1"),
+            ("multiplier=4","multiplier=8"),
+            ("cap_offset=768","cap_offset=769"),
+            ("cap_length=16","cap_length=1"),
+            ("cap_offset=768","cap_offset=4094"),
+            ("physical_bounded=1","physical_bounded=0"),
+            ("ro=1 notify_reads=0","ro=0 notify_reads=0"),
+            ("notify_reads=0","notify_reads=1"),
+            ("writes=0 dma=0","writes=1 dma=0"),
+        ]:
+            self.assertFalse(validate(WITH_NOTIFY.replace(
+                NOTIFY_LINE, NOTIFY_LINE.replace(before,after)),
+                33,require_notify_ro=True))
+
+    def test_notify_rejects_duplicate_failure_and_missing_check(self):
+        self.assertFalse(validate(WITH_NOTIFY+"\n"+NOTIFY_LINE,
+                                  33,require_notify_ro=True))
+        self.assertFalse(validate(WITH_NOTIFY+
+            "\nWOLFOS_VIRTIO_GPU_NOTIFY_RO_FAIL unsafe",
+            33,require_notify_ro=True))
+        self.assertFalse(validate(WITH_NOTIFY.replace(
+            "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK",""),
+            33,require_notify_ro=True))
+        self.assertFalse(validate(WITH_NOTIFY.replace(
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK",
+            "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK\n"
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK"),
+            33,require_notify_ro=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
