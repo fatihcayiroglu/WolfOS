@@ -40,7 +40,7 @@ const ZERO_MODE: DisplayMode = DisplayMode {
     pixel_clock_khz: 0, preferred: false, interlaced: false,
 };
 
-fn detailed_timing(bytes: &[u8]) -> Result<Option<DisplayMode>, EdidError> {
+pub(crate) fn detailed_timing(bytes: &[u8]) -> Result<Option<DisplayMode>, EdidError> {
     let pixel_clock_units = u16::from_le_bytes([bytes[0], bytes[1]]);
     if pixel_clock_units == 0 {
         // EDID monitor name/range/serial descriptors are not timings.
@@ -82,6 +82,16 @@ fn detailed_timing(bytes: &[u8]) -> Result<Option<DisplayMode>, EdidError> {
 /// has no unparsed extensions. The driver may feed this to the independent
 /// display mode/pipeline selection policy, never directly to register I/O.
 pub fn parse_base(edid: &[u8]) -> Result<BaseModes, EdidError> {
+    parse_base_inner(edid, false)
+}
+
+/// Used only after a complete EDID consumer verifies *all* advertised
+/// extension blocks. The base-only API continues to reject extensions.
+pub(crate) fn parse_base_with_checked_extensions(edid: &[u8]) -> Result<BaseModes, EdidError> {
+    parse_base_inner(edid, true)
+}
+
+fn parse_base_inner(edid: &[u8], extensions_checked: bool) -> Result<BaseModes, EdidError> {
     if edid.len() != BASE_LEN { return Err(EdidError::WrongLength); }
     if edid[..8] != HEADER { return Err(EdidError::InvalidHeader); }
     if edid.iter().fold(0u8, |sum,byte|sum.wrapping_add(*byte)) != 0 {
@@ -90,7 +100,7 @@ pub fn parse_base(edid: &[u8]) -> Result<BaseModes, EdidError> {
     if edid[18] != 1 || edid[19] > 4 {
         return Err(EdidError::UnsupportedVersion);
     }
-    if edid[126] != 0 {
+    if edid[126] != 0 && !extensions_checked {
         return Err(EdidError::UnparsedExtensions);
     }
     let mut result = BaseModes {

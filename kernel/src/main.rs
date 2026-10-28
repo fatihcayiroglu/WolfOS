@@ -126,6 +126,7 @@ mod pci;
 mod display_driver_policy;
 mod display_mode_policy;
 mod display_edid_base;
+mod display_edid_cta;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
