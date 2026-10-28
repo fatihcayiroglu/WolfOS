@@ -49,7 +49,7 @@ fn disjoint_from_ram_and_framebuffer(base: u64, entries: &[&Entry]) -> bool {
     true
 }
 
-pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> bool {
+pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> Option<controlq::Layout> {
     let contract_window = contract::Window {
         bar_base: window.physical_base,
         bar_bytes: window.aperture_bytes,
@@ -63,27 +63,27 @@ pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> bool
             serial::write_fmt(format_args!(
                 "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL window={error:?}\n"
             ));
-            return false;
+            return None;
         }
     };
     if !disjoint_from_ram_and_framebuffer(span.physical_page, entries) {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL overlaps_memory");
-        return false;
+        return None;
     }
     if x86_64::instructions::interrupts::are_enabled() {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL interrupts_enabled");
-        return false;
+        return None;
     }
     let (cr3_frame, _) = Cr3::read();
     let Some(pml4_va) = hhdm.checked_add(cr3_frame.start_address().as_u64())
         .and_then(|a| VirtAddr::try_new(a).ok())
     else {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL bad_cr3");
-        return false;
+        return None;
     };
     let Some(hhdm_va) = VirtAddr::try_new(hhdm).ok() else {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL bad_hhdm");
-        return false;
+        return None;
     };
     // SAFETY: only the BSP mutates these active tables; no AP was started
     // and interrupts are disabled. The PML4 itself is RAM in HHDM.
@@ -92,7 +92,7 @@ pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> bool
     let target = VirtAddr::new(TEST_SLOT);
     if mapper.translate_addr(target).is_some() {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL slot_occupied");
-        return false;
+        return None;
     }
     let page = Page::<Size4KiB>::containing_address(target);
     let physical = PhysFrame::<Size4KiB>::containing_address(
@@ -106,7 +106,7 @@ pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> bool
         mapper.map_to(page, physical, flags, &mut TableAllocator)
     }) else {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL map");
-        return false;
+        return None;
     };
     flush.flush();
 
@@ -151,18 +151,18 @@ pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> bool
     // Mandatory removal of temporary read-only mapping.
     let Ok((unmapped, flush)) = mapper.unmap(page) else {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL unmap");
-        return false;
+        return None;
     };
     flush.flush();
     if !mapped_ok || unmapped.start_address().as_u64() != span.physical_page
         || mapper.translate_addr(target).is_some()
     {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL mapping_not_restored");
-        return false;
+        return None;
     }
     if !feature_bank_zero {
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL feature_bank_not_zero");
-        return false;
+        return None;
     }
     let layout = match controlq::verify(snapshot) {
         Ok(l) => l,
@@ -170,7 +170,7 @@ pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> bool
             serial::write_fmt(format_args!(
                 "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL registers={error:?}\n"
             ));
-            return false;
+            return None;
         }
     };
     serial::write_fmt(format_args!(
@@ -178,5 +178,5 @@ pub fn verify(hhdm: u64, entries: &[&Entry], window: pci::QemuBarWindow) -> bool
         snapshot.num_queues, snapshot.queue_size, snapshot.queue_notify_off,
         layout.selected,layout.desc_bytes,layout.avail_bytes,layout.used_bytes
     ));
-    true
+    Some(layout)
 }

@@ -158,6 +158,8 @@ mod virtio_gpu_feature_neg;
 mod virtio_gpu_controlq_ro_contract;
 #[cfg(feature = "qemu-virtio-gpu-controlq-ro-smoke")]
 mod virtio_gpu_controlq_ro;
+#[cfg(feature = "qemu-virtio-gpu-controlq-pmm-smoke")]
+mod virtio_gpu_controlq_pmm;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
@@ -544,11 +546,23 @@ pub extern "C" fn kmain() -> ! {
             serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_FAILED no_common_window");
             halt_forever();
         };
-        if !virtio_gpu_controlq_ro::verify(hhdm.offset, entries, window) {
+        let Some(controlq_layout) =
+            virtio_gpu_controlq_ro::verify(hhdm.offset, entries, window)
+        else {
             serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_FAILED");
             halt_forever();
-        }
+        };
         serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_OK");
+        #[cfg(feature = "qemu-virtio-gpu-controlq-pmm-smoke")]
+        {
+            if !virtio_gpu_controlq_pmm::verify(hhdm.offset, controlq_layout) {
+                serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_FAILED");
+                halt_forever();
+            }
+            serial::write_line("WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK");
+        }
+        #[cfg(not(feature = "qemu-virtio-gpu-controlq-pmm-smoke"))]
+        let _ = controlq_layout;
     }
     #[cfg(feature = "qemu-stdvga-dispi-smoke")]
     let Some(dispi_snapshot) = qemu_stdvga_dispi_smoke::prove(pci_summary.qemu_stdvga) else {
