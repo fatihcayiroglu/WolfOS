@@ -28,6 +28,9 @@ qemu-virtio-gpu-bar-size-smoke = ["qemu-virtio-gpu-bars-smoke"]
 # QEMU only: transient UC read-only common config page after a verified BAR
 # aperture and exact restoration. No VirtIO negotiation or GPU DMA.
 qemu-virtio-gpu-common-mmio-smoke = ["qemu-virtio-gpu-bar-size-smoke"]
+# One independently bounded read-only VirtIO GPU-specific MMIO page.
+# A separate BAR requires a separate verified probe and is refused here.
+qemu-virtio-gpu-device-mmio-smoke = ["qemu-virtio-gpu-common-mmio-smoke"]
 # QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.

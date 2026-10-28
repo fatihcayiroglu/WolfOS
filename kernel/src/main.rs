@@ -138,6 +138,10 @@ mod virtio_gpu_bar_size_contract;
 mod virtio_gpu_mmio_contract;
 #[cfg(feature = "qemu-virtio-gpu-common-mmio-smoke")]
 mod virtio_gpu_common_mmio;
+#[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
+mod virtio_gpu_device_mmio_contract;
+#[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
+mod virtio_gpu_device_mmio;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
@@ -469,6 +473,18 @@ pub extern "C" fn kmain() -> ! {
             halt_forever();
         }
         serial::write_line("WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK");
+    }
+    #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
+    {
+        let Some(window) = pci_summary.device_window else {
+            serial::write_line("WOLFOS_VIRTIO_GPU_DEVICE_MMIO_TEST_FAILED no_window");
+            halt_forever();
+        };
+        if !virtio_gpu_device_mmio::verify(hhdm.offset, entries, window) {
+            serial::write_line("WOLFOS_VIRTIO_GPU_DEVICE_MMIO_TEST_FAILED");
+            halt_forever();
+        }
+        serial::write_line("WOLFOS_VIRTIO_GPU_DEVICE_MMIO_TEST_OK");
     }
     #[cfg(feature = "qemu-stdvga-dispi-smoke")]
     let Some(dispi_snapshot) = qemu_stdvga_dispi_smoke::prove(pci_summary.qemu_stdvga) else {

@@ -29,6 +29,8 @@ pub struct VirtioGpuCapabilities {
     pub notify_bar: u8,
     pub isr_bar: u8,
     pub device_bar: u8,
+    pub device_offset: u32,
+    pub device_length: u32,
     pub notify_multiplier: u32,
     pub vendor_caps: u8,
     /// Additional well-formed alternate capabilities, after the preferred first.
@@ -135,11 +137,12 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
         pointer=next;
     }
     let [Some((common_bar,common_offset,common_length)),Some((notify_bar,_,_)),
-         Some((isr_bar,_,_)),Some((device_bar,_,_))]=kinds else {
+         Some((isr_bar,_,_)),Some((device_bar,device_offset,device_length))]=kinds else {
         return Err(CapabilityError::IncompleteTypes);
     };
     Ok(VirtioGpuCapabilities {
         common_bar,common_offset,common_length,notify_bar,isr_bar,device_bar,
+        device_offset,device_length,
         notify_multiplier:multiplier,vendor_caps,alternative_caps,
     })
 }
@@ -163,6 +166,11 @@ mod tests {
         vendor_cap(&mut c,0x80,0xa0,3,4,1);
         vendor_cap(&mut c,0xa0,0,4,4,16);
         c
+    }
+    #[test]
+    fn device_specific_capability_window_is_exposed_exactly() {
+        let c = inspect(&example()).expect("QEMU sample has device config");
+        assert_eq!((c.device_bar, c.device_offset, c.device_length), (4, 0x100, 16));
     }
     #[test]
     fn known_valid_four_required_capabilities() {

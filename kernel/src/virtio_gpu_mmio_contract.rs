@@ -27,12 +27,18 @@ pub enum WindowError {
 }
 
 pub fn check(window:Window)->Result<Span,WindowError> {
+    check_with_minimum(window, 56)
+}
+
+/// Variant for the separate VirtIO-GPU device-specific capability (16 bytes).
+/// All other aperture, RAM/MEMMAP and single-page rules remain identical.
+pub fn check_with_minimum(window:Window, minimum:u32)->Result<Span,WindowError> {
     if !window.is_memory {return Err(WindowError::NotMmio);}
     if window.bar_base==0 {return Err(WindowError::Unassigned);}
     if window.bar_bytes==0 || !window.bar_bytes.is_power_of_two()
         || window.bar_base%window.bar_bytes!=0
     {return Err(WindowError::BadAperture);}
-    if window.length<56 {return Err(WindowError::TooShort);}
+    if window.length<minimum {return Err(WindowError::TooShort);}
     let bar_end=window.bar_base.checked_add(window.bar_bytes)
         .ok_or(WindowError::Overflow)?;
     let begin=window.bar_base.checked_add(u64::from(window.offset))
@@ -117,6 +123,15 @@ mod tests {
     fn reject_reserved_status_bits() {
         assert_eq!(validate_readonly(2,0x10),Err(WindowError::BadStatus));
         assert_eq!(validate_readonly(2,0xcf),Ok(()));
+    }
+    #[test]
+    fn sixteen_byte_gpu_device_config_region_is_supported_without_loosening_common() {
+        let mut w = win();
+        w.length = 16;
+        assert_eq!(check(w), Err(WindowError::TooShort));
+        assert!(check_with_minimum(w, 16).is_ok());
+        w.length = 15;
+        assert_eq!(check_with_minimum(w, 16), Err(WindowError::TooShort));
     }
     #[test]
     fn common_field_offsets_are_stable() {

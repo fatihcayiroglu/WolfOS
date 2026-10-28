@@ -33,6 +33,8 @@ pub struct PciSummary {
     pub virtio_gpu_bar_size_verified: usize,
     #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
     pub common_window: Option<QemuBarWindow>,
+    #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
+    pub device_window: Option<QemuDeviceWindow>,
 }
 
 /// Read an aligned u32 from a function's first 256 PCI config bytes.
@@ -99,6 +101,16 @@ pub(crate) struct QemuBarWindow {
     pub common_offset: u32,
     pub common_length: u32,
     pub is_memory: bool,
+}
+
+#[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct QemuDeviceWindow {
+    pub physical_base: u64,
+    pub aperture_bytes: u64,
+    pub is_memory: bool,
+    pub device_offset: u32,
+    pub device_length: u32,
 }
 
 #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
@@ -224,6 +236,23 @@ fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8, summary: &mut PciSum
                                 caps.common_offset,caps.common_length,
                             ) else { return false; };
                             summary.common_window = Some(window);
+                            #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
+                            {
+                                // Only this QEMU layout is safe with the one
+                                // already measured physical BAR. Different
+                                // device BARs need independent sizing first.
+                                if caps.device_bar != caps.common_bar {
+                                    serial::write_line("WOLFOS_VIRTIO_GPU_DEVICE_MMIO_FAIL separate_bar_unmeasured");
+                                    return false;
+                                }
+                                summary.device_window = Some(QemuDeviceWindow {
+                                    physical_base: window.physical_base,
+                                    aperture_bytes: window.aperture_bytes,
+                                    is_memory: window.is_memory,
+                                    device_offset: caps.device_offset,
+                                    device_length: caps.device_length,
+                                });
+                            }
                         }
                     },
                     Err(error) => {
@@ -315,6 +344,8 @@ pub fn discover() -> PciSummary {
         virtio_gpu_bar_size_verified: 0,
         #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
         common_window: None,
+        #[cfg(feature = "qemu-virtio-gpu-device-mmio-smoke")]
+        device_window: None,
     };
     for bus in 0u16..=255 {
         for slot in 0u8..32 {
