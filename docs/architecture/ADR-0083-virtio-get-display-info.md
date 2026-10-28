@@ -44,7 +44,7 @@ feature handshake, whether the response succeeds or fails. Require
 both status0 and queue_enable0 within a bounded wait. Guest RAM pages
 are released only after the device reset is proven, with PMM frame
 statistics returning to baseline and temporary supervisor-only,
-uncached MMIO mapping removed and TLB flushed. If any queue address
+uncached common and notify MMIO mappings removed and TLB flushed. If any queue address
 was exposed but reset is unconfirmed, quarantine all five pages until
 QEMU teardown and fail. No retries or green without genuine QEMU
 completion and strict serial proof.

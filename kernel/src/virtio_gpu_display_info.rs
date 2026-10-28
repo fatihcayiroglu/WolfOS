@@ -136,7 +136,10 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
         wr32(a,v as u32);wr32(a+4,(v>>32)as u32);
     };
     let st=(start+off::DEVICE_STATUS_OFFSET)as *mut u8;
+    // Common and notify capabilities may reside on distinct pages of
+    // the same measured BAR (QEMU: 0x1000 and 0x3000). Own both PTEs.
     let mut notify_register:Option<u64>=None;
+    let mut notify_mapping:Option<(Page<Size4KiB>,u64)>=None;
     let preflight=if mapped{
         let selected=rd16(off::QUEUE_SELECTOR_OFFSET);
         let enable=rd16(off::QUEUE_ENABLE_OFFSET);
@@ -155,11 +158,32 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                 same_measured_bar:cap.same_measured_bar,
             };
             if let Ok(reg)=notify::resolve(c,queue_off){
-                // This bounded flavor supports a single physical PCI page
-                // already mapped for common_cfg, never an unproven second BAR.
-                if reg.physical_page==span.physical_page&&
-                   outside_ram(reg.physical_page,entries){
-                    notify_register=Some(SLOT+reg.page_offset);
+                if outside_ram(reg.physical_page,entries){
+                    if reg.physical_page==span.physical_page{
+                        notify_register=Some(SLOT+reg.page_offset);
+                    }else{
+                        // Independently map exactly one further validated
+                        // MMIO page; never alias common_cfg's virtual slot.
+                        let notify_va=VirtAddr::new(SLOT+mmio::PAGE_BYTES);
+                        if mapper.translate_addr(notify_va).is_none(){
+                            let notify_page=Page::<Size4KiB>::containing_address(notify_va);
+                            let notify_frame=PhysFrame::<Size4KiB>::containing_address(
+                                PhysAddr::new(reg.physical_page));
+                            if let Ok(flush)=unsafe{
+                                mapper.map_to(notify_page,notify_frame,flags,&mut TableAllocator)
+                            }{
+                                flush.flush();
+                                // Keep the mapping for unconditional cleanup
+                                // even if the translation verification fails.
+                                notify_mapping=Some((notify_page,reg.physical_page));
+                                if mapper.translate_addr(notify_va).map(|p|p.as_u64())==
+                                    Some(reg.physical_page){
+                                    notify_register=Some(
+                                        SLOT+mmio::PAGE_BYTES+reg.page_offset);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -322,13 +346,25 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
         reset_confirmed=status==0&&qenabled==0;
     }
 
-    // Unmap all PCI MMIO before handing its page back to the VA pool.
+    // Unmap every PCI MMIO page, including a distinct notify-cap page.
+    let mut notify_unmapped_ok=true;
+    if let Some((notify_page,physical))=notify_mapping{
+        match mapper.unmap(notify_page){
+            Ok((frame,flush))=>{
+                flush.flush();
+                notify_unmapped_ok=frame.start_address().as_u64()==physical&&
+                    mapper.translate_addr(notify_page.start_address()).is_none();
+            }
+            Err(_)=>{notify_unmapped_ok=false;}
+        }
+    }
     let Ok((unmapped,flush))=mapper.unmap(page)else{
         serial::write_line("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL unmap");
         return false;
     };
     flush.flush();
-    let unmapped_ok=mapped&&unmapped.start_address().as_u64()==span.physical_page&&
+    let unmapped_ok=mapped&&notify_unmapped_ok&&
+        unmapped.start_address().as_u64()==span.physical_page&&
         mapper.translate_addr(target).is_none();
 
     // If queue addresses were exposed and reset is unproven, quarantine all
