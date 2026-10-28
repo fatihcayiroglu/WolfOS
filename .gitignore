@@ -1,0 +1,8 @@
+/target/
+/out/
+/limine/
+*.iso
+*.img
+*.hdd
+*.log
+__pycache__/
