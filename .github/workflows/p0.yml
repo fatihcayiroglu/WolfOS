@@ -48,6 +48,8 @@ jobs:
         run: make smoke
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke
+      - name: Controlled QEMU VGA ENABLE register writes, restored mode and preserved VRAM pixel
+        run: make qemu-stdvga-enable-tx-smoke
       - name: First interactive COM1 shell commands in QEMU (BSP-only)
         run: make serial-shell-smoke
       - name: Real PS/2 keyboard input to Rust framebuffer text (QEMU HMP sendkey)

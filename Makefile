@@ -11,6 +11,8 @@ ifeq ($(FLAVOR),smoke)
 FEATURES := --features smoke-exit
 else ifeq ($(FLAVOR),qemu-stdvga-dispi)
 FEATURES := --features qemu-stdvga-dispi-smoke
+else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
+FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
 else ifeq ($(FLAVOR),ps2-graphics-overflow)
@@ -232,6 +234,11 @@ smoke:
 qemu-stdvga-dispi-smoke:
 	$(MAKE) iso FLAVOR=qemu-stdvga-dispi
 	python3 scripts/qemu_stdvga_dispi_smoke.py $(OUT)/wolfos-qemu-stdvga-dispi.iso
+
+.PHONY: qemu-stdvga-enable-tx-smoke
+qemu-stdvga-enable-tx-smoke:
+	$(MAKE) iso FLAVOR=qemu-stdvga-enable-tx
+	python3 scripts/qemu_vbe_enable_tx_smoke.py $(OUT)/wolfos-qemu-stdvga-enable-tx.iso
 
 .PHONY: address-space-retirement-smoke
 address-space-retirement-smoke:
@@ -488,6 +495,7 @@ test:
 	python3 -m unittest discover -s tests -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_display_driver_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_stdvga_dispi_smoke.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_vbe_enable_tx_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_four_live_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_event_wait_evidence.py' -v
