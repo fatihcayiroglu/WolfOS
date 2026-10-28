@@ -21,8 +21,14 @@ CAPS = re.compile(
     r"common=([0-5]) notify=([0-5]) isr=([0-5]) device=([0-5]) "
     r"multiplier=([1-9]\d*) cap_reads=64 cfg_writes=0 dma=0 accel=0"
 )
+BARS = re.compile(
+    r"WOLFOS_VIRTIO_GPU_BARS_OK common=(io|mem32|mem64) "
+    r"notify=(io|mem32|mem64) isr=(io|mem32|mem64) "
+    r"device=(io|mem32|mem64) cfg_writes=0 bar_probe_writes=0 mmio=0 dma=0"
+)
 FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL",
+    "WOLFOS_VIRTIO_GPU_BARS_FAIL", "bar_probe_writes=1", "mmio=1",
     "WOLFOS_VIRTIO_GPU_PCI_TEST_FAILED",
     "WOLFOS_GPU_DRIVER_LOADED", "WOLFOS_PANIC",
     "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_DF",
@@ -31,7 +37,7 @@ FORBIDDEN = (
 )
 
 
-def validate(output: str, exit_code: int) -> bool:
+def validate(output: str, exit_code: int, require_bars: bool = False) -> bool:
     rows = output.splitlines()
     if exit_code != 33 or rows.count("WOLFOS_BOOT_OK") != 1:
         return False
@@ -41,6 +47,8 @@ def validate(output: str, exit_code: int) -> bool:
     policy = [i for i, row in enumerate(rows) if row == POLICY]
     caps = [(i, CAPS.fullmatch(row)) for i, row in enumerate(rows)
             if row.startswith("WOLFOS_VIRTIO_GPU_PCI_CAPS_OK ")]
+    bars = [(i, BARS.fullmatch(row)) for i, row in enumerate(rows)
+            if row.startswith("WOLFOS_VIRTIO_GPU_BARS_OK ")]
     pci = [i for i, row in enumerate(rows) if row == "WOLFOS_PCI_TEST_OK"]
     proof = [i for i, row in enumerate(rows)
              if row == "WOLFOS_VIRTIO_GPU_PCI_TEST_OK"]
@@ -50,8 +58,14 @@ def validate(output: str, exit_code: int) -> bool:
         return False
     if caps[0][1] is None:
         return False
+    if require_bars and (len(bars) != 1 or bars[0][1] is None):
+        return False
+    if not require_bars and bars:
+        return False
     if not (gpu[0] < policy[0] < caps[0][0] < pci[0] < proof[0]
             < fb[0] < rows.index("WOLFOS_BOOT_OK")):
+        return False
+    if require_bars and not (caps[0][0] < bars[0][0] < pci[0]):
         return False
     # Capability BAR indices and nonzero notification multiplier are
     # validated by the genuine kernel parser. No driver binding claimed.
@@ -59,9 +73,12 @@ def validate(output: str, exit_code: int) -> bool:
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
-        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO")
+    if (len(sys.argv) not in (2, 3) or
+            (len(sys.argv) == 3 and sys.argv[2] != "--bars") or
+            not Path(sys.argv[1]).is_file()):
+        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars]")
         return 2
+    require_bars = len(sys.argv) == 3
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-pci-") as directory:
         serial_log = Path(directory) / "serial.log"
         cmd = [
@@ -80,7 +97,7 @@ def main() -> int:
             return 1
         output = serial_log.read_text(errors="replace") if serial_log.exists() else ""
         print(output)
-        if not validate(output, result.returncode):
+        if not validate(output, result.returncode, require_bars=require_bars):
             print(f"FAIL: no trustworthy virtio-vga PCI capability proof; exit={result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1

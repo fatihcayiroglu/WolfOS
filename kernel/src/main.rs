@@ -130,6 +130,8 @@ mod display_edid_cta;
 mod virtio_gpu_edid_wire;
 #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
 mod virtio_gpu_pci_caps;
+#[cfg(feature = "qemu-virtio-gpu-bars-smoke")]
+mod virtio_gpu_pci_bars;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
