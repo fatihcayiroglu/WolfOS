@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Require genuine QEMU virtio-vga PCI capability proof, not a host mock.
 
-The ordinary modes are read-only. --size requires a QEMU-only, bounded,
-fully restored BAR-size probe. No MMIO, DMA or physical GPU/disk.
+The ordinary PCI modes are read-only. --size requires a QEMU-only, bounded,
+fully restored BAR-size probe. --mmio additionally proves one volatile
+read-only common-config MMIO mapping, unmapped before boot. No DMA, queues,
+physical GPU, disk, or driver binding.
 """
 from pathlib import Path
 import re
@@ -32,11 +34,18 @@ SIZE = re.compile(
     r"bytes=([1-9][0-9]*) common_offset=([0-9]+) common_length=([1-9][0-9]*) "
     r"command_writes=2 bar_writes=(2|4) restored=1 decode_stopped=1 mmio=0 dma=0"
 )
+MMIO = re.compile(
+    r"WOLFOS_VIRTIO_GPU_COMMON_MMIO_OK queues=([1-9][0-9]*) "
+    r"status=([0-9]+) generation=([0-9]+) "
+    r"ro=1 uc=1 pages=1 writes=0 dma=0"
+)
 FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL",
     "WOLFOS_VIRTIO_GPU_BARS_FAIL", "bar_probe_writes=1", "mmio=1",
     "WOLFOS_VIRTIO_GPU_BAR_SIZE_FAIL",
     "WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_FAILED",
+    "WOLFOS_VIRTIO_GPU_COMMON_MMIO_FAIL",
+    "WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_PCI_TEST_FAILED",
     "WOLFOS_GPU_DRIVER_LOADED", "WOLFOS_PANIC",
     "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_DF",
@@ -46,7 +55,8 @@ FORBIDDEN = (
 
 
 def validate(output: str, exit_code: int, require_bars: bool = False,
-             require_size: bool = False) -> bool:
+             require_size: bool = False, require_mmio: bool = False) -> bool:
+    require_size = require_size or require_mmio
     require_bars = require_bars or require_size
     rows = output.splitlines()
     if exit_code != 33 or rows.count("WOLFOS_BOOT_OK") != 1:
@@ -63,6 +73,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
             if row.startswith("WOLFOS_VIRTIO_GPU_BAR_SIZE_OK ")]
     size_test = [i for i, row in enumerate(rows)
                  if row == "WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK"]
+    mmio = [(i, MMIO.fullmatch(row)) for i, row in enumerate(rows)
+            if row.startswith("WOLFOS_VIRTIO_GPU_COMMON_MMIO_OK ")]
+    mmio_test = [i for i, row in enumerate(rows)
+                 if row == "WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK"]
     pci = [i for i, row in enumerate(rows) if row == "WOLFOS_PCI_TEST_OK"]
     proof = [i for i, row in enumerate(rows)
              if row == "WOLFOS_VIRTIO_GPU_PCI_TEST_OK"]
@@ -80,6 +94,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
         return False
     if not require_size and (size or size_test):
         return False
+    if require_mmio and (len(mmio) != 1 or mmio[0][1] is None or len(mmio_test) != 1):
+        return False
+    if not require_mmio and (mmio or mmio_test):
+        return False
     if not (gpu[0] < policy[0] < caps[0][0] < pci[0] < proof[0]
             < fb[0] < rows.index("WOLFOS_BOOT_OK")):
         return False
@@ -96,6 +114,16 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
             return False
         if (kind == "mem64") != (bar_writes == "4"):
             return False
+        if require_mmio:
+            if kind == "io" or not (size_test[0] < mmio[0][0]
+                                    < mmio_test[0] < fb[0]):
+                return False
+            queues, status, generation = map(int, mmio[0][1].groups())
+            if not (1 <= queues <= 256 and 0 <= status <= 255
+                    and status & ~0xcf == 0 and 0 <= generation <= 255):
+                return False
+            if length < 56:
+                return False
     # Capability BAR indices and nonzero notification multiplier are
     # validated by the genuine kernel parser. No driver binding claimed.
     return True
@@ -103,11 +131,12 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
 
 def main() -> int:
     if (len(sys.argv) not in (2, 3) or
-            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size")) or
+            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio")) or
             not Path(sys.argv[1]).is_file()):
-        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size]")
+        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio]")
         return 2
-    require_size = len(sys.argv) == 3 and sys.argv[2] == "--size"
+    require_mmio = len(sys.argv) == 3 and sys.argv[2] == "--mmio"
+    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio")
     require_bars = len(sys.argv) == 3
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-pci-") as directory:
         serial_log = Path(directory) / "serial.log"
@@ -128,11 +157,15 @@ def main() -> int:
         output = serial_log.read_text(errors="replace") if serial_log.exists() else ""
         print(output)
         if not validate(output, result.returncode,
-                        require_bars=require_bars, require_size=require_size):
+                        require_bars=require_bars, require_size=require_size,
+                        require_mmio=require_mmio):
             print(f"FAIL: no trustworthy virtio-vga PCI capability proof; exit={result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if require_size:
+        if require_mmio:
+            print("PASS: genuine QEMU virtio-vga one-page, non-cached RO common "
+                  "register reads; mapping removed; no DMA or physical device.")
+        elif require_size:
             print("PASS: genuine QEMU virtio-vga BAR-size probe with decode "
                   "disabled, command/BARs restored, no MMIO/DMA or physical device.")
         else:

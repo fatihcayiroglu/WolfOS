@@ -32,6 +32,16 @@ WITH_SIZE = WITH_SIZE.replace("WOLFOS_VIRTIO_GPU_PCI_TEST_OK",
                               "WOLFOS_VIRTIO_GPU_PCI_TEST_OK\n"
                               "WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK")
 
+MMIO_LINE = (
+    "WOLFOS_VIRTIO_GPU_COMMON_MMIO_OK queues=2 status=0 generation=0 "
+    "ro=1 uc=1 pages=1 writes=0 dma=0"
+)
+WITH_MMIO = WITH_SIZE.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    MMIO_LINE + "\nWOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -96,6 +106,44 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(WITH_SIZE.replace("WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK",
                                                    "WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_FAILED"),
                                   33,require_size=True))
+
+    def test_mmio_requires_real_proof_and_excludes_other_flavors(self):
+        self.assertTrue(validate(WITH_MMIO, 33, require_mmio=True))
+        self.assertFalse(validate(WITH_SIZE, 33, require_mmio=True))
+        self.assertFalse(validate(WITH_MMIO, 33, require_size=True))
+        self.assertFalse(validate(WITH_MMIO, 33))
+
+    def test_mmio_rejects_malformed_duplicate_and_fake_readonly(self):
+        self.assertFalse(validate(WITH_MMIO.replace("ro=1", "ro=0"),
+                                  33, require_mmio=True))
+        self.assertFalse(validate(WITH_MMIO.replace("uc=1", "uc=0"),
+                                  33, require_mmio=True))
+        self.assertFalse(validate(WITH_MMIO.replace("writes=0", "writes=1"),
+                                  33, require_mmio=True))
+        self.assertFalse(validate(WITH_MMIO + "\n" + MMIO_LINE,
+                                  33, require_mmio=True))
+
+    def test_mmio_rejects_invalid_hardware_values_and_failure(self):
+        self.assertFalse(validate(WITH_MMIO.replace("queues=2", "queues=0"),
+                                  33, require_mmio=True))
+        self.assertFalse(validate(WITH_MMIO.replace("status=0", "status=16"),
+                                  33, require_mmio=True))
+        self.assertFalse(validate(WITH_MMIO.replace("generation=0", "generation=256"),
+                                  33, require_mmio=True))
+        self.assertFalse(validate(WITH_MMIO + "\nWOLFOS_VIRTIO_GPU_COMMON_MMIO_FAIL map",
+                                  33, require_mmio=True))
+
+    def test_mmio_rejects_wrong_order_short_capability_and_missing_gate(self):
+        self.assertFalse(validate(
+            WITH_MMIO.replace("common_length=64", "common_length=32"),
+            33, require_mmio=True))
+        self.assertFalse(validate(
+            WITH_MMIO.replace("WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK", ""),
+            33, require_mmio=True))
+        self.assertFalse(validate(
+            WITH_MMIO.replace("WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK",
+                              "WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK"),
+            33, require_mmio=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
