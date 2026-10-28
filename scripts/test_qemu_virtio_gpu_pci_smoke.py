@@ -15,6 +15,12 @@ SAMPLE = "\n".join([
     "WOLFOS_BOOT_OK",
 ])
 
+BAR_LINE = (
+    "WOLFOS_VIRTIO_GPU_BARS_OK common=mem64 notify=mem64 "
+    "isr=mem64 device=mem64 cfg_writes=0 bar_probe_writes=0 mmio=0 dma=0"
+)
+WITH_BARS = SAMPLE.replace("WOLFOS_PCI_TEST_OK", BAR_LINE + "\nWOLFOS_PCI_TEST_OK")
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -39,6 +45,17 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         rows=SAMPLE.splitlines()
         rows[3],rows[5]=rows[5],rows[3]
         self.assertFalse(validate("\n".join(rows),33))
+
+    def test_strict_bar_proof_only_in_bar_mode(self):
+        self.assertTrue(validate(WITH_BARS,33,require_bars=True))
+        self.assertFalse(validate(SAMPLE,33,require_bars=True))
+        self.assertFalse(validate(WITH_BARS,33))
+
+    def test_malformed_or_duplicate_bar_proof_rejected(self):
+        self.assertFalse(validate(WITH_BARS.replace("mem64","bogus",1),33,require_bars=True))
+        self.assertFalse(validate(WITH_BARS + "\n" + BAR_LINE,33,require_bars=True))
+        self.assertFalse(validate(WITH_BARS.replace("bar_probe_writes=0",
+                                                    "bar_probe_writes=1"),33,require_bars=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))

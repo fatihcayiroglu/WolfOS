@@ -9,6 +9,8 @@ use core::arch::asm;
 use crate::{display_driver_policy::DisplayIdentity, serial};
 #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
 use crate::virtio_gpu_pci_caps;
+#[cfg(feature = "qemu-virtio-gpu-bars-smoke")]
+use crate::virtio_gpu_pci_bars;
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -71,6 +73,25 @@ fn inspect_qemu_virtio_gpu(bus: u8, slot: u8, function: u8) -> bool {
                 caps.common_bar,caps.notify_bar,caps.isr_bar,caps.device_bar,
                 caps.notify_multiplier
             ));
+            #[cfg(feature = "qemu-virtio-gpu-bars-smoke")]
+            {
+                match virtio_gpu_pci_bars::inspect(&cfg, [
+                    caps.common_bar, caps.notify_bar,
+                    caps.isr_bar, caps.device_bar,
+                ]) {
+                    Ok(bars) => serial::write_fmt(format_args!(
+                        "WOLFOS_VIRTIO_GPU_BARS_OK common={} notify={} isr={} device={} cfg_writes=0 bar_probe_writes=0 mmio=0 dma=0\n",
+                        bars.common.label(), bars.notify.label(),
+                        bars.isr.label(), bars.device.label(),
+                    )),
+                    Err(error) => {
+                        serial::write_fmt(format_args!(
+                            "WOLFOS_VIRTIO_GPU_BARS_FAIL {error:?}\n"
+                        ));
+                        return false;
+                    }
+                }
+            }
             true
         }
         Ok(_) => {

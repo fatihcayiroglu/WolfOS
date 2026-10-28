@@ -13,6 +13,8 @@ else ifeq ($(FLAVOR),qemu-stdvga-dispi)
 FEATURES := --features qemu-stdvga-dispi-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-pci)
 FEATURES := --features qemu-virtio-gpu-pci-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-bars)
+FEATURES := --features qemu-virtio-gpu-bars-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -242,6 +244,11 @@ smoke:
 qemu-virtio-gpu-pci-smoke:
 	$(MAKE) iso FLAVOR=qemu-virtio-gpu-pci
 	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-pci.iso
+
+.PHONY: qemu-virtio-gpu-bars-smoke
+qemu-virtio-gpu-bars-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-bars
+	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-bars.iso --bars
 
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:
@@ -502,6 +509,8 @@ test:
 	mkdir -p $(OUT)
 	rustc --edition=2024 --test kernel/src/virtio_gpu_pci_caps.rs -o $(OUT)/virtio_gpu_pci_caps_tests
 	$(OUT)/virtio_gpu_pci_caps_tests
+	rustc --edition=2024 --test kernel/src/virtio_gpu_pci_bars.rs -o $(OUT)/virtio_gpu_pci_bars_tests
+	$(OUT)/virtio_gpu_pci_bars_tests
 	rustc --edition=2024 --test kernel/src/display_driver_policy.rs -o $(OUT)/display_driver_policy_tests
 	$(OUT)/display_driver_policy_tests
 	rustc --edition=2024 --test kernel/src/display_edid_host.rs -o $(OUT)/display_edid_policy_tests
