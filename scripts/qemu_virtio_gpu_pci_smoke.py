@@ -4,7 +4,7 @@
 The ordinary PCI modes are read-only. --size requires a QEMU-only, bounded,
 fully restored BAR-size probe. --mmio additionally proves one volatile
 read-only common-config MMIO mapping, and --device adds GPU-specific
-scanout/capset reads. --preflight adds GPU feature-bank and controlq\ncapacity readback. All pages unmap before boot. No DMA, configured queues,
+scanout/capset reads. --preflight adds GPU feature-bank and controlq\ncapacity readback. --bank1 adds a QEMU-only two-write selector\ntransaction with exact rollback. No DMA, configured queues,
 physical GPU, disk, or driver binding.
 """
 from pathlib import Path
@@ -50,6 +50,11 @@ PREFLIGHT = re.compile(
     r"features=([0-9]+) edid=([01]) queue_select=0 queue_size=([1-9][0-9]*) "
     r"queue_enabled=0 status=0 ro=1 uc=1 pages=1 writes=0 dma=0"
 )
+BANK1 = re.compile(
+    r"WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_OK bank0=([0-9]+) "
+    r"bank1=([0-9]+) version1=1 selector_writes=2 restored=1 "
+    r"status=0 queue_enabled=0 dma=0"
+)
 FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL",
     "WOLFOS_VIRTIO_GPU_BARS_FAIL", "bar_probe_writes=1", "mmio=1",
@@ -61,6 +66,8 @@ FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_DEVICE_MMIO_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_FAIL",
     "WOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_TEST_FAILED",
+    "WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_FAIL",
+    "WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_PCI_TEST_FAILED",
     "WOLFOS_GPU_DRIVER_LOADED", "WOLFOS_PANIC",
     "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_DF",
@@ -72,7 +79,9 @@ FORBIDDEN = (
 def validate(output: str, exit_code: int, require_bars: bool = False,
              require_size: bool = False, require_mmio: bool = False,
              require_device: bool = False,
-             require_preflight: bool = False) -> bool:
+             require_preflight: bool = False,
+             require_bank1: bool = False) -> bool:
+    require_preflight = require_preflight or require_bank1
     require_device = require_device or require_preflight
     require_mmio = require_mmio or require_device
     require_size = require_size or require_mmio
@@ -104,6 +113,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                  if row.startswith("WOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_OK ")]
     preflight_test = [i for i, row in enumerate(rows)
                       if row == "WOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_TEST_OK"]
+    bank1 = [(i, BANK1.fullmatch(row)) for i, row in enumerate(rows)
+             if row.startswith("WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_OK ")]
+    bank1_test = [i for i, row in enumerate(rows)
+                  if row == "WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_TEST_OK"]
     pci = [i for i, row in enumerate(rows) if row == "WOLFOS_PCI_TEST_OK"]
     proof = [i for i, row in enumerate(rows)
              if row == "WOLFOS_VIRTIO_GPU_PCI_TEST_OK"]
@@ -133,6 +146,11 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                              or len(preflight_test) != 1):
         return False
     if not require_preflight and (preflight or preflight_test):
+        return False
+    if require_bank1 and (len(bank1) != 1 or bank1[0][1] is None
+                          or len(bank1_test) != 1):
+        return False
+    if not require_bank1 and (bank1 or bank1_test):
         return False
     if not (gpu[0] < policy[0] < caps[0][0] < pci[0] < proof[0]
             < fb[0] < rows.index("WOLFOS_BOOT_OK")):
@@ -177,6 +195,15 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                             int(bool(feature_bits & 2)) == edid_bit and
                             1 <= queue_size <= 32768):
                         return False
+                    if require_bank1:
+                        if not (preflight_test[0] < bank1[0][0]
+                                < bank1_test[0] < fb[0]):
+                            return False
+                        bank0_bits, bank1_bits = map(int, bank1[0][1].groups())
+                        if not (bank0_bits == feature_bits and
+                                0 <= bank1_bits <= 0xffffffff and
+                                bank1_bits & 1 == 1):
+                            return False
     # Capability BAR indices and nonzero notification multiplier are
     # validated by the genuine kernel parser. No driver binding claimed.
     return True
@@ -184,14 +211,15 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
 
 def main() -> int:
     if (len(sys.argv) not in (2, 3) or
-            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight")) or
+            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight", "--bank1")) or
             not Path(sys.argv[1]).is_file()):
-        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight]")
+        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight|--bank1]")
         return 2
-    require_preflight = len(sys.argv) == 3 and sys.argv[2] == "--preflight"
-    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight")
-    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight")
-    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight")
+    require_bank1 = len(sys.argv) == 3 and sys.argv[2] == "--bank1"
+    require_preflight = len(sys.argv) == 3 and sys.argv[2] in ("--preflight", "--bank1")
+    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight", "--bank1")
+    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight", "--bank1")
+    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight", "--bank1")
     require_bars = len(sys.argv) == 3
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-pci-") as directory:
         serial_log = Path(directory) / "serial.log"
@@ -215,11 +243,15 @@ def main() -> int:
                         require_bars=require_bars, require_size=require_size,
                         require_mmio=require_mmio,
                         require_device=require_device,
-                        require_preflight=require_preflight):
+                        require_preflight=require_preflight,
+                        require_bank1=require_bank1):
             print(f"FAIL: no trustworthy virtio-vga PCI capability proof; exit={result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if require_preflight:
+        if require_bank1:
+            print("PASS: genuine QEMU VirtIO feature bank1 selected and "
+                  "restored exactly; VERSION_1 observed; no DMA/queues.")
+        elif require_preflight:
             print("PASS: genuine QEMU VirtIO common feature bank 0 and "
                   "control queue capacity inspected without MMIO writes or DMA.")
         elif require_device:
