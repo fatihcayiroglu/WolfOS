@@ -32,6 +32,8 @@ use crate::{
 use crate::virtio_gpu_resource2d_contract as resource;
 #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
 use crate::virtio_gpu_backing_contract as backing;
+#[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+use crate::virtio_gpu_transfer2d_contract as transfer;
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
 #[derive(Clone,Copy)]
 struct EdidProof{size:u32,modes:usize,width:u32,height:u32,refresh_millihz:u32}
@@ -191,6 +193,32 @@ fn send_resource_command(
     Ok(())
 }
 
+#[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+fn verify_transfer_pattern(vas:&[u64;FRAMES])->Result<(),&'static str>{
+    for page in 0..transfer::BACKING_PAGES{
+        let ptr=vas[5+page] as *const u8;
+        for at in 0..transfer::PAGE_BYTES{
+            let expected=transfer::pattern_byte(page,at).map_err(|_|"pattern_contract")?;
+            if unsafe{ptr.add(at).read_volatile()}!=expected{
+                return Err("backing_pattern_corrupted");
+            }
+        }
+    }
+    Ok(())
+}
+#[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+fn paint_transfer_pattern(vas:&[u64;FRAMES])->Result<(),&'static str>{
+    for page in 0..transfer::BACKING_PAGES{
+        let ptr=vas[5+page] as *mut u8;
+        for at in 0..transfer::PAGE_BYTES{
+            let value=transfer::pattern_byte(page,at).map_err(|_|"pattern_contract")?;
+            unsafe{ptr.add(at).write_volatile(value);}
+        }
+    }
+    fence(Ordering::SeqCst);
+    verify_transfer_pattern(vas)
+}
+
 #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
 fn query_resource2d(
     vas:&[u64;FRAMES], frames:&[u64;FRAMES], notify_port:u64, selected:u16,
@@ -201,6 +229,12 @@ fn query_resource2d(
     const ATTACH_FENCE:u64=0x574f_4c46_3244_4154;
     #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
     const DETACH_FENCE:u64=0x574f_4c46_3244_4454;
+    #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+    const TRANSFER_FENCE:u64=0x574f_4c46_3244_5452;
+    #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+    transfer::distinct_fences([
+        CREATE_FENCE,ATTACH_FENCE,TRANSFER_FENCE,DETACH_FENCE,UNREF_FENCE
+    ]).map_err(|_|"transfer_fence_reused")?;
     #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
     backing::distinct_fences([CREATE_FENCE,ATTACH_FENCE,DETACH_FENCE,UNREF_FENCE])
         .map_err(|_|"fence_reused")?;
@@ -213,19 +247,40 @@ fn query_resource2d(
         // Four zeroed, PMM-owned 4KiB pages are disjoint from controlq pages,
         // and remain pinned until detach acknowledgement AND device reset.
         let pages=[frames[5],frames[6],frames[7],frames[8]];
+        #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+        paint_transfer_pattern(vas)?;
         let attach=backing::attach(resource::RESOURCE_ID,true,pages,ATTACH_FENCE)
             .map_err(|_|"attach_wire")?;
         send_resource_command(vas,frames,notify_port,selected,4,
             &attach.bytes[..attach.len],attach.fence)?;
+        #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+        {
+            // Genuine host-read transfer: 64x64x4 bytes, exact offset zero.
+            // The device response proves acceptance, NOT host pixel readback.
+            let command=transfer::encode(resource::RESOURCE_ID,true,64,64,0,TRANSFER_FENCE)
+                .map_err(|_|"transfer_wire")?;
+            fence(Ordering::SeqCst);
+            send_resource_command(vas,frames,notify_port,selected,5,
+                &command.bytes,command.fence)?;
+            // The device must not modify our four guest-owned source pages.
+            verify_transfer_pattern(vas)?;
+        }
         let detach=backing::detach(resource::RESOURCE_ID,true,DETACH_FENCE)
             .map_err(|_|"detach_wire")?;
-        send_resource_command(vas,frames,notify_port,selected,5,
+        #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+        let detach_index=6;
+        #[cfg(not(feature="qemu-virtio-gpu-transfer2d-smoke"))]
+        let detach_index=5;
+        send_resource_command(vas,frames,notify_port,selected,detach_index,
             &detach.bytes[..detach.len],detach.fence)?;
     }
     // Acknowledged explicit host-resource destruction is mandatory.
     let unref=resource::unref(resource::RESOURCE_ID,true,UNREF_FENCE)
         .map_err(|_|"unref_wire")?;
-    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+    let unref_index=7;
+    #[cfg(all(feature="qemu-virtio-gpu-attach-backing-smoke",
+              not(feature="qemu-virtio-gpu-transfer2d-smoke")))]
     let unref_index=6;
     #[cfg(not(feature="qemu-virtio-gpu-attach-backing-smoke"))]
     let unref_index=4;
@@ -672,10 +727,17 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
             "WOLFOS_VIRTIO_GPU_RESOURCE2D_OK resource_id=1 format=2 width=64 height=64 create_type=257 unref_type=258 response_type=4352 used_idx=4 used_head=0 used_len=24 fences_verified=2 notify_writes=4 scanout_writes=0 attach_backing=0 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 pmm_leak=0 qemu_only=1"
         );
     }
-    #[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+    #[cfg(all(feature="qemu-virtio-gpu-attach-backing-smoke",
+              not(feature="qemu-virtio-gpu-transfer2d-smoke")))]
     if resource_done {
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_ATTACH_BACKING_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 detach_type=263 unref_type=258 response_type=4352 used_idx=6 used_head=0 used_len=24 fences_verified=4 notify_writes=6 backing_entries=4 backing_bytes=16384 pages_zeroed=4 attach_ack=1 detach_ack=1 unref_ack=1 transfer_writes=0 scanout_writes=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+    if resource_done {
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_TRANSFER2D_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 transfer_type=261 detach_type=263 unref_type=258 response_type=4352 used_idx=7 used_head=0 used_len=24 fences_verified=5 notify_writes=7 backing_entries=4 backing_bytes=16384 pattern_nonzero_bytes=16384 guest_pattern_verified=2 transfer_ack=1 detach_ack=1 unref_ack=1 host_readback=0 scanout_writes=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
     true
