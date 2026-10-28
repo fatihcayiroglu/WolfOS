@@ -131,6 +131,19 @@ WITH_NOTIFY = WITH_QUEUE_TX.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+DISPLAY_LINE = (
+    "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK req=256 resp=4353 "
+    "used_idx=1 used_head=0 used_len=408 scanout0_enabled=1 "
+    "width=1024 height=768 notify_writes=1 driver_ok=15 reset=0 "
+    "queue_disabled=1 frames_allocated=5 frames_released=5 "
+    "response_dma_verified=1 pmm_leak=0 qemu_only=1"
+)
+WITH_DISPLAY = WITH_NOTIFY.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    DISPLAY_LINE + "\nWOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -532,6 +545,65 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
             "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK\n"
             "WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK"),
             33,require_notify_ro=True))
+
+    def test_real_display_info_accepts_exact_chain(self):
+        self.assertTrue(validate(WITH_DISPLAY,33,require_display_info=True))
+        self.assertFalse(validate(WITH_NOTIFY,33,require_display_info=True))
+        self.assertFalse(validate(WITH_DISPLAY,33,require_notify_ro=True))
+        self.assertFalse(validate(WITH_DISPLAY,33,require_queue_tx=True))
+
+    def test_real_display_info_refuses_fake_used_or_reset(self):
+        for before,after in [
+            ("req=256","req=0"),
+            ("resp=4353","resp=4352"),
+            ("used_idx=1","used_idx=0"),
+            ("used_head=0","used_head=1"),
+            ("used_len=408","used_len=24"),
+            ("notify_writes=1","notify_writes=0"),
+            ("driver_ok=15","driver_ok=11"),
+            ("reset=0","reset=15"),
+            ("queue_disabled=1","queue_disabled=0"),
+            ("frames_allocated=5","frames_allocated=4"),
+            ("frames_released=5","frames_released=4"),
+            ("response_dma_verified=1","response_dma_verified=0"),
+            ("pmm_leak=0","pmm_leak=1"),
+            ("qemu_only=1","qemu_only=0"),
+        ]:
+            mutation=WITH_DISPLAY.replace(
+                DISPLAY_LINE,DISPLAY_LINE.replace(before,after))
+            self.assertFalse(validate(mutation,33,require_display_info=True))
+
+    def test_display_info_invalid_dimensions_or_enabled(self):
+        for before,after in [
+            ("scanout0_enabled=1","scanout0_enabled=2"),
+            ("width=1024","width=0"),
+            ("height=768","height=0"),
+            ("width=1024","width=65535"),
+            ("height=768","height=65535"),
+        ]:
+            mutation=WITH_DISPLAY.replace(
+                DISPLAY_LINE,DISPLAY_LINE.replace(before,after))
+            self.assertFalse(validate(mutation,33,require_display_info=True))
+        headless=WITH_DISPLAY.replace(DISPLAY_LINE,
+            DISPLAY_LINE.replace("scanout0_enabled=1","scanout0_enabled=0")
+                        .replace("width=1024","width=0")
+                        .replace("height=768","height=0"))
+        self.assertTrue(validate(headless,33,require_display_info=True))
+
+    def test_display_info_rejects_duplicates_failure_and_wrong_order(self):
+        self.assertFalse(validate(WITH_DISPLAY+"\n"+DISPLAY_LINE,
+                                  33,require_display_info=True))
+        self.assertFalse(validate(WITH_DISPLAY+
+            "\nWOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL pending",
+            33,require_display_info=True))
+        self.assertFalse(validate(WITH_DISPLAY.replace(
+            "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK",""),
+            33,require_display_info=True))
+        self.assertFalse(validate(WITH_DISPLAY.replace(
+            "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK",
+            "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK\n"
+            "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK"),
+            33,require_display_info=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
