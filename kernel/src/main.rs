@@ -168,6 +168,10 @@ mod virtio_gpu_controlq_tx;
 mod virtio_gpu_notify_contract;
 #[cfg(feature = "qemu-virtio-gpu-notify-ro-smoke")]
 mod virtio_gpu_notify_ro;
+#[cfg(feature = "qemu-virtio-gpu-display-info-smoke")]
+mod virtio_gpu_display_info_contract;
+#[cfg(feature = "qemu-virtio-gpu-display-info-smoke")]
+mod virtio_gpu_display_info;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
@@ -590,6 +594,16 @@ pub extern "C" fn kmain() -> ! {
                         halt_forever();
                     }
                     serial::write_line("WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK");
+                    #[cfg(feature = "qemu-virtio-gpu-display-info-smoke")]
+                    {
+                        if !virtio_gpu_display_info::verify(
+                            hhdm.offset,entries,window,notify_window,controlq_layout
+                        ){
+                            serial::write_line("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_FAILED");
+                            halt_forever();
+                        }
+                        serial::write_line("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK");
+                    }
                 }
             }
         }

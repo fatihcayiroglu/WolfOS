@@ -84,6 +84,13 @@ NOTIFY_RO = re.compile(
     r"cap_length=([1-9][0-9]*) physical_bounded=1 ro=1 "
     r"notify_reads=0 writes=0 dma=0"
 )
+DISPLAY_INFO = re.compile(
+    r"WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK req=256 resp=4353 "
+    r"used_idx=1 used_head=0 used_len=408 scanout0_enabled=([01]) "
+    r"width=([0-9]+) height=([0-9]+) notify_writes=1 "
+    r"driver_ok=15 reset=0 queue_disabled=1 frames_allocated=5 "
+    r"frames_released=5 response_dma_verified=1 pmm_leak=0 qemu_only=1"
+)
 FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL",
     "WOLFOS_VIRTIO_GPU_BARS_FAIL", "bar_probe_writes=1", "mmio=1",
@@ -107,6 +114,8 @@ FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_NOTIFY_RO_FAIL",
     "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_FAILED",
+    "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL",
+    "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_PCI_TEST_FAILED",
     "WOLFOS_GPU_DRIVER_LOADED", "WOLFOS_PANIC",
     "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_DF",
@@ -124,7 +133,9 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
              require_controlq: bool = False,
              require_pmm: bool = False,
              require_queue_tx: bool = False,
-             require_notify_ro: bool = False) -> bool:
+             require_notify_ro: bool = False,
+             require_display_info: bool = False) -> bool:
+    require_notify_ro = require_notify_ro or require_display_info
     require_queue_tx = require_queue_tx or require_notify_ro
     require_pmm = require_pmm or require_queue_tx
     require_controlq = require_controlq or require_pmm
@@ -186,6 +197,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                  if row.startswith("WOLFOS_VIRTIO_GPU_NOTIFY_RO_OK ")]
     notify_ro_test = [i for i, row in enumerate(rows)
                       if row == "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK"]
+    display_info = [(i, DISPLAY_INFO.fullmatch(row)) for i, row in enumerate(rows)
+                    if row.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
+    display_info_test = [i for i, row in enumerate(rows)
+                         if row == "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK"]
     pci = [i for i, row in enumerate(rows) if row == "WOLFOS_PCI_TEST_OK"]
     proof = [i for i, row in enumerate(rows)
              if row == "WOLFOS_VIRTIO_GPU_PCI_TEST_OK"]
@@ -244,6 +259,13 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                               or len(notify_ro_test) != 1):
         return False
     if not require_notify_ro and (notify_ro or notify_ro_test):
+        return False
+    if require_display_info and (
+        len(display_info) != 1 or display_info[0][1] is None
+        or len(display_info_test) != 1
+    ):
+        return False
+    if not require_display_info and (display_info or display_info_test):
         return False
     if not (gpu[0] < policy[0] < caps[0][0] < pci[0] < proof[0]
             < fb[0] < rows.index("WOLFOS_BOOT_OK")):
@@ -351,6 +373,17 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                                                 notify_off*multiplier+2 <= cap_length
                                             ):
                                                 return False
+                                            if require_display_info:
+                                                if not (notify_ro_test[0] < display_info[0][0]
+                                                        < display_info_test[0] < fb[0]):
+                                                    return False
+                                                enabled,width,height=map(
+                                                    int,display_info[0][1].groups())
+                                                if not (0 <= width <= 16384 and
+                                                        0 <= height <= 16384 and
+                                                        (enabled == 0 or
+                                                         (width > 0 and height > 0))):
+                                                    return False
     # Capability BAR indices and nonzero notification multiplier are
     # validated by the genuine kernel parser. No driver binding claimed.
     return True
@@ -358,20 +391,21 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
 
 def main() -> int:
     if (len(sys.argv) not in (2, 3) or
-            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")) or
+            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")) or
             not Path(sys.argv[1]).is_file()):
-        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight|--bank1|--negotiate|--controlq-ro|--controlq-pmm|--controlq-tx|--notify-ro]")
+        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight|--bank1|--negotiate|--controlq-ro|--controlq-pmm|--controlq-tx|--notify-ro|--display-info]")
         return 2
-    require_notify_ro = len(sys.argv) == 3 and sys.argv[2] == "--notify-ro"
-    require_queue_tx = len(sys.argv) == 3 and sys.argv[2] in ("--controlq-tx", "--notify-ro")
-    require_pmm = len(sys.argv) == 3 and sys.argv[2] in ("--controlq-pmm", "--controlq-tx", "--notify-ro")
-    require_controlq = len(sys.argv) == 3 and sys.argv[2] in ("--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")
-    require_negotiation = len(sys.argv) == 3 and sys.argv[2] in ("--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")
-    require_bank1 = len(sys.argv) == 3 and sys.argv[2] in ("--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")
-    require_preflight = len(sys.argv) == 3 and sys.argv[2] in ("--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")
-    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")
-    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")
-    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro")
+    require_display_info = len(sys.argv) == 3 and sys.argv[2] == "--display-info"
+    require_notify_ro = len(sys.argv) == 3 and sys.argv[2] in ("--notify-ro", "--display-info")
+    require_queue_tx = len(sys.argv) == 3 and sys.argv[2] in ("--controlq-tx", "--notify-ro", "--display-info")
+    require_pmm = len(sys.argv) == 3 and sys.argv[2] in ("--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
+    require_controlq = len(sys.argv) == 3 and sys.argv[2] in ("--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
+    require_negotiation = len(sys.argv) == 3 and sys.argv[2] in ("--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
+    require_bank1 = len(sys.argv) == 3 and sys.argv[2] in ("--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
+    require_preflight = len(sys.argv) == 3 and sys.argv[2] in ("--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
+    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
+    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
+    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm", "--controlq-tx", "--notify-ro", "--display-info")
     require_bars = len(sys.argv) == 3
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-pci-") as directory:
         serial_log = Path(directory) / "serial.log"
@@ -401,11 +435,15 @@ def main() -> int:
                         require_controlq=require_controlq,
                         require_pmm=require_pmm,
                         require_queue_tx=require_queue_tx,
-                        require_notify_ro=require_notify_ro):
+                        require_notify_ro=require_notify_ro,
+                        require_display_info=require_display_info):
             print(f"FAIL: no trustworthy virtio-vga PCI capability proof; exit={result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if require_notify_ro:
+        if require_display_info:
+            print("PASS: genuine QEMU VirtIO-GPU GET_DISPLAY_INFO, one "
+                  "writable response DMA, exact used completion and reset.")
+        elif require_notify_ro:
             print("PASS: QEMU preferred PCI notify capability bounds and "
                   "queue0 address verified; no notify MMIO reads or writes.")
         elif require_queue_tx:
