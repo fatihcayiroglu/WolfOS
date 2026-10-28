@@ -17,8 +17,8 @@ pub enum CapabilityError {
     MalformedCapability,
     BadBar,
     InvalidRange,
-    DuplicateType,
     IncompleteTypes,
+    MisalignedRange,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +29,8 @@ pub struct VirtioGpuCapabilities {
     pub device_bar: u8,
     pub notify_multiplier: u32,
     pub vendor_caps: u8,
+    /// Additional well-formed alternate capabilities, after the preferred first.
+    pub alternative_caps: u8,
 }
 
 fn le16(cfg: &[u8;PCI_BYTES], i: usize) -> u16 {
@@ -56,6 +58,7 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
     let mut kinds: [Option<(u8,u32)>;4]=[None;4];
     let mut multiplier=0u32;
     let mut vendor_caps=0u8;
+    let mut alternative_caps=0u8;
     let mut hops=0usize;
 
     while pointer != 0 {
@@ -101,15 +104,25 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
                 if length<min_len || offset.checked_add(length).is_none() {
                     return Err(CapabilityError::InvalidRange);
                 }
-                if kinds[(kind-1) as usize].is_some() {
-                    return Err(CapabilityError::DuplicateType);
+                let alignment=match kind { 1|4=>4, 2=>2, 3=>1, _=>1 };
+                if offset % alignment != 0 {
+                    return Err(CapabilityError::MisalignedRange);
                 }
-                if kind==2 {
+                let notify_multiplier = if kind==2 {
                     if cap_len<20 { return Err(CapabilityError::MalformedCapability); }
-                    multiplier=le32(cfg,pointer+16);
-                    if multiplier==0 { return Err(CapabilityError::InvalidRange); }
+                    let value=le32(cfg,pointer+16);
+                    if value==0 { return Err(CapabilityError::InvalidRange); }
+                    value
+                } else { 0 };
+                let ix=(kind-1) as usize;
+                if kinds[ix].is_some() {
+                    // VirtIO 1.2 permits alternatives. The device's chain
+                    // order expresses preference; preserve the first.
+                    alternative_caps=alternative_caps.saturating_add(1);
+                } else {
+                    kinds[ix]=Some((bar,length));
+                    if kind==2 { multiplier=notify_multiplier; }
                 }
-                kinds[(kind-1) as usize]=Some((bar,length));
                 vendor_caps=vendor_caps.saturating_add(1);
             }
         }
@@ -125,7 +138,7 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
     };
     Ok(VirtioGpuCapabilities {
         common_bar,notify_bar,isr_bar,device_bar,
-        notify_multiplier:multiplier,vendor_caps,
+        notify_multiplier:multiplier,vendor_caps,alternative_caps,
     })
 }
 
@@ -155,6 +168,7 @@ mod tests {
         assert_eq!((s.vendor_caps,s.common_bar,s.notify_bar,s.isr_bar,s.device_bar),
                    (4,4,4,4,4));
         assert_eq!(s.notify_multiplier,4);
+        assert_eq!(s.alternative_caps,0);
     }
     #[test]
     fn wrong_vendor_device_or_pci_class_rejected() {
@@ -173,14 +187,44 @@ mod tests {
         let mut c=example();c[0x34]=0x20;assert_eq!(inspect(&c),Err(CapabilityError::BadPointer));
     }
     #[test]
-    fn detect_cycle_and_duplicated_cap_kind() {
+    fn detect_cycle_even_when_vendor_caps_are_well_formed() {
         let mut c=example();c[0xa1]=0x40;
         assert_eq!(inspect(&c),Err(CapabilityError::CapabilityLoop));
-        let mut c=example();c[0xa3]=1;
-        // Keep the payload range valid so duplicate detection is the first
-        // violated contract. Otherwise InvalidRange correctly wins.
-        c[0xac..0xb0].copy_from_slice(&64u32.to_le_bytes());
-        assert_eq!(inspect(&c),Err(CapabilityError::DuplicateType));
+    }
+    #[test]
+    fn valid_alternative_notify_preserves_first_preference() {
+        let mut c=example();c[0xa1]=0xc0;
+        vendor_cap(&mut c,0xc0,0,2,1,2);
+        c[0xd0..0xd4].copy_from_slice(&8u32.to_le_bytes());
+        let got=inspect(&c).unwrap();
+        assert_eq!((got.notify_bar,got.notify_multiplier),(4,4));
+        assert_eq!((got.vendor_caps,got.alternative_caps),(5,1));
+    }
+    #[test]
+    fn valid_alternative_common_does_not_override_primary_bar() {
+        let mut c=example();c[0xa1]=0xc0;
+        vendor_cap(&mut c,0xc0,0,1,5,64);
+        let got=inspect(&c).unwrap();
+        assert_eq!((got.common_bar,got.alternative_caps),(4,1));
+    }
+    #[test]
+    fn malformed_alternative_still_fails_closed() {
+        let mut c=example();c[0xa1]=0xc0;
+        vendor_cap(&mut c,0xc0,0,2,1,2);
+        c[0xd0..0xd4].fill(0);
+        assert_eq!(inspect(&c),Err(CapabilityError::InvalidRange));
+    }
+    #[test]
+    fn common_notify_and_device_offsets_require_alignment() {
+        for (pos,kind) in [(0x40,1),(0x60,2),(0xa0,4)] {
+            let mut c=example();
+            assert_eq!(c[pos+3],kind);
+            c[pos+8..pos+12].copy_from_slice(&0x101u32.to_le_bytes());
+            assert_eq!(inspect(&c),Err(CapabilityError::MisalignedRange));
+        }
+        // An ISR byte has no additional alignment requirement.
+        let mut c=example();c[0x88..0x8c].copy_from_slice(&0x101u32.to_le_bytes());
+        assert!(inspect(&c).is_ok());
     }
     #[test]
     fn reject_capability_pointer_into_previous_vendor_payload() {
