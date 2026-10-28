@@ -26,6 +26,8 @@ pub enum VirtioEdidError {
     WrongResponseHeader,
     WrongFence,
     InvalidEdidSize,
+    IncompleteEdidBlocks,
+    NonzeroEdidPadding,
     StaleConnector,
     GenerationOverflow,
     ParsedEdid(FullEdidError),
@@ -136,7 +138,18 @@ pub fn decode_get_edid(
         return Err(VirtioEdidError::InvalidEdidSize);
     }
     let edid = &response[EDID_OFFSET..EDID_OFFSET + edid_size];
-    let modes = display_edid_cta::parse_complete(edid)
+    // QEMU may report the 1024-byte reply array capacity while the
+    // base EDID declares only 0 or 1 actual CTA extension. The
+    // declared, checksummed blocks are authoritative; require all
+    // remaining reply bytes to be ZERO to prevent hidden capabilities.
+    let declared_bytes=(usize::from(edid[126])+1)*128;
+    if declared_bytes>edid_size {
+        return Err(VirtioEdidError::IncompleteEdidBlocks);
+    }
+    if edid[declared_bytes..].iter().any(|b|*b!=0) {
+        return Err(VirtioEdidError::NonzeroEdidPadding);
+    }
+    let modes = display_edid_cta::parse_complete(&edid[..declared_bytes])
         .map_err(VirtioEdidError::ParsedEdid)?;
     Ok(VerifiedScanout {
         scanout: request.scanout,
@@ -194,6 +207,32 @@ mod tests {
         r[24..28].copy_from_slice(&(edid.len() as u32).to_le_bytes());
         r[EDID_OFFSET..EDID_OFFSET+edid.len()].copy_from_slice(edid);
         r
+    }
+
+    #[test]
+    fn qemu_capacity_sized_edid_reply_must_have_zero_padding() {
+        let mut padded=[0u8;1024];
+        padded[..128].copy_from_slice(&base());
+        let got=decode_get_edid(request(),9,&response(&padded)).unwrap();
+        assert_eq!(got.modes()[0].width,1920);
+        assert_eq!(got.modes()[0].height,1080);
+        assert_eq!(got.modes()[0].refresh_millihz,60_000);
+        padded[128]=1; // Hidden data beyond the declared base block.
+        assert_eq!(
+            decode_get_edid(request(),9,&response(&padded)),
+            Err(VirtioEdidError::NonzeroEdidPadding)
+        );
+    }
+
+    #[test]
+    fn incomplete_advertised_extensions_fail_closed() {
+        let mut e=base();
+        e[126]=1;
+        checksum(&mut e);
+        assert_eq!(
+            decode_get_edid(request(),9,&response(&e)),
+            Err(VirtioEdidError::IncompleteEdidBlocks)
+        );
     }
     fn gpu() -> PipelineLimits {
         PipelineLimits {

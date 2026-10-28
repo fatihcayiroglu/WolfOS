@@ -31,7 +31,11 @@ avail head0 in slot1, advance available index to2, write the bounded queue
 notify register exactly once more and await a bounded second used entry.
 Require used index2, id0, bytes1056 and an exactly echoed response fence.
 The full EDID response must pass strict length, header, version, checksums,
-extension parsing and nonzero timed modes. Record the EDID-preferred mode's
+extension parsing and nonzero timed modes. Some QEMU guests advertise a
+1024-byte response array while the EDID base declares fewer actual 128-byte
+blocks; parse only those declared blocks, and accept surplus bytes **only**
+when every byte is zero. Hidden nonzero trailing data and incomplete
+declared extensions are rejected. Record the EDID-preferred mode's
 pixel-timing-derived refresh in **millihertz**. Neither a guessed 60 Hz
 fallback nor an unverified monitor mode is accepted as EDID evidence.
 
