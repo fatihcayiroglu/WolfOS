@@ -10,7 +10,7 @@ use crate::{
 const WIDTH: u32 = 1280;
 const HEIGHT: u32 = 800;
 const PITCH: usize = 5120;
-const BYTES: usize = PITCH * HEIGHT;
+const BYTES: usize = PITCH * (HEIGHT as usize);
 const A: u32 = 0x0044_2211;
 const B: u32 = 0x0088_5533;
 const C: u32 = 0x0000_aa66;
