@@ -39,10 +39,10 @@ fn register(index: u16) -> u16 {
 
 /// True guest I/O exercise: exactly one verified QEMU stdvga PCI device.
 /// Caller must invoke before SMP boot and with interrupts disabled.
-pub(crate) fn prove(stdvga_devices: usize) -> bool {
+pub(crate) fn prove(stdvga_devices: usize) -> Option<DispiObservation> {
     if stdvga_devices != 1 {
         serial::write_line("WOLFOS_QEMU_DISPI_PROBE_FAIL stage=pci");
-        return false;
+        return None;
     }
     let original = read_word(SELECTOR);
     let id = register(0);
@@ -63,11 +63,11 @@ pub(crate) fn prove(stdvga_devices: usize) -> bool {
             id, xres, yres, bpp, enable, vram64k,
             original, sample.selector_after,
         ));
-        return false;
+        return None;
     }
     serial::write_fmt(format_args!(
         "WOLFOS_QEMU_DISPI_PROBE_OK pci=1234:1111 id={:04x} xres={} yres={} bpp={} enabled={} vram64k={} selector_restored=1 mode_writes=0 native_accel=0\n",
         id, xres, yres, bpp, enable, vram64k,
     ));
-    true
+    Some(sample)
 }

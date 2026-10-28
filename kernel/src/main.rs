@@ -127,6 +127,8 @@ mod display_driver_policy;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
+mod qemu_display_attestation;
+#[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_stdvga_dispi_smoke;
 mod paging;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
@@ -414,10 +416,10 @@ pub extern "C" fn kmain() -> ! {
     }
     serial::write_line("WOLFOS_PCI_TEST_OK");
     #[cfg(feature = "qemu-stdvga-dispi-smoke")]
-    if !qemu_stdvga_dispi_smoke::prove(pci_summary.qemu_stdvga) {
+    let Some(dispi_snapshot) = qemu_stdvga_dispi_smoke::prove(pci_summary.qemu_stdvga) else {
         serial::write_line("WOLFOS_QEMU_DISPI_TEST_FAILED");
         halt_forever();
-    }
+    };
     let Some(rsdp_response) = RSDP_REQUEST.response() else {
         serial::write_line("WOLFOS_ACPI_ERROR no Limine RSDP response");
         halt_forever();
@@ -487,6 +489,33 @@ pub extern "C" fn kmain() -> ! {
         serial::write_line("WOLFOS_ERROR: invalid framebuffer geometry");
         halt_forever();
     }
+    // Validate the full mapped pitch*height and aligned pointer BEFORE the
+    // first framebuffer write, including the initial color-band fill.
+    let Some(layout) = framebuffer_text::Layout::new(fb.width, fb.height, fb.pitch) else {
+        serial::write_line("WOLFOS_FB_TEXT_FAILED invalid_geometry");
+        halt_forever();
+    };
+    if (fb.address() as usize) % 4 != 0
+        || fb.red_mask_shift > 24
+        || fb.green_mask_shift > 24
+        || fb.blue_mask_shift > 24
+    {
+        serial::write_line("WOLFOS_FB_TEXT_FAILED unaligned_or_invalid_shifts");
+        halt_forever();
+    }
+    #[cfg(feature = "qemu-stdvga-dispi-smoke")]
+    {
+        if !qemu_display_attestation::matches_scanout(
+            dispi_snapshot, fb.width, fb.height, fb.pitch, fb.bpp as u16,
+        ) {
+            serial::write_line("WOLFOS_QEMU_DISPLAY_ATTEST_FAILED stage=mode_or_vram");
+            halt_forever();
+        }
+        serial::write_fmt(format_args!(
+            "WOLFOS_QEMU_DISPLAY_ATTEST_OK width={} height={} pitch={} bpp={} vram64k={} rgb=1 mode_writes=0\n",
+            fb.width, fb.height, fb.pitch, fb.bpp, dispi_snapshot.vram64k,
+        ));
+    }
     for y in 0..height {
         for x in 0..width {
             let (r,g,b) = if y < 64 { (22_u32, 54_u32, 68_u32) }
@@ -500,19 +529,7 @@ pub extern "C" fn kmain() -> ! {
         }
     }
     // Allocation-free original Rust glyphs are written through volatile stores.
-    // Validate stride and pointer arithmetic before calculating raw offsets.
-    let Some(layout) = framebuffer_text::Layout::new(fb.width, fb.height, fb.pitch) else {
-        serial::write_line("WOLFOS_FB_TEXT_FAILED invalid_geometry");
-        halt_forever();
-    };
-    if (fb.address() as usize) % 4 != 0
-        || fb.red_mask_shift > 24
-        || fb.green_mask_shift > 24
-        || fb.blue_mask_shift > 24
-    {
-        serial::write_line("WOLFOS_FB_TEXT_FAILED unaligned_or_invalid_shifts");
-        halt_forever();
-    }
+    // The mapped stride and raw pointer were already validated before painting.
     let white = (255u32 << fb.red_mask_shift)
         | (255u32 << fb.green_mask_shift)
         | (255u32 << fb.blue_mask_shift);

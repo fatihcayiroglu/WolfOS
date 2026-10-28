@@ -8,6 +8,10 @@ GOOD = (
     "WOLFOS_QEMU_DISPI_PROBE_OK pci=1234:1111 id=b0c5 "
     "xres=1024 yres=768 bpp=32 enabled=65 vram64k=256 "
     "selector_restored=1 mode_writes=0 native_accel=0\n"
+    "WOLFOS_QEMU_DISPLAY_ATTEST_OK width=1024 height=768 "
+    "pitch=4096 bpp=32 vram64k=256 rgb=1 mode_writes=0\n"
+    "WOLFOS_FB_TEXT_OK glyph_pixels=89 first_pixel=verified\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768\n"
     "WOLFOS_BOOT_OK\n"
 )
 
@@ -106,10 +110,60 @@ class QemuDispiEvidenceTests(unittest.TestCase):
     def test_later_gpu_error(self):
         self.assertFalse(validate(GOOD + "WOLFOS_QEMU_DISPI_PROBE_FAIL stage=pci\n", 33))
 
-    def test_disabled_mode_may_have_empty_size(self):
-        self.assertTrue(validate(GOOD.replace(
+    def test_disabled_mode_is_not_an_attested_scanout(self):
+        self.assertFalse(validate(GOOD.replace(
             "xres=1024 yres=768 bpp=32 enabled=65",
             "xres=0 yres=0 bpp=0 enabled=0"), 33))
+
+    def test_missing_attestation(self):
+        self.assertFalse(validate("".join(row + "\n" for row in GOOD.splitlines()
+                                          if not row.startswith("WOLFOS_QEMU_DISPLAY_ATTEST_OK")), 33))
+
+    def test_duplicate_attestation(self):
+        self.assertFalse(validate(GOOD + GOOD.splitlines()[3] + "\n", 33))
+
+    def test_attestation_after_pixel_writes(self):
+        rows = GOOD.splitlines()
+        rows[3], rows[4] = rows[4], rows[3]
+        self.assertFalse(validate("\n".join(rows) + "\n", 33))
+
+    def test_forged_scanout_width(self):
+        self.assertFalse(validate(GOOD.replace("width=1024", "width=1023"), 33))
+
+    def test_forged_scanout_height(self):
+        self.assertFalse(validate(GOOD.replace("height=768", "height=769"), 33))
+
+    def test_attestation_bit_depth_mismatch(self):
+        self.assertFalse(validate(GOOD.replace("pitch=4096 bpp=32", "pitch=4096 bpp=24"), 33))
+
+    def test_attestation_vram_mismatch(self):
+        self.assertFalse(validate(GOOD.replace("pitch=4096 bpp=32 vram64k=256",
+                                               "pitch=4096 bpp=32 vram64k=255"), 33))
+
+    def test_short_scanline_pitch(self):
+        self.assertFalse(validate(GOOD.replace("pitch=4096", "pitch=4092"), 33))
+
+    def test_unaligned_scanline_pitch(self):
+        self.assertFalse(validate(GOOD.replace("pitch=4096", "pitch=4097"), 33))
+
+    def test_framebuffer_outside_reported_vram(self):
+        self.assertFalse(validate(GOOD.replace("pitch=4096", "pitch=30000"), 33))
+
+    def test_mismatched_framebuffer_marker(self):
+        self.assertFalse(validate(GOOD.replace("WOLFOS_FRAMEBUFFER_OK 1024x768",
+                                               "WOLFOS_FRAMEBUFFER_OK 1024x700"), 33))
+
+    def test_attestation_rgb_must_be_valid(self):
+        self.assertFalse(validate(GOOD.replace("rgb=1 mode_writes=0",
+                                               "rgb=0 mode_writes=0"), 33))
+
+    def test_late_attestation_error_invalidates_proof(self):
+        self.assertFalse(validate(GOOD + "WOLFOS_QEMU_DISPLAY_ATTEST_FAILED stage=mode_or_vram\n", 33))
+
+    def test_display_proof_must_be_before_fb_text(self):
+        rows = GOOD.splitlines()
+        rows[2], rows[4] = rows[4], rows[2]
+        self.assertFalse(validate("\n".join(rows) + "\n", 33))
 
     def test_allowed_older_id(self):
         self.assertTrue(validate(GOOD.replace("id=b0c5", "id=b0c3"), 33))
