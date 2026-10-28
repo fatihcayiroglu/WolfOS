@@ -17,6 +17,8 @@ else ifeq ($(FLAVOR),qemu-stdvga-full-state)
 FEATURES := --features qemu-stdvga-full-state-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-mode-rollback)
 FEATURES := --features qemu-stdvga-mode-rollback-smoke
+else ifeq ($(FLAVOR),qemu-stdvga-software-queue)
+FEATURES := --features qemu-stdvga-software-queue-smoke
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
 else ifeq ($(FLAVOR),ps2-graphics-overflow)
@@ -254,6 +256,11 @@ qemu-stdvga-mode-rollback-smoke:
 	$(MAKE) iso FLAVOR=qemu-stdvga-mode-rollback
 	python3 scripts/qemu_vbe_mode_rollback_smoke.py $(OUT)/wolfos-qemu-stdvga-mode-rollback.iso
 
+.PHONY: qemu-stdvga-software-queue-smoke
+qemu-stdvga-software-queue-smoke:
+	$(MAKE) iso FLAVOR=qemu-stdvga-software-queue
+	python3 scripts/qemu_gpu_sw_queue_smoke.py $(OUT)/wolfos-qemu-stdvga-software-queue.iso
+
 .PHONY: address-space-retirement-smoke
 address-space-retirement-smoke:
 	$(MAKE) iso FLAVOR=address-space-retirement
@@ -490,6 +497,8 @@ test:
 	$(OUT)/display_driver_policy_tests
 	rustc --edition=2024 --test kernel/src/display_mode_policy.rs -o $(OUT)/display_mode_policy_tests
 	$(OUT)/display_mode_policy_tests
+	rustc --edition=2024 --test kernel/src/gpu_sw_queue_contract.rs -o $(OUT)/gpu_sw_queue_contract_tests
+	$(OUT)/gpu_sw_queue_contract_tests
 	rustc --edition=2024 --test kernel/src/qemu_dispi_contract.rs -o $(OUT)/qemu_dispi_contract_tests
 	$(OUT)/qemu_dispi_contract_tests
 	rustc --edition=2024 --test kernel/src/qemu_display_attestation_host.rs -o $(OUT)/qemu_display_attestation_tests
@@ -514,6 +523,7 @@ test:
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_vbe_enable_tx_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_vbe_full_state_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_vbe_mode_rollback_smoke.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_gpu_sw_queue_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_four_live_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_event_wait_evidence.py' -v

@@ -54,6 +54,8 @@ jobs:
         run: make qemu-stdvga-full-state-smoke
       - name: QEMU-only real 1280x800 to 1024x768 mode switch and exact 1280x800 rollback
         run: make qemu-stdvga-mode-rollback-smoke
+      - name: CPU software GPU command queue and synchronous fences on real QEMU framebuffer
+        run: make qemu-stdvga-software-queue-smoke
       - name: First interactive COM1 shell commands in QEMU (BSP-only)
         run: make serial-shell-smoke
       - name: Real PS/2 keyboard input to Rust framebuffer text (QEMU HMP sendkey)

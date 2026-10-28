@@ -143,6 +143,9 @@ mod qemu_vbe_full_state_smoke;
 mod qemu_vbe_mode_rollback_contract;
 #[cfg(feature = "qemu-stdvga-mode-rollback-smoke")]
 mod qemu_vbe_mode_rollback_smoke;
+mod gpu_sw_queue_contract;
+#[cfg(feature = "qemu-stdvga-software-queue-smoke")]
+mod gpu_sw_queue_smoke;
 mod paging;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_preflight;
@@ -548,6 +551,13 @@ pub extern "C" fn kmain() -> ! {
             dispi_snapshot, full_before, fb.address().cast::<u32>()
         ) {
             serial::write_line("WOLFOS_QEMU_VBE_MODE_ROLLBACK_TEST_FAILED");
+            halt_forever();
+        }
+        #[cfg(feature = "qemu-stdvga-software-queue-smoke")]
+        if !gpu_sw_queue_smoke::prove(
+            fb.width, fb.height, fb.pitch, fb.address().cast::<u8>()
+        ) {
+            serial::write_line("WOLFOS_GPU_SW_QUEUE_TEST_FAILED");
             halt_forever();
         }
     }
