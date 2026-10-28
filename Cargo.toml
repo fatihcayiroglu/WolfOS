@@ -33,6 +33,9 @@ qemu-virtio-gpu-common-mmio-smoke = ["qemu-virtio-gpu-bar-size-smoke"]
 qemu-virtio-gpu-device-mmio-smoke = ["qemu-virtio-gpu-common-mmio-smoke"]
 # Read-only QEMU common-config transport preflight: no queue writes or DMA.
 qemu-virtio-gpu-transport-preflight-smoke = ["qemu-virtio-gpu-device-mmio-smoke"]
+# QEMU-only bank1 selector transaction (0 -> 1 -> 0), exact rollback.
+# Not enabled on hardware or ordinary kernel boots.
+qemu-virtio-gpu-bank1-tx-smoke = ["qemu-virtio-gpu-transport-preflight-smoke"]
 # QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.

@@ -63,6 +63,17 @@ WITH_PREFLIGHT = WITH_DEVICE.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+BANK1_LINE = (
+    "WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_OK bank0=2 bank1=1 "
+    "version1=1 selector_writes=2 restored=1 "
+    "status=0 queue_enabled=0 dma=0"
+)
+WITH_BANK1 = WITH_PREFLIGHT.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    BANK1_LINE + "\nWOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -239,6 +250,44 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(
             WITH_PREFLIGHT + "\nWOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_FAIL map",
             33, require_preflight=True))
+
+    def test_bank1_requires_full_real_preflight_chain(self):
+        self.assertTrue(validate(WITH_BANK1, 33, require_bank1=True))
+        self.assertFalse(validate(WITH_PREFLIGHT, 33, require_bank1=True))
+        self.assertFalse(validate(WITH_BANK1, 33, require_preflight=True))
+        self.assertFalse(validate(WITH_BANK1, 33, require_mmio=True))
+
+    def test_bank1_rejects_selector_or_restore_lies(self):
+        for old, new in [
+            ("selector_writes=2", "selector_writes=1"),
+            ("restored=1", "restored=0"),
+            ("version1=1", "version1=0"),
+            ("status=0", "status=4"),
+            ("queue_enabled=0", "queue_enabled=1"),
+        ]:
+            self.assertFalse(validate(
+                WITH_BANK1.replace(old,new), 33, require_bank1=True))
+
+    def test_bank1_rejects_no_version_one_and_changed_bank_zero(self):
+        self.assertFalse(validate(
+            WITH_BANK1.replace("bank1=1", "bank1=0"),
+            33, require_bank1=True))
+        self.assertFalse(validate(
+            WITH_BANK1.replace("bank0=2", "bank0=4"),
+            33, require_bank1=True))
+        self.assertFalse(validate(
+            WITH_BANK1.replace("bank1=1", "bank1=4294967296"),
+            33, require_bank1=True))
+
+    def test_bank1_rejects_duplicate_failure_and_missing_gate(self):
+        self.assertFalse(validate(WITH_BANK1 + "\n" + BANK1_LINE,
+                                  33, require_bank1=True))
+        self.assertFalse(validate(WITH_BANK1.replace(
+            "WOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_TEST_OK", ""),
+            33, require_bank1=True))
+        self.assertFalse(validate(
+            WITH_BANK1 + "\nWOLFOS_VIRTIO_GPU_FEATURE_BANK1_TX_FAIL restore",
+            33, require_bank1=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
