@@ -97,6 +97,17 @@ WITH_CONTROLQ = WITH_NEGOTIATION.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+PMM_LINE = (
+    "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_OK layout_n=256 "
+    "frames_allocated=3 frames_released=3 disjoint=1 zeroed=1 "
+    "pmm_leak=0 no_queue=1 dma=0"
+)
+WITH_PMM = WITH_CONTROLQ.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    PMM_LINE + "\nWOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -382,6 +393,41 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(WITH_CONTROLQ+
             "\nWOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL bad_queue",
             33,require_controlq=True))
+
+    def test_pmm_requires_real_controlq_and_full_chain(self):
+        self.assertTrue(validate(WITH_PMM,33,require_pmm=True))
+        self.assertFalse(validate(WITH_CONTROLQ,33,require_pmm=True))
+        self.assertFalse(validate(WITH_PMM,33,require_controlq=True))
+        self.assertFalse(validate(WITH_PMM,33,require_negotiation=True))
+
+    def test_pmm_refuses_partial_cleanup(self):
+        for old, replacement in [
+            ("frames_allocated=3","frames_allocated=2"),
+            ("frames_released=3","frames_released=2"),
+            ("disjoint=1","disjoint=0"),
+            ("zeroed=1","zeroed=0"),
+            ("pmm_leak=0","pmm_leak=1"),
+            ("no_queue=1","no_queue=0"),
+            ("dma=0","dma=1"),
+        ]:
+            self.assertFalse(validate(WITH_PMM.replace(old,replacement),
+                                     33,require_pmm=True))
+
+    def test_pmm_rejects_layout_mismatch(self):
+        self.assertFalse(validate(WITH_PMM.replace(
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_OK layout_n=256",
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_OK layout_n=128"),
+            33,require_pmm=True))
+
+    def test_pmm_rejects_duplicate_and_failure_marker(self):
+        self.assertFalse(validate(WITH_PMM+"\n"+PMM_LINE,
+                                  33,require_pmm=True))
+        self.assertFalse(validate(WITH_PMM+
+            "\nWOLFOS_VIRTIO_GPU_CONTROLQ_PMM_FAIL leaked",
+            33,require_pmm=True))
+        self.assertFalse(validate(WITH_PMM.replace(
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK",""),
+            33,require_pmm=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))

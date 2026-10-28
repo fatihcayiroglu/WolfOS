@@ -67,6 +67,11 @@ CONTROLQ = re.compile(
     r"desc_bytes=([1-9][0-9]*) avail_bytes=([1-9][0-9]*) "
     r"used_bytes=([1-9][0-9]*) ro=1 uc=1 pages=1 writes=0 dma=0"
 )
+CONTROLQ_PMM = re.compile(
+    r"WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_OK layout_n=([1-9][0-9]*) "
+    r"frames_allocated=3 frames_released=3 disjoint=1 zeroed=1 "
+    r"pmm_leak=0 no_queue=1 dma=0"
+)
 FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL",
     "WOLFOS_VIRTIO_GPU_BARS_FAIL", "bar_probe_writes=1", "mmio=1",
@@ -84,6 +89,8 @@ FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_FEATURE_NEGOTIATION_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_FAIL",
     "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_FAILED",
+    "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_FAIL",
+    "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_FAILED",
     "WOLFOS_VIRTIO_GPU_PCI_TEST_FAILED",
     "WOLFOS_GPU_DRIVER_LOADED", "WOLFOS_PANIC",
     "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_DF",
@@ -98,7 +105,9 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
              require_preflight: bool = False,
              require_bank1: bool = False,
              require_negotiation: bool = False,
-             require_controlq: bool = False) -> bool:
+             require_controlq: bool = False,
+             require_pmm: bool = False) -> bool:
+    require_controlq = require_controlq or require_pmm
     require_negotiation = require_negotiation or require_controlq
     require_bank1 = require_bank1 or require_negotiation
     require_preflight = require_preflight or require_bank1
@@ -145,6 +154,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                 if row.startswith("WOLFOS_VIRTIO_GPU_CONTROLQ_RO_OK ")]
     controlq_test = [i for i, row in enumerate(rows)
                      if row == "WOLFOS_VIRTIO_GPU_CONTROLQ_RO_TEST_OK"]
+    pmm = [(i, CONTROLQ_PMM.fullmatch(row)) for i, row in enumerate(rows)
+           if row.startswith("WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_OK ")]
+    pmm_test = [i for i, row in enumerate(rows)
+                if row == "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK"]
     pci = [i for i, row in enumerate(rows) if row == "WOLFOS_PCI_TEST_OK"]
     proof = [i for i, row in enumerate(rows)
              if row == "WOLFOS_VIRTIO_GPU_PCI_TEST_OK"]
@@ -189,6 +202,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                              or len(controlq_test) != 1):
         return False
     if not require_controlq and (controlq or controlq_test):
+        return False
+    if require_pmm and (len(pmm) != 1 or pmm[0][1] is None or len(pmm_test) != 1):
+        return False
+    if not require_pmm and (pmm or pmm_test):
         return False
     if not (gpu[0] < policy[0] < caps[0][0] < pci[0] < proof[0]
             < fb[0] < rows.index("WOLFOS_BOOT_OK")):
@@ -266,6 +283,12 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                                         avail_bytes == 6+2*chosen and
                                         used_bytes == 6+8*chosen):
                                     return False
+                                if require_pmm:
+                                    if not (controlq_test[0] < pmm[0][0]
+                                            < pmm_test[0] < fb[0]):
+                                        return False
+                                    if int(pmm[0][1].group(1)) != chosen:
+                                        return False
     # Capability BAR indices and nonzero notification multiplier are
     # validated by the genuine kernel parser. No driver binding claimed.
     return True
@@ -273,17 +296,18 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
 
 def main() -> int:
     if (len(sys.argv) not in (2, 3) or
-            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")) or
+            (len(sys.argv) == 3 and sys.argv[2] not in ("--bars", "--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm")) or
             not Path(sys.argv[1]).is_file()):
-        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight|--bank1|--negotiate|--controlq-ro]")
+        print("Usage: qemu_virtio_gpu_pci_smoke.py ISO [--bars|--size|--mmio|--device|--preflight|--bank1|--negotiate|--controlq-ro|--controlq-pmm]")
         return 2
-    require_controlq = len(sys.argv) == 3 and sys.argv[2] == "--controlq-ro"
-    require_negotiation = len(sys.argv) == 3 and sys.argv[2] in ("--negotiate", "--controlq-ro")
-    require_bank1 = len(sys.argv) == 3 and sys.argv[2] in ("--bank1", "--negotiate", "--controlq-ro")
-    require_preflight = len(sys.argv) == 3 and sys.argv[2] in ("--preflight", "--bank1", "--negotiate", "--controlq-ro")
-    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")
-    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")
-    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro")
+    require_pmm = len(sys.argv) == 3 and sys.argv[2] == "--controlq-pmm"
+    require_controlq = len(sys.argv) == 3 and sys.argv[2] in ("--controlq-ro", "--controlq-pmm")
+    require_negotiation = len(sys.argv) == 3 and sys.argv[2] in ("--negotiate", "--controlq-ro", "--controlq-pmm")
+    require_bank1 = len(sys.argv) == 3 and sys.argv[2] in ("--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm")
+    require_preflight = len(sys.argv) == 3 and sys.argv[2] in ("--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm")
+    require_device = len(sys.argv) == 3 and sys.argv[2] in ("--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm")
+    require_mmio = len(sys.argv) == 3 and sys.argv[2] in ("--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm")
+    require_size = len(sys.argv) == 3 and sys.argv[2] in ("--size", "--mmio", "--device", "--preflight", "--bank1", "--negotiate", "--controlq-ro", "--controlq-pmm")
     require_bars = len(sys.argv) == 3
     with tempfile.TemporaryDirectory(prefix="wolfos-virtio-gpu-pci-") as directory:
         serial_log = Path(directory) / "serial.log"
@@ -310,11 +334,15 @@ def main() -> int:
                         require_preflight=require_preflight,
                         require_bank1=require_bank1,
                         require_negotiation=require_negotiation,
-                        require_controlq=require_controlq):
+                        require_controlq=require_controlq,
+                        require_pmm=require_pmm):
             print(f"FAIL: no trustworthy virtio-vga PCI capability proof; exit={result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
-        if require_controlq:
+        if require_pmm:
+            print("PASS: QEMU actual PMM frames allocated, zero readback, "
+                  "and all 3 freed; no GPU queue registration or DMA.")
+        elif require_controlq:
             print("PASS: QEMU controlq split-ring addresses read as zero, "
                   "bounded layout checked, one RO mapping unmapped; no DMA.")
         elif require_negotiation:

@@ -29,6 +29,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-negotiate)
 FEATURES := --features qemu-virtio-gpu-negotiate-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-controlq-ro)
 FEATURES := --features qemu-virtio-gpu-controlq-ro-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-controlq-pmm)
+FEATURES := --features qemu-virtio-gpu-controlq-pmm-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -298,6 +300,11 @@ qemu-virtio-gpu-negotiate-smoke:
 qemu-virtio-gpu-controlq-ro-smoke:
 	$(MAKE) iso FLAVOR=qemu-virtio-gpu-controlq-ro
 	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-controlq-ro.iso --controlq-ro
+
+.PHONY: qemu-virtio-gpu-controlq-pmm-smoke
+qemu-virtio-gpu-controlq-pmm-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-controlq-pmm
+	python3 scripts/qemu_virtio_gpu_pci_smoke.py $(OUT)/wolfos-qemu-virtio-gpu-controlq-pmm.iso --controlq-pmm
 
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:
