@@ -91,6 +91,12 @@ DISPLAY_INFO = re.compile(
     r"driver_ok=15 reset=0 queue_disabled=1 frames_allocated=5 "
     r"frames_released=5 response_dma_verified=1 pmm_leak=0 qemu_only=1"
 )
+# Separate truthfully accounted nine-frame backing feature. Existing five-frame
+# QEMU proofs keep their original strict matcher and invocation unchanged.
+DISPLAY_INFO_NINE = re.compile(DISPLAY_INFO.pattern.replace(
+    "frames_allocated=5", "frames_allocated=9"
+).replace("frames_released=5", "frames_released=9"))
+
 FORBIDDEN = (
     "WOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL",
     "WOLFOS_VIRTIO_GPU_BARS_FAIL", "bar_probe_writes=1", "mmio=1",
@@ -134,7 +140,10 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
              require_pmm: bool = False,
              require_queue_tx: bool = False,
              require_notify_ro: bool = False,
-             require_display_info: bool = False) -> bool:
+             require_display_info: bool = False,
+             display_frames: int = 5) -> bool:
+    if display_frames not in (5,9):
+        return False
     require_notify_ro = require_notify_ro or require_display_info
     require_queue_tx = require_queue_tx or require_notify_ro
     require_pmm = require_pmm or require_queue_tx
@@ -197,7 +206,8 @@ def validate(output: str, exit_code: int, require_bars: bool = False,
                  if row.startswith("WOLFOS_VIRTIO_GPU_NOTIFY_RO_OK ")]
     notify_ro_test = [i for i, row in enumerate(rows)
                       if row == "WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK"]
-    display_info = [(i, DISPLAY_INFO.fullmatch(row)) for i, row in enumerate(rows)
+    display_pattern = DISPLAY_INFO if display_frames == 5 else DISPLAY_INFO_NINE
+    display_info = [(i, display_pattern.fullmatch(row)) for i, row in enumerate(rows)
                     if row.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
     display_info_test = [i for i, row in enumerate(rows)
                          if row == "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK"]

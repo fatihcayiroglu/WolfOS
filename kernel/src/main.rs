@@ -132,6 +132,8 @@ mod virtio_gpu_edid_wire;
 mod virtio_gpu_edid_live_contract;
 #[cfg(feature = "qemu-virtio-gpu-resource2d-smoke")]
 mod virtio_gpu_resource2d_contract;
+#[cfg(feature = "qemu-virtio-gpu-attach-backing-smoke")]
+mod virtio_gpu_backing_contract;
 #[cfg(feature = "qemu-virtio-gpu-pci-smoke")]
 mod virtio_gpu_pci_caps;
 #[cfg(feature = "qemu-virtio-gpu-bars-smoke")]
@@ -609,8 +611,11 @@ pub extern "C" fn kmain() -> ! {
                         serial::write_line("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK");
                         #[cfg(feature = "qemu-virtio-gpu-edid-live-smoke")]
                         serial::write_line("WOLFOS_VIRTIO_GPU_EDID_LIVE_TEST_OK");
-                        #[cfg(feature = "qemu-virtio-gpu-resource2d-smoke")]
+                        #[cfg(all(feature = "qemu-virtio-gpu-resource2d-smoke",
+                                  not(feature = "qemu-virtio-gpu-attach-backing-smoke")))]
                         serial::write_line("WOLFOS_VIRTIO_GPU_RESOURCE2D_TEST_OK");
+                        #[cfg(feature = "qemu-virtio-gpu-attach-backing-smoke")]
+                        serial::write_line("WOLFOS_VIRTIO_GPU_ATTACH_BACKING_TEST_OK");
                     }
                 }
             }

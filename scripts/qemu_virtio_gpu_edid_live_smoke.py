@@ -19,13 +19,19 @@ EDID = re.compile(
     r"reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 "
     r"pmm_leak=0 qemu_only=1"
 )
+EDID_NINE = re.compile(EDID.pattern.replace(
+    "frames_allocated=5", "frames_allocated=9"
+).replace("frames_released=5", "frames_released=9"))
 TEST_OK = "WOLFOS_VIRTIO_GPU_EDID_LIVE_TEST_OK"
 
-def validate_edid_marker(output: str) -> bool:
+def validate_edid_marker(output: str, frame_count: int = 5) -> bool:
+    if frame_count not in (5,9):
+        return False
+    pattern = EDID if frame_count == 5 else EDID_NINE
     lines = output.splitlines()
     if any("WOLFOS_VIRTIO_GPU_EDID_LIVE_FAIL" in line for line in lines):
         return False
-    matches = [(i, EDID.fullmatch(line)) for i, line in enumerate(lines)
+    matches = [(i, pattern.fullmatch(line)) for i, line in enumerate(lines)
                if line.startswith("WOLFOS_VIRTIO_GPU_EDID_LIVE_OK ")]
     if len(matches) != 1 or matches[0][1] is None:
         return False
