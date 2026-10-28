@@ -3,7 +3,7 @@
 //! QEMU Bochs VGA does not expose a refresh clock; no guessed modes or writes.
 
 use crate::display_edid_cta::{self, ConnectorModes, FullEdidError};
-use crate::display_mode_policy::{self, DisplayMode, ModeError, PipelineLimits, UserChoice};
+use crate::display_mode_policy::{self, DisplayMode, ModeChangePlan, ModeError, PipelineLimits, UserChoice};
 
 pub const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
 pub const VIRTIO_GPU_CMD_GET_EDID: u32 = 0x010a;
@@ -32,6 +32,8 @@ pub enum VirtioEdidError {
     GenerationOverflow,
     ParsedEdid(FullEdidError),
     UnsupportedSelection(ModeError),
+    MissingGpuTimingEvidence,
+    GpuTimingCatalogOverflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +42,16 @@ pub struct GetEdidRequest {
     pub generation: u64,
     pub fence: u64,
     pub bytes: [u8; REQUEST_LEN],
+}
+
+/// Supplied only by a driver that has independently validated the GPU's
+/// exact timings, bandwidth/pixel clock and current connector generation.
+/// EDID is NOT evidence of GPU support. Never construct this from EDID alone.
+#[derive(Clone, Copy)]
+pub struct GpuTimingEvidence<'a> {
+    pub generation: u64,
+    pub supported_timings: &'a [DisplayMode],
+    pub limits: PipelineLimits,
 }
 
 /// Device negotiation and num_scanouts MUST come from an independently
@@ -102,6 +114,77 @@ impl VerifiedScanout {
         }
         display_mode_policy::choose(self.modes(), pipeline, choice)
             .map_err(VirtioEdidError::UnsupportedSelection)
+    }
+
+    /// Intersect genuine EDID modes with *independently driver-validated*
+    /// scanout timings. An absent GPU proof never becomes an EDID-only
+    /// automatic choice, even if the monitor marks a native/preferred mode.
+    fn common_gpu_modes(
+        &self,
+        current_generation: u64,
+        gpu: Option<GpuTimingEvidence<'_>>,
+    ) -> Result<([DisplayMode; 16], usize, PipelineLimits), VirtioEdidError> {
+        if current_generation == 0 || current_generation != self.generation {
+            return Err(VirtioEdidError::StaleConnector);
+        }
+        let gpu = gpu.ok_or(VirtioEdidError::MissingGpuTimingEvidence)?;
+        if gpu.generation != current_generation {
+            return Err(VirtioEdidError::StaleConnector);
+        }
+        let empty = DisplayMode {
+            width: 0, height: 0, refresh_millihz: 0,
+            pixel_clock_khz: 0, preferred: false, interlaced: false,
+        };
+        let mut modes = [empty; 16];
+        let mut len = 0;
+        for mode in self.modes().iter().copied() {
+            if gpu.supported_timings.iter().any(|m| m.same_timing(mode)) {
+                if len == modes.len() {
+                    return Err(VirtioEdidError::GpuTimingCatalogOverflow);
+                }
+                modes[len] = mode; // retain preferred metadata from real EDID
+                len += 1;
+            }
+        }
+        if len == 0 {
+            return Err(VirtioEdidError::UnsupportedSelection(
+                ModeError::UnsupportedSelection
+            ));
+        }
+        Ok((modes, len, gpu.limits))
+    }
+
+    /// A read-only choice. This never writes GPU registers or confirms that a
+    /// requested mode is currently applied. Exact mHz and preferred metadata
+    /// are preserved; manual requests cannot invent an unsupported timing.
+    pub fn choose_with_gpu_evidence(
+        &self,
+        current_generation: u64,
+        gpu: Option<GpuTimingEvidence<'_>>,
+        choice: UserChoice,
+    ) -> Result<DisplayMode, VirtioEdidError> {
+        let (common, len, limits) = self.common_gpu_modes(current_generation, gpu)?;
+        display_mode_policy::choose(&common[..len], limits, choice)
+            .map_err(VirtioEdidError::UnsupportedSelection)
+    }
+
+    /// Produces a rollback *plan* only. A future modeset driver must apply
+    /// the requested timing, read it back, then really restore previous on
+    /// failed readback/hotplug/15-second confirmation expiry.
+    pub fn plan_with_gpu_evidence(
+        &self,
+        current_generation: u64,
+        gpu: Option<GpuTimingEvidence<'_>>,
+        current: DisplayMode,
+        choice: UserChoice,
+        confirmation_token: u64,
+        now_ms: u64,
+    ) -> Result<Option<ModeChangePlan>, VirtioEdidError> {
+        let (common, len, limits) = self.common_gpu_modes(current_generation, gpu)?;
+        display_mode_policy::plan_change(
+            current, &common[..len], limits, choice, current_generation,
+            confirmation_token, now_ms
+        ).map_err(VirtioEdidError::UnsupportedSelection)
     }
 }
 
@@ -389,4 +472,120 @@ mod tests {
         let r=[0u8;RESPONSE_LEN];
         assert_eq!(decode_get_edid(request(),9,&r),Err(VirtioEdidError::WrongResponseType));
     }
+    #[test]
+    fn live_edid_without_independent_gpu_timings_cannot_select_a_mode() {
+        let verified=decode_get_edid(request(),9,&response(&base())).unwrap();
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,None,UserChoice::AUTOMATIC),
+            Err(VirtioEdidError::MissingGpuTimingEvidence)
+        );
+        assert_eq!(
+            verified.plan_with_gpu_evidence(
+                9,None,verified.modes()[0],UserChoice::AUTOMATIC,17,100
+            ),
+            Err(VirtioEdidError::MissingGpuTimingEvidence)
+        );
+    }
+    #[test]
+    fn automatic_choice_is_intersection_of_edid_and_driver_proven_timings() {
+        let mut b=base();b[126]=1;checksum(&mut b);
+        let mut payload=[0u8;256];payload[..128].copy_from_slice(&b);
+        payload[128..].copy_from_slice(&cta());
+        let verified=decode_get_edid(request(),9,&response(&payload)).unwrap();
+        let modes=verified.modes();
+        let only_4k=[modes.iter().copied().find(|m|m.width==3840).unwrap()];
+        let evidence=GpuTimingEvidence {
+            generation:9,supported_timings:&only_4k,limits:gpu(),
+        };
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,Some(evidence),UserChoice::AUTOMATIC),
+            Ok(only_4k[0])
+        );
+        let exact_1080=UserChoice {
+            resolution:ResolutionChoice::Exact{width:1920,height:1080},
+            refresh:RefreshChoice::ExactMilliHz(60_000),
+        };
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,Some(evidence),exact_1080),
+            Err(VirtioEdidError::UnsupportedSelection(ModeError::UnsupportedSelection))
+        );
+        let exact_4k=UserChoice {
+            resolution:ResolutionChoice::Exact{width:3840,height:2160},
+            refresh:RefreshChoice::ExactMilliHz(60_000),
+        };
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,Some(evidence),exact_4k),
+            Ok(only_4k[0])
+        );
+        let wrong_refresh=UserChoice {
+            refresh:RefreshChoice::ExactMilliHz(59_940),..exact_4k
+        };
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,Some(evidence),wrong_refresh),
+            Err(VirtioEdidError::UnsupportedSelection(ModeError::UnsupportedSelection))
+        );
+    }
+    #[test]
+    fn stale_hotplug_generation_or_empty_gpu_catalogue_fail_closed() {
+        let verified=decode_get_edid(request(),9,&response(&base())).unwrap();
+        let candidate=[verified.modes()[0]];
+        let evidence=GpuTimingEvidence {
+            generation:9,supported_timings:&candidate,limits:gpu(),
+        };
+        assert_eq!(
+            verified.choose_with_gpu_evidence(10,Some(evidence),UserChoice::AUTOMATIC),
+            Err(VirtioEdidError::StaleConnector)
+        );
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,Some(GpuTimingEvidence{
+                generation:10,..evidence
+            }),UserChoice::AUTOMATIC),
+            Err(VirtioEdidError::StaleConnector)
+        );
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,Some(GpuTimingEvidence{
+                supported_timings:&[],..evidence
+            }),UserChoice::AUTOMATIC),
+            Err(VirtioEdidError::UnsupportedSelection(ModeError::UnsupportedSelection))
+        );
+        assert_eq!(
+            verified.choose_with_gpu_evidence(9,Some(GpuTimingEvidence{
+                limits:PipelineLimits{max_pixel_clock_khz:100_000,..gpu()},..evidence
+            }),UserChoice::AUTOMATIC),
+            Err(VirtioEdidError::UnsupportedSelection(ModeError::UnsupportedSelection))
+        );
+    }
+    #[test]
+    fn rollback_plan_requires_edid_gpu_intersection_and_real_readback() {
+        let mut b=base();b[126]=1;checksum(&mut b);
+        let mut payload=[0u8;256];payload[..128].copy_from_slice(&b);
+        payload[128..].copy_from_slice(&cta());
+        let verified=decode_get_edid(request(),9,&response(&payload)).unwrap();
+        let modes=verified.modes();
+        let current=modes.iter().copied().find(|m|m.width==1920).unwrap();
+        let preferred_4k=modes.iter().copied().find(|m|m.width==3840).unwrap();
+        let allowed=[current,preferred_4k];
+        let evidence=GpuTimingEvidence {
+            generation:9,supported_timings:&allowed,limits:gpu(),
+        };
+        let selection=UserChoice {
+            resolution:ResolutionChoice::Exact{width:3840,height:2160},
+            refresh:RefreshChoice::ExactMilliHz(60_000),
+        };
+        let plan=verified.plan_with_gpu_evidence(
+            9,Some(evidence),current,selection,7,100
+        ).unwrap().unwrap();
+        assert_eq!(plan.requested,preferred_4k);
+        assert_eq!(plan.rollback_target(),current);
+        assert_eq!(plan.confirm(7,9,current,200),Err(ModeError::DeviceDidNotApply));
+        assert_eq!(plan.confirm(7,9,preferred_4k,15_100),Err(ModeError::ConfirmationExpired));
+        assert_eq!(plan.confirm(7,9,preferred_4k,200),Ok(preferred_4k));
+        assert_eq!(
+            verified.plan_with_gpu_evidence(9,Some(GpuTimingEvidence{
+                supported_timings:&allowed[1..],..evidence
+            }),current,selection,7,100),
+            Err(VirtioEdidError::UnsupportedSelection(ModeError::UnsupportedSelection))
+        );
+    }
+
 }
