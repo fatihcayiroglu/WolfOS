@@ -74,6 +74,8 @@ jobs:
         run: make qemu-virtio-gpu-display-info-smoke
       - name: QEMU-only real GET_EDID with negotiated feature, second used ring and reset-before-free
         run: make qemu-virtio-gpu-edid-live-smoke
+      - name: QEMU-only real 64x64 VirtIO-GPU resource create/unref, four completions, reset-before-free
+        run: make qemu-virtio-gpu-resource2d-smoke
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke
       - name: Controlled QEMU VGA ENABLE register writes, restored mode and preserved VRAM pixel

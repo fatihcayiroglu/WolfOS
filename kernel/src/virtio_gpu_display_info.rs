@@ -28,6 +28,8 @@ use crate::{
     virtio_gpu_edid_wire as edid,virtio_gpu_edid_live_contract as live,
     display_mode_policy as mode_policy,
 };
+#[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+use crate::virtio_gpu_resource2d_contract as resource;
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
 #[derive(Clone,Copy)]
 struct EdidProof{size:u32,modes:usize,width:u32,height:u32,refresh_millihz:u32}
@@ -115,6 +117,90 @@ fn query_edid(vas:&[u64;FRAMES],frames:&[u64;FRAMES],port:u64)
         size,modes:verified.modes().len(),width:preferred.width,
         height:preferred.height,refresh_millihz:preferred.refresh_millihz,
     })
+}
+
+
+#[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+fn send_resource_command(
+    vas:&[u64;FRAMES], frames:&[u64;FRAMES], notify_port:u64,
+    selected:u16, next_idx:u16, request:resource::Request,
+) -> Result<(),&'static str> {
+    let slot=resource::ring_slot(next_idx,selected).map_err(|_|"queue_slot")?;
+    let request_ptr=vas[3] as *mut u8;
+    let response_ptr=vas[4] as *mut u8;
+    // EDID DMA has completed. Clear its entire 1056B response before
+    // exposing this same PMM-owned page to a new 24B response.
+    unsafe {
+        core::ptr::write_bytes(response_ptr,0,edid::RESPONSE_LEN);
+        core::ptr::write_bytes(request_ptr,0,resource::CREATE_BYTES);
+    }
+    for n in 0..edid::RESPONSE_LEN {
+        if unsafe { response_ptr.add(n).read_volatile() } != 0 {
+            return Err("response_not_zero");
+        }
+    }
+    for (i,b) in request.bytes[..request.len].iter().copied().enumerate() {
+        unsafe { request_ptr.add(i).write_volatile(b); }
+    }
+    let desc=vas[0] as *mut Desc;
+    unsafe {
+        desc.write_volatile(Desc {
+            addr:frames[3].to_le(),len:(request.len as u32).to_le(),
+            flags:1u16.to_le(),next:1u16.to_le(),
+        });
+        desc.add(1).write_volatile(Desc {
+            addr:frames[4].to_le(),len:(resource::RESPONSE_BYTES as u32).to_le(),
+            flags:2u16.to_le(),next:0,
+        });
+        ((vas[1]+4+u64::from(slot)*2)as *mut u16).write_volatile(0u16.to_le());
+    }
+    fence(Ordering::SeqCst);
+    unsafe { ((vas[1]+2)as *mut u16).write_volatile(next_idx.to_le()); }
+    fence(Ordering::SeqCst);
+    unsafe { (notify_port as *mut u16).write_volatile(0u16.to_le()); }
+    for _ in 0..2_000_000u32 {
+        if u16::from_le(unsafe{
+            ((vas[2]+2)as *const u16).read_volatile()
+        })>=next_idx { break; }
+        core::hint::spin_loop();
+    }
+    fence(Ordering::SeqCst);
+    let idx=u16::from_le(unsafe{((vas[2]+2)as *const u16).read_volatile()});
+    let used=vas[2]+4+u64::from(slot)*8;
+    let head=u32::from_le(unsafe{(used as *const u32).read_volatile()});
+    let len=u32::from_le(unsafe{((used+4)as *const u32).read_volatile()});
+    let mut response=[0u8;resource::RESPONSE_BYTES];
+    if idx==next_idx {
+        for (i,b) in response.iter_mut().enumerate() {
+            *b=unsafe{response_ptr.add(i).read_volatile()};
+        }
+    }
+    if let Err(e)=resource::validate_completion(
+        next_idx,idx,head,len,&response,request.fence
+    ) {
+        serial::write_fmt(format_args!(
+            "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL command_idx={next_idx} used={idx} head={head} len={len} response={e:?}\n"
+        ));
+        return Err("completion");
+    }
+    Ok(())
+}
+
+#[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+fn query_resource2d(
+    vas:&[u64;FRAMES], frames:&[u64;FRAMES], notify_port:u64, selected:u16,
+) -> Result<(),&'static str> {
+    const CREATE_FENCE:u64=0x574f_4c46_3244_4352;
+    const UNREF_FENCE:u64=0x574f_4c46_3244_5552;
+    let create=resource::create(resource::RESOURCE_ID,64,64,CREATE_FENCE)
+        .map_err(|_|"create_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,3,create)?;
+    // No backing pages or scanout association were ever exposed.
+    // The acknowledged host-only resource must be explicitly destroyed.
+    let unref=resource::unref(resource::RESOURCE_ID,true,UNREF_FENCE)
+        .map_err(|_|"unref_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,4,unref)?;
+    Ok(())
 }
 
 const SLOT:u64=0x0000_4000_0000_b000;
@@ -325,6 +411,8 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     let mut display_info:Option<display::DisplayOne>=None;
     #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
     let mut edid_info:Option<EdidProof>=None;
+    #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+    let mut resource_done=false;
     if zeroed{
         // Wire layout is 16-byte LE descriptors and a bare 24-byte GPU
         // header; available ring flags=0, head[0]=0, then idx=1.
@@ -447,6 +535,17 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                             }
                         }
                     }
+                    #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+                    if edid_info.is_some() {
+                        if let Some(port)=notify_register {
+                            match query_resource2d(&vas,&frames,port,layout.selected) {
+                                Ok(())=>resource_done=true,
+                                Err(e)=>serial::write_fmt(format_args!(
+                                    "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL stage={e}\n"
+                                )),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -502,8 +601,12 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     let edid_ok=edid_info.is_some();
     #[cfg(not(feature="qemu-virtio-gpu-edid-live-smoke"))]
     let edid_ok=true;
+    #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+    let resource_ok=resource_done;
+    #[cfg(not(feature="qemu-virtio-gpu-resource2d-smoke"))]
+    let resource_ok=true;
     if !preflight||!addresses_ok||!zeroed||!exposed||!did_notify||
-        !completed||!edid_ok||!reset_confirmed||!balanced||!unmapped_ok{
+        !completed||!edid_ok||!resource_ok||!reset_confirmed||!balanced||!unmapped_ok{
         serial::write_fmt(format_args!(
             "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL preflight={} alloc={} released={} quarantined={} exposed={} notified={} completed={} reset={} map={} balanced={}\n",
             preflight,acquired,released,acquired-released,exposed,
@@ -525,6 +628,12 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
             "WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size={} modes={} preferred_width={} preferred_height={} refresh_millihz={} gpu_timing_proof_required=1 mode_writes=0 used_idx=2 used_head=0 used_len=1056 fence_verified=1 negotiated_edid=1 notify_writes=2 driver_ok=15 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 pmm_leak=0 qemu_only=1\n",
             edid.size,edid.modes,edid.width,edid.height,edid.refresh_millihz
         ));
+    }
+    #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
+    if resource_done {
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_RESOURCE2D_OK resource_id=1 format=2 width=64 height=64 create_type=257 unref_type=258 response_type=4352 used_idx=4 used_head=0 used_len=24 fences_verified=2 notify_writes=4 scanout_writes=0 attach_backing=0 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 pmm_leak=0 qemu_only=1"
+        );
     }
     true
 }
