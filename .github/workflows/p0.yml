@@ -66,6 +66,8 @@ jobs:
         run: make qemu-virtio-gpu-controlq-ro-smoke
       - name: QEMU-only three split-ring PMM frames real allocate-zero-read-free without DMA
         run: make qemu-virtio-gpu-controlq-pmm-smoke
+      - name: QEMU-only real controlq0 physical registers, enable, reset then PMM free, no DRIVER_OK
+        run: make qemu-virtio-gpu-controlq-tx-smoke
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke
       - name: Controlled QEMU VGA ENABLE register writes, restored mode and preserved VRAM pixel

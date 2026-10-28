@@ -45,6 +45,9 @@ qemu-virtio-gpu-controlq-ro-smoke = ["qemu-virtio-gpu-negotiate-smoke"]
 # QEMU-only proof of three PMM owned and fully reaped 4KiB queue ring frames.
 # No physical GPU, queue writes, DMA, notify or DRIVER_OK.
 qemu-virtio-gpu-controlq-pmm-smoke = ["qemu-virtio-gpu-controlq-ro-smoke"]
+# QEMU-only three real physical ring addresses written, queue0 briefly enabled,
+# then full device reset before PMM free; never DRIVER_OK, notify, or GPU work.
+qemu-virtio-gpu-controlq-tx-smoke = ["qemu-virtio-gpu-controlq-pmm-smoke"]
 # QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.

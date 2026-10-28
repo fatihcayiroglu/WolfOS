@@ -108,6 +108,18 @@ WITH_PMM = WITH_CONTROLQ.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+TX_LINE = (
+    "WOLFOS_VIRTIO_GPU_CONTROLQ_TX_OK layout_n=256 "
+    "desc_written=1 avail_written=1 used_written=1 queue_enabled=1 "
+    "features_ok=11 driver_ok=0 notify=0 reset=0 queue_disabled=1 "
+    "frames_released=3 pmm_leak=0 qemu_only=1"
+)
+WITH_QUEUE_TX = WITH_PMM.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    TX_LINE + "\nWOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -428,6 +440,50 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(WITH_PMM.replace(
             "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK",""),
             33,require_pmm=True))
+
+    def test_queue_tx_requires_exact_real_chain(self):
+        self.assertTrue(validate(WITH_QUEUE_TX,33,require_queue_tx=True))
+        self.assertFalse(validate(WITH_PMM,33,require_queue_tx=True))
+        self.assertFalse(validate(WITH_QUEUE_TX,33,require_pmm=True))
+        self.assertFalse(validate(WITH_QUEUE_TX,33,require_controlq=True))
+
+    def test_queue_tx_refuses_unreset_or_unfreed_frames(self):
+        for before, after in [
+            ("desc_written=1","desc_written=0"),
+            ("avail_written=1","avail_written=0"),
+            ("used_written=1","used_written=0"),
+            ("queue_enabled=1","queue_enabled=0"),
+            ("features_ok=11","features_ok=3"),
+            ("driver_ok=0","driver_ok=1"),
+            ("notify=0","notify=1"),
+            ("reset=0","reset=11"),
+            ("queue_disabled=1","queue_disabled=0"),
+            ("frames_released=3","frames_released=2"),
+            ("pmm_leak=0","pmm_leak=1"),
+            ("qemu_only=1","qemu_only=0"),
+        ]:
+            self.assertFalse(validate(
+                WITH_QUEUE_TX.replace(before,after),33,require_queue_tx=True))
+
+    def test_queue_tx_refuses_duplicate_failure_and_bad_order(self):
+        self.assertFalse(validate(
+            WITH_QUEUE_TX+"\n"+TX_LINE,33,require_queue_tx=True))
+        self.assertFalse(validate(
+            WITH_QUEUE_TX+"\nWOLFOS_VIRTIO_GPU_CONTROLQ_TX_FAIL unreset",
+            33,require_queue_tx=True))
+        self.assertFalse(validate(WITH_QUEUE_TX.replace(
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK",""),
+            33,require_queue_tx=True))
+        self.assertFalse(validate(WITH_QUEUE_TX.replace(
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK",
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_TX_TEST_OK\n"
+            "WOLFOS_VIRTIO_GPU_CONTROLQ_PMM_TEST_OK"),
+            33,require_queue_tx=True))
+
+    def test_queue_tx_refuses_layout_mismatch(self):
+        self.assertFalse(validate(WITH_QUEUE_TX.replace(
+            "CONTROLQ_TX_OK layout_n=256","CONTROLQ_TX_OK layout_n=128"),
+            33,require_queue_tx=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
