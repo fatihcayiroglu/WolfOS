@@ -56,6 +56,8 @@ qemu-virtio-gpu-notify-ro-smoke = ["qemu-virtio-gpu-controlq-tx-smoke"]
 qemu-virtio-gpu-display-info-smoke = ["qemu-virtio-gpu-notify-ro-smoke"]
 # QEMU-only second real controlq command with EDID feature negotiated, strict response and reset.
 qemu-virtio-gpu-edid-live-smoke = ["qemu-virtio-gpu-display-info-smoke"]
+# QEMU-only real 64x64 2D resource create + unref, without backing or scanout.
+qemu-virtio-gpu-resource2d-smoke = ["qemu-virtio-gpu-edid-live-smoke"]
 # QEMU only: reversible NOCLEARMEM enable-bit write, never on physical devices.
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.
