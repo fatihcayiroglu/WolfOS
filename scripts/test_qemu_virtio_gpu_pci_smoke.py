@@ -52,6 +52,17 @@ WITH_DEVICE = WITH_MMIO.replace(
     "WOLFOS_FRAMEBUFFER_OK 1024x768",
 )
 
+PREFLIGHT_LINE = (
+    "WOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_OK feature_select=0 "
+    "features=2 edid=1 queue_select=0 queue_size=256 "
+    "queue_enabled=0 status=0 ro=1 uc=1 pages=1 writes=0 dma=0"
+)
+WITH_PREFLIGHT = WITH_DEVICE.replace(
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+    PREFLIGHT_LINE + "\nWOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_TEST_OK\n"
+    "WOLFOS_FRAMEBUFFER_OK 1024x768",
+)
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -190,6 +201,44 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(
             WITH_DEVICE.replace("WOLFOS_VIRTIO_GPU_COMMON_MMIO_TEST_OK", ""),
             33, require_device=True))
+
+    def test_preflight_is_only_accepted_with_all_real_prior_proofs(self):
+        self.assertTrue(validate(WITH_PREFLIGHT, 33, require_preflight=True))
+        self.assertFalse(validate(WITH_DEVICE, 33, require_preflight=True))
+        self.assertFalse(validate(WITH_PREFLIGHT, 33, require_device=True))
+        self.assertFalse(validate(WITH_PREFLIGHT, 33, require_mmio=True))
+
+    def test_preflight_rejects_nonzero_selectors_enabled_queue_status(self):
+        for original, modified in [
+            ("feature_select=0", "feature_select=1"),
+            ("queue_select=0", "queue_select=1"),
+            ("queue_enabled=0", "queue_enabled=1"),
+            ("status=0", "status=4"),
+        ]:
+            self.assertFalse(validate(
+                WITH_PREFLIGHT.replace(original, modified), 33,
+                require_preflight=True))
+
+    def test_preflight_rejects_edid_lies_queue_overflow_and_bad_flags(self):
+        for original, modified in [
+            ("edid=1", "edid=0"), ("features=2", "features=4294967296"),
+            ("queue_size=256", "queue_size=0"),
+            ("queue_size=256", "queue_size=32769"),
+            ("writes=0", "writes=1"), ("ro=1", "ro=0")
+        ]:
+            self.assertFalse(validate(
+                WITH_PREFLIGHT.replace(original, modified), 33,
+                require_preflight=True))
+
+    def test_preflight_rejects_duplicate_missing_or_failed_proof(self):
+        self.assertFalse(validate(WITH_PREFLIGHT + "\n" + PREFLIGHT_LINE,
+                                  33, require_preflight=True))
+        self.assertFalse(validate(WITH_PREFLIGHT.replace(
+            "WOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_TEST_OK", ""
+        ), 33, require_preflight=True))
+        self.assertFalse(validate(
+            WITH_PREFLIGHT + "\nWOLFOS_VIRTIO_GPU_TRANSPORT_PREFLIGHT_FAIL map",
+            33, require_preflight=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
