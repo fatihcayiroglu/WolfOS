@@ -6,3 +6,5 @@ mod display_mode_policy;
 mod display_edid_base;
 #[path = "display_edid_cta.rs"]
 mod display_edid_cta;
+#[path = "virtio_gpu_edid_wire.rs"]
+mod virtio_gpu_edid_wire;
