@@ -132,6 +132,8 @@ mod virtio_gpu_edid_wire;
 mod virtio_gpu_pci_caps;
 #[cfg(feature = "qemu-virtio-gpu-bars-smoke")]
 mod virtio_gpu_pci_bars;
+#[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
+mod virtio_gpu_bar_size_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
 mod qemu_dispi_contract;
 #[cfg(feature = "qemu-stdvga-dispi-smoke")]
@@ -444,6 +446,13 @@ pub extern "C" fn kmain() -> ! {
         halt_forever();
     } else {
         serial::write_line("WOLFOS_VIRTIO_GPU_PCI_TEST_OK");
+    }
+    #[cfg(feature = "qemu-virtio-gpu-bar-size-smoke")]
+    if pci_summary.virtio_gpu_bar_size_verified != 1 {
+        serial::write_line("WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_FAILED");
+        halt_forever();
+    } else {
+        serial::write_line("WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK");
     }
     #[cfg(feature = "qemu-stdvga-dispi-smoke")]
     let Some(dispi_snapshot) = qemu_stdvga_dispi_smoke::prove(pci_summary.qemu_stdvga) else {

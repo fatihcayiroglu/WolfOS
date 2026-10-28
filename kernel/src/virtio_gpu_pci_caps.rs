@@ -24,6 +24,8 @@ pub enum CapabilityError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VirtioGpuCapabilities {
     pub common_bar: u8,
+    pub common_offset: u32,
+    pub common_length: u32,
     pub notify_bar: u8,
     pub isr_bar: u8,
     pub device_bar: u8,
@@ -55,7 +57,7 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
     if pointer==0 { return Err(CapabilityError::NoCapabilityList); }
     let mut seen=[false;PCI_BYTES];
     let mut occupied=[false;PCI_BYTES];
-    let mut kinds: [Option<(u8,u32)>;4]=[None;4];
+    let mut kinds: [Option<(u8,u32,u32)>;4]=[None;4];
     let mut multiplier=0u32;
     let mut vendor_caps=0u8;
     let mut alternative_caps=0u8;
@@ -120,7 +122,7 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
                     // order expresses preference; preserve the first.
                     alternative_caps=alternative_caps.saturating_add(1);
                 } else {
-                    kinds[ix]=Some((bar,length));
+                    kinds[ix]=Some((bar,offset,length));
                     if kind==2 { multiplier=notify_multiplier; }
                 }
                 vendor_caps=vendor_caps.saturating_add(1);
@@ -132,12 +134,12 @@ pub fn inspect(cfg: &[u8;PCI_BYTES]) -> Result<VirtioGpuCapabilities, Capability
         }
         pointer=next;
     }
-    let [Some((common_bar,_)),Some((notify_bar,_)),
-         Some((isr_bar,_)),Some((device_bar,_))]=kinds else {
+    let [Some((common_bar,common_offset,common_length)),Some((notify_bar,_,_)),
+         Some((isr_bar,_,_)),Some((device_bar,_,_))]=kinds else {
         return Err(CapabilityError::IncompleteTypes);
     };
     Ok(VirtioGpuCapabilities {
-        common_bar,notify_bar,isr_bar,device_bar,
+        common_bar,common_offset,common_length,notify_bar,isr_bar,device_bar,
         notify_multiplier:multiplier,vendor_caps,alternative_caps,
     })
 }
@@ -168,6 +170,7 @@ mod tests {
         assert_eq!((s.vendor_caps,s.common_bar,s.notify_bar,s.isr_bar,s.device_bar),
                    (4,4,4,4,4));
         assert_eq!(s.notify_multiplier,4);
+        assert_eq!((s.common_offset,s.common_length),(0x100,64));
         assert_eq!(s.alternative_caps,0);
     }
     #[test]
@@ -206,6 +209,7 @@ mod tests {
         vendor_cap(&mut c,0xc0,0,1,5,64);
         let got=inspect(&c).unwrap();
         assert_eq!((got.common_bar,got.alternative_caps),(4,1));
+        assert_eq!((got.common_offset,got.common_length),(0x100,64));
     }
     #[test]
     fn malformed_alternative_still_fails_closed() {
