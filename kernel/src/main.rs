@@ -138,6 +138,10 @@ mod qemu_vbe_enable_tx;
 mod qemu_vbe_full_state_contract;
 #[cfg(feature = "qemu-stdvga-full-state-smoke")]
 mod qemu_vbe_full_state_smoke;
+#[cfg(feature = "qemu-stdvga-mode-rollback-smoke")]
+mod qemu_vbe_mode_rollback_contract;
+#[cfg(feature = "qemu-stdvga-mode-rollback-smoke")]
+mod qemu_vbe_mode_rollback_smoke;
 mod paging;
 #[cfg(any(any(feature = "p2-ring3-yield-smoke", any(feature = "p2-ring3-irq-ready-smoke", any(feature = "p2-ring3-timer-observe-smoke", feature = "p2-ring3-timer-preempt-smoke"))), any(feature = "elf64-preflight-smoke", feature = "user-vm-shadow-smoke", any(any(any(feature = "user-elf-run-smoke", any(feature = "user-copy-smoke", feature = "user-file-io-smoke")), any(feature = "user-ramfs-smoke", feature = "user-vfs-smoke")), feature = "user-process-smoke"))))]
 mod elf64_preflight;
@@ -536,6 +540,13 @@ pub extern "C" fn kmain() -> ! {
         #[cfg(feature = "qemu-stdvga-full-state-smoke")]
         if !qemu_vbe_full_state_smoke::verify_after(full_before, dispi_snapshot) {
             serial::write_line("WOLFOS_QEMU_VBE_FULL_TEST_FAILED stage=after");
+            halt_forever();
+        }
+        #[cfg(feature = "qemu-stdvga-mode-rollback-smoke")]
+        if !qemu_vbe_mode_rollback_smoke::prove(
+            dispi_snapshot, full_before, fb.address().cast::<u32>()
+        ) {
+            serial::write_line("WOLFOS_QEMU_VBE_MODE_ROLLBACK_TEST_FAILED");
             halt_forever();
         }
     }

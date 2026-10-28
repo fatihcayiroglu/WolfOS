@@ -10,3 +10,6 @@ mod qemu_vbe_transaction_contract;
 
 #[path = "qemu_vbe_full_state_contract.rs"]
 mod qemu_vbe_full_state_contract;
+
+#[path = "qemu_vbe_mode_rollback_contract.rs"]
+mod qemu_vbe_mode_rollback_contract;
