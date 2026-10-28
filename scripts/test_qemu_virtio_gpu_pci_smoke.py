@@ -21,6 +21,17 @@ BAR_LINE = (
 )
 WITH_BARS = SAMPLE.replace("WOLFOS_PCI_TEST_OK", BAR_LINE + "\nWOLFOS_PCI_TEST_OK")
 
+SIZE_LINE = (
+    "WOLFOS_VIRTIO_GPU_BAR_SIZE_OK kind=mem64 bytes=4096 "
+    "common_offset=256 common_length=64 command_writes=2 bar_writes=4 "
+    "restored=1 decode_stopped=1 mmio=0 dma=0"
+)
+WITH_SIZE = WITH_BARS.replace("WOLFOS_PCI_TEST_OK",
+                              SIZE_LINE + "\nWOLFOS_PCI_TEST_OK")
+WITH_SIZE = WITH_SIZE.replace("WOLFOS_VIRTIO_GPU_PCI_TEST_OK",
+                              "WOLFOS_VIRTIO_GPU_PCI_TEST_OK\n"
+                              "WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK")
+
 class VirtioGpuPciEvidenceTests(unittest.TestCase):
     def test_requires_all_exact_markers(self):
         self.assertTrue(validate(SAMPLE,33))
@@ -56,6 +67,35 @@ class VirtioGpuPciEvidenceTests(unittest.TestCase):
         self.assertFalse(validate(WITH_BARS + "\n" + BAR_LINE,33,require_bars=True))
         self.assertFalse(validate(WITH_BARS.replace("bar_probe_writes=0",
                                                     "bar_probe_writes=1"),33,require_bars=True))
+
+    def test_size_mode_requires_both_real_restoration_proofs(self):
+        self.assertTrue(validate(WITH_SIZE,33,require_size=True))
+        self.assertFalse(validate(WITH_SIZE,33,require_bars=True))
+        self.assertFalse(validate(WITH_BARS,33,require_size=True))
+
+    def test_size_mode_rejects_power_and_aperture_lies(self):
+        self.assertFalse(validate(WITH_SIZE.replace("bytes=4096","bytes=3000"),
+                                  33,require_size=True))
+        self.assertFalse(validate(WITH_SIZE.replace("common_offset=256",
+                                                   "common_offset=4096"),
+                                  33,require_size=True))
+
+    def test_size_mode_rejects_missing_or_wrong_rollback(self):
+        self.assertFalse(validate(WITH_SIZE.replace("restored=1","restored=0"),
+                                  33,require_size=True))
+        self.assertFalse(validate(WITH_SIZE.replace("decode_stopped=1",
+                                                   "decode_stopped=0"),
+                                  33,require_size=True))
+        self.assertFalse(validate(WITH_SIZE.replace("bar_writes=4","bar_writes=2"),
+                                  33,require_size=True))
+
+    def test_size_mode_rejects_duplicate_or_failed_marker(self):
+        self.assertFalse(validate(WITH_SIZE + "\n" + SIZE_LINE,33,require_size=True))
+        self.assertFalse(validate(WITH_SIZE + "\nWOLFOS_VIRTIO_GPU_BAR_SIZE_FAIL restore",
+                                  33,require_size=True))
+        self.assertFalse(validate(WITH_SIZE.replace("WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_OK",
+                                                   "WOLFOS_VIRTIO_GPU_BAR_SIZE_TEST_FAILED"),
+                                  33,require_size=True))
 
     def test_failure_and_acceleration_claims_fail(self):
         self.assertFalse(validate(SAMPLE+"\nWOLFOS_VIRTIO_GPU_PCI_CAPS_FAIL BadPointer",33))
