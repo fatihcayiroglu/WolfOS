@@ -555,6 +555,8 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     }
     let mut exposed=false;
     let mut reset_confirmed=false;
+    #[cfg(feature="qemu-virtio-gpu-scanout-reset-smoke")]
+    let mut reset_capture_ok=false;
     let mut completed=false;
     let mut did_notify=false;
     let mut display_info:Option<display::DisplayOne>=None;
@@ -721,6 +723,18 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
             qenabled=rd16(off::QUEUE_ENABLE_OFFSET);
         }
         reset_confirmed=status==0&&qenabled==0;
+        // VirtIO-GPU VGA compatibility returns on device reset, not on
+        // SET_SCANOUT(resource_id=0). The host independently captures the
+        // screen while all DMA frames are still exclusively owned.
+        #[cfg(feature="qemu-virtio-gpu-scanout-reset-smoke")]
+        if reset_confirmed&&resource_done{
+            match await_host_capture("restored",b'R'){
+                Ok(())=>reset_capture_ok=true,
+                Err(e)=>serial::write_fmt(format_args!(
+                    "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_FAIL capture={e}\n"
+                )),
+            }
+        }
     }
 
     // Unmap every PCI MMIO page, including a distinct notify-cap page.
@@ -756,6 +770,10 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     }
     let after=pmm::statistics().allocated_frames;
     let balanced=acquired==FRAMES&&released==FRAMES&&errors==0&&after==baseline;
+    #[cfg(feature="qemu-virtio-gpu-scanout-reset-smoke")]
+    let reset_capture_proven=reset_capture_ok;
+    #[cfg(not(feature="qemu-virtio-gpu-scanout-reset-smoke"))]
+    let reset_capture_proven=true;
     #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
     let edid_ok=edid_info.is_some();
     #[cfg(not(feature="qemu-virtio-gpu-edid-live-smoke"))]
@@ -765,7 +783,8 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     #[cfg(not(feature="qemu-virtio-gpu-resource2d-smoke"))]
     let resource_ok=true;
     if !preflight||!addresses_ok||!zeroed||!exposed||!did_notify||
-        !completed||!edid_ok||!resource_ok||!reset_confirmed||!balanced||!unmapped_ok{
+        !completed||!edid_ok||!resource_ok||!reset_confirmed||!balanced||
+        !unmapped_ok||!reset_capture_proven{
         serial::write_fmt(format_args!(
             "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL preflight={} alloc={} released={} quarantined={} exposed={} notified={} completed={} reset={} map={} balanced={}\n",
             preflight,acquired,released,acquired-released,exposed,
@@ -813,6 +832,12 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     if resource_done {
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_SCANOUT_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 transfer_type=261 set_type=259 flush_type=260 clear_type=259 detach_type=263 unref_type=258 response_type=4352 used_idx=10 used_head=0 used_len=24 fences_verified=8 notify_writes=10 backing_entries=4 backing_bytes=16384 guest_pattern_verified=2 set_ack=1 flush_ack=1 clear_ack=1 detach_ack=1 unref_ack=1 capture_acks=3 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-scanout-reset-smoke")]
+    if resource_done&&reset_capture_ok{
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK reset_to_vga_ack=1 capture_acks=4 geometry_and_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
     true
