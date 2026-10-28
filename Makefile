@@ -15,6 +15,8 @@ else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
 FEATURES := --features qemu-stdvga-full-state-smoke
+else ifeq ($(FLAVOR),qemu-stdvga-mode-rollback)
+FEATURES := --features qemu-stdvga-mode-rollback-smoke
 else ifeq ($(FLAVOR),serial-shell)
 FEATURES := --features serial-shell
 else ifeq ($(FLAVOR),ps2-graphics-overflow)
@@ -246,6 +248,11 @@ qemu-stdvga-enable-tx-smoke:
 qemu-stdvga-full-state-smoke:
 	$(MAKE) iso FLAVOR=qemu-stdvga-full-state
 	python3 scripts/qemu_vbe_full_state_smoke.py $(OUT)/wolfos-qemu-stdvga-full-state.iso
+
+.PHONY: qemu-stdvga-mode-rollback-smoke
+qemu-stdvga-mode-rollback-smoke:
+	$(MAKE) iso FLAVOR=qemu-stdvga-mode-rollback
+	python3 scripts/qemu_vbe_mode_rollback_smoke.py $(OUT)/wolfos-qemu-stdvga-mode-rollback.iso
 
 .PHONY: address-space-retirement-smoke
 address-space-retirement-smoke:
@@ -504,6 +511,7 @@ test:
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_stdvga_dispi_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_vbe_enable_tx_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_vbe_full_state_smoke.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_vbe_mode_rollback_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_nonyield_exit_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_timer_four_live_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_event_wait_evidence.py' -v

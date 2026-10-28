@@ -23,6 +23,8 @@ qemu-stdvga-dispi-smoke = ["smoke-exit"]
 qemu-stdvga-enable-tx-smoke = ["qemu-stdvga-dispi-smoke"]
 # Capture all QEMU VBE virtual-plane/pan registers before and after toggling.
 qemu-stdvga-full-state-smoke = ["qemu-stdvga-enable-tx-smoke"]
+# Opt-in QEMU stdvga mode switch 1280x800 -> 1024x768 -> 1280x800 with verified rollback.
+qemu-stdvga-mode-rollback-smoke = ["qemu-stdvga-full-state-smoke"]
 # Opt-in BSP polling diagnostics; does not write disks or launch applications.
 serial-shell = []
 # QEMU-only polling of PS/2 set-1 keyboard into bounded framebuffer cells.
