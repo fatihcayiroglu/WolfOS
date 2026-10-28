@@ -93,7 +93,7 @@ pub fn validate_completion(
     expected_index: u16, used_index: u16, used_id: u32, used_len: u32,
     response: &[u8], expected_fence: u64,
 ) -> Result<(), Error> {
-    if !(3..=7).contains(&expected_index) { return Err(Error::MissingCompletion); }
+    if !(3..=10).contains(&expected_index) { return Err(Error::MissingCompletion); }
     if used_index != expected_index { return Err(Error::MissingCompletion); }
     if used_id != 0 { return Err(Error::WrongHead); }
     if used_len != RESPONSE_BYTES as u32 || response.len() != RESPONSE_BYTES {
@@ -170,7 +170,10 @@ mod tests {
         assert_eq!(validate_completion(5,5,0,24,&response(fence),fence),Ok(()));
         assert_eq!(validate_completion(6,6,0,24,&response(fence),fence),Ok(()));
         assert_eq!(validate_completion(7,7,0,24,&response(fence),fence),Ok(()));
-        assert_eq!(validate_completion(8,8,0,24,&response(fence),fence),Err(Error::MissingCompletion));
+        assert_eq!(validate_completion(8,8,0,24,&response(fence),fence),Ok(()));
+        assert_eq!(validate_completion(9,9,0,24,&response(fence),fence),Ok(()));
+        assert_eq!(validate_completion(10,10,0,24,&response(fence),fence),Ok(()));
+        assert_eq!(validate_completion(11,11,0,24,&response(fence),fence),Err(Error::MissingCompletion));
         assert_eq!(validate_completion(3,2,0,24,&response(fence),fence),
                    Err(Error::MissingCompletion));
         assert_eq!(validate_completion(4,3,0,24,&response(fence),fence),

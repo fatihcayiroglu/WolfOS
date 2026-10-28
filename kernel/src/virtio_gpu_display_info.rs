@@ -34,6 +34,8 @@ use crate::virtio_gpu_resource2d_contract as resource;
 use crate::virtio_gpu_backing_contract as backing;
 #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
 use crate::virtio_gpu_transfer2d_contract as transfer;
+#[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+use crate::virtio_gpu_scanout_contract as scanout;
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
 #[derive(Clone,Copy)]
 struct EdidProof{size:u32,modes:usize,width:u32,height:u32,refresh_millihz:u32}
@@ -219,6 +221,23 @@ fn paint_transfer_pattern(vas:&[u64;FRAMES])->Result<(),&'static str>{
     verify_transfer_pattern(vas)
 }
 
+#[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+fn await_host_capture(stage:&str,ack:u8)->Result<(),&'static str>{
+    serial::write_fmt(format_args!(
+        "WOLFOS_VIRTIO_GPU_SCANOUT_CAPTURE stage={stage}\n"
+    ));
+    // The external QEMU-only QMP screendump gate must release this wait
+    // with exactly one stage token. No timer-based screenshot guessing.
+    for _ in 0..600_000_000u32{
+        if let Some(got)=serial::read_byte_nonblocking(){
+            if got==ack{return Ok(());}
+            return Err("unexpected_capture_ack");
+        }
+        core::hint::spin_loop();
+    }
+    Err("capture_timeout")
+}
+
 #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
 fn query_resource2d(
     vas:&[u64;FRAMES], frames:&[u64;FRAMES], notify_port:u64, selected:u16,
@@ -231,6 +250,17 @@ fn query_resource2d(
     const DETACH_FENCE:u64=0x574f_4c46_3244_4454;
     #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
     const TRANSFER_FENCE:u64=0x574f_4c46_3244_5452;
+    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    const SET_FENCE:u64=0x574f_4c46_3244_5343;
+    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    const FLUSH_FENCE:u64=0x574f_4c46_3244_464c;
+    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    const CLEAR_FENCE:u64=0x574f_4c46_3244_434c;
+    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    scanout::unique_fences([
+        CREATE_FENCE,ATTACH_FENCE,TRANSFER_FENCE,SET_FENCE,FLUSH_FENCE,
+        CLEAR_FENCE,DETACH_FENCE,UNREF_FENCE
+    ]).map_err(|_|"scanout_fence_reused")?;
     #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
     transfer::distinct_fences([
         CREATE_FENCE,ATTACH_FENCE,TRANSFER_FENCE,DETACH_FENCE,UNREF_FENCE
@@ -265,9 +295,33 @@ fn query_resource2d(
             // The device must not modify our four guest-owned source pages.
             verify_transfer_pattern(vas)?;
         }
+        #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+        {
+            // First capture the QEMU display BEFORE this driver binds it.
+            await_host_capture("baseline",b'B')?;
+            let set=scanout::set(resource::RESOURCE_ID,true,0,0,64,64,SET_FENCE)
+                .map_err(|_|"scanout_set_wire")?;
+            send_resource_command(vas,frames,notify_port,selected,6,
+                &set.bytes,set.fence)?;
+            let flush=scanout::flush(resource::RESOURCE_ID,true,0,0,64,64,FLUSH_FENCE)
+                .map_err(|_|"scanout_flush_wire")?;
+            send_resource_command(vas,frames,notify_port,selected,7,
+                &flush.bytes,flush.fence)?;
+            // Host captures a QMP PPM; kernel only observes the host ACK.
+            await_host_capture("active",b'A')?;
+            let clear=scanout::disable(true,CLEAR_FENCE)
+                .map_err(|_|"scanout_disable_wire")?;
+            send_resource_command(vas,frames,notify_port,selected,8,
+                &clear.bytes,clear.fence)?;
+            // Host verifies baseline/restored QMP PPM equality.
+            await_host_capture("restored",b'R')?;
+        }
         let detach=backing::detach(resource::RESOURCE_ID,true,DETACH_FENCE)
             .map_err(|_|"detach_wire")?;
-        #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+        #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+        let detach_index=9;
+        #[cfg(all(feature="qemu-virtio-gpu-transfer2d-smoke",
+                  not(feature="qemu-virtio-gpu-scanout-live-smoke")))]
         let detach_index=6;
         #[cfg(not(feature="qemu-virtio-gpu-transfer2d-smoke"))]
         let detach_index=5;
@@ -277,7 +331,10 @@ fn query_resource2d(
     // Acknowledged explicit host-resource destruction is mandatory.
     let unref=resource::unref(resource::RESOURCE_ID,true,UNREF_FENCE)
         .map_err(|_|"unref_wire")?;
-    #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    let unref_index=10;
+    #[cfg(all(feature="qemu-virtio-gpu-transfer2d-smoke",
+              not(feature="qemu-virtio-gpu-scanout-live-smoke")))]
     let unref_index=7;
     #[cfg(all(feature="qemu-virtio-gpu-attach-backing-smoke",
               not(feature="qemu-virtio-gpu-transfer2d-smoke")))]
@@ -629,11 +686,21 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                     #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
                     if edid_info.is_some() {
                         if let Some(port)=notify_register {
+                            #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+                            let scanout_ok=display_info.as_ref().is_some_and(|m|m.enabled==1);
+                            #[cfg(not(feature="qemu-virtio-gpu-scanout-live-smoke"))]
+                            let scanout_ok=true;
+                            if !scanout_ok {
+                                serial::write_line(
+                                    "WOLFOS_VIRTIO_GPU_SCANOUT_FAIL stage=disabled_scanout"
+                                );
+                            } else {
                             match query_resource2d(&vas,&frames,port,layout.selected) {
                                 Ok(())=>resource_done=true,
                                 Err(e)=>serial::write_fmt(format_args!(
                                     "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL stage={e}\n"
                                 )),
+                            }
                             }
                         }
                     }
@@ -734,10 +801,17 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
             "WOLFOS_VIRTIO_GPU_ATTACH_BACKING_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 detach_type=263 unref_type=258 response_type=4352 used_idx=6 used_head=0 used_len=24 fences_verified=4 notify_writes=6 backing_entries=4 backing_bytes=16384 pages_zeroed=4 attach_ack=1 detach_ack=1 unref_ack=1 transfer_writes=0 scanout_writes=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
-    #[cfg(feature="qemu-virtio-gpu-transfer2d-smoke")]
+    #[cfg(all(feature="qemu-virtio-gpu-transfer2d-smoke",
+              not(feature="qemu-virtio-gpu-scanout-live-smoke")))]
     if resource_done {
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_TRANSFER2D_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 transfer_type=261 detach_type=263 unref_type=258 response_type=4352 used_idx=7 used_head=0 used_len=24 fences_verified=5 notify_writes=7 backing_entries=4 backing_bytes=16384 pattern_nonzero_bytes=16384 guest_pattern_verified=2 transfer_ack=1 detach_ack=1 unref_ack=1 host_readback=0 scanout_writes=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-scanout-live-smoke")]
+    if resource_done {
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_SCANOUT_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 transfer_type=261 set_type=259 flush_type=260 clear_type=259 detach_type=263 unref_type=258 response_type=4352 used_idx=10 used_head=0 used_len=24 fences_verified=8 notify_writes=10 backing_entries=4 backing_bytes=16384 guest_pattern_verified=2 set_ack=1 flush_ack=1 clear_ack=1 detach_ack=1 unref_ack=1 capture_acks=3 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
     true
