@@ -13,7 +13,8 @@ from qemu_virtio_gpu_pci_smoke import validate as validate_gpu
 EDID = re.compile(
     r"WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size=([0-9]+) "
     r"modes=([0-9]+) preferred_width=([0-9]+) preferred_height=([0-9]+) "
-    r"refresh_millihz=([0-9]+) used_idx=2 used_head=0 used_len=1056 "
+    r"refresh_millihz=([0-9]+) gpu_timing_proof_required=1 mode_writes=0 "
+    r"used_idx=2 used_head=0 used_len=1056 "
     r"fence_verified=1 negotiated_edid=1 notify_writes=2 driver_ok=15 "
     r"reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 "
     r"pmm_leak=0 qemu_only=1"

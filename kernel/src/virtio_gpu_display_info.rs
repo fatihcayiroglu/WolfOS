@@ -24,7 +24,10 @@ use crate::{
 };
 
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
-use crate::{virtio_gpu_edid_wire as edid,virtio_gpu_edid_live_contract as live};
+use crate::{
+    virtio_gpu_edid_wire as edid,virtio_gpu_edid_live_contract as live,
+    display_mode_policy as mode_policy,
+};
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
 #[derive(Clone,Copy)]
 struct EdidProof{size:u32,modes:usize,width:u32,height:u32,refresh_millihz:u32}
@@ -95,6 +98,14 @@ fn query_edid(vas:&[u64;FRAMES],frames:&[u64;FRAMES],port:u64)
             return Err("decode");
         }
     };
+    // The genuine monitor EDID is not a GPU scanout timing proof. QEMU's
+    // GET_DISPLAY_INFO does not specify a pixel-clock/link limit, so the
+    // live path must refuse automatic (or manual) selection for now.
+    if verified.choose_with_gpu_evidence(
+        1,None,mode_policy::UserChoice::AUTOMATIC
+    )!=Err(edid::VirtioEdidError::MissingGpuTimingEvidence){
+        return Err("unproven_gpu_mode_accepted");
+    }
     let mut preferred=verified.modes().first().copied().ok_or("zero_modes")?;
     for m in verified.modes(){
         if m.preferred{preferred=*m;break;}
@@ -511,7 +522,7 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
     if let Some(edid)=edid_info{
         serial::write_fmt(format_args!(
-            "WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size={} modes={} preferred_width={} preferred_height={} refresh_millihz={} used_idx=2 used_head=0 used_len=1056 fence_verified=1 negotiated_edid=1 notify_writes=2 driver_ok=15 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 pmm_leak=0 qemu_only=1\n",
+            "WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size={} modes={} preferred_width={} preferred_height={} refresh_millihz={} gpu_timing_proof_required=1 mode_writes=0 used_idx=2 used_head=0 used_len=1056 fence_verified=1 negotiated_edid=1 notify_writes=2 driver_ok=15 reset=0 queue_disabled=1 frames_allocated=5 frames_released=5 pmm_leak=0 qemu_only=1\n",
             edid.size,edid.modes,edid.width,edid.height,edid.refresh_millihz
         ));
     }
