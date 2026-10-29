@@ -4,6 +4,12 @@ Status: separate **draft PR** stacked on #323; no automatic merge.
 QEMU-only proof for a single `virtio-vga`, **not** a production GPU driver
 and **not** general display-mode programming.
 
+> Amended by [ADR-0093](ADR-0093-host-pixel-attestation-channel.md): the first
+> revision of this catalog let the *driver itself* record
+> `HostVerifiedApplied`. Entries are now created only from a nonce-bound host
+> reply carrying the digest of the pixels the host really captured, so the
+> driver can no longer assert host verification on its own.
+
 ## Purpose and bounded scope
 
 ADR-0085 already required independent GPU timing evidence before an EDID

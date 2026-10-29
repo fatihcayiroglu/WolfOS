@@ -390,6 +390,231 @@ const fn refresh_rank(refresh: RefreshEvidence) -> u32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host attestation channel
+// ---------------------------------------------------------------------------
+//
+// `ScanoutProof::HostVerifiedApplied` is a strong claim: an independent host
+// really looked at the pixels at exactly this geometry. The driver alone must
+// never be able to assert it, because that would be exactly the fabricated
+// "the GPU supports this mode" claim this project forbids.
+//
+// So the claim is a challenge/response. Before each capture the driver prints a
+// per-stage nonce together with its **own** digest of the exact source pixels it
+// placed in the resource. The host captures the screen, verifies every pixel, and
+// echoes the nonce, the observed geometry and the digest of the pixels it really
+// saw. Only a reply that matches the nonce, the geometry the driver applied and
+// the driver's source digest produces an `Attestation` that may create an entry.
+//
+// A corrupted transfer, a wrong stride, wrong channel order, a resized scanout or
+// a replayed/stale reply all break the match, so no entry appears and automatic
+// selection fails closed instead of silently trusting the driver.
+
+/// Offset basis of FNV-1a over the canonical RGB bytes.
+pub const DIGEST_SEED: u32 = 0x811c_9dc5;
+/// A hostile or broken peer must not be able to stall the driver forever.
+pub const MAX_REPLY_BYTES: usize = 96;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttestationError {
+    EmptyReply,
+    ReplyTooLong,
+    UnexpectedStageToken,
+    MalformedReply,
+    BadNonce,
+    WrongGeometry,
+    DigestMismatch,
+    InvalidRequest,
+}
+
+impl AttestationError {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::EmptyReply => "empty_reply",
+            Self::ReplyTooLong => "reply_too_long",
+            Self::UnexpectedStageToken => "unexpected_stage_token",
+            Self::MalformedReply => "malformed_reply",
+            Self::BadNonce => "bad_nonce",
+            Self::WrongGeometry => "wrong_geometry",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::InvalidRequest => "invalid_request",
+        }
+    }
+}
+
+/// Evidence that a host capture really matched this exact scanout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Attestation {
+    pub nonce: u64,
+    pub width: u32,
+    pub height: u32,
+    pub digest: u32,
+}
+
+impl Attestation {
+    pub const fn entry(self, scanout: u8) -> ModeEntry {
+        ModeEntry {
+            scanout,
+            width: self.width,
+            height: self.height,
+            // The host saw these exact pixels at this exact geometry. Refresh
+            // stays unavailable: capturing geometry proves no pixel clock.
+            proof: ScanoutProof::HostVerifiedApplied,
+            refresh: RefreshEvidence::Unavailable,
+        }
+    }
+}
+
+/// FNV-1a over width*height canonical `(r, g, b)` triples in scanline order.
+/// Both the driver (over its source pixels) and the host (over the captured
+/// screenshot) compute this same value, so any corruption diverges.
+pub fn rgb_digest(width: u32, height: u32, pixel: &dyn Fn(u32, u32) -> [u8; 3]) -> u32 {
+    let mut hash = DIGEST_SEED;
+    for y in 0..height {
+        for x in 0..width {
+            for byte in pixel(x, y) {
+                hash ^= u32::from(byte);
+                hash = hash.wrapping_mul(0x0100_0193);
+            }
+        }
+    }
+    hash
+}
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+fn parse_hex(bytes: &[u8], max_digits: usize) -> Option<u64> {
+    if bytes.is_empty() || bytes.len() > max_digits {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in bytes.iter().copied() {
+        value = value.checked_mul(16)?.checked_add(u64::from(hex_nibble(byte)?))?;
+    }
+    Some(value)
+}
+/// Geometry is decimal in the attestation line; nonce and digest are hex.
+fn parse_dec(bytes: &[u8], max_digits: usize) -> Option<u32> {
+    if bytes.is_empty() || bytes.len() > max_digits {
+        return None;
+    }
+    let mut value = 0u32;
+    for byte in bytes.iter().copied() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    Some(value)
+}
+fn parse_geometry(bytes: &[u8]) -> Option<(u32, u32)> {
+    let split = bytes.iter().position(|b| *b == b'x')?;
+    let width = parse_dec(&bytes[..split], 5)?;
+    let height = parse_dec(&bytes[split + 1..], 5)?;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return None;
+    }
+    Some((width as u32, height as u32))
+}
+
+/// The line the driver prints before waiting for a capture. It carries the
+/// nonce and the driver's own source digest so the reply can be bound to this
+/// exact stage instead of being replayed from an earlier one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageChallenge {
+    pub token: u8,
+    pub nonce: u64,
+    pub width: u32,
+    pub height: u32,
+    pub source_digest: u32,
+}
+
+impl StageChallenge {
+    pub fn new(
+        token: u8,
+        nonce: u64,
+        width: u32,
+        height: u32,
+        source_digest: u32,
+    ) -> Result<Self, AttestationError> {
+        if nonce == 0 || width == 0 || height == 0 || !token.is_ascii_alphabetic() {
+            return Err(AttestationError::InvalidRequest);
+        }
+        Ok(Self { token, nonce, width, height, source_digest })
+    }
+
+    pub fn stage_label(&self) -> &'static str {
+        match self.token {
+            b'A' => "active",
+            b'M' => "reduced",
+            b'E' => "reexpanded",
+            _ => "unknown",
+        }
+    }
+}
+
+/// `"<token> <w>x<h> <nonce-hex> <digest-hex>"`, one line, ASCII only.
+/// Rejects anything else: extra fields, wrong token, wrong nonce, wrong
+/// geometry, wrong digest, trailing garbage or oversized input.
+pub fn decode_attestation_reply(
+    line: &[u8],
+    challenge: StageChallenge,
+) -> Result<Attestation, AttestationError> {
+    let line = match line.last() {
+        Some(b'\n') => &line[..line.len() - 1],
+        _ => line,
+    };
+    let line = match line.last() {
+        Some(b'\r') => &line[..line.len() - 1],
+        _ => line,
+    };
+    if line.is_empty() {
+        return Err(AttestationError::EmptyReply);
+    }
+    if line.len() > MAX_REPLY_BYTES {
+        return Err(AttestationError::ReplyTooLong);
+    }
+    for byte in line.iter().copied() {
+        if !byte.is_ascii_graphic() && byte != b' ' {
+            return Err(AttestationError::MalformedReply);
+        }
+    }
+    let mut fields = line.split(|b| *b == b' ');
+    let token = fields.next().ok_or(AttestationError::MalformedReply)?;
+    let geometry = fields.next().ok_or(AttestationError::MalformedReply)?;
+    let nonce = fields.next().ok_or(AttestationError::MalformedReply)?;
+    let digest = fields.next().ok_or(AttestationError::MalformedReply)?;
+    if fields.next().is_some() {
+        return Err(AttestationError::MalformedReply);
+    }
+    if token.len() != 1 || token[0] != challenge.token {
+        return Err(AttestationError::UnexpectedStageToken);
+    }
+    let (width, height) = parse_geometry(geometry).ok_or(AttestationError::MalformedReply)?;
+    let got_nonce = parse_hex(nonce, 16).ok_or(AttestationError::MalformedReply)?;
+    let got_digest = parse_hex(digest, 8).ok_or(AttestationError::MalformedReply)? as u32;
+    if got_nonce == 0 || got_nonce != challenge.nonce {
+        return Err(AttestationError::BadNonce);
+    }
+    if width != challenge.width || height != challenge.height {
+        return Err(AttestationError::WrongGeometry);
+    }
+    if got_digest != challenge.source_digest {
+        return Err(AttestationError::DigestMismatch);
+    }
+    Ok(Attestation {
+        nonce: got_nonce,
+        width,
+        height,
+        digest: got_digest,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,5 +919,122 @@ mod tests {
         c.record(second_output).unwrap();
         c.record(APPLIED_64).unwrap();
         assert_eq!(c.choose(5, UserChoice::AUTOMATIC), Ok(APPLIED_64));
+    }
+
+    // ---- host attestation channel -----------------------------------------
+
+    const CHALLENGE: StageChallenge = StageChallenge {
+        token: b'A',
+        nonce: 0x574f_4154_0001,
+        width: 64,
+        height: 64,
+        source_digest: 0x1a2b_3c4d,
+    };
+
+    #[test]
+    fn digest_is_stable_across_channels_and_detects_corruption() {
+        let renders = |x: u32, y: u32| -> [u8; 3] { [x as u8, y as u8, 0x5a] };
+        let same = rgb_digest(64, 64, &renders);
+        assert_eq!(same, rgb_digest(64, 64, &renders));
+        assert_eq!(same, rgb_digest(64, 64, &|x, y| renders(x, y)));
+        // Channel order, one host-visible pixel and geometry all matter.
+        let swapped = |x: u32, y: u32| -> [u8; 3] { let p = renders(x, y); [p[2], p[1], p[0]] };
+        assert_ne!(same, rgb_digest(64, 64, &swapped));
+        let one_pixel = |x: u32, y: u32| -> [u8; 3] {
+            let mut p = renders(x, y);
+            if x == 63 && y == 63 { p[1] ^= 1; }
+            p
+        };
+        assert_ne!(same, rgb_digest(64, 64, &one_pixel));
+        assert_ne!(same, rgb_digest(32, 32, &renders));
+        // An empty frame still produces the well-defined seed value.
+        assert_eq!(rgb_digest(0, 0, &renders), DIGEST_SEED);
+    }
+
+    #[test]
+    fn matching_reply_becomes_host_verified_evidence() {
+        let reply = decode_attestation_reply(b"A 64x64 574f41540001 1a2b3c4d\n", CHALLENGE)
+            .unwrap();
+        assert_eq!(reply, Attestation {
+            nonce: CHALLENGE.nonce, width: 64, height: 64, digest: CHALLENGE.source_digest,
+        });
+        let entry = reply.entry(0);
+        assert_eq!(entry.proof, ScanoutProof::HostVerifiedApplied);
+        // Geometry was captured, but no pixel clock was ever programmed.
+        assert_eq!(entry.refresh, RefreshEvidence::Unavailable);
+        assert!(entry.selectable());
+        assert_eq!(reply.entry(0), APPLIED_64);
+        // LF and CRLF are both accepted; no other terminator is required.
+        assert!(decode_attestation_reply(b"A 64x64 574f41540001 1a2b3c4d", CHALLENGE).is_ok());
+        assert!(decode_attestation_reply(b"A 64x64 574f41540001 1a2b3c4d\r\n", CHALLENGE).is_ok());
+    }
+
+    #[test]
+    fn forged_stale_and_malformed_replies_never_attest() {
+        for (reply, expected) in [
+            (&b""[..], AttestationError::EmptyReply),
+            (b"\n", AttestationError::EmptyReply),
+            (b"A 64x64 574f41540001\n", AttestationError::MalformedReply),
+            (b"A 64x64 574f41540001 1a2b3c4d 00\n", AttestationError::MalformedReply),
+            (b"A 64x64 574f41540001 1a2b3c4d\t\n", AttestationError::MalformedReply),
+            (b"A 64X64 574f41540001 1a2b3c4d\n", AttestationError::MalformedReply),
+            (b"A 64x64 0 1a2b3c4d\n", AttestationError::BadNonce),
+            (b"A 64x64 574f41540002 1a2b3c4d\n", AttestationError::BadNonce),
+            (b"A 32x32 574f41540001 1a2b3c4d\n", AttestationError::WrongGeometry),
+            (b"A 64x64 574f41540001 1a2b3c4e\n", AttestationError::DigestMismatch),
+            (b"M 64x64 574f41540001 1a2b3c4d\n", AttestationError::UnexpectedStageToken),
+            (b"AA 64x64 574f41540001 1a2b3c4d\n", AttestationError::UnexpectedStageToken),
+            (b"A 64x64 574f41540001 1a2b3c4d\x00", AttestationError::MalformedReply),
+        ] {
+            assert_eq!(decode_attestation_reply(reply, CHALLENGE), Err(expected), "{reply:?}");
+        }
+        let oversized = [b'A'; MAX_REPLY_BYTES + 1];
+        assert_eq!(
+            decode_attestation_reply(&oversized, CHALLENGE),
+            Err(AttestationError::ReplyTooLong)
+        );
+    }
+
+    #[test]
+    fn challenge_rejects_unusable_stage_parameters() {
+        assert_eq!(
+            StageChallenge::new(b'A', 0, 64, 64, 1).err(),
+            Some(AttestationError::InvalidRequest)
+        );
+        assert_eq!(
+            StageChallenge::new(b'A', 1, 0, 64, 1).err(),
+            Some(AttestationError::InvalidRequest)
+        );
+        assert_eq!(
+            StageChallenge::new(b'1', 1, 64, 64, 1).err(),
+            Some(AttestationError::InvalidRequest)
+        );
+        assert_eq!(StageChallenge::new(b'M', 1, 32, 32, 1).unwrap().nonce, 1);
+    }
+
+    #[test]
+    fn selectable_mode_requires_attestation_not_driver_assertion() {
+        // Exactly what the old boot path did: claim host verification without
+        // any host reply. That must remain impossible to reach through the
+        // attestation path, and an unattested catalog stays non-selectable.
+        let mut claimed = ModeCatalog::new(1).unwrap();
+        claimed
+            .record(ModeEntry {
+                scanout: 0,
+                width: 64,
+                height: 64,
+                proof: ScanoutProof::DeviceReportedConfigured,
+                refresh: RefreshEvidence::Unavailable,
+            })
+            .unwrap();
+        assert_eq!(claimed.selectable_count(), 0);
+        assert_eq!(claimed.choose(1, UserChoice::AUTOMATIC), Err(CatalogError::NoSelectableMode));
+        assert_eq!(claimed.choose(1, exact(64, 64)), Err(CatalogError::UnprovenGpuTiming));
+        let attested = decode_attestation_reply(
+            b"A 64x64 574f41540001 1a2b3c4d\n", CHALLENGE
+        ).unwrap();
+        claimed.record(attested.entry(0)).unwrap();
+        assert_eq!(claimed.selectable_count(), 1);
+        assert_eq!(claimed.choose(1, UserChoice::AUTOMATIC), Ok(APPLIED_64));
     }
 }

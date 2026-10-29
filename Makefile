@@ -395,6 +395,24 @@ qemu-virtio-gpu-native-rollback-smoke:
 	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_native_rollback_smoke.py
 	python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py --native-rollback $(OUT)/wolfos-qemu-virtio-gpu-native-rollback.iso
 
+.PHONY: qemu-virtio-gpu-attestation-negative
+# The attestation gate must be able to fail: a host that lies about the digest,
+# the nonce or the geometry has to be refused by the guest, loudly.
+# ATTEST_FAULTS may be narrowed locally, e.g. ATT... "FAULTS=digest".
+ATTEST_FAULTS ?= digest nonce geometry
+qemu-virtio-gpu-attestation-negative:
+	@for fault in $(ATTEST_FAULTS); do \
+	  if WOLFOS_ATTEST_FAULT=$$fault python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py \
+	       --native-rollback $(OUT)/wolfos-qemu-virtio-gpu-native-rollback.iso \
+	       > $(OUT)/attest-$$fault.log 2>&1; then \
+	    echo "FAIL: attestation fault $$fault was not refused"; exit 1; \
+	  elif ! grep -q "WOLFOS_GPU_ATTEST_FAIL" $(OUT)/attest-$$fault.log; then \
+	    echo "FAIL: attestation fault $$fault refused without kernel evidence"; exit 1; \
+	  else \
+	    echo "OK: attestation fault $$fault refused by the guest"; \
+	  fi; \
+	done
+
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:
 	$(MAKE) iso FLAVOR=qemu-stdvga-dispi

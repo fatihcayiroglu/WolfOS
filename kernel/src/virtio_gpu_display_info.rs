@@ -270,7 +270,85 @@ fn await_host_capture(stage:&str,ack:u8)->Result<(),&'static str>{
 }
 
 #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
-fn verify_mode_catalog(vas:&[u64;FRAMES],facts:CatalogFacts)->Result<(),&'static str>{
+const ACTIVE_NONCE:u64=0x574f_4154_0001;
+#[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+const REDUCED_NONCE:u64=0x574f_4152_0002;
+#[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+const REEXPANDED_NONCE:u64=0x574f_4158_0003;
+
+/// The driver's own digest of the exact pixels it placed in the resource.
+/// Both sides compute the same FNV-1a over canonical RGB, so a corrupted
+/// transfer, wrong stride or swapped channel order cannot match.
+#[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+fn source_digest(width:u32,height:u32)->Result<u32,&'static str>{
+    use crate::display_mode_catalog::rgb_digest;
+    let byte=|index:usize|->Result<u8,&'static str>{
+        let page=index/transfer::PAGE_BYTES;
+        if page>=transfer::BACKING_PAGES{return Err("source_index");}
+        transfer::pattern_byte(page,index%transfer::PAGE_BYTES)
+            .map_err(|_|"pattern_contract")
+    };
+    // Validate every index up front: the digest must never be computed over a
+    // substituted value, so the host comparison stays meaningful.
+    for y in 0..height{
+        for x in 0..width{
+            let base=(y as usize*64+x as usize)*4;
+            for channel in 0..3{byte(base+channel)?;}
+        }
+    }
+    Ok(rgb_digest(width,height,&|x,y|{
+        let base=(y as usize*64+x as usize)*4;
+        [byte(base+2).unwrap_or(0),byte(base+1).unwrap_or(0),byte(base).unwrap_or(0)]
+    }))
+}
+
+/// Challenge the QEMU host to prove what it actually displayed. Prints the
+/// nonce and source digest, then accepts exactly one reply line bound to this
+/// stage. No reply, a replayed nonce, a resized scanout or a differing digest
+/// all fail closed and leave the catalog without host-verified evidence.
+#[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+fn await_host_attestation(
+    token:u8,nonce:u64,width:u32,height:u32,
+)->Result<crate::display_mode_catalog::Attestation,&'static str>{
+    use crate::display_mode_catalog::{
+        StageChallenge,MAX_REPLY_BYTES,decode_attestation_reply,
+    };
+    let digest=source_digest(width,height)?;
+    let challenge=StageChallenge::new(token,nonce,width,height,digest)
+        .map_err(|_|"attest_challenge")?;
+    serial::write_fmt(format_args!(
+        "WOLFOS_GPU_STAGE_ATTEST stage={} geometry={}x{} nonce={:016x} source_digest={:08x}\n",
+        challenge.stage_label(),width,height,nonce,digest
+    ));
+    let mut line=[0u8;MAX_REPLY_BYTES+1];
+    let mut len=0usize;
+    for _ in 0..600_000_000u32{
+        if let Some(byte)=serial::read_byte_nonblocking(){
+            if len==line.len(){return Err("attest_reply_too_long");}
+            line[len]=byte;
+            len+=1;
+            if byte==b'\n'{break;}
+            continue;
+        }
+        core::hint::spin_loop();
+    }
+    match decode_attestation_reply(&line[..len],challenge){
+        Ok(attestation)=>Ok(attestation),
+        Err(e)=>{
+            serial::write_fmt(format_args!(
+                "WOLFOS_GPU_ATTEST_FAIL stage={} reason={} bytes={} source_digest={:08x}\n",
+                challenge.stage_label(),e.label(),len,digest
+            ));
+            Err("attest_reply")
+        }
+    }
+}
+
+#[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+fn verify_mode_catalog(
+    vas:&[u64;FRAMES],facts:CatalogFacts,
+    attestations:&[Option<crate::display_mode_catalog::Attestation>;3],
+)->Result<(),&'static str>{
     use crate::display_mode_catalog::{
         CatalogError,ModeCatalog,ModeEntry,RefreshEvidence,ScanoutProof,
     };
@@ -284,13 +362,35 @@ fn verify_mode_catalog(vas:&[u64;FRAMES],facts:CatalogFacts)->Result<(),&'static
     };
     let before=read_used();
     let mut modes=ModeCatalog::new(GENERATION).map_err(|_|"catalog_generation")?;
-    // Only geometry this driver really scanned out and the host verified.
-    modes.record(ModeEntry{scanout:0,width:64,height:64,
-        proof:ScanoutProof::HostVerifiedApplied,
-        refresh:RefreshEvidence::Unavailable}).map_err(|_|"catalog_record_64x64")?;
-    modes.record(ModeEntry{scanout:0,width:32,height:32,
-        proof:ScanoutProof::HostVerifiedApplied,
-        refresh:RefreshEvidence::Unavailable}).map_err(|_|"catalog_record_32x32")?;
+    // Only geometry the host really attested with a nonce-bound pixel digest.
+    // The driver cannot assert HostVerifiedApplied on its own any more.
+    let mut attested=0usize;
+    for attestation in attestations.iter().copied(){
+        let Some(attestation)=attestation else{continue;};
+        modes.record(attestation.entry(0)).map_err(|_|"catalog_record_attested")?;
+        attested+=1;
+    }
+    let unattested=attestations.len()-attested;
+    // Fail closed: with no genuine host attestation nothing may be selectable.
+    if attested==0{
+        if modes.choose(GENERATION,mode_policy::UserChoice::AUTOMATIC)
+            !=Err(CatalogError::NoSelectableMode){
+            return Err("catalog_selectable_without_attestation");
+        }
+    }
+    // A subset must not inherit an unattested geometry: drop the 64x64 active
+    // attestation and the automatic choice must fall back to 32x32, proving
+    // the selection really depends on host evidence rather than a constant.
+    if let Some(reduced)=attestations[1]{
+        let mut reduced_only=ModeCatalog::new(GENERATION).map_err(|_|"catalog_generation")?;
+        reduced_only.record(reduced.entry(0))
+            .map_err(|_|"catalog_record_subset")?;
+        let subset=reduced_only.choose(GENERATION,mode_policy::UserChoice::AUTOMATIC)
+            .map_err(|_|"catalog_subset_automatic")?;
+        if subset.width!=32||subset.height!=32{
+            return Err("catalog_automatic_ignored_attestation_subset");
+        }
+    }
     // GET_DISPLAY_INFO's own claim is recorded but stays non-selectable.
     modes.record(ModeEntry{scanout:0,width:facts.device_width,
         height:facts.device_height,proof:ScanoutProof::DeviceReportedConfigured,
@@ -356,8 +456,8 @@ fn verify_mode_catalog(vas:&[u64;FRAMES],facts:CatalogFacts)->Result<(),&'static
     let after=read_used();
     if after!=before{return Err("catalog_consumed_gpu_command");}
     serial::write_fmt(format_args!(
-        "WOLFOS_DISPLAY_CATALOG_OK generation={} entries={} selectable={} device_reported={} device_width={} device_height={} automatic_width={} automatic_height={} automatic_refresh={} automatic_change_required=0 manual_32x32=accepted manual_32x32_refresh={} device_reported_mode=rejected:{} edid_advertised={} edid_refused={} edid_hz_request=rejected:{} plan=some plan_confirm=accepted plan_wrong_readback=rejected:{} confirmation_window_ms={} gpu_commands_sent=0 used_idx_before={} used_idx_after={} refusal_capture_acks=1 host_pixels_verified_by_kernel=0\n",
-        GENERATION,modes.entries().len(),modes.selectable_count(),
+        "WOLFOS_DISPLAY_CATALOG_OK generation={} entries={} selectable={} attested={} unattested={} device_reported={} device_width={} device_height={} automatic_width={} automatic_height={} automatic_refresh={} automatic_change_required=0 manual_32x32=accepted manual_32x32_refresh={} device_reported_mode=rejected:{} edid_advertised={} edid_refused={} edid_hz_request=rejected:{} plan=some plan_confirm=accepted plan_wrong_readback=rejected:{} confirmation_window_ms={} gpu_commands_sent=0 used_idx_before={} used_idx_after={} refusal_capture_acks=1 host_pixels_verified_by_kernel=0\n",
+        GENERATION,modes.entries().len(),modes.selectable_count(),attested,unattested,
         modes.device_reported_count(),facts.device_width,facts.device_height,
         automatic.width,automatic.height,automatic.refresh_label(),
         manual.refresh_label(),CatalogError::UnprovenGpuTiming.label(),
@@ -454,7 +554,17 @@ fn query_resource2d(
                 .map_err(|_|"scanout_flush_wire")?;
             send_resource_command(vas,frames,notify_port,selected,7,
                 &flush.bytes,flush.fence)?;
-            // Host captures a QMP PPM; kernel only observes the host ACK.
+            // Host captures a QMP PPM and answers with a nonce-bound pixel
+            // digest. Without that reply the catalog gets no evidence at all.
+            #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+            let mut attestations=[None;3];
+            #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+            {
+                attestations[0]=Some(await_host_attestation(
+                    b'A',ACTIVE_NONCE,64,64
+                )?);
+            }
+            #[cfg(not(feature="qemu-virtio-gpu-native-rollback-smoke"))]
             await_host_capture("active",b'A')?;
             #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
             {
@@ -470,7 +580,9 @@ fn query_resource2d(
                 ).map_err(|_|"native_shrink_flush_wire")?;
                 send_resource_command(vas,frames,notify_port,selected,9,
                     &shrunk_flush.bytes,shrunk_flush.fence)?;
-                await_host_capture("reduced",b'M')?;
+                attestations[1]=Some(await_host_attestation(
+                    b'M',REDUCED_NONCE,32,32
+                )?);
                 let expand=scanout::set(resource::RESOURCE_ID,true,
                     0,0,64,64,EXPAND_SET_FENCE
                 ).map_err(|_|"native_expand_wire")?;
@@ -481,10 +593,12 @@ fn query_resource2d(
                 ).map_err(|_|"native_expand_flush_wire")?;
                 send_resource_command(vas,frames,notify_port,selected,11,
                     &expanded_flush.bytes,expanded_flush.fence)?;
-                await_host_capture("reexpanded",b'E')?;
+                attestations[2]=Some(await_host_attestation(
+                    b'E',REEXPANDED_NONCE,64,64
+                )?);
                 // Pure-policy catalog evidence: refuses every EDID-only and
                 // device-reported geometry, and must not alter the display.
-                verify_mode_catalog(vas,_facts)?;
+                verify_mode_catalog(vas,_facts,&attestations)?;
                 await_host_capture("refused",b'F')?;
             }
             let clear=scanout::disable(true,CLEAR_FENCE)

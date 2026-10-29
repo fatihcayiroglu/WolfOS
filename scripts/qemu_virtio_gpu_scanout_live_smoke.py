@@ -7,6 +7,7 @@ No physical GPU, guest disk image writes or GUI backend.
 """
 from pathlib import Path
 import json
+import os
 import re
 import socket
 import subprocess
@@ -29,6 +30,19 @@ MARKER = (
     "pmm_leak=0 qemu_only=1"
 )
 PREFIX="WOLFOS_VIRTIO_GPU_SCANOUT_CAPTURE stage="
+# Nonce-bound pixel attestation: the guest challenges with its own source
+# digest, the host answers with the digest of the pixels it really captured.
+ATTEST_PREFIX="WOLFOS_GPU_STAGE_ATTEST "
+ATTEST=re.compile(
+    r"WOLFOS_GPU_STAGE_ATTEST stage=(\w+) geometry=(\d+)x(\d+) "
+    r"nonce=([0-9a-f]{16}) source_digest=([0-9a-f]{8})")
+ATTEST_STAGES={"active":(64,64,0x574F41540001),
+              "reduced":(32,32,0x574F41520002),
+              "reexpanded":(64,64,0x574F41580003)}
+ATTEST_TOKENS={"active":b"A","reduced":b"M","reexpanded":b"E"}
+# Deliberate-fault switch used by the negative test: the host lies about one
+# field so the guest's refusal must be observable, not assumed.
+ATTEST_FAULT=os.environ.get("WOLFOS_ATTEST_FAULT","")
 STAGES=("baseline","active","disabled")
 RELEASE={"baseline":b"B","active":b"A","disabled":b"D"}
 RESTORE_STAGES=STAGES+("restored",)
@@ -51,7 +65,8 @@ NATIVE_MARKER=(
 # independently owns the pixel and ordering evidence around this line.
 CATALOG=re.compile(
     r"WOLFOS_DISPLAY_CATALOG_OK generation=(\d+) entries=(\d+) "
-    r"selectable=(\d+) device_reported=(\d+) device_width=(\d+) "
+    r"selectable=(\d+) attested=(\d+) unattested=(\d+) device_reported=(\d+) "
+    r"device_width=(\d+) "
     r"device_height=(\d+) automatic_width=(\d+) automatic_height=(\d+) "
     r"automatic_refresh=(\w+) automatic_change_required=0 "
     r"manual_32x32=accepted manual_32x32_refresh=(\w+) "
@@ -101,16 +116,20 @@ def validate_catalog(output: str) -> tuple[int,int] | None:
     advertised_edid=int(mode_lines[0][0])
     real_width,real_height=map(int,geometry_lines[0])
     index,match=found[0]
-    (generation,entries,selectable,device_reported,device_width,
-     device_height,automatic_width,automatic_height,automatic_refresh,
-     manual_refresh,device_reason,edid_advertised,edid_refused,hz_reason,
-     readback_reason,window,used_before,used_after)=(
+    (generation,entries,selectable,attested,unattested,device_reported,
+     device_width,device_height,automatic_width,automatic_height,
+     automatic_refresh,manual_refresh,device_reason,edid_advertised,
+     edid_refused,hz_reason,readback_reason,window,used_before,used_after)=(
          int(g) if g.isdigit() else g for g in match.groups()
      )
     if generation<1 or not 1<=entries<=16:
         return None
     # Two genuinely applied scanouts are selectable, the device's own claim is not.
     if selectable!=2 or device_reported!=entries-selectable:
+        return None
+    # Exactly the three captured scanouts carried a host pixel attestation;
+    # none was accepted without one.
+    if attested!=3 or unattested!=0:
         return None
     if not (1<=device_width<=8192 and 1<=device_height<=8192):
         return None
@@ -177,7 +196,14 @@ def validate_serial(output: str, reset_restore:bool=False,
         else "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK "
     ) for l in lines):
         return False
+    # Attested stages are announced with a nonce challenge, not a bare capture
+    # request; both forms name the same stage sequence.
     stages=[(i,l[len(PREFIX):]) for i,l in enumerate(lines) if l.startswith(PREFIX)]
+    if native_rollback:
+        stages.extend((i,m.group(1)) for i,m in
+                      ((i,ATTEST.fullmatch(l)) for i,l in enumerate(lines)
+                       if l.startswith(ATTEST_PREFIX)) if m is not None)
+        stages.sort()
     expected_stages=(NATIVE_STAGES if native_rollback else
                      RESTORE_STAGES if reset_restore else STAGES)
     if [x[1] for x in stages]!=list(expected_stages):
@@ -187,6 +213,34 @@ def validate_serial(output: str, reset_restore:bool=False,
         before_refused=stages[4][0]
         if not after_reexpanded<catalog_index<before_refused:
             return False
+        # Each attested capture must have been challenged exactly once, with a
+        # stage-unique nonce, before the catalog line that consumes it.
+        attested=[(i,ATTEST.fullmatch(l)) for i,l in enumerate(lines)
+                  if l.startswith(ATTEST_PREFIX)]
+        if len(attested)!=3 or any(m is None for _,m in attested):
+            return False
+        names=[m.group(1) for _,m in attested]
+        if names!=list(ATTEST_STAGES):
+            return False
+        for index,match in attested:
+            name=match.group(1)
+            width,height,nonce=ATTEST_STAGES[name]
+            if (int(match.group(2)),int(match.group(3)))!=(width,height):
+                return False
+            if int(match.group(4),16)!=nonce:
+                return False
+            # The guest's claimed source digest must be the digest of the
+            # pattern the host independently verified in the screenshot.
+            if int(match.group(5),16)!=pattern_digest(width,height):
+                return False
+            # The challenge must precede the catalog that records its result.
+            if index>catalog_index:
+                return False
+        nonces=[int(m.group(4),16) for _,m in attested]
+        if len(set(nonces))!=len(nonces):
+            return False
+    if any(l.startswith("WOLFOS_GPU_ATTEST_FAIL ") for l in lines):
+        return False
     edid=[i for i,l in enumerate(lines)
           if l.startswith("WOLFOS_VIRTIO_GPU_EDID_LIVE_OK ")]
     display_ack=[i for i,l in enumerate(lines)
@@ -269,6 +323,24 @@ def ppm(path:Path)->tuple[int,int,bytes]:
         raise ProofError("PPM pixel length mismatch")
     return width,height,pixels
 
+def rgb_digest(width:int,height:int,image:tuple[int,int,bytes])->int:
+    """Same FNV-1a over canonical RGB that the guest computes over its source.
+
+    Computed from the real screenshot, never from the pattern, so a corrupted
+    transfer or wrong stride/channel order cannot produce a matching digest.
+    """
+    shot_width,shot_height,rgb=image
+    if width>shot_width or height>shot_height:
+        raise ProofError(f"Digest region {width}x{height} exceeds {shot_width}x{shot_height}")
+    value=0x811C9DC5
+    for y in range(height):
+        for x in range(width):
+            at=(y*shot_width+x)*3
+            for byte in rgb[at:at+3]:
+                value^=byte
+                value=(value*0x01000193)&0xFFFFFFFF
+    return value
+
 def expected_rgb(x:int,y:int)->tuple[int,int,int]:
     start=(y*64+x)*4
     vals=[]
@@ -277,6 +349,19 @@ def expected_rgb(x:int,y:int)->tuple[int,int,int]:
         vals.append(((page*37+at*17+1)%251)+1)
     # VirtIO B8G8R8X8_UNORM: backing B,G,R,X -> QMP RGB PPM.
     return vals[2],vals[1],vals[0]
+
+def pattern_digest(width:int,height:int)->int:
+    """Digest of the guest's deterministic pattern in canonical RGB order.
+
+    Known offline, so a serial log cannot claim an arbitrary digest.
+    """
+    value=0x811C9DC5
+    for y in range(height):
+        for x in range(width):
+            for byte in expected_rgb(x,y):
+                value^=byte
+                value=(value*0x01000193)&0xFFFFFFFF
+    return value
 
 def verify_active(image:tuple[int,int,bytes])->None:
     width,height,rgb=image
@@ -432,6 +517,51 @@ def run(iso:Path, reset_restore:bool=False, native_rollback:bool=False)->int:
                                         verify_restored(images["baseline"],images["active"],
                                                         images["disabled"],images["restored"])
                                     ser.sendall(releases[name])
+                                    stages+=1
+                                elif clean.startswith(ATTEST_PREFIX):
+                                    match=ATTEST.fullmatch(clean)
+                                    if match is None:
+                                        raise ProofError(f"Malformed guest attestation: {clean!r}")
+                                    name,width,height,nonce,guest_digest=match.groups()
+                                    width,height=int(width),int(height)
+                                    if name not in ATTEST_STAGES:
+                                        raise ProofError(f"Unattestable stage {name!r}")
+                                    if stages>=len(stages_expected) or name!=stages_expected[stages]:
+                                        raise ProofError(f"Unexpected attestation stage {name}")
+                                    want_width,want_height,want_nonce=ATTEST_STAGES[name]
+                                    if (width,height)!=(want_width,want_height):
+                                        raise ProofError(
+                                            f"Guest attested geometry {width}x{height}, "
+                                            f"expected {want_width}x{want_height}")
+                                    if int(nonce,16)!=want_nonce:
+                                        raise ProofError(f"Guest stage {name} reused nonce {nonce}")
+                                    target=root/(name+".ppm")
+                                    qmp_call(qmp,qmp_reader,"screendump",{"filename":str(target)})
+                                    images[name]=ppm(target)
+                                    if name=="active":
+                                        verify_active(images[name])
+                                    elif name=="reduced":
+                                        verify_reduced(images[name])
+                                    else:
+                                        verify_reexpanded(images["active"],images[name])
+                                    digest=rgb_digest(width,height,images[name])
+                                    claimed=int(guest_digest,16)
+                                    if not ATTEST_FAULT and digest!=claimed:
+                                        raise ProofError(
+                                            f"Host digest {digest:08x} != guest source "
+                                            f"{claimed:08x} at {width}x{height}: "
+                                            "the scanout does not show the source pixels")
+                                    if ATTEST_FAULT=="digest":
+                                        digest^=0x0100
+                                    elif ATTEST_FAULT=="nonce":
+                                        nonce=f"{int(nonce,16)+1:016x}"
+                                    elif ATTEST_FAULT=="geometry":
+                                        # Both staged geometries are square, so a
+                                        # transpose would be invisible.
+                                        width,height=width+1,height
+                                    ser.sendall(
+                                        f"{ATTEST_TOKENS[name].decode()} {width}x{height} "
+                                        f"{nonce} {digest:08x}\n".encode("ascii"))
                                     stages+=1
                         if proc.poll() is not None and not chunk:
                             break

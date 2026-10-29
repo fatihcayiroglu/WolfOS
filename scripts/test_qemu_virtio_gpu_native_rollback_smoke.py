@@ -10,14 +10,21 @@ from test_qemu_virtio_gpu_scanout_live_smoke import (
     CAPTURE1,CAPTURE2,TEXT,image,
 )
 
-REDUCED=PREFIX+"reduced"
-REEXPANDED=PREFIX+"reexpanded"
 REFUSED=PREFIX+"refused"
 RESTORED=PREFIX+"restored"
+# The three applied scanouts are challenged with a nonce and the guest's own
+# source digest; only these lines may create host-verified catalog entries.
+ACTIVE_ATTEST=("WOLFOS_GPU_STAGE_ATTEST stage=active geometry=64x64 "
+               "nonce=0000574f41540001 source_digest=171cbca5")
+REDUCED_ATTEST=("WOLFOS_GPU_STAGE_ATTEST stage=reduced geometry=32x32 "
+                "nonce=0000574f41520002 source_digest=53ec77a5")
+REEXPANDED_ATTEST=("WOLFOS_GPU_STAGE_ATTEST stage=reexpanded geometry=64x64 "
+                   "nonce=0000574f41580003 source_digest=171cbca5")
 # Matches the offline EDID fixture (modes=1), so the host can cross-check that
 # every advertised connector mode was refused.
 CATALOG=(
     "WOLFOS_DISPLAY_CATALOG_OK generation=1 entries=3 selectable=2 "
+    "attested=3 unattested=0 "
     "device_reported=1 device_width=1920 device_height=1080 "
     "automatic_width=64 automatic_height=64 automatic_refresh=unavailable "
     "automatic_change_required=0 manual_32x32=accepted "
@@ -32,7 +39,8 @@ CATALOG=(
 )
 NATIVE_TEXT=TEXT.replace(
     CAPTURE1+"\n",
-    CAPTURE1+"\n"+REDUCED+"\n"+REEXPANDED+"\n"+CATALOG+"\n"+REFUSED+"\n"
+    ACTIVE_ATTEST+"\n"+REDUCED_ATTEST+"\n"+REEXPANDED_ATTEST+"\n"
+    +CATALOG+"\n"+REFUSED+"\n"
 ).replace(
     CAPTURE2+"\n",CAPTURE2+"\n"+RESTORED+"\n"
 ).replace(MARKER,NATIVE_MARKER)
@@ -53,15 +61,15 @@ class NativeRollbackTests(unittest.TestCase):
 
     def test_missing_duplicate_swapped_and_fake_markers_fail(self):
         for broken in (
-            NATIVE_TEXT.replace(REDUCED+"\n",""),
-            NATIVE_TEXT.replace(REEXPANDED+"\n",""),
+            NATIVE_TEXT.replace(REDUCED_ATTEST+"\n",""),
+            NATIVE_TEXT.replace(REEXPANDED_ATTEST+"\n",""),
             NATIVE_TEXT.replace(REFUSED+"\n",""),
             NATIVE_TEXT.replace(RESTORED+"\n",""),
-            NATIVE_TEXT+"\n"+REDUCED,
-            NATIVE_TEXT.replace(REDUCED+"\n"+REEXPANDED,
-                                REEXPANDED+"\n"+REDUCED),
-            NATIVE_TEXT.replace(REEXPANDED+"\n"+CATALOG,
-                                CATALOG+"\n"+REEXPANDED),
+            NATIVE_TEXT+"\n"+REDUCED_ATTEST,
+            NATIVE_TEXT.replace(REDUCED_ATTEST+"\n"+REEXPANDED_ATTEST,
+                                REEXPANDED_ATTEST+"\n"+REDUCED_ATTEST),
+            NATIVE_TEXT.replace(REEXPANDED_ATTEST+"\n"+CATALOG,
+                                CATALOG+"\n"+REEXPANDED_ATTEST),
             NATIVE_TEXT.replace(CATALOG+"\n"+REFUSED,REFUSED+"\n"+CATALOG),
             NATIVE_TEXT.replace(NATIVE_MARKER,MARKER),
             NATIVE_TEXT+"\n"+MARKER,
@@ -70,6 +78,56 @@ class NativeRollbackTests(unittest.TestCase):
         ):
             with self.subTest(input=broken[:80]):
                 self.assertFalse(validate_serial(broken,native_rollback=True))
+
+    def test_attestation_nonce_geometry_and_digest_are_mandatory(self):
+        # Replayed, missing, misordered or weakened challenges never attest, so
+        # the catalog cannot claim a host-verified mode from any of them.
+        for broken in (
+            # The same nonce reused for a second stage is a replay.
+            NATIVE_TEXT.replace(
+                REDUCED_ATTEST,
+                REDUCED_ATTEST.replace("0000574f41520002","0000574f41540001")),
+            # A stage name that was never challenged.
+            NATIVE_TEXT.replace(
+                REEXPANDED_ATTEST,
+                REEXPANDED_ATTEST.replace("stage=reexpanded","stage=refused")),
+            # Geometry the driver never applied.
+            NATIVE_TEXT.replace(
+                ACTIVE_ATTEST,
+                ACTIVE_ATTEST.replace("geometry=64x64","geometry=1280x800")),
+            # Digest that is not even hex, and one that is not ours.
+            NATIVE_TEXT.replace(
+                ACTIVE_ATTEST,
+                ACTIVE_ATTEST.replace("171cbca5","zzzzzzzz")),
+            NATIVE_TEXT.replace(
+                REDUCED_ATTEST,
+                REDUCED_ATTEST.replace("53ec77a5","53ec77a6")),
+            # Malformed, truncated and duplicate attestations.
+            NATIVE_TEXT.replace(ACTIVE_ATTEST,ACTIVE_ATTEST[:40]),
+            NATIVE_TEXT+"\n"+ACTIVE_ATTEST,
+            # An explicit refusal must never be followed by a success claim.
+            NATIVE_TEXT+"\nWOLFOS_GPU_ATTEST_FAIL stage=active "
+            "reason=digest_mismatch bytes=34 source_digest=171cbca5",
+        ):
+            with self.subTest(input=broken[:80]):
+                self.assertFalse(validate_serial(broken,native_rollback=True))
+        # The unmodified positive fixture is still accepted.
+        self.assertTrue(validate_serial(NATIVE_TEXT,native_rollback=True))
+
+    def test_catalog_requires_every_attestation(self):
+        for old,new in (
+            ("attested=3","attested=2"),
+            ("attested=3","attested=0"),
+            ("unattested=0","unattested=1"),
+        ):
+            with self.subTest(field=old):
+                altered=CATALOG.replace(old,new)
+                self.assertFalse(validate_serial(
+                    NATIVE_TEXT.replace(CATALOG,altered),native_rollback=True))
+        # Dropping a challenge while still claiming three attested scanouts is
+        # exactly the fabricated evidence this channel exists to forbid.
+        self.assertFalse(validate_serial(
+            NATIVE_TEXT.replace(REDUCED_ATTEST+"\n",""),native_rollback=True))
 
     def test_catalog_evidence_is_mandatory_and_uniquely_positioned(self):
         # No catalog proof at all: the native rollback alone is not enough.
