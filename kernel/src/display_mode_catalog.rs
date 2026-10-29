@@ -11,6 +11,11 @@
 //! stays `RefreshEvidence::Unavailable` instead of being presented as a
 //! supported refresh rate.
 //!
+//! `ModeEntry::proof` is private and `Attestation` has no public constructor,
+//! so code outside this module can only express `DeviceReportedConfigured`
+//! entries. A host-verified claim cannot be written down by a driver even by
+//! mistake: it can only be the result of `decode_attestation_reply`.
+//!
 //! The graphical settings consumer is not wired into the boot path yet, so
 //! these entry points are currently exercised by the host unit tests and the
 //! QEMU native-rollback scenario only; dead-code warnings would otherwise
@@ -50,7 +55,9 @@ pub struct ModeEntry {
     pub scanout: u8,
     pub width: u32,
     pub height: u32,
-    pub proof: ScanoutProof,
+    /// Private on purpose. See the module docs: only a host attestation may
+    /// produce `HostVerifiedApplied`.
+    proof: ScanoutProof,
     pub refresh: RefreshEvidence,
 }
 
@@ -62,6 +69,22 @@ impl ModeEntry {
         proof: ScanoutProof::DeviceReportedConfigured,
         refresh: RefreshEvidence::Unavailable,
     };
+
+    /// The only entry a device or EDID reading may produce. Never selectable.
+    pub const fn device_reported(
+        scanout: u8,
+        width: u32,
+        height: u32,
+        refresh: RefreshEvidence,
+    ) -> Self {
+        Self {
+            scanout,
+            width,
+            height,
+            proof: ScanoutProof::DeviceReportedConfigured,
+            refresh,
+        }
+    }
 
     pub const fn selectable(self) -> bool {
         matches!(self.proof, ScanoutProof::HostVerifiedApplied)
@@ -84,9 +107,15 @@ impl ModeEntry {
     }
 
     pub const fn refresh_label(self) -> &'static str {
-        match self.refresh {
-            RefreshEvidence::Unavailable => "unavailable",
-            RefreshEvidence::VerifiedMilliHz(_) => "verified",
+        self.refresh.label()
+    }
+}
+
+impl RefreshEvidence {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::VerifiedMilliHz(_) => "verified",
         }
     }
 }
@@ -443,15 +472,34 @@ impl AttestationError {
 }
 
 /// Evidence that a host capture really matched this exact scanout.
+///
+/// Fields stay private: `decode_attestation_reply` is the only producer, so a
+/// driver cannot fabricate the evidence that makes a mode selectable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attestation {
-    pub nonce: u64,
-    pub width: u32,
-    pub height: u32,
-    pub digest: u32,
+    nonce: u64,
+    width: u32,
+    height: u32,
+    digest: u32,
 }
 
 impl Attestation {
+    pub const fn nonce(self) -> u64 {
+        self.nonce
+    }
+
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+
+    pub const fn digest(self) -> u32 {
+        self.digest
+    }
+
     pub const fn entry(self, scanout: u8) -> ModeEntry {
         ModeEntry {
             scanout,
@@ -613,6 +661,142 @@ pub fn decode_attestation_reply(
         width,
         height,
         digest: got_digest,
+    })
+}
+
+/// Stable summary of the attested-desktop selection proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DesktopSelection {
+    pub width: u32,
+    pub height: u32,
+    pub entries: usize,
+    pub selectable: usize,
+    pub device_reported: usize,
+    /// How the device's own `GET_DISPLAY_INFO` claim was handled.
+    pub device_claim: &'static str,
+    pub refresh: RefreshEvidence,
+}
+
+/// The catalog's own transaction token for "this mode is already applied".
+pub const APPLIED_CHANGE_TOKEN: u64 = 0x574f_4c46_4d4f_4446;
+
+fn exact_geometry(width: u32, height: u32) -> UserChoice {
+    UserChoice {
+        resolution: ResolutionChoice::Exact { width, height },
+        refresh: RefreshChoice::Automatic,
+    }
+}
+
+/// Turns ONE accepted host attestation into the catalog's automatic choice and
+/// re-proves, every boot, the refusals that keep unproven modes out of the
+/// settings UI.
+///
+/// Production ordering: attest first, catalog second. Nothing here can be
+/// called with a driver-asserted geometry because `Attestation` has no public
+/// constructor, and device/EDID data only enters through
+/// `ModeEntry::device_reported`, which is never selectable. A rejected
+/// attestation therefore leaves the catalog empty and automatic selection
+/// fails closed instead of silently falling back to a claimed mode.
+pub fn prove_desktop_selection(
+    generation: u64,
+    scanout: u8,
+    attestation: Attestation,
+    device: Option<(u32, u32)>,
+    edid_rate_millihz: u32,
+) -> Result<DesktopSelection, &'static str> {
+    // Without a real monitor rate the EDID-refusal proof would be vacuous.
+    if edid_rate_millihz == 0 {
+        return Err("missing_edid_rate");
+    }
+    let mut modes = ModeCatalog::new(generation).map_err(|_| "catalog_generation")?;
+    let attested = attestation.entry(scanout);
+    modes
+        .record(attested)
+        .map_err(|_| "catalog_record_attested")?;
+    // An unattested catalog must remain non-selectable. This is checked against
+    // a fresh catalog so it cannot be satisfied by the entry above.
+    let empty = ModeCatalog::new(generation).map_err(|_| "catalog_generation")?;
+    if empty.choose(generation, UserChoice::AUTOMATIC) != Err(CatalogError::NoSelectableMode) {
+        return Err("catalog_selectable_without_attestation");
+    }
+    let mut device_reported = 0usize;
+    let mut device_claim = "not_present";
+    if let Some((width, height)) = device {
+        let claim = ModeEntry::device_reported(scanout, width, height, RefreshEvidence::Unavailable);
+        if (width, height) == (attested.width, attested.height) {
+            // A weaker claim for an already proven geometry must never
+            // downgrade it, and needs no separate entry.
+            if modes.record(claim) != Err(CatalogError::ConflictingProof) {
+                return Err("catalog_device_downgraded_proven_mode");
+            }
+            device_claim = "refused:conflicting_proof";
+        } else {
+            modes.record(claim).map_err(|_| "catalog_record_device")?;
+            device_reported += 1;
+            // However large the claimed area is, it must never be selectable.
+            if modes.choose(generation, exact_geometry(width, height))
+                != Err(CatalogError::UnprovenGpuTiming)
+            {
+                return Err("catalog_device_reported_accepted");
+            }
+            device_claim = "rejected:unproven_gpu_timing";
+        }
+    }
+    let automatic = modes
+        .choose(generation, UserChoice::AUTOMATIC)
+        .map_err(|_| "catalog_automatic")?;
+    if automatic != attested {
+        return Err("catalog_automatic_not_attested");
+    }
+    if automatic.refresh != RefreshEvidence::Unavailable {
+        return Err("catalog_invented_refresh");
+    }
+    if modes
+        .choose(generation, exact_geometry(attested.width, attested.height))
+        .map_err(|_| "catalog_manual_attested")?
+        != attested
+    {
+        return Err("catalog_manual_geometry");
+    }
+    // A monitor's EDID rate is not a programmable GPU rate, for the exact
+    // geometry as much as for automatic selection.
+    for choice in [
+        UserChoice {
+            resolution: ResolutionChoice::Exact {
+                width: attested.width,
+                height: attested.height,
+            },
+            refresh: RefreshChoice::ExactMilliHz(edid_rate_millihz),
+        },
+        UserChoice {
+            resolution: ResolutionChoice::Automatic,
+            refresh: RefreshChoice::ExactMilliHz(edid_rate_millihz),
+        },
+    ] {
+        if modes.choose(generation, choice) != Err(CatalogError::RefreshNotProgrammable) {
+            return Err("catalog_edid_refresh_accepted");
+        }
+    }
+    // The attested geometry is already applied, so a change request must not
+    // open a rollback window for a switch that never happens.
+    if modes.plan_change(
+        generation,
+        attested,
+        UserChoice::AUTOMATIC,
+        APPLIED_CHANGE_TOKEN,
+        1_000,
+    ) != Ok(None)
+    {
+        return Err("catalog_attested_change_not_noop");
+    }
+    Ok(DesktopSelection {
+        width: attested.width,
+        height: attested.height,
+        entries: modes.entries().len(),
+        selectable: modes.selectable_count(),
+        device_reported,
+        device_claim,
+        refresh: automatic.refresh,
     })
 }
 
@@ -1020,13 +1204,12 @@ mod tests {
         // attestation path, and an unattested catalog stays non-selectable.
         let mut claimed = ModeCatalog::new(1).unwrap();
         claimed
-            .record(ModeEntry {
-                scanout: 0,
-                width: 64,
-                height: 64,
-                proof: ScanoutProof::DeviceReportedConfigured,
-                refresh: RefreshEvidence::Unavailable,
-            })
+            .record(ModeEntry::device_reported(
+                0,
+                64,
+                64,
+                RefreshEvidence::Unavailable,
+            ))
             .unwrap();
         assert_eq!(claimed.selectable_count(), 0);
         assert_eq!(claimed.choose(1, UserChoice::AUTOMATIC), Err(CatalogError::NoSelectableMode));
@@ -1037,5 +1220,125 @@ mod tests {
         claimed.record(attested.entry(0)).unwrap();
         assert_eq!(claimed.selectable_count(), 1);
         assert_eq!(claimed.choose(1, UserChoice::AUTOMATIC), Ok(APPLIED_64));
+    }
+
+    // ---- attested desktop selection ---------------------------------------
+
+    const DESKTOP_ATTESTATION: Attestation = Attestation {
+        nonce: 0x574f_4445_534b_0004,
+        width: 1024,
+        height: 768,
+        digest: 0x0b6b_1dc5,
+    };
+    /// The rate QEMU's real EDID advertises; monitor data, never selectable.
+    const EDID_MILLIHZ: u32 = 74_994;
+
+    #[test]
+    fn attested_desktop_becomes_the_automatic_choice() {
+        let selection = prove_desktop_selection(
+            1,
+            0,
+            DESKTOP_ATTESTATION,
+            Some((1280, 800)),
+            EDID_MILLIHZ,
+        )
+        .unwrap();
+        assert_eq!((selection.width, selection.height), (1024, 768));
+        assert_eq!(selection.entries, 2);
+        assert_eq!(selection.selectable, 1);
+        assert_eq!(selection.device_reported, 1);
+        assert_eq!(selection.device_claim, "rejected:unproven_gpu_timing");
+        assert_eq!(selection.refresh, RefreshEvidence::Unavailable);
+        assert_eq!(selection.refresh.label(), "unavailable");
+        // The entry itself carries no invented clock either.
+        assert_eq!(DESKTOP_ATTESTATION.entry(0).refresh_label(), "unavailable");
+        assert_eq!(DESKTOP_ATTESTATION.width(), 1024);
+        assert_eq!(DESKTOP_ATTESTATION.height(), 768);
+        assert_eq!(DESKTOP_ATTESTATION.nonce(), 0x574f_4445_534b_0004);
+        assert_eq!(DESKTOP_ATTESTATION.digest(), 0x0b6b_1dc5);
+    }
+
+    #[test]
+    fn a_smaller_attested_geometry_still_beats_a_larger_device_claim() {
+        let small = Attestation { width: 64, height: 64, ..DESKTOP_ATTESTATION };
+        let selection =
+            prove_desktop_selection(1, 0, small, Some((1280, 800)), EDID_MILLIHZ).unwrap();
+        assert_eq!((selection.width, selection.height), (64, 64));
+        assert_eq!(selection.selectable, 1);
+        assert_eq!(selection.device_reported, 1);
+    }
+
+    #[test]
+    fn device_claim_for_the_attested_geometry_cannot_downgrade_it() {
+        let selection = prove_desktop_selection(
+            1,
+            0,
+            DESKTOP_ATTESTATION,
+            Some((1024, 768)),
+            EDID_MILLIHZ,
+        )
+        .unwrap();
+        assert_eq!((selection.width, selection.height), (1024, 768));
+        assert_eq!(selection.entries, 1);
+        assert_eq!(selection.selectable, 1);
+        assert_eq!(selection.device_reported, 0);
+        assert_eq!(selection.device_claim, "refused:conflicting_proof");
+    }
+
+    #[test]
+    fn attested_desktop_without_a_device_claim_still_proves_the_refusals() {
+        let selection =
+            prove_desktop_selection(1, 0, DESKTOP_ATTESTATION, None, EDID_MILLIHZ).unwrap();
+        assert_eq!(selection.entries, 1);
+        assert_eq!(selection.selectable, 1);
+        assert_eq!(selection.device_claim, "not_present");
+    }
+
+    #[test]
+    fn unusable_evidence_never_produces_a_desktop_selection() {
+        for (generation, attestation, rate, expected) in [
+            (0, DESKTOP_ATTESTATION, EDID_MILLIHZ, "catalog_generation"),
+            (1, DESKTOP_ATTESTATION, 0, "missing_edid_rate"),
+            (
+                1,
+                Attestation { width: 0, ..DESKTOP_ATTESTATION },
+                EDID_MILLIHZ,
+                "catalog_record_attested",
+            ),
+            (
+                1,
+                Attestation { height: 0, ..DESKTOP_ATTESTATION },
+                EDID_MILLIHZ,
+                "catalog_record_attested",
+            ),
+            (
+                1,
+                Attestation { width: 70_000, height: 70_000, ..DESKTOP_ATTESTATION },
+                EDID_MILLIHZ,
+                "catalog_record_attested",
+            ),
+        ] {
+            assert_eq!(
+                prove_desktop_selection(generation, 0, attestation, Some((1280, 800)), rate),
+                Err(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn device_reported_constructor_is_never_selectable() {
+        let claim = ModeEntry::device_reported(0, 1024, 768, RefreshEvidence::Unavailable);
+        assert!(!claim.selectable());
+        assert_eq!(claim.refresh_label(), "unavailable");
+        let mut modes = ModeCatalog::new(4).unwrap();
+        modes.record(claim).unwrap();
+        assert_eq!(modes.selectable_count(), 0);
+        assert_eq!(modes.choose(4, UserChoice::AUTOMATIC), Err(CatalogError::NoSelectableMode));
+        assert_eq!(modes.choose(4, exact(1024, 768)), Err(CatalogError::UnprovenGpuTiming));
+        // Only an accepted attestation turns the same geometry selectable.
+        modes
+            .record(Attestation { width: 1024, height: 768, ..DESKTOP_ATTESTATION }.entry(0))
+            .unwrap();
+        assert_eq!(modes.selectable_count(), 1);
     }
 }

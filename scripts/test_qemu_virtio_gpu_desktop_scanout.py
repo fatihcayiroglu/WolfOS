@@ -36,8 +36,15 @@ MARK = ("WOLFOS_VIRTIO_GPU_DESKTOP_SCANOUT_OK resource_id=1 width=1024 "
         "guest_copy_verified=1 host_pixels_verified_by_kernel=0 capture_acks=1 "
         "reset_to_vga_ack=1 reset=0 queue_disabled=1 frames_allocated=773 "
         "frames_released=773 pmm_leak=0 qemu_only=1")
+CATALOG = ("WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK generation=1 entries=2 "
+           "selectable=1 attested=1 device_reported=1 device_width=1280 "
+           "device_height=800 selected=1024x768 selected_refresh=unavailable "
+           "device_claim=rejected:unproven_gpu_timing edid_millihz=74994 "
+           "edid_hz_request=rejected:refresh_not_programmable "
+           "applied_change_plan=none "
+           "unattested_catalog=rejected:no_selectable_mode gpu_commands_sent=0")
 ACK = "WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
-TEXT = "\n".join((ATTEST, CAPTURE, DISPLAY, EDID, MARK,
+TEXT = "\n".join((ATTEST, CATALOG, CAPTURE, DISPLAY, EDID, MARK,
                   "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
                   "WOLFOS_FRAMEBUFFER_OK 1024x768"))
 
@@ -169,6 +176,80 @@ class DesktopSerialTests(unittest.TestCase):
         for index, candidate in enumerate(broken):
             with self.subTest(case=index):
                 self.assertFalse(validate_desktop_serial(candidate))
+
+    def test_catalog_proof_is_required_exact_and_consistent(self):
+        broken = (
+            TEXT.replace(CATALOG, ""),
+            TEXT + "\n" + CATALOG,
+            TEXT.replace("attested=1", "attested=0"),
+            TEXT.replace("selectable=1 ", "selectable=0 "),
+            TEXT.replace("selected=1024x768", "selected=1280x800"),
+            TEXT.replace("selected_refresh=unavailable",
+                         "selected_refresh=verified"),
+            TEXT.replace(" entries=2 ", " entries=3 "),
+            TEXT.replace(" entries=2 ", " entries=1 "),
+            TEXT.replace("device_reported=1", "device_reported=0"),
+            TEXT.replace("device_claim=rejected:unproven_gpu_timing",
+                         "device_claim=accepted"),
+            TEXT.replace("device_claim=rejected:unproven_gpu_timing",
+                         "device_claim=refused:conflicting_proof"),
+            TEXT.replace("edid_hz_request=rejected:refresh_not_programmable",
+                         "edid_hz_request=accepted"),
+            TEXT.replace("applied_change_plan=none", "applied_change_plan=some"),
+            TEXT.replace("unattested_catalog=rejected:no_selectable_mode",
+                         "unattested_catalog=selectable"),
+            TEXT.replace("gpu_commands_sent=0", "gpu_commands_sent=21"),
+            TEXT.replace("generation=1 entries=2", "generation=2 entries=2"),
+            TEXT.replace("edid_millihz=74994", "edid_millihz=60000"),
+            TEXT.replace("device_width=1280", "device_width=1024"),
+            TEXT.replace("device_height=800", "device_height=768"),
+            TEXT + "\nWOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL stage=attest_reply "
+                   "entries=0 selectable=0 mode=no_selectable_mode",
+        )
+        for index, candidate in enumerate(broken):
+            with self.subTest(case=index):
+                self.assertFalse(validate_desktop_serial(candidate))
+
+    def test_catalog_proof_must_follow_the_attestation(self):
+        broken = (
+            "\n".join((CATALOG, ATTEST, CAPTURE, DISPLAY, EDID, MARK,
+                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
+                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
+            "\n".join((ATTEST, CAPTURE, DISPLAY, EDID, CATALOG, MARK,
+                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
+                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
+            "\n".join((ATTEST, DISPLAY, EDID, MARK, CATALOG,
+                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
+                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
+        )
+        for index, candidate in enumerate(broken):
+            with self.subTest(case=index):
+                self.assertFalse(validate_desktop_serial(candidate))
+
+    def test_device_geometry_equal_to_the_attested_one_is_consistent(self):
+        # QEMU's default VGA mode may already be 1024x768. Then the device claim
+        # collides with the proven geometry: no second entry, and the weaker
+        # claim must be refused rather than downgrading it.
+        display = (DISPLAY.replace("width=1280", "width=1024")
+                   .replace("height=800", "height=768"))
+        catalog = (CATALOG.replace(" entries=2 ", " entries=1 ")
+                   .replace("device_reported=1", "device_reported=0")
+                   .replace("device_claim=rejected:unproven_gpu_timing",
+                            "device_claim=refused:conflicting_proof")
+                   .replace("device_width=1280", "device_width=1024")
+                   .replace("device_height=800", "device_height=768"))
+        self.assertTrue(validate_desktop_serial(
+            "\n".join((ATTEST, catalog, CAPTURE, display, EDID, MARK,
+                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
+                       "WOLFOS_FRAMEBUFFER_OK 1024x768"))))
+        # ... but the pair must stay consistent: reported=0 with two entries,
+        # or a conflicting claim, is not an acceptable mailing of the same run.
+        self.assertFalse(validate_desktop_serial(
+            "\n".join((ATTEST,
+                       catalog.replace(" entries=1 ", " entries=2 "),
+                       CAPTURE, display, EDID, MARK,
+                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
+                       "WOLFOS_FRAMEBUFFER_OK 1024x768"))))
 
     def test_geometry_and_nonce_constants_match_the_kernel(self):
         self.assertEqual((WIDTH, HEIGHT, PIXELS), (1024, 768, 786432))

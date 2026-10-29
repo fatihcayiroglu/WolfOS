@@ -352,6 +352,11 @@ fn await_host_attestation(
 
 #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
 const DESKTOP_NONCE:u64=0x574f_4445_534b_0004;
+/// Connector generation for the desktop catalog proof. One synthetic
+/// generation: this driver performs no hotplug re-read yet, so a stale
+/// generation must never be treated as current.
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+const DESKTOP_GENERATION:u64=1;
 
 /// Present the kernel's REAL 1024x768 Limine framebuffer as the native
 /// scanout resource, then require host pixel proof before claiming anything.
@@ -364,7 +369,8 @@ const DESKTOP_NONCE:u64=0x574f_4445_534b_0004;
 fn present_desktop(
     vas:&[u64;FRAMES],frames:&[u64;FRAMES],notify_port:u64,selected:u16,
     fb:&crate::virtio_gpu_desktop_wire::Framebuffer,
-)->Result<crate::virtio_gpu_desktop_wire::AttachPlan,&'static str>{
+)->Result<(crate::virtio_gpu_desktop_wire::AttachPlan,
+           crate::display_mode_catalog::Attestation),&'static str>{
     use crate::virtio_gpu_desktop_wire as desk;
     const CREATE_FENCE:u64=0x574f_4c46_4444_4352;
     const ATTACH_FENCE:u64=0x574f_4c46_4444_4154;
@@ -455,8 +461,8 @@ fn present_desktop(
     let attestation=await_host_attestation(
         b'P',DESKTOP_NONCE,desk::WIDTH,desk::HEIGHT,digest
     )?;
-    if attestation.width!=desk::WIDTH||attestation.height!=desk::HEIGHT||
-        attestation.nonce!=DESKTOP_NONCE||attestation.digest!=digest{
+    if attestation.width()!=desk::WIDTH||attestation.height()!=desk::HEIGHT||
+        attestation.nonce()!=DESKTOP_NONCE||attestation.digest()!=digest{
         return Err("attestation_binding");
     }
     // Bounded teardown of exactly this resource. The caller still resets the
@@ -470,7 +476,9 @@ fn present_desktop(
     let unref=desk::unref(UNREF_FENCE).map_err(|_|"unref_wire")?;
     send_resource_command(vas,frames,notify_port,selected,9+desk::BANDS as u16,
         &unref,UNREF_FENCE)?;
-    Ok(plan)
+    // The accepted attestation travels with the plan: the caller may record it
+    // in the mode catalog, but nothing here may claim a mode on its own.
+    Ok((plan,attestation))
 }
 
 #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
@@ -479,7 +487,7 @@ fn verify_mode_catalog(
     attestations:&[Option<crate::display_mode_catalog::Attestation>;3],
 )->Result<(),&'static str>{
     use crate::display_mode_catalog::{
-        CatalogError,ModeCatalog,ModeEntry,RefreshEvidence,ScanoutProof,
+        CatalogError,ModeCatalog,ModeEntry,RefreshEvidence,
     };
     const GENERATION:u64=1;
     const TOKEN:u64=0x574f_4c46_4d4f_4445;
@@ -521,9 +529,9 @@ fn verify_mode_catalog(
         }
     }
     // GET_DISPLAY_INFO's own claim is recorded but stays non-selectable.
-    modes.record(ModeEntry{scanout:0,width:facts.device_width,
-        height:facts.device_height,proof:ScanoutProof::DeviceReportedConfigured,
-        refresh:RefreshEvidence::Unavailable}).map_err(|_|"catalog_record_device")?;
+    modes.record(ModeEntry::device_reported(0,facts.device_width,
+        facts.device_height,RefreshEvidence::Unavailable))
+        .map_err(|_|"catalog_record_device")?;
     let automatic=modes.choose(GENERATION,mode_policy::UserChoice::AUTOMATIC)
         .map_err(|_|"catalog_automatic")?;
     if automatic.width!=64||automatic.height!=64{
@@ -1006,6 +1014,8 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     let mut resource_done=false;
     #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
     let mut desktop_entries=0usize;
+    #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+    let mut desktop_catalog=false;
     if zeroed{
         // Wire layout is 16-byte LE descriptors and a bare 24-byte GPU
         // header; available ring flags=0, head[0]=0, then idx=1.
@@ -1153,10 +1163,37 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                             };
                             #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
                             let outcome={
-                                let _=facts;
-                                present_desktop(
-                                    &vas,&frames,port,layout.selected,fb
-                                ).map(|plan|{desktop_entries=plan.entries;})
+                                present_desktop(&vas,&frames,port,layout.selected,fb)
+                                    .and_then(|(plan,attestation)|{
+                                        desktop_entries=plan.entries;
+                                        // Attest first, catalog second. The only
+                                        // path to a selectable desktop mode runs
+                                        // through the host's own pixel proof, and
+                                        // the device/EDID data below can never
+                                        // authorize a switch.
+                                        let selection=
+                                            crate::display_mode_catalog::prove_desktop_selection(
+                                                DESKTOP_GENERATION,0,attestation,
+                                                Some((facts.device_width,facts.device_height)),
+                                                facts.edid_refresh_millihz,
+                                            )?;
+                                        desktop_catalog=true;
+                                        serial::write_fmt(format_args!(
+                                            "WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK generation={} entries={} selectable={} attested=1 device_reported={} device_width={} device_height={} selected={}x{} selected_refresh={} device_claim={} edid_millihz={} edid_hz_request=rejected:{} applied_change_plan=none unattested_catalog=rejected:{} gpu_commands_sent=0\n",
+                                            DESKTOP_GENERATION,selection.entries,
+                                            selection.selectable,selection.device_reported,
+                                            facts.device_width,facts.device_height,
+                                            selection.width,selection.height,
+                                            selection.refresh.label(),
+                                            selection.device_claim,
+                                            facts.edid_refresh_millihz,
+                                            crate::display_mode_catalog::CatalogError::
+                                                RefreshNotProgrammable.label(),
+                                            crate::display_mode_catalog::CatalogError::
+                                                NoSelectableMode.label()
+                                        ));
+                                        Ok(())
+                                    })
                             };
                             #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
                             let outcome=query_resource2d(
@@ -1166,9 +1203,20 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                                 Ok(())=>resource_done=true,
                                 Err(e)=>{
                                     #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
-                                    serial::write_fmt(format_args!(
-                                        "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL stage={e}\n"
-                                    ));
+                                    {
+                                        // The screen was not proven, so nothing
+                                        // may be selectable: report the empty
+                                        // catalog explicitly instead of leaving
+                                        // the absence of evidence unstated.
+                                        serial::write_fmt(format_args!(
+                                            "WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL stage={e} entries=0 selectable=0 mode={}\n",
+                                            crate::display_mode_catalog::CatalogError::
+                                                NoSelectableMode.label()
+                                        ));
+                                        serial::write_fmt(format_args!(
+                                            "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL stage={e}\n"
+                                        ));
+                                    }
                                     #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
                                     serial::write_fmt(format_args!(
                                         "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL stage={e}\n"
@@ -1316,7 +1364,7 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
         );
     }
     #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
-    if resource_done&&reset_capture_ok{
+    if resource_done&&reset_capture_ok&&desktop_catalog{
         serial::write_fmt(format_args!(
             "WOLFOS_VIRTIO_GPU_DESKTOP_SCANOUT_OK resource_id=1 width=1024 height=768 format=2 create_type=257 attach_type=262 transfer_type=261 set_type=259 flush_type=260 clear_type=259 detach_type=263 unref_type=258 response_type=4352 used_idx=21 used_head=0 used_len=24 fences_verified=19 notify_writes=21 backing_entries={} backing_bytes=3145728 transfer_bands=12 band_rows=64 pixels=786432 guest_copy_verified=1 host_pixels_verified_by_kernel=0 capture_acks=1 reset_to_vga_ack=1 reset=0 queue_disabled=1 frames_allocated={FRAMES} frames_released={FRAMES} pmm_leak=0 qemu_only=1\n",
             desktop_entries

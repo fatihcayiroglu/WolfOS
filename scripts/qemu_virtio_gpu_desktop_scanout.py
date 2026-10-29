@@ -53,7 +53,22 @@ DISPLAY = re.compile(
     r"pmm_leak=0 qemu_only=1")
 EDID = re.compile(
     r"WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size=\d+ modes=\d+ "
-    r"preferred_width=\d+ preferred_height=\d+ refresh_millihz=\d+ .*")
+    r"preferred_width=\d+ preferred_height=\d+ refresh_millihz=(\d+) .*")
+# The attested geometry must become the catalog's automatic choice while the
+# device's own reported geometry and the monitor's EDID rate stay refused.
+CATALOG_PREFIX = "WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK "
+CATALOG_FAIL_PREFIX = "WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL "
+CATALOG = re.compile(
+    r"WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK generation=1 entries=(\d+) "
+    r"selectable=1 attested=1 device_reported=(\d+) device_width=(\d+) "
+    r"device_height=(\d+) selected=1024x768 selected_refresh=unavailable "
+    r"device_claim=(rejected:unproven_gpu_timing|refused:conflicting_proof) "
+    r"edid_millihz=(\d+) edid_hz_request=rejected:refresh_not_programmable "
+    r"applied_change_plan=none unattested_catalog=rejected:no_selectable_mode "
+    r"gpu_commands_sent=0")
+CATALOG_FAIL = re.compile(
+    r"WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL stage=\w+ entries=0 "
+    r"selectable=0 mode=no_selectable_mode")
 TEST_OK = "WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 # Deliberate-fault switch: the host lies about one field so the guest's
 # refusal has to be observable instead of assumed.
@@ -118,6 +133,7 @@ def validate_desktop_serial(output: str) -> bool:
     lines = output.splitlines()
     if any(line.startswith((
         "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL", "WOLFOS_GPU_ATTEST_FAIL",
+        "WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL",
         "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL", "WOLFOS_VIRTIO_GPU_EDID_LIVE_FAIL",
         "WOLFOS_VIRTIO_GPU_SCANOUT_FAIL", "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_FAIL",
         "WOLFOS_FB_TEXT_FAILED",
@@ -145,9 +161,13 @@ def validate_desktop_serial(output: str) -> bool:
         return False
     if (allocated, released) != (773, 773):
         return False
-    edid = [i for i, line in enumerate(lines)
-            if EDID.fullmatch(line)]
-    if len(edid) != 1:
+    edids = [(i, EDID.fullmatch(line)) for i, line in enumerate(lines)
+             if line.startswith("WOLFOS_VIRTIO_GPU_EDID_LIVE_OK ")]
+    if len(edids) != 1 or edids[0][1] is None:
+        return False
+    edid = [edids[0][0]]
+    edid_millihz = int(edids[0][1].group(1))
+    if edid_millihz == 0:
         return False
     attested = [(i, ATTEST.fullmatch(line)) for i, line in enumerate(lines)
                 if line.startswith(ATTEST_PREFIX)]
@@ -165,9 +185,32 @@ def validate_desktop_serial(output: str) -> bool:
     restored_index = lines.index(CAPTURE_PREFIX + "restored")
     # Real device evidence must precede the claim, then present, prove pixels,
     # tear down, reset and re-prove the VGA output.
+    # The catalog proof must sit between the host-owned attestation and the
+    # teardown readback: attest, then catalog, then reset, then claim.
+    catalogs = [(i, CATALOG.fullmatch(line)) for i, line in enumerate(lines)
+                if line.startswith(CATALOG_PREFIX)]
+    if len(catalogs) != 1 or catalogs[0][1] is None:
+        return False
+    catalog_index = catalogs[0][0]
+    entries, reported, dev_w, dev_h, claim, catalog_hz = catalogs[0][1].groups()
+    entries, reported = int(entries), int(reported)
+    dev_w, dev_h, catalog_hz = int(dev_w), int(dev_h), int(catalog_hz)
+    # The catalog may only record the geometry the device itself reported, and
+    # only the EDID rate the device really returned.
+    if (dev_w, dev_h) != (width, height) or catalog_hz != edid_millihz:
+        return False
+    if entries != 1 + reported or reported > 1 or entries > 2:
+        return False
+    if (dev_w, dev_h) == (WIDTH, HEIGHT):
+        # Device agrees with the attested geometry: no second entry, and the
+        # weaker claim must be refused instead of downgrading the proven mode.
+        if reported != 0 or claim != "refused:conflicting_proof":
+            return False
+    elif reported != 1 or claim != "rejected:unproven_gpu_timing":
+        return False
     if not displays[0][0] < edid[0] < marker_index:
         return False
-    if not attested[0][0] < restored_index < marker_index:
+    if not attested[0][0] < catalog_index < restored_index < marker_index:
         return False
     if lines.count(TEST_OK) != 1:
         return False
@@ -302,7 +345,21 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                         for line in output.splitlines()):
                     raise ProofError(
                         f"Guest accepted a forged attestation ({FAULT})")
+                # A refused attestation must leave nothing selectable, and it
+                # must say so rather than merely omitting the claim.
+                if any(line.startswith(CATALOG_PREFIX)
+                       for line in output.splitlines()):
+                    raise ProofError(
+                        f"Forged {FAULT} attestation still produced a "
+                        "selectable mode catalog")
+                refused = [line for line in output.splitlines()
+                           if line.startswith(CATALOG_FAIL_PREFIX)]
+                if len(refused) != 1 or not CATALOG_FAIL.fullmatch(refused[0]):
+                    raise ProofError(
+                        f"Missing or malformed empty-catalog refusal: {refused}")
                 print(f"PASS: guest refused the forged {FAULT} attestation reply")
+                print("PASS: the refused attestation left the mode catalog "
+                      "empty (mode=no_selectable_mode)")
                 return 0
             if proc.returncode != 33:
                 raise ProofError(f"QEMU exit {proc.returncode}, expected 33")
@@ -318,6 +375,9 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                   "request, 12 fenced band transfers, 19 fenced replies")
             print("PASS: after resource teardown and device reset the VGA "
                   "output shows every framebuffer pixel again")
+            print("PASS: the host-attested 1024x768 geometry is the catalog's "
+                  "automatic choice; the device's own claim and the EDID rate "
+                  "are both refused, and refresh stays unproven")
             return 0
         except (ProofError, FileNotFoundError, ConnectionError, OSError,
                 ValueError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
