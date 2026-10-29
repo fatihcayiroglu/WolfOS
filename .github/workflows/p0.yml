@@ -88,6 +88,10 @@ jobs:
         run: make qemu-virtio-gpu-native-rollback-smoke
       - name: Host pixel attestation must refuse a forged digest, nonce or geometry
         run: make qemu-virtio-gpu-attestation-negative
+      - name: Real QEMU 1024x768 desktop: 768 backing pages, 786432 host-verified framebuffer pixels
+        run: make qemu-virtio-gpu-desktop-scanout-smoke
+      - name: Desktop scanout must refuse a forged digest, nonce or geometry
+        run: make qemu-virtio-gpu-desktop-scanout-negative
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke
       - name: Controlled QEMU VGA ENABLE register writes, restored mode and preserved VRAM pixel

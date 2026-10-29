@@ -553,6 +553,7 @@ impl StageChallenge {
             b'A' => "active",
             b'M' => "reduced",
             b'E' => "reexpanded",
+            b'P' => "desktop",
             _ => "unknown",
         }
     }

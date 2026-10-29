@@ -215,8 +215,14 @@ fn send_resource_command(
             *b=unsafe{response_ptr.add(i).read_volatile()};
         }
     }
-    if let Err(e)=resource::validate_completion(
-        next_idx,idx,head,len,&response,request_fence
+    // The upper bound is a flavor constant, so an unexpected completion
+    // index is still refused instead of being accepted as this request.
+    #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+    let max_index=resource::DESKTOP_MAX_INDEX;
+    #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
+    let max_index=resource::PROBE_MAX_INDEX;
+    if let Err(e)=resource::validate_completion_upto(
+        next_idx,max_index,idx,head,len,&response,request_fence
     ) {
         serial::write_fmt(format_args!(
             "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL command_idx={next_idx} used={idx} head={head} len={len} response={e:?}\n"
@@ -306,14 +312,14 @@ fn source_digest(width:u32,height:u32)->Result<u32,&'static str>{
 /// nonce and source digest, then accepts exactly one reply line bound to this
 /// stage. No reply, a replayed nonce, a resized scanout or a differing digest
 /// all fail closed and leave the catalog without host-verified evidence.
-#[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+#[cfg(any(feature="qemu-virtio-gpu-native-rollback-smoke",
+          feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
 fn await_host_attestation(
-    token:u8,nonce:u64,width:u32,height:u32,
+    token:u8,nonce:u64,width:u32,height:u32,digest:u32,
 )->Result<crate::display_mode_catalog::Attestation,&'static str>{
     use crate::display_mode_catalog::{
         StageChallenge,MAX_REPLY_BYTES,decode_attestation_reply,
     };
-    let digest=source_digest(width,height)?;
     let challenge=StageChallenge::new(token,nonce,width,height,digest)
         .map_err(|_|"attest_challenge")?;
     serial::write_fmt(format_args!(
@@ -342,6 +348,129 @@ fn await_host_attestation(
             Err("attest_reply")
         }
     }
+}
+
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+const DESKTOP_NONCE:u64=0x574f_4445_534b_0004;
+
+/// Present the kernel's REAL 1024x768 Limine framebuffer as the native
+/// scanout resource, then require host pixel proof before claiming anything.
+///
+/// This is the first path with production geometry: 3 MiB of real VRAM,
+/// pitch-respecting copy, scatter-gather backing runs and banded transfers.
+/// The host must still answer a nonce-bound digest challenge with the digest
+/// of the pixels it actually captured; the driver never grades itself.
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+fn present_desktop(
+    vas:&[u64;FRAMES],frames:&[u64;FRAMES],notify_port:u64,selected:u16,
+    fb:&crate::virtio_gpu_desktop_wire::Framebuffer,
+)->Result<crate::virtio_gpu_desktop_wire::AttachPlan,&'static str>{
+    use crate::virtio_gpu_desktop_wire as desk;
+    const CREATE_FENCE:u64=0x574f_4c46_4444_4352;
+    const ATTACH_FENCE:u64=0x574f_4c46_4444_4154;
+    const SET_FENCE:u64=0x574f_4c46_4444_5343;
+    const FLUSH_FENCE:u64=0x574f_4c46_4444_464c;
+    const CLEAR_FENCE:u64=0x574f_4c46_4444_434c;
+    const DETACH_FENCE:u64=0x574f_4c46_4444_4454;
+    const UNREF_FENCE:u64=0x574f_4c46_4444_5552;
+    const TRANSFER_BASE:u64=0x574f_4c46_4444_5400;
+    fb.supported().map_err(|_|"framebuffer_layout")?;
+    let mut fences=[0u64;7+desk::BANDS];
+    fences[0]=CREATE_FENCE;fences[1]=ATTACH_FENCE;
+    for (i,slot) in fences[2..2+desk::BANDS].iter_mut().enumerate(){
+        *slot=TRANSFER_BASE+i as u64;
+    }
+    fences[2+desk::BANDS]=SET_FENCE;
+    fences[3+desk::BANDS]=FLUSH_FENCE;
+    fences[4+desk::BANDS]=CLEAR_FENCE;
+    fences[5+desk::BANDS]=DETACH_FENCE;
+    fences[6+desk::BANDS]=UNREF_FENCE;
+    scanout::unique_fences(fences).map_err(|_|"desktop_fence_reused")?;
+    // 1. Paint the deterministic desktop image through the real framebuffer
+    //    pointer, so the presented bytes are genuine VRAM content.
+    let base=fb.address as *mut u8;
+    for y in 0..desk::HEIGHT{
+        let row=fb.pitch as usize*(y as usize);
+        for x in 0..desk::WIDTH{
+            let value=desk::pixel_word(x,y);
+            // SAFETY: supported() proved a 4-aligned 32-bpp 1024x768
+            // framebuffer whose pitch covers every written row inside the
+            // validated mapped extent.
+            unsafe{base.add(row+x as usize*4).cast::<u32>().write_volatile(value);}
+        }
+    }
+    fence(Ordering::SeqCst);
+    // 2. Copy real VRAM rows into the exclusively owned backing pages. The
+    //    resource row stride is exactly one 4 KiB page, so page y holds row y.
+    for y in 0..desk::HEIGHT as usize{
+        let src=unsafe{base.add(fb.pitch as usize*y)};
+        let dst=vas[5+y] as *mut u8;
+        for at in 0..desk::ROW_BYTES{
+            let byte=unsafe{src.add(at).read_volatile()};
+            unsafe{dst.add(at).write_volatile(byte);}
+        }
+    }
+    fence(Ordering::SeqCst);
+    // 3. Digest exactly the bytes the device will read, so the host reply is
+    //    bound to this transfer and not to a stale buffer.
+    let digest=crate::display_mode_catalog::rgb_digest(
+        desk::WIDTH,desk::HEIGHT,
+        &|x,y|{
+            let page=vas[5+y as usize] as *const u8;
+            let at=x as usize*4;
+            // SAFETY: page y is one exclusively owned 4 KiB backing frame and
+            // x*4+2 stays inside its 4096-byte row.
+            unsafe{
+                [page.add(at+2).read_volatile(),page.add(at+1).read_volatile(),
+                 page.add(at).read_volatile()]
+            }
+        },
+    );
+    // The copy must be the intended image, not merely self-consistent.
+    if digest!=crate::display_mode_catalog::rgb_digest(
+        desk::WIDTH,desk::HEIGHT,&desk::pixel_rgb
+    ){
+        return Err("framebuffer_copy_mismatch");
+    }
+    let create=desk::create(CREATE_FENCE).map_err(|_|"create_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,3,
+        &create,CREATE_FENCE)?;
+    let mut request=[0u8;desk::REQUEST_LIMIT];
+    let plan=desk::attach(&frames[5..5+desk::PAGES],&mut request,ATTACH_FENCE)
+        .map_err(|_|"attach_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,4,
+        &request[..plan.len],ATTACH_FENCE)?;
+    for band in 0..desk::BANDS{
+        let command=desk::transfer(band,TRANSFER_BASE+band as u64)
+            .map_err(|_|"transfer_wire")?;
+        send_resource_command(vas,frames,notify_port,selected,5+band as u16,
+            &command,TRANSFER_BASE+band as u64)?;
+    }
+    let set=desk::set_scanout(SET_FENCE).map_err(|_|"scanout_set_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,5+desk::BANDS as u16,
+        &set,SET_FENCE)?;
+    let flush=desk::flush(FLUSH_FENCE).map_err(|_|"scanout_flush_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,6+desk::BANDS as u16,
+        &flush,FLUSH_FENCE)?;
+    let attestation=await_host_attestation(
+        b'P',DESKTOP_NONCE,desk::WIDTH,desk::HEIGHT,digest
+    )?;
+    if attestation.width!=desk::WIDTH||attestation.height!=desk::HEIGHT||
+        attestation.nonce!=DESKTOP_NONCE||attestation.digest!=digest{
+        return Err("attestation_binding");
+    }
+    // Bounded teardown of exactly this resource. The caller still resets the
+    // device before any pinned frame may be freed.
+    let clear=scanout::disable(true,CLEAR_FENCE).map_err(|_|"scanout_disable_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,7+desk::BANDS as u16,
+        &clear.bytes,CLEAR_FENCE)?;
+    let detach=desk::detach(DETACH_FENCE).map_err(|_|"detach_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,8+desk::BANDS as u16,
+        &detach,DETACH_FENCE)?;
+    let unref=desk::unref(UNREF_FENCE).map_err(|_|"unref_wire")?;
+    send_resource_command(vas,frames,notify_port,selected,9+desk::BANDS as u16,
+        &unref,UNREF_FENCE)?;
+    Ok(plan)
 }
 
 #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
@@ -561,7 +690,7 @@ fn query_resource2d(
             #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
             {
                 attestations[0]=Some(await_host_attestation(
-                    b'A',ACTIVE_NONCE,64,64
+                    b'A',ACTIVE_NONCE,64,64,source_digest(64,64)?
                 )?);
             }
             #[cfg(not(feature="qemu-virtio-gpu-native-rollback-smoke"))]
@@ -581,7 +710,7 @@ fn query_resource2d(
                 send_resource_command(vas,frames,notify_port,selected,9,
                     &shrunk_flush.bytes,shrunk_flush.fence)?;
                 attestations[1]=Some(await_host_attestation(
-                    b'M',REDUCED_NONCE,32,32
+                    b'M',REDUCED_NONCE,32,32,source_digest(32,32)?
                 )?);
                 let expand=scanout::set(resource::RESOURCE_ID,true,
                     0,0,64,64,EXPAND_SET_FENCE
@@ -594,7 +723,7 @@ fn query_resource2d(
                 send_resource_command(vas,frames,notify_port,selected,11,
                     &expanded_flush.bytes,expanded_flush.fence)?;
                 attestations[2]=Some(await_host_attestation(
-                    b'E',REEXPANDED_NONCE,64,64
+                    b'E',REEXPANDED_NONCE,64,64,source_digest(64,64)?
                 )?);
                 // Pure-policy catalog evidence: refuses every EDID-only and
                 // device-reported geometry, and must not alter the display.
@@ -650,9 +779,15 @@ fn query_resource2d(
 }
 
 const SLOT:u64=0x0000_4000_0000_b000;
-#[cfg(feature="qemu-virtio-gpu-attach-backing-smoke")]
+// Desktop scanout pins a real 3 MiB resource: 5 controlq pages plus the 768
+// backing pages that hold the framebuffer rows.
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+const FRAMES:usize=5+crate::virtio_gpu_desktop_wire::PAGES;
+#[cfg(all(feature="qemu-virtio-gpu-attach-backing-smoke",
+          not(feature="qemu-virtio-gpu-desktop-scanout-smoke")))]
 const FRAMES:usize=9;
-#[cfg(not(feature="qemu-virtio-gpu-attach-backing-smoke"))]
+#[cfg(all(not(feature="qemu-virtio-gpu-attach-backing-smoke"),
+          not(feature="qemu-virtio-gpu-desktop-scanout-smoke")))]
 const FRAMES:usize=5;
 #[repr(C)]
 #[derive(Clone,Copy)]
@@ -694,7 +829,10 @@ fn owned_frames_valid(l:queue::Layout,f:&[u64;FRAMES])->bool{
 }
 pub fn verify(hhdm:u64,entries:&[&Entry],
     common:pci::QemuBarWindow,
-    cap:pci::QemuNotifyWindow, layout:queue::Layout)->bool{
+    cap:pci::QemuNotifyWindow, layout:queue::Layout,
+    fb:&crate::virtio_gpu_desktop_wire::Framebuffer)->bool{
+    #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
+    let _=fb;
     let mut witness=[0u64;FRAMES];
     for (i,f) in witness.iter_mut().enumerate(){*f=(i as u64+1)*4096;}
     if x86_64::instructions::interrupts::are_enabled()||
@@ -866,6 +1004,8 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     let mut edid_info:Option<EdidProof>=None;
     #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
     let mut resource_done=false;
+    #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+    let mut desktop_entries=0usize;
     if zeroed{
         // Wire layout is 16-byte LE descriptors and a bare 24-byte GPU
         // header; available ring flags=0, head[0]=0, then idx=1.
@@ -1011,11 +1151,29 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                                 },
                                 _=>CatalogFacts::EMPTY,
                             };
-                            match query_resource2d(&vas,&frames,port,layout.selected,facts) {
+                            #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+                            let outcome={
+                                let _=facts;
+                                present_desktop(
+                                    &vas,&frames,port,layout.selected,fb
+                                ).map(|plan|{desktop_entries=plan.entries;})
+                            };
+                            #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
+                            let outcome=query_resource2d(
+                                &vas,&frames,port,layout.selected,facts
+                            );
+                            match outcome {
                                 Ok(())=>resource_done=true,
-                                Err(e)=>serial::write_fmt(format_args!(
-                                    "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL stage={e}\n"
-                                )),
+                                Err(e)=>{
+                                    #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+                                    serial::write_fmt(format_args!(
+                                        "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL stage={e}\n"
+                                    ));
+                                    #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
+                                    serial::write_fmt(format_args!(
+                                        "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL stage={e}\n"
+                                    ));
+                                }
                             }
                             }
                         }
@@ -1142,18 +1300,27 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
         );
     }
     #[cfg(all(feature="qemu-virtio-gpu-scanout-live-smoke",
-              not(feature="qemu-virtio-gpu-native-rollback-smoke")))]
+              not(feature="qemu-virtio-gpu-native-rollback-smoke"),
+              not(feature="qemu-virtio-gpu-desktop-scanout-smoke")))]
     if resource_done {
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_SCANOUT_OK resource_id=1 format=2 width=64 height=64 create_type=257 attach_type=262 transfer_type=261 set_type=259 flush_type=260 clear_type=259 detach_type=263 unref_type=258 response_type=4352 used_idx=10 used_head=0 used_len=24 fences_verified=8 notify_writes=10 backing_entries=4 backing_bytes=16384 guest_pattern_verified=2 set_ack=1 flush_ack=1 clear_ack=1 detach_ack=1 unref_ack=1 capture_acks=3 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
     #[cfg(all(feature="qemu-virtio-gpu-scanout-reset-smoke",
-              not(feature="qemu-virtio-gpu-native-rollback-smoke")))]
+              not(feature="qemu-virtio-gpu-native-rollback-smoke"),
+              not(feature="qemu-virtio-gpu-desktop-scanout-smoke")))]
     if resource_done&&reset_capture_ok{
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK reset_to_vga_ack=1 capture_acks=4 geometry_and_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
+    }
+    #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+    if resource_done&&reset_capture_ok{
+        serial::write_fmt(format_args!(
+            "WOLFOS_VIRTIO_GPU_DESKTOP_SCANOUT_OK resource_id=1 width=1024 height=768 format=2 create_type=257 attach_type=262 transfer_type=261 set_type=259 flush_type=260 clear_type=259 detach_type=263 unref_type=258 response_type=4352 used_idx=21 used_head=0 used_len=24 fences_verified=19 notify_writes=21 backing_entries={} backing_bytes=3145728 transfer_bands=12 band_rows=64 pixels=786432 guest_copy_verified=1 host_pixels_verified_by_kernel=0 capture_acks=1 reset_to_vga_ack=1 reset=0 queue_disabled=1 frames_allocated={FRAMES} frames_released={FRAMES} pmm_leak=0 qemu_only=1\n",
+            desktop_entries
+        ));
     }
     #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
     if resource_done&&reset_capture_ok{
