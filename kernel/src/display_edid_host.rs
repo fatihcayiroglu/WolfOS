@@ -8,3 +8,5 @@ mod display_edid_base;
 mod display_edid_cta;
 #[path = "virtio_gpu_edid_wire.rs"]
 mod virtio_gpu_edid_wire;
+#[path = "display_mode_catalog.rs"]
+mod display_mode_catalog;

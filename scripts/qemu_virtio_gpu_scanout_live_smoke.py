@@ -7,6 +7,7 @@ No physical GPU, guest disk image writes or GUI backend.
 """
 from pathlib import Path
 import json
+import re
 import socket
 import subprocess
 import sys
@@ -32,8 +33,10 @@ STAGES=("baseline","active","disabled")
 RELEASE={"baseline":b"B","active":b"A","disabled":b"D"}
 RESTORE_STAGES=STAGES+("restored",)
 RESTORE_RELEASE={**RELEASE,"restored":b"R"}
-NATIVE_STAGES=("baseline","active","reduced","reexpanded","disabled","restored")
-NATIVE_RELEASE={**RESTORE_RELEASE,"reduced":b"M","reexpanded":b"E"}
+NATIVE_STAGES=("baseline","active","reduced","reexpanded","refused",
+               "disabled","restored")
+NATIVE_RELEASE={**RESTORE_RELEASE,"reduced":b"M","reexpanded":b"E",
+               "refused":b"F"}
 NATIVE_MARKER=(
     "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK resource_id=1 "
     "width_before=64 width_changed=32 width_restored=64 "
@@ -41,8 +44,29 @@ NATIVE_MARKER=(
     "set_type=259 flush_type=260 response_type=4352 "
     "used_idx=14 used_head=0 used_len=24 fences_verified=12 notify_writes=14 "
     "guest_pattern_verified=2 native_switch_acks=4 reset_to_vga_ack=1 "
-    "capture_acks=6 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 "
+    "capture_acks=7 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 "
     "frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+)
+# Every field below is produced by the guest's real catalog work; the host
+# independently owns the pixel and ordering evidence around this line.
+CATALOG=re.compile(
+    r"WOLFOS_DISPLAY_CATALOG_OK generation=(\d+) entries=(\d+) "
+    r"selectable=(\d+) device_reported=(\d+) device_width=(\d+) "
+    r"device_height=(\d+) automatic_width=(\d+) automatic_height=(\d+) "
+    r"automatic_refresh=(\w+) automatic_change_required=0 "
+    r"manual_32x32=accepted manual_32x32_refresh=(\w+) "
+    r"device_reported_mode=rejected:(\w+) edid_advertised=(\d+) "
+    r"edid_refused=(\d+) edid_hz_request=rejected:(\w+) plan=some "
+    r"plan_confirm=accepted plan_wrong_readback=rejected:(\w+) "
+    r"confirmation_window_ms=(\d+) gpu_commands_sent=0 "
+    r"used_idx_before=(\d+) used_idx_after=(\d+) refusal_capture_acks=1 "
+    r"host_pixels_verified_by_kernel=0"
+)
+EDID_MODES=re.compile(
+    r"WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=\d+ edid_size=\d+ modes=(\d+) "
+)
+DISPLAY_GEOM=re.compile(
+    r"WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK .* width=(\d+) height=(\d+) "
 )
 RESET_MARKER=(
     "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK reset_to_vga_ack=1 capture_acks=4 "
@@ -53,6 +77,68 @@ TEST_OK="WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 
 class ProofError(Exception):
     pass
+
+def validate_catalog(output: str) -> tuple[int,int] | None:
+    """Guest catalog evidence; the host still owns every pixel decision.
+
+    Returns (line index, advertised EDID mode count) or None.
+    """
+    lines=output.splitlines()
+    if any("WOLFOS_DISPLAY_CATALOG_FAIL" in l for l in lines):
+        return None
+    found=[(i,CATALOG.fullmatch(l)) for i,l in enumerate(lines)
+           if l.startswith("WOLFOS_DISPLAY_CATALOG_OK ")]
+    if len(found)!=1 or found[0][1] is None:
+        return None
+    mode_lines=[m.groups() for m in
+                (EDID_MODES.match(l) for l in lines if l.startswith(
+                    "WOLFOS_VIRTIO_GPU_EDID_LIVE_OK ")) if m]
+    geometry_lines=[m.groups() for m in
+                    (DISPLAY_GEOM.match(l) for l in lines if l.startswith(
+                        "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")) if m]
+    if len(mode_lines)!=1 or len(geometry_lines)!=1:
+        return None
+    advertised_edid=int(mode_lines[0][0])
+    real_width,real_height=map(int,geometry_lines[0])
+    index,match=found[0]
+    (generation,entries,selectable,device_reported,device_width,
+     device_height,automatic_width,automatic_height,automatic_refresh,
+     manual_refresh,device_reason,edid_advertised,edid_refused,hz_reason,
+     readback_reason,window,used_before,used_after)=(
+         int(g) if g.isdigit() else g for g in match.groups()
+     )
+    if generation<1 or not 1<=entries<=16:
+        return None
+    # Two genuinely applied scanouts are selectable, the device's own claim is not.
+    if selectable!=2 or device_reported!=entries-selectable:
+        return None
+    if not (1<=device_width<=8192 and 1<=device_height<=8192):
+        return None
+    # The claim must be the geometry the device really reported, not a guess.
+    if (device_width,device_height)!=(real_width,real_height):
+        return None
+    if (device_width,device_height)==(automatic_width,automatic_height):
+        return None
+    if (automatic_width,automatic_height)!=(64,64):
+        return None
+    # Refresh is never invented for a device with no pixel-clock programming.
+    if automatic_refresh!="unavailable" or manual_refresh!="unavailable":
+        return None
+    if device_reason!="unproven_gpu_timing":
+        return None
+    # Every advertised EDID geometry must be refused as unproven.
+    if advertised_edid!=edid_advertised or edid_refused!=edid_advertised or edid_refused<1:
+        return None
+    if hz_reason!="refresh_not_programmable":
+        return None
+    if readback_reason!="device_did_not_apply":
+        return None
+    if window!=15_000:
+        return None
+    # Refusal must consume no GPU command at all.
+    if used_before!=used_after or used_before<1:
+        return None
+    return index,edid_advertised
 
 def validate_serial(output: str, reset_restore:bool=False,
                     native_rollback:bool=False) -> bool:
@@ -66,6 +152,14 @@ def validate_serial(output: str, reset_restore:bool=False,
            or "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL" in l for l in lines):
         return False
     if not validate_edid_marker(output,frame_count=9):
+        return False
+    catalog_index=None
+    if native_rollback:
+        catalog=validate_catalog(output)
+        if catalog is None:
+            return False
+        catalog_index=catalog[0]
+    elif any(l.startswith("WOLFOS_DISPLAY_CATALOG_OK ") for l in lines):
         return False
     displays=[DISPLAY_INFO_NINE.fullmatch(l) for l in lines
               if l.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
@@ -88,6 +182,11 @@ def validate_serial(output: str, reset_restore:bool=False,
                      RESTORE_STAGES if reset_restore else STAGES)
     if [x[1] for x in stages]!=list(expected_stages):
         return False
+    if native_rollback:
+        after_reexpanded=stages[3][0]
+        before_refused=stages[4][0]
+        if not after_reexpanded<catalog_index<before_refused:
+            return False
     edid=[i for i,l in enumerate(lines)
           if l.startswith("WOLFOS_VIRTIO_GPU_EDID_LIVE_OK ")]
     display_ack=[i for i,l in enumerate(lines)
@@ -208,6 +307,22 @@ def verify_reexpanded(active:tuple[int,int,bytes],reexpanded:tuple[int,int,bytes
         raise ProofError("Native 64x64 scanout rollback differs from original active image")
     verify_active(reexpanded)
 
+def verify_refused(shown:tuple[int,int,bytes],
+                   refused:tuple[int,int,bytes])->None:
+    # A rejected EDID/device-reported mode change must not touch the live
+    # output: the host compares every byte of both captures.
+    if refused[:2]!=shown[:2]:
+        raise ProofError(
+            f"Refused mode change resized the display {refused[0]}x{refused[1]}"
+            f" from {shown[0]}x{shown[1]}"
+        )
+    if refused[2]!=shown[2]:
+        first=next(i for i,(a,b) in enumerate(zip(shown[2],refused[2])) if a!=b)
+        raise ProofError(
+            f"Refused mode change altered pixel "
+            f"({first//3%shown[0]},{first//3//shown[0]}) channel={first%3}"
+        )
+
 def verify_disabled(active:tuple[int,int,bytes],disabled:tuple[int,int,bytes])->None:
     # VirtIO resource_id=0 detaches output but does NOT restore the
     # original pre-driver (often 1024x768) console geometry in QEMU.
@@ -309,6 +424,8 @@ def run(iso:Path, reset_restore:bool=False, native_rollback:bool=False)->int:
                                         verify_reduced(images[name])
                                     elif name=="reexpanded":
                                         verify_reexpanded(images["active"],images[name])
+                                    elif name=="refused":
+                                        verify_refused(images["reexpanded"],images[name])
                                     elif name=="disabled":
                                         verify_disabled(images["active"],images["disabled"])
                                     elif name=="restored":
@@ -338,6 +455,8 @@ def run(iso:Path, reset_restore:bool=False, native_rollback:bool=False)->int:
             if native_rollback:
                 print("PASS: QEMU native 64x64 -> 32x32 -> 64x64, "
                       "every pixel restored WITHOUT device reset during the transition")
+                print("PASS: EDID-only and device-reported modes refused; "
+                      "live scanout byte-identical after the rejection")
             if reset_restore:
                 print("PASS: post-reset VGA geometry and EVERY baseline RGB pixel restored")
                 print(f"Restored geometry={images['restored'][0]}x{images['restored'][1]}; "

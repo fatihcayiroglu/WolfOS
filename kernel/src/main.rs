@@ -125,6 +125,7 @@ mod ramfs_smoke;
 mod pci;
 mod display_driver_policy;
 mod display_mode_policy;
+mod display_mode_catalog;
 mod display_edid_base;
 mod display_edid_cta;
 mod virtio_gpu_edid_wire;

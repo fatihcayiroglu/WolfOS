@@ -84,7 +84,7 @@ jobs:
         run: make qemu-virtio-gpu-scanout-live-smoke
       - name: Real QEMU VirtIO-VGA post-reset baseline geometry and every pixel restored, headless only
         run: make qemu-virtio-gpu-scanout-reset-smoke
-      - name: Real QEMU native VirtIO 64x64-to-32x32-to-64x64 scanout rollback before reset, pixel-exact
+      - name: Real QEMU native 64x64-to-32x32-to-64x64 rollback; EDID-only mode refusal leaves every pixel
         run: make qemu-virtio-gpu-native-rollback-smoke
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
         run: make qemu-stdvga-dispi-smoke

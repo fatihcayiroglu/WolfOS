@@ -38,7 +38,30 @@ use crate::virtio_gpu_transfer2d_contract as transfer;
 use crate::virtio_gpu_scanout_contract as scanout;
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
 #[derive(Clone,Copy)]
-struct EdidProof{size:u32,modes:usize,width:u32,height:u32,refresh_millihz:u32}
+struct EdidProof{
+    size:u32,modes:usize,width:u32,height:u32,refresh_millihz:u32,
+    // Every advertised connector geometry, retained only so the display mode
+    // catalog can prove each one is refused without host-verified GPU proof.
+    geometries:[(u32,u32);crate::display_mode_catalog::MAX_CATALOG_ENTRIES],
+    geometry_len:usize,
+}
+/// Real driver observations handed to the display mode catalog stage. None of
+/// these fields is GPU timing evidence by itself; the catalog grades each one.
+#[derive(Clone,Copy)]
+#[allow(dead_code)]
+struct CatalogFacts{
+    device_width:u32, device_height:u32,
+    edid_mode_count:usize, edid_refresh_millihz:u32,
+    edid_geometries:[(u32,u32);crate::display_mode_catalog::MAX_CATALOG_ENTRIES],
+    edid_geometry_len:usize,
+}
+impl CatalogFacts{
+    const EMPTY:Self=Self{
+        device_width:0,device_height:0,edid_mode_count:0,edid_refresh_millihz:0,
+        edid_geometries:[(0,0);crate::display_mode_catalog::MAX_CATALOG_ENTRIES],
+        edid_geometry_len:0,
+    };
+}
 #[cfg(feature="qemu-virtio-gpu-edid-live-smoke")]
 fn query_edid(vas:&[u64;FRAMES],frames:&[u64;FRAMES],port:u64)
     ->Result<EdidProof,&'static str>{
@@ -118,10 +141,18 @@ fn query_edid(vas:&[u64;FRAMES],frames:&[u64;FRAMES],port:u64)
     for m in verified.modes(){
         if m.preferred{preferred=*m;break;}
     }
+    let mut geometries=[(0u32,0u32);crate::display_mode_catalog::MAX_CATALOG_ENTRIES];
+    let mut geometry_len=0usize;
+    for m in verified.modes().iter().copied(){
+        if geometry_len==geometries.len(){return Err("edid_geometry_overflow");}
+        geometries[geometry_len]=(m.width,m.height);
+        geometry_len+=1;
+    }
     let size=u32::from_le_bytes([data[24],data[25],data[26],data[27]]);
     Ok(EdidProof{
         size,modes:verified.modes().len(),width:preferred.width,
         height:preferred.height,refresh_millihz:preferred.refresh_millihz,
+        geometries,geometry_len,
     })
 }
 
@@ -238,9 +269,110 @@ fn await_host_capture(stage:&str,ack:u8)->Result<(),&'static str>{
     Err("capture_timeout")
 }
 
+#[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
+fn verify_mode_catalog(vas:&[u64;FRAMES],facts:CatalogFacts)->Result<(),&'static str>{
+    use crate::display_mode_catalog::{
+        CatalogError,ModeCatalog,ModeEntry,RefreshEvidence,ScanoutProof,
+    };
+    const GENERATION:u64=1;
+    const TOKEN:u64=0x574f_4c46_4d4f_4445;
+    // Any GPU command would advance the device's used index. Catalog work is
+    // pure policy: it must consume no completion and touch no register.
+    let read_used=||{
+        fence(Ordering::SeqCst);
+        u16::from_le(unsafe{((vas[2]+2)as *const u16).read_volatile()})
+    };
+    let before=read_used();
+    let mut modes=ModeCatalog::new(GENERATION).map_err(|_|"catalog_generation")?;
+    // Only geometry this driver really scanned out and the host verified.
+    modes.record(ModeEntry{scanout:0,width:64,height:64,
+        proof:ScanoutProof::HostVerifiedApplied,
+        refresh:RefreshEvidence::Unavailable}).map_err(|_|"catalog_record_64x64")?;
+    modes.record(ModeEntry{scanout:0,width:32,height:32,
+        proof:ScanoutProof::HostVerifiedApplied,
+        refresh:RefreshEvidence::Unavailable}).map_err(|_|"catalog_record_32x32")?;
+    // GET_DISPLAY_INFO's own claim is recorded but stays non-selectable.
+    modes.record(ModeEntry{scanout:0,width:facts.device_width,
+        height:facts.device_height,proof:ScanoutProof::DeviceReportedConfigured,
+        refresh:RefreshEvidence::Unavailable}).map_err(|_|"catalog_record_device")?;
+    let automatic=modes.choose(GENERATION,mode_policy::UserChoice::AUTOMATIC)
+        .map_err(|_|"catalog_automatic")?;
+    if automatic.width!=64||automatic.height!=64{
+        return Err("catalog_automatic_unproven_geometry");
+    }
+    if automatic.refresh!=RefreshEvidence::Unavailable{
+        return Err("catalog_automatic_invented_refresh");
+    }
+    let manual=modes.choose(GENERATION,mode_policy::UserChoice{
+        resolution:mode_policy::ResolutionChoice::Exact{width:32,height:32},
+        refresh:mode_policy::RefreshChoice::Automatic,
+    }).map_err(|_|"catalog_manual_32x32")?;
+    if manual.width!=32||manual.height!=32{return Err("catalog_manual_geometry");}
+    if manual.refresh!=RefreshEvidence::Unavailable{
+        return Err("catalog_manual_invented_refresh");
+    }
+    // The device's own reported scanout must never authorize a switch.
+    if modes.choose(GENERATION,mode_policy::UserChoice{
+        resolution:mode_policy::ResolutionChoice::Exact{
+            width:facts.device_width,height:facts.device_height,
+        },
+        refresh:mode_policy::RefreshChoice::Automatic,
+    })!=Err(CatalogError::UnprovenGpuTiming){
+        return Err("catalog_device_reported_accepted");
+    }
+    // Every advertised EDID geometry must be refused as unproven.
+    let mut edid_refused=0usize;
+    for (width,height) in facts.edid_geometries[..facts.edid_geometry_len].iter().copied(){
+        match modes.choose(GENERATION,mode_policy::UserChoice{
+            resolution:mode_policy::ResolutionChoice::Exact{width,height},
+            refresh:mode_policy::RefreshChoice::Automatic,
+        }){
+            Err(CatalogError::UnprovenGpuTiming)=>edid_refused+=1,
+            _=>return Err("catalog_edid_only_mode_accepted"),
+        }
+    }
+    // An EDID hertz value is monitor data, not a programmable GPU rate.
+    if modes.choose(GENERATION,mode_policy::UserChoice{
+        resolution:mode_policy::ResolutionChoice::Automatic,
+        refresh:mode_policy::RefreshChoice::ExactMilliHz(facts.edid_refresh_millihz),
+    })!=Err(CatalogError::RefreshNotProgrammable){
+        return Err("catalog_edid_refresh_accepted");
+    }
+    let plan=modes.plan_change(GENERATION,automatic,mode_policy::UserChoice{
+        resolution:mode_policy::ResolutionChoice::Exact{width:32,height:32},
+        refresh:mode_policy::RefreshChoice::Automatic,
+    },TOKEN,1_000).map_err(|_|"catalog_plan")?.ok_or("catalog_plan_missing")?;
+    if plan.rollback_target()!=automatic{return Err("catalog_plan_rollback_target");}
+    if plan.confirm(TOKEN,GENERATION,manual,2_000)!=Ok(manual){
+        return Err("catalog_confirm_readback");
+    }
+    if plan.confirm(TOKEN,GENERATION,automatic,2_000)!=Err(CatalogError::DeviceDidNotApply){
+        return Err("catalog_confirm_unapplied_mode");
+    }
+    if modes.plan_change(GENERATION,automatic,mode_policy::UserChoice::AUTOMATIC,
+        TOKEN,1_000)!=Ok(None){
+        return Err("catalog_automatic_change_not_noop");
+    }
+    let after=read_used();
+    if after!=before{return Err("catalog_consumed_gpu_command");}
+    serial::write_fmt(format_args!(
+        "WOLFOS_DISPLAY_CATALOG_OK generation={} entries={} selectable={} device_reported={} device_width={} device_height={} automatic_width={} automatic_height={} automatic_refresh={} automatic_change_required=0 manual_32x32=accepted manual_32x32_refresh={} device_reported_mode=rejected:{} edid_advertised={} edid_refused={} edid_hz_request=rejected:{} plan=some plan_confirm=accepted plan_wrong_readback=rejected:{} confirmation_window_ms={} gpu_commands_sent=0 used_idx_before={} used_idx_after={} refusal_capture_acks=1 host_pixels_verified_by_kernel=0\n",
+        GENERATION,modes.entries().len(),modes.selectable_count(),
+        modes.device_reported_count(),facts.device_width,facts.device_height,
+        automatic.width,automatic.height,automatic.refresh_label(),
+        manual.refresh_label(),CatalogError::UnprovenGpuTiming.label(),
+        facts.edid_mode_count,edid_refused,
+        CatalogError::RefreshNotProgrammable.label(),
+        CatalogError::DeviceDidNotApply.label(),
+        crate::display_mode_catalog::CONFIRM_WINDOW_MS,before,after
+    ));
+    Ok(())
+}
+
 #[cfg(feature="qemu-virtio-gpu-resource2d-smoke")]
 fn query_resource2d(
     vas:&[u64;FRAMES], frames:&[u64;FRAMES], notify_port:u64, selected:u16,
+    _facts:CatalogFacts,
 ) -> Result<(),&'static str> {
     const CREATE_FENCE:u64=0x574f_4c46_3244_4352;
     const UNREF_FENCE:u64=0x574f_4c46_3244_5552;
@@ -350,6 +482,10 @@ fn query_resource2d(
                 send_resource_command(vas,frames,notify_port,selected,11,
                     &expanded_flush.bytes,expanded_flush.fence)?;
                 await_host_capture("reexpanded",b'E')?;
+                // Pure-policy catalog evidence: refuses every EDID-only and
+                // device-reported geometry, and must not alter the display.
+                verify_mode_catalog(vas,_facts)?;
+                await_host_capture("refused",b'F')?;
             }
             let clear=scanout::disable(true,CLEAR_FENCE)
                 .map_err(|_|"scanout_disable_wire")?;
@@ -750,7 +886,18 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                                     "WOLFOS_VIRTIO_GPU_SCANOUT_FAIL stage=disabled_scanout"
                                 );
                             } else {
-                            match query_resource2d(&vas,&frames,port,layout.selected) {
+                            let facts=match (display_info.as_ref(),edid_info.as_ref()){
+                                (Some(display),Some(edid))=>CatalogFacts{
+                                    device_width:display.width,
+                                    device_height:display.height,
+                                    edid_mode_count:edid.modes,
+                                    edid_refresh_millihz:edid.refresh_millihz,
+                                    edid_geometries:edid.geometries,
+                                    edid_geometry_len:edid.geometry_len,
+                                },
+                                _=>CatalogFacts::EMPTY,
+                            };
+                            match query_resource2d(&vas,&frames,port,layout.selected,facts) {
                                 Ok(())=>resource_done=true,
                                 Err(e)=>serial::write_fmt(format_args!(
                                     "WOLFOS_VIRTIO_GPU_RESOURCE2D_FAIL stage={e}\n"
@@ -897,7 +1044,7 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
     #[cfg(feature="qemu-virtio-gpu-native-rollback-smoke")]
     if resource_done&&reset_capture_ok{
         serial::write_line(
-            "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK resource_id=1 width_before=64 width_changed=32 width_restored=64 height_before=64 height_changed=32 height_restored=64 set_type=259 flush_type=260 response_type=4352 used_idx=14 used_head=0 used_len=24 fences_verified=12 notify_writes=14 guest_pattern_verified=2 native_switch_acks=4 reset_to_vga_ack=1 capture_acks=6 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
+            "WOLFOS_VIRTIO_GPU_NATIVE_ROLLBACK_OK resource_id=1 width_before=64 width_changed=32 width_restored=64 height_before=64 height_changed=32 height_restored=64 set_type=259 flush_type=260 response_type=4352 used_idx=14 used_head=0 used_len=24 fences_verified=12 notify_writes=14 guest_pattern_verified=2 native_switch_acks=4 reset_to_vga_ack=1 capture_acks=7 host_pixels_verified_by_kernel=0 reset=0 queue_disabled=1 frames_allocated=9 frames_released=9 pmm_leak=0 qemu_only=1"
         );
     }
     true
