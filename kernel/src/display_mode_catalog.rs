@@ -30,6 +30,20 @@ pub const MAX_CATALOG_ENTRIES: usize = 16;
 pub const MAX_SCANOUTS: u8 = 16;
 pub const CONFIRM_WINDOW_MS: u64 = 15_000;
 
+/// A late *decision* has exactly two fields: X/E and decimal elapsed ms.
+/// Do not confuse the E-stage pixel attestation (four fields) with an expiry.
+/// This classifier never accepts an attestation, even one beginning with E.
+pub fn is_elapsed_verdict_line(input: &[u8]) -> bool {
+    let line = input.strip_suffix(b"\n").unwrap_or(input);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if line.len() < 3 || !matches!(line[0], b'X' | b'E') || line[1] != b' ' {
+        return false;
+    }
+    let elapsed = &line[2..];
+    elapsed.len() <= 12 && elapsed.iter().all(u8::is_ascii_digit)
+}
+
+
 /// What actually happened, not what a device claims it can do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanoutProof {
@@ -878,6 +892,26 @@ pub fn prove_desktop_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_exact_numeric_two_field_verdict_lines_can_be_discarded() {
+        for valid in [b"X 0\n".as_slice(), b"E 15000\n", b"X 15200\r\n",
+                      b"E 999999999999", b"X 1"] {
+            assert!(is_elapsed_verdict_line(valid), "valid verdict {valid:?}");
+        }
+        for other in [
+            b"E 64x64 0000574f41580003 171cbca5\n".as_slice(),
+            b"A 64x64 0000574f41540001 171cbca5\n",
+            b"E 32x32 0000574f41520002 53ec77a5\n",
+            b"E 1 2", b"X 15000 extra", b"E ", b"X ",
+            b"E 15x00", b"E -1", b"E 1000000000000",
+            b"Z 15000", b"x 15000", b"E\t15000",
+            b"E 15000\nE 16000", b"X 7\x00",
+        ] {
+            assert!(!is_elapsed_verdict_line(other), "not a verdict: {other:?}");
+        }
+    }
+
 
     const APPLIED_64: ModeEntry = ModeEntry {
         scanout: 0,
