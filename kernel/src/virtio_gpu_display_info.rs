@@ -343,8 +343,10 @@ fn drain_stale_input()->usize{
 /// Asking a peer to screenshot a frame the console has not picked up yet would
 /// grade timing rather than pixels. This only works with a validated clock; the
 /// wait is measured on that clock and is never a spin-count stand-in.
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
 const DISPLAY_SETTLE_MS:u64=40;
 
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
 fn settle_display(){
     let Some(period_fs)=crate::hpet_clock::period_fs() else{return;};
     let Some(start)=crate::hpet_clock::counter() else{return;};
@@ -365,9 +367,12 @@ fn settle_display(){
     }
 }
 
+#[cfg(any(feature="qemu-virtio-gpu-native-rollback-smoke",
+          feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
 fn await_host_attestation(
     token:u8,nonce:u64,width:u32,height:u32,digest:u32,
 )->Result<crate::display_mode_catalog::Attestation,&'static str>{
+    #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
     settle_display();
     let stale=drain_stale_input();
     if stale>0{
@@ -691,13 +696,13 @@ enum StageVerdict{
 }
 
 #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
-#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
 enum ReplyFail{Timeout,TooLong,Deadline(u64)}
 
 /// Reads one reply line. When the guest owns a device clock the read is bounded
 /// by that clock, so a peer that simply goes silent cannot keep the guest in a
 /// half-applied mode: the guest ends the window itself and reports how long it
 /// really waited.
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
 fn read_reply_until(
     capture:&mut [u8],start:Option<(u64,u32)>,window_ms:u64,
 )->Result<usize,ReplyFail>{
