@@ -217,7 +217,10 @@ fn send_resource_command(
     }
     // The upper bound is a flavor constant, so an unexpected completion
     // index is still refused instead of being accepted as this request.
-    #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-damage-live-smoke")]
+    let max_index=resource::DAMAGE_LIVE_MAX_INDEX;
+    #[cfg(all(feature="qemu-virtio-gpu-desktop-scanout-smoke",
+              not(feature="qemu-virtio-gpu-damage-live-smoke")))]
     let max_index=resource::DESKTOP_MAX_INDEX;
     #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
     let max_index=resource::PROBE_MAX_INDEX;
@@ -607,6 +610,72 @@ fn upload_bands(
     Ok(next)
 }
 
+
+#[cfg(feature="qemu-virtio-gpu-damage-live-smoke")]
+fn paint_partial_damage(
+    fb:&crate::virtio_gpu_desktop_wire::Framebuffer,
+    vas:&[u64;FRAMES],
+    rect:crate::virtio_gpu_desktop_wire::damage::Rect,
+    altered:bool,
+)->Result<(),&'static str>{
+    use crate::virtio_gpu_desktop_wire as desk;
+    fb.supported().map_err(|_|"damage_framebuffer")?;
+    // A partial change MUST retain the full 4096-byte row stride. Do not
+    // repaint the rest of the row, any other backing page, or another frame.
+    for y in rect.y..rect.y+rect.height{
+        let fb_row=fb.pitch as usize*y as usize;
+        let guest_row=vas[5+y as usize] as *mut u8;
+        for x in rect.x..rect.x+rect.width{
+            let at=x as usize*4;
+            let word=desk::pixel_word(x,y)^if altered{0x00ff_ffff}else{0};
+            unsafe{
+                (fb.address as *mut u8).add(fb_row+at)
+                    .cast::<u32>().write_volatile(word);
+                guest_row.add(at).cast::<u32>().write_volatile(word);
+            }
+        }
+    }
+    fence(Ordering::SeqCst);
+    // Read back precisely the changed backing rectangle before the device
+    // consumes it; the host independently verifies EVERY screen pixel.
+    for y in rect.y..rect.y+rect.height{
+        let ptr=vas[5+y as usize] as *const u8;
+        for x in rect.x..rect.x+rect.width{
+            let word=desk::pixel_word(x,y)^if altered{0x00ff_ffff}else{0};
+            if unsafe{ptr.add(x as usize*4).cast::<u32>().read_volatile()}!=word{
+                return Err("damage_backing_mismatch");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Independently fence the transfer and matching flush. A lost completion
+/// cannot clear pending damage and therefore cannot authorize resource reuse.
+#[cfg(feature="qemu-virtio-gpu-damage-live-smoke")]
+fn commit_partial_damage(
+    tracker:&mut crate::virtio_gpu_desktop_wire::damage::DamageTracker,
+    rect:crate::virtio_gpu_desktop_wire::damage::Rect,
+    vas:&[u64;FRAMES],frames:&[u64;FRAMES],notify_port:u64,selected:u16,
+    first:u16,transfer_fence:u64,flush_fence:u64,
+)->Result<u16,&'static str>{
+    tracker.mark(rect).map_err(|_|"damage_mark")?;
+    let batch=tracker.begin(transfer_fence,flush_fence)
+        .map_err(|_|"damage_begin")?;
+    send_resource_command(vas,frames,notify_port,selected,first,
+        &batch.transfer,batch.transfer_fence)?;
+    tracker.ack_transfer(batch.transfer_fence)
+        .map_err(|_|"damage_transfer_ack")?;
+    send_resource_command(vas,frames,notify_port,selected,first+1,
+        &batch.flush,batch.flush_fence)?;
+    tracker.ack_flush(batch.flush_fence)
+        .map_err(|_|"damage_flush_ack")?;
+    if tracker.must_keep_resource_pinned()||tracker.pending().is_some(){
+        return Err("damage_unsettled");
+    }
+    Ok(first+2)
+}
+
 /// A fresh GET_DISPLAY_INFO after a switch: the device's own statement about
 /// the scanout rectangle it now has configured. Fence-bound to this exact
 /// request, so an older completion cannot be mistaken for the readback.
@@ -921,6 +990,31 @@ fn present_desktop(
     if desktop.width()!=desk::WIDTH||desktop.height()!=desk::HEIGHT||
         desktop.nonce()!=DESKTOP_NONCE||desktop.digest()!=desktop_digest{
         return Err("attestation_binding");
+    }
+    #[cfg(feature="qemu-virtio-gpu-damage-live-smoke")]
+    {
+        // A true partial-width mutation of the *currently visible* resource.
+        // The host checks all 786432 pixels of both screenshots, including
+        // every pixel outside this 1024-pixel rectangle.
+        let rect=desk::damage::Rect::checked(73,91,32,32)
+            .map_err(|_|"damage_rectangle")?;
+        let mut dirty=desk::damage::DamageTracker::new();
+        paint_partial_damage(fb,vas,rect,true)?;
+        next=commit_partial_damage(&mut dirty,rect,vas,frames,notify_port,
+            selected,next,0x574f_444d_4700_0101,0x574f_444d_4700_0102)?;
+        await_host_capture("damage",b'G')?;
+        captures+=1;
+        paint_partial_damage(fb,vas,rect,false)?;
+        next=commit_partial_damage(&mut dirty,rect,vas,frames,notify_port,
+            selected,next,0x574f_444d_4700_0201,0x574f_444d_4700_0202)?;
+        await_host_capture("damage_restored",b'H')?;
+        captures+=1;
+        if page_digest(vas,desk::HEIGHT)!=desktop_digest{
+            return Err("damage_restore_digest");
+        }
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_DAMAGE_LIVE_OK x=73 y=91 width=32 height=32 transfer_acks=2 flush_acks=2 capture_acks=2 host_pixel_authority=required outside_pixels=785408"
+        );
     }
     // 2. Second real geometry: the same resource presented as 1024x384. Only
     //    the rows it owns are repainted and re-uploaded, so the desktop frame
