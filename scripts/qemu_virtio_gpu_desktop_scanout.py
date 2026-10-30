@@ -705,8 +705,6 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                         ser.sendall(b"G" if name == "damage" else b"H")
                                         captured.append(name)
                                         continue
-                                elif clean.startswith(CAPTURE_PREFIX):
-                                    name = clean[len(CAPTURE_PREFIX):]
                                     if name != "restored" or captured[-1:] != ["applied"] \
                                             and captured[-1:] != ["rollback"]:
                                         raise ProofError(
