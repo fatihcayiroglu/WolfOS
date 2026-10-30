@@ -445,14 +445,20 @@ qemu-virtio-gpu-desktop-scanout-negative:
 ATTEST_FAULTS ?= digest nonce geometry
 qemu-virtio-gpu-attestation-negative:
 	@for fault in $(ATTEST_FAULTS); do \
-	  if WOLFOS_ATTEST_FAULT=$$fault python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py \
+	  case "$fault" in \
+	    digest) reason=digest_mismatch ;; \
+	    nonce) reason=bad_nonce ;; \
+	    geometry) reason=wrong_geometry ;; \
+	    *) echo "FAIL: unknown attestation fault $fault"; exit 1 ;; \
+	  esac; \
+	  if WOLFOS_ATTEST_FAULT=$fault python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py \
 	       --native-rollback $(OUT)/wolfos-qemu-virtio-gpu-native-rollback.iso \
-	       > $(OUT)/attest-$$fault.log 2>&1; then \
-	    echo "FAIL: attestation fault $$fault was not refused"; exit 1; \
-	  elif ! grep -q "WOLFOS_GPU_ATTEST_FAIL" $(OUT)/attest-$$fault.log; then \
-	    echo "FAIL: attestation fault $$fault refused without kernel evidence"; exit 1; \
+	       > $(OUT)/attest-$fault.log 2>&1; then \
+	    echo "FAIL: attestation fault $fault was not refused"; exit 1; \
+	  elif ! grep -q "WOLFOS_GPU_ATTEST_FAIL stage=active reason=$reason " $(OUT)/attest-$fault.log; then \
+	    echo "FAIL: attestation fault $fault refused without matching kernel evidence"; exit 1; \
 	  else \
-	    echo "OK: attestation fault $$fault refused by the guest"; \
+	    echo "OK: attestation fault $fault refused by the guest as $reason"; \
 	  fi; \
 	done
 
