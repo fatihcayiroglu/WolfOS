@@ -126,6 +126,11 @@ EDID = re.compile(
 TEST_OK = "WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 FAULT = os.environ.get("WOLFOS_DESKTOP_FAULT", "")
 ATTEST_FAULTS = ("digest", "nonce", "geometry")
+DAMAGE_LIVE = os.environ.get("WOLFOS_DAMAGE_LIVE") == "1"
+DAMAGE_RECT = (73, 91, 32, 32)
+DAMAGE_MARKER = ("WOLFOS_VIRTIO_GPU_DAMAGE_LIVE_OK x=73 y=91 width=32 height=32 "
+                 "transfer_acks=2 flush_acks=2 capture_acks=2 "
+                 "host_pixel_authority=required outside_pixels=785408")
 
 FORGED_REASON = {
     "digest": "digest_mismatch",
@@ -303,6 +308,23 @@ def verify_restored_pixels(image: tuple[int, int, bytes],
     return _verify(image, (WIDTH, HEIGHT), payload, "restored")
 
 
+
+@lru_cache(maxsize=1)
+def damage_bytes() -> bytes:
+    """Exactly 1024 modified pixels; every other RGB byte stays original."""
+    result = bytearray(expected_bytes())
+    x0, y0, w, h = DAMAGE_RECT
+    for y in range(y0, y0+h):
+        for x in range(x0, x0+w):
+            at = (y*WIDTH+x)*3
+            for channel in range(3):
+                result[at+channel] ^= 0xff
+    return bytes(result)
+
+
+def verify_damage_pixels(image: tuple[int, int, bytes]) -> int:
+    return _verify(image, (WIDTH, HEIGHT), damage_bytes(), "damage")
+
 def verify_alt_pixels(image: tuple[int, int, bytes]) -> int:
     """Every pixel of the real 1024x384 image must match."""
     return _verify(image, (ALT_WIDTH, ALT_HEIGHT), alt_bytes(), "reduced")
@@ -332,12 +354,12 @@ def validate_desktop_serial(output: str, expired: bool = False,
     used_idx, fences, writes, entries, capture_acks = map(int, markers[0].groups())
     # 1 x GET_DISPLAY_INFO, 1 x GET_EDID, then the desktop resource work. The
     # expired path adds one extra switch+restore cycle of exactly 8 commands.
-    expected_idx = 46 if expired else 38
+    expected_idx = (46 if expired else 38) + (4 if DAMAGE_LIVE else 0)
     if (used_idx, writes) != (expected_idx, expected_idx) or fences != expected_idx - 2:
         return False
     if not 1 <= entries <= 254:
         return False
-    if capture_acks != (4 if expired else 3):
+    if capture_acks != (4 if expired else 3) + (2 if DAMAGE_LIVE else 0):
         return False
     displays = [(i, DISPLAY.fullmatch(line)) for i, line in enumerate(lines)
                 if line.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
@@ -384,7 +406,21 @@ def validate_desktop_serial(output: str, expired: bool = False,
             return False
     captures = [line[len(CAPTURE_PREFIX):] for line in lines
                 if line.startswith(CAPTURE_PREFIX)]
-    if captures != ["restored"]:
+    if captures != (["damage","damage_restored","restored"]
+                    if DAMAGE_LIVE else ["restored"]):
+        return False
+    damage_markers=[(i,line) for i,line in enumerate(lines)
+                    if line.startswith("WOLFOS_VIRTIO_GPU_DAMAGE_LIVE_OK ")]
+    if DAMAGE_LIVE:
+        if len(damage_markers)!=1 or damage_markers[0][1]!=DAMAGE_MARKER:
+            return False
+        desktop_index=attested[0][0]
+        reduced_index=attested[1][0]
+        change=lines.index(CAPTURE_PREFIX+"damage")
+        restore=lines.index(CAPTURE_PREFIX+"damage_restored")
+        if not desktop_index<change<restore<damage_markers[0][0]<reduced_index:
+            return False
+    elif damage_markers:
         return False
     restored_index = lines.index(CAPTURE_PREFIX + "restored")
     catalogs = [(i, CATALOG.fullmatch(line)) for i, line in enumerate(lines)
@@ -654,6 +690,21 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                     captured.append(stage)
                                 elif clean.startswith(CAPTURE_PREFIX):
                                     name = clean[len(CAPTURE_PREFIX):]
+                                    if DAMAGE_LIVE and name in ("damage", "damage_restored"):
+                                        expected_prev = "desktop" if name == "damage" else "damage"
+                                        if captured[-1:] != [expected_prev]:
+                                            raise ProofError("Partial damage capture out of order")
+                                        image = _capture(qmp, reader, root, name)
+                                        if name == "damage":
+                                            verify_damage_pixels(image)
+                                        else:
+                                            verify_pixels(image)
+                                            if image != images.get("desktop"):
+                                                raise ProofError("Restored damage image differs from baseline")
+                                        images[name] = image
+                                        ser.sendall(b"G" if name == "damage" else b"H")
+                                        captured.append(name)
+                                        continue
                                     if name != "restored" or captured[-1:] != ["applied"] \
                                             and captured[-1:] != ["rollback"]:
                                         raise ProofError(
@@ -687,6 +738,9 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                         expected = ["desktop", "reduced", "applied"]
                     else:
                         expected = ["desktop", "reduced", "applied", "restored"]
+                    if DAMAGE_LIVE:
+                        expected = (["desktop", "damage", "damage_restored"] +
+                                    expected[1:])
                     if FAULT not in ATTEST_FAULTS and captured != expected:
                         raise ProofError(
                             f"Stages {captured} captured, expected {expected}")
