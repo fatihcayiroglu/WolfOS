@@ -11,7 +11,7 @@ from qemu_virtio_gpu_desktop_scanout import (
     ALT_HEIGHT, ALT_WIDTH, CAPTURE_PREFIX, HEIGHT, MARKER, PIXELS, WIDTH,
     ProofError, alt_bytes, alt_rgb, expected_bytes, expected_rgb,
     alt_pattern_digest, pattern_digest, validate_desktop_serial,
-    verify_alt_pixels, verify_pixels,
+    verify_alt_pixels, verify_pixels, validate_forged_desktop_refusal,
 )
 
 DESKTOP_DIGEST = f"{pattern_digest():08x}"
@@ -99,6 +99,53 @@ EXPIRED = serial(tx=TX_EXPIRED, used=46, acks=4,
                  stages=(ATTEST_P, ATTEST_S, ATTEST_T, ATTEST_R))
 SILENT = serial(tx=TX_SILENT, used=46, acks=4,
                 stages=(ATTEST_P, ATTEST_S, ATTEST_T, ATTEST_R))
+
+
+class ForgedDesktopRefusalTests(unittest.TestCase):
+    """QEMU negative runs may terminate early only with all guest witnesses."""
+
+    def test_exact_refusal_needs_valid_guest_error_and_empty_catalog(self):
+        for fault,reason in (
+            ("digest","digest_mismatch"),
+            ("nonce","bad_nonce"),
+            ("geometry","wrong_geometry"),
+        ):
+            good=("\n".join([
+                ATTEST_P,
+                (f"WOLFOS_GPU_ATTEST_FAIL stage=desktop reason={reason} "
+                 f"bytes=42 source_digest={DESKTOP_DIGEST}"),
+                ("WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL "
+                 "stage=attest_reply entries=0 selectable=0 "
+                 "mode=no_selectable_mode"),
+                "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL stage=attest_reply",
+            ]))
+            self.assertTrue(validate_forged_desktop_refusal(good, fault))
+            self.assertFalse(validate_forged_desktop_refusal(good, "invalid"))
+            mutations=(
+                good.replace(ATTEST_P,""),
+                good.replace(f"reason={reason}","reason=bad_nonce")
+                    if reason!="bad_nonce"
+                    else good.replace("reason=bad_nonce","reason=wrong_geometry"),
+                good.replace("bytes=42","bytes=0"),
+                good.replace("stage=desktop reason=",
+                             "stage=reduced reason="),
+                good.replace("stage=attest_reply entries=0",
+                             "stage=attest_reply entries=1"),
+                good.replace("mode=no_selectable_mode",
+                             "mode=host_verified"),
+                good.replace("DESKTOP_CATALOG_FAIL",
+                             "DESKTOP_CATALOG_OK"),
+                good.replace("DESKTOP_FAIL stage=attest_reply",
+                             "DESKTOP_FAIL stage=unknown"),
+                good.replace("WOLFOS_GPU_ATTEST_FAIL","WOLFOS_GPU_ATTEST_OK"),
+                good.replace(ATTEST_P, ATTEST_P+"\n"+ATTEST_P),
+                good+"\nWOLFOS_VIRTIO_GPU_MODE_TX_OK invalid=1",
+                good+"\nWOLFOS_VIRTIO_GPU_DESKTOP_SCANOUT_OK forged=1",
+                "\n".join(reversed(good.splitlines())),
+            )
+            for bad in mutations:
+                with self.subTest(fault=fault, tail=bad[-45:]):
+                    self.assertFalse(validate_forged_desktop_refusal(bad, fault))
 
 
 class DesktopSerialTests(unittest.TestCase):
