@@ -10,6 +10,9 @@
 //! physically sequential backing pages into runs and refuses the mode when
 //! the fragmention would exceed the single-page request limit.
 
+#[path = "virtio_gpu_damage.rs"]
+pub mod damage;
+
 pub const WIDTH: u32 = 1024;
 pub const HEIGHT: u32 = 768;
 pub const BYTES_PER_PIXEL: u32 = 4;
@@ -176,16 +179,40 @@ pub fn band(index: usize) -> Result<(u32, u32, u64), Error> {
     Ok((y, rows, offset))
 }
 
+fn damage_error(err: damage::Error) -> Error {
+    match err {
+        damage::Error::InvalidFence => Error::InvalidFence,
+        _ => Error::InvalidBand,
+    }
+}
+
+fn damage_rect(x: u32, y: u32, width: u32, height: u32) -> Result<damage::Rect, Error> {
+    damage::Rect::checked(x, y, width, height).map_err(damage_error)
+}
+
+/// A partial-row damage command uses the full resource stride, not the
+/// cropped scanout width. The caller must fence the completion before flush.
+pub fn damage_transfer(x: u32, y: u32, width: u32, height: u32, fence: u64)
+    -> Result<[u8; TRANSFER_BYTES], Error>
+{
+    damage::encode_transfer(damage_rect(x, y, width, height)?, fence)
+        .map_err(damage_error)
+}
+
+/// The matching exact rectangle to flush after a fenced transfer.
+pub fn damage_flush(x: u32, y: u32, width: u32, height: u32, fence: u64)
+    -> Result<[u8; RECT_BYTES], Error>
+{
+    damage::encode_flush(damage_rect(x, y, width, height)?, fence)
+        .map_err(damage_error)
+}
+
 pub fn transfer(index: usize, fence: u64) -> Result<[u8; TRANSFER_BYTES], Error> {
     let (y, rows, offset) = band(index)?;
-    let mut bytes = [0u8; TRANSFER_BYTES];
-    header(CMD_TRANSFER_TO_HOST_2D, fence, &mut bytes)?;
-    // rect.x stays zero; rect.y is the band's first scanline.
-    bytes[28..32].copy_from_slice(&y.to_le_bytes());
-    bytes[32..36].copy_from_slice(&WIDTH.to_le_bytes());
-    bytes[36..40].copy_from_slice(&rows.to_le_bytes());
-    bytes[40..48].copy_from_slice(&offset.to_le_bytes());
-    bytes[48..52].copy_from_slice(&RESOURCE_ID.to_le_bytes());
+    let bytes = damage_transfer(0, y, WIDTH, rows, fence)?;
+    if u64::from_le_bytes(bytes[40..48].try_into().unwrap()) != offset {
+        return Err(Error::InvalidBand);
+    }
     Ok(bytes)
 }
 
@@ -200,12 +227,7 @@ pub fn set_scanout(fence: u64) -> Result<[u8; RECT_BYTES], Error> {
 }
 
 pub fn flush(fence: u64) -> Result<[u8; RECT_BYTES], Error> {
-    let mut bytes = [0u8; RECT_BYTES];
-    header(CMD_RESOURCE_FLUSH, fence, &mut bytes)?;
-    bytes[32..36].copy_from_slice(&WIDTH.to_le_bytes());
-    bytes[36..40].copy_from_slice(&HEIGHT.to_le_bytes());
-    bytes[40..44].copy_from_slice(&RESOURCE_ID.to_le_bytes());
-    Ok(bytes)
+    damage_flush(0, 0, WIDTH, HEIGHT, fence)
 }
 
 /// `(y, rows, byte offset)` of one 1024x384 transfer band. Same stride as the
@@ -230,13 +252,10 @@ pub fn alt_band(index: usize) -> Result<(u32, u32, u64), Error> {
 
 pub fn alt_transfer(index: usize, fence: u64) -> Result<[u8; TRANSFER_BYTES], Error> {
     let (y, rows, offset) = alt_band(index)?;
-    let mut bytes = [0u8; TRANSFER_BYTES];
-    header(CMD_TRANSFER_TO_HOST_2D, fence, &mut bytes)?;
-    bytes[28..32].copy_from_slice(&y.to_le_bytes());
-    bytes[32..36].copy_from_slice(&ALT_WIDTH.to_le_bytes());
-    bytes[36..40].copy_from_slice(&rows.to_le_bytes());
-    bytes[40..48].copy_from_slice(&offset.to_le_bytes());
-    bytes[48..52].copy_from_slice(&RESOURCE_ID.to_le_bytes());
+    let bytes = damage_transfer(0, y, ALT_WIDTH, rows, fence)?;
+    if u64::from_le_bytes(bytes[40..48].try_into().unwrap()) != offset {
+        return Err(Error::InvalidBand);
+    }
     Ok(bytes)
 }
 
@@ -251,12 +270,7 @@ pub fn alt_set_scanout(fence: u64) -> Result<[u8; RECT_BYTES], Error> {
 }
 
 pub fn alt_flush(fence: u64) -> Result<[u8; RECT_BYTES], Error> {
-    let mut bytes = [0u8; RECT_BYTES];
-    header(CMD_RESOURCE_FLUSH, fence, &mut bytes)?;
-    bytes[32..36].copy_from_slice(&ALT_WIDTH.to_le_bytes());
-    bytes[36..40].copy_from_slice(&ALT_HEIGHT.to_le_bytes());
-    bytes[40..44].copy_from_slice(&RESOURCE_ID.to_le_bytes());
-    Ok(bytes)
+    damage_flush(0, 0, ALT_WIDTH, ALT_HEIGHT, fence)
 }
 
 pub fn detach(fence: u64) -> Result<[u8; DETACH_BYTES], Error> {
