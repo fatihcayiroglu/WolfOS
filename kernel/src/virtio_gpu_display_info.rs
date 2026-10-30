@@ -407,7 +407,7 @@ fn await_host_attestation(
         // A verdict line that shows up after the window closed is a late
         // decision, not evidence about pixels; it must not be mistaken for the
         // attestation this stage is waiting for.
-        if len>1&&is_verdict_line(&line[..len])&&late<MAX_LATE_VERDICTS{
+        if len>1&&crate::display_mode_catalog::is_elapsed_verdict_line(&line[..len])&&late<MAX_LATE_VERDICTS{
             late+=1;
             serial::write_fmt(format_args!(
                 "WOLFOS_GPU_STALE_REPLY_DROPPED lines={} late_verdict=1 before_stage_token={}\n",
@@ -440,10 +440,6 @@ fn await_host_attestation(
 
 /// How many late decision lines may be skipped before giving up.
 const MAX_LATE_VERDICTS:u32=4;
-
-fn is_verdict_line(line:&[u8])->bool{
-    line.len()>=2&&matches!(line[0],b'X'|b'E')&&line[1]==b' '
-}
 
 /// Reads the nonce field of a reply line without accepting or rejecting it.
 fn reply_nonce(line:&[u8])->Option<u64>{
