@@ -125,6 +125,10 @@ mod ramfs_smoke;
 mod pci;
 mod display_driver_policy;
 mod display_mode_policy;
+mod display_mode_catalog;
+mod display_mode_transaction;
+mod hpet_clock;
+mod virtio_gpu_desktop_wire;
 mod display_edid_base;
 mod display_edid_cta;
 mod virtio_gpu_edid_wire;
@@ -606,8 +610,30 @@ pub extern "C" fn kmain() -> ! {
                     serial::write_line("WOLFOS_VIRTIO_GPU_NOTIFY_RO_TEST_OK");
                     #[cfg(feature = "qemu-virtio-gpu-display-info-smoke")]
                     {
+                        #[cfg(feature = "qemu-virtio-gpu-desktop-scanout-smoke")]
+                        let desktop_fb = FRAMEBUFFER_REQUEST
+                            .response()
+                            .and_then(|response| response.framebuffers().first())
+                            .map(|fb| virtio_gpu_desktop_wire::Framebuffer {
+                                address: fb.address() as usize as u64,
+                                width: fb.width as u32,
+                                height: fb.height as u32,
+                                pitch: fb.pitch as u32,
+                                bits_per_pixel: u32::from(fb.bpp),
+                                red_shift: u32::from(fb.red_mask_shift),
+                                green_shift: u32::from(fb.green_mask_shift),
+                                blue_shift: u32::from(fb.blue_mask_shift),
+                            })
+                            .unwrap_or(virtio_gpu_desktop_wire::Framebuffer::NONE);
+                        #[cfg(not(feature = "qemu-virtio-gpu-desktop-scanout-smoke"))]
+                        let desktop_fb = virtio_gpu_desktop_wire::Framebuffer::NONE;
+                        // The confirmation window is enforced by the guest's own
+                        // validated clock, not by the peer that answers it.
+                        #[cfg(feature = "qemu-virtio-gpu-desktop-scanout-smoke")]
+                        hpet_clock::init(hhdm.offset,entries);
                         if !virtio_gpu_display_info::verify(
-                            hhdm.offset,entries,window,notify_window,controlq_layout
+                            hhdm.offset,entries,window,notify_window,controlq_layout,
+                            &desktop_fb
                         ){
                             serial::write_line("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_FAILED");
                             halt_forever();

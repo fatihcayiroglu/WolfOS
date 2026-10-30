@@ -51,6 +51,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-scanout-reset)
 FEATURES := --features qemu-virtio-gpu-scanout-reset-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-native-rollback)
 FEATURES := --features qemu-virtio-gpu-native-rollback-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-desktop-scanout)
+FEATURES := --features qemu-virtio-gpu-desktop-scanout-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -395,6 +397,69 @@ qemu-virtio-gpu-native-rollback-smoke:
 	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_native_rollback_smoke.py
 	python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py --native-rollback $(OUT)/wolfos-qemu-virtio-gpu-native-rollback.iso
 
+.PHONY: qemu-virtio-gpu-desktop-scanout-smoke
+qemu-virtio-gpu-desktop-scanout-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-desktop-scanout
+	rustc --edition=2024 --test kernel/src/virtio_gpu_desktop_wire.rs -o $(OUT)/virtio_gpu_desktop_wire_tests
+	$(OUT)/virtio_gpu_desktop_wire_tests
+	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_desktop_scanout.py
+	python3 scripts/qemu_virtio_gpu_desktop_scanout.py $(OUT)/wolfos-qemu-virtio-gpu-desktop-scanout.iso
+
+.PHONY: qemu-virtio-gpu-desktop-scanout-negative
+# The desktop proof must be able to fail. Two independent classes:
+#  * a lying host corrupted attestation field must abort the whole proof;
+#  * a lying host verdict must be graded, not obeyed: an early "expired" claim
+#    is refused outright, and a really elapsed window forces a verified
+#    rollback to the previous mode;
+#  * a peer that says nothing at all must not strand the guest: the guest ends
+#    the window on its own HPET clock and rolls back.
+# DESKTOP_ATTEST_FAULTS / DESKTOP_MODE_FAULTS may be narrowed locally.
+DESKTOP_ATTEST_FAULTS ?= digest nonce geometry
+DESKTOP_MODE_FAULTS ?= mode_early mode_expired mode_silent
+qemu-virtio-gpu-desktop-scanout-negative:
+	@for fault in $(DESKTOP_ATTEST_FAULTS); do \
+	  if WOLFOS_DESKTOP_FAULT=$$fault python3 scripts/qemu_virtio_gpu_desktop_scanout.py \
+	       --require-refusal $(OUT)/wolfos-qemu-virtio-gpu-desktop-scanout.iso \
+	       > $(OUT)/desktop-$$fault.log 2>&1; then \
+	    echo "OK: desktop attestation fault $$fault refused by the guest"; \
+	  else \
+	    echo "FAIL: desktop attestation fault $$fault was accepted"; exit 1; \
+	  fi; \
+	done
+	@for fault in $(DESKTOP_MODE_FAULTS); do \
+	  if WOLFOS_DESKTOP_FAULT=$$fault python3 scripts/qemu_virtio_gpu_desktop_scanout.py \
+	       $(OUT)/wolfos-qemu-virtio-gpu-desktop-scanout.iso \
+	       > $(OUT)/desktop-$$fault.log 2>&1; then \
+	    echo "OK: desktop mode-transaction fault $$fault refused by the guest"; \
+	  else \
+	    echo "FAIL: desktop mode-transaction fault $$fault was accepted"; exit 1; \
+	  fi; \
+	done
+
+.PHONY: qemu-virtio-gpu-attestation-negative
+# The attestation gate must be able to fail: a host that lies about the digest,
+# the nonce or the geometry has to be refused by the guest, loudly.
+# ATTEST_FAULTS may be narrowed locally, e.g. ATT... "FAULTS=digest".
+ATTEST_FAULTS ?= digest nonce geometry
+qemu-virtio-gpu-attestation-negative:
+	@for fault in $(ATTEST_FAULTS); do \
+	  case "$$fault" in \
+	    digest) reason=digest_mismatch ;; \
+	    nonce) reason=bad_nonce ;; \
+	    geometry) reason=wrong_geometry ;; \
+	    *) echo "FAIL: unknown attestation fault $$fault"; exit 1 ;; \
+	  esac; \
+	  if WOLFOS_ATTEST_FAULT=$$fault python3 scripts/qemu_virtio_gpu_scanout_live_smoke.py \
+	       --native-rollback $(OUT)/wolfos-qemu-virtio-gpu-native-rollback.iso \
+	       > $(OUT)/attest-$$fault.log 2>&1; then \
+	    echo "FAIL: attestation fault $$fault was not refused"; exit 1; \
+	  elif ! grep -q "WOLFOS_GPU_ATTEST_FAIL stage=active reason=$$reason " $(OUT)/attest-$$fault.log; then \
+	    echo "FAIL: attestation fault $$fault refused without matching kernel evidence"; exit 1; \
+	  else \
+	    echo "OK: attestation fault $$fault refused by the guest as $$reason"; \
+	  fi; \
+	done
+
 .PHONY: qemu-stdvga-dispi-smoke
 qemu-stdvga-dispi-smoke:
 	$(MAKE) iso FLAVOR=qemu-stdvga-dispi
@@ -701,6 +766,9 @@ test:
 	rustc --edition=2024 --test tests/serial_shell.rs -o $(OUT)/serial_shell_tests
 	$(OUT)/serial_shell_tests
 	python3 -m unittest discover -s tests -v
+	rustc --edition=2024 --test kernel/src/virtio_gpu_desktop_wire.rs -o $(OUT)/virtio_gpu_desktop_wire_tests
+	$(OUT)/virtio_gpu_desktop_wire_tests
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_virtio_gpu_desktop_scanout.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_display_driver_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_virtio_gpu_pci_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_stdvga_dispi_smoke.py' -v

@@ -87,13 +87,36 @@ fn u64le(data: &[u8], at: usize) -> u64 {
     ])
 }
 
+/// Highest controlq command index the bounded 64x64 probes may ever reach.
+pub const PROBE_MAX_INDEX: u16 = 14;
+/// Highest controlq index of the real desktop presentation (21 commands), the
+/// second-geometry discovery (8), the transactional change (8 + readback) and,
+/// when the confirmation window really elapsed, the verified rollback (8).
+/// 46 is the worst case; anything above it is not a legal desktop command.
+pub const DESKTOP_MAX_INDEX: u16 = 46;
+
 /// A sent request or plausible 24-byte DMA buffer is never completion.
 /// Require exact used idx/head/len plus the echoed nonzero request fence.
 pub fn validate_completion(
     expected_index: u16, used_index: u16, used_id: u32, used_len: u32,
     response: &[u8], expected_fence: u64,
 ) -> Result<(), Error> {
-    if !(3..=14).contains(&expected_index) { return Err(Error::MissingCompletion); }
+    validate_completion_upto(
+        expected_index, PROBE_MAX_INDEX, used_index, used_id, used_len,
+        response, expected_fence,
+    )
+}
+
+/// Same completion contract with an explicit upper bound. The bound is a
+/// compile-time constant of the calling flavor, never a runtime value that an
+/// untrusted response could influence.
+pub fn validate_completion_upto(
+    expected_index: u16, max_index: u16, used_index: u16, used_id: u32,
+    used_len: u32, response: &[u8], expected_fence: u64,
+) -> Result<(), Error> {
+    if expected_index < 3 || expected_index > max_index {
+        return Err(Error::MissingCompletion);
+    }
     if used_index != expected_index { return Err(Error::MissingCompletion); }
     if used_id != 0 { return Err(Error::WrongHead); }
     if used_len != RESPONSE_BYTES as u32 || response.len() != RESPONSE_BYTES {
