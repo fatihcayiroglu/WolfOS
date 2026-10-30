@@ -127,6 +127,51 @@ TEST_OK = "WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 FAULT = os.environ.get("WOLFOS_DESKTOP_FAULT", "")
 ATTEST_FAULTS = ("digest", "nonce", "geometry")
 
+FORGED_REASON = {
+    "digest": "digest_mismatch",
+    "nonce": "bad_nonce",
+    "geometry": "wrong_geometry",
+}
+FORGED_FAIL = re.compile(
+    r"WOLFOS_GPU_ATTEST_FAIL stage=desktop reason=(\w+) "
+    r"bytes=(\d+) source_digest=([0-9a-f]{8})")
+
+
+def validate_forged_desktop_refusal(output: str, fault: str) -> bool:
+    """Require independent, correctly ordered guest evidence for a fault.
+
+    A host-side exception, an unrelated guest failure, a truncated serial
+    line, or a forged-success marker must never count as a negative pass.
+    """
+    if fault not in FORGED_REASON:
+        return False
+    lines = output.splitlines()
+    injected = [i for i,line in enumerate(lines)
+                if line.startswith(ATTEST_PREFIX)
+                and "stage=desktop " in line]
+    errors = [(i,FORGED_FAIL.fullmatch(line)) for i,line in enumerate(lines)
+              if line.startswith("WOLFOS_GPU_ATTEST_FAIL ")]
+    empty = [(i,CATALOG_FAIL.fullmatch(line)) for i,line in enumerate(lines)
+             if line.startswith(CATALOG_FAIL_PREFIX)]
+    desktop_fail = [(i,line) for i,line in enumerate(lines)
+                    if line.startswith("WOLFOS_VIRTIO_GPU_DESKTOP_FAIL ")]
+    if (len(injected)!=1 or len(errors)!=1 or errors[0][1] is None
+            or len(empty)!=1 or empty[0][1] is None
+            or len(desktop_fail)!=1
+            or desktop_fail[0][1] !=
+               "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL stage=attest_reply"):
+        return False
+    reason,length,_source=errors[0][1].groups()
+    if reason != FORGED_REASON[fault] or int(length)<1:
+        return False
+    if not (injected[0] < errors[0][0] < empty[0][0] < desktop_fail[0][0]):
+        return False
+    forbidden=("WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK ",
+               "WOLFOS_VIRTIO_GPU_MODE_TX_OK ",
+               "WOLFOS_VIRTIO_GPU_DESKTOP_SCANOUT_OK ")
+    return not any(line.startswith(forbidden) for line in lines)
+
+
 
 def expected_rgb(x: int, y: int) -> tuple[int, int, int]:
     """Mirror of `virtio_gpu_desktop_wire::pixel_rgb`."""
@@ -503,6 +548,8 @@ def run(iso: Path, require_refusal: bool = False) -> int:
         captured = []
         measured = {}
         saw_refusal = False
+        injected_forgery = False
+        guest_refused_forgery = False
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
@@ -529,6 +576,12 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                             while b"\n" in pending:
                                 line, pending = pending.split(b"\n", 1)
                                 clean = line.decode("ascii", errors="replace").strip()
+                                if (FAULT in ATTEST_FAULTS and injected_forgery
+                                        and clean ==
+                                        "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL stage=attest_reply"):
+                                    # Only the subsequent strict validator can
+                                    # declare success; this just ends the wait.
+                                    guest_refused_forgery = True
                                 if clean.startswith(
                                         "WOLFOS_VIRTIO_GPU_MODE_TX_FAIL"):
                                     saw_refusal = True
@@ -596,6 +649,8 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                     else:
                                         _reply(ser, token, geometry, nonce, digest,
                                                FAULT)
+                                        if FAULT in ATTEST_FAULTS and stage == "desktop":
+                                            injected_forgery = True
                                     captured.append(stage)
                                 elif clean.startswith(CAPTURE_PREFIX):
                                     name = clean[len(CAPTURE_PREFIX):]
@@ -616,6 +671,8 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                     captured.append("restored")
                         if proc.poll() is not None and not chunk:
                             break
+                        if guest_refused_forgery:
+                            break
                         if FAULT == "mode_early" and len(captured) == 3 and saw_refusal:
                             # The refused change halts the guest without a
                             # teardown, so there is nothing left to observe --
@@ -633,6 +690,10 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                     if FAULT not in ATTEST_FAULTS and captured != expected:
                         raise ProofError(
                             f"Stages {captured} captured, expected {expected}")
+            if FAULT in ATTEST_FAULTS and guest_refused_forgery:
+                # A correctly rejected test guest may halt forever; QEMU does
+                # not need to exit normally for a negative acceptance proof.
+                proc.kill()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -646,25 +707,13 @@ def run(iso: Path, require_refusal: bool = False) -> int:
             output = received.decode("ascii", errors="replace")
             print(output)
             if FAULT in ATTEST_FAULTS:
-                if proc.returncode == 33 or not any(
-                        "WOLFOS_GPU_ATTEST_FAIL" in line
-                        or "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL" in line
-                        for line in output.splitlines()):
+                if not guest_refused_forgery or not validate_forged_desktop_refusal(
+                        output, FAULT):
                     raise ProofError(
-                        f"Guest accepted a forged attestation ({FAULT})")
-                if any(line.startswith(CATALOG_PREFIX)
-                       for line in output.splitlines()):
-                    raise ProofError(
-                        f"Forged {FAULT} attestation still produced a "
-                        "selectable mode catalog")
-                refused = [line for line in output.splitlines()
-                           if line.startswith(CATALOG_FAIL_PREFIX)]
-                if len(refused) != 1 or not CATALOG_FAIL.fullmatch(refused[0]):
-                    raise ProofError(
-                        f"Missing or malformed empty-catalog refusal: {refused}")
-                print(f"PASS: guest refused the forged {FAULT} attestation reply")
-                print("PASS: the refused attestation left the mode catalog "
-                      "empty (mode=no_selectable_mode)")
+                        f"Forged {FAULT} attestation not explicitly refused "
+                        "with an empty catalog and exact kernel reason")
+                print(f"PASS: guest refused forged {FAULT} attestation with "
+                      f"{FORGED_REASON[FAULT]} and an empty mode catalog")
                 return 0
             if FAULT == "mode_early":
                 # A peer may not shorten the window: the guest must keep the
