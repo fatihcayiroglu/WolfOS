@@ -46,8 +46,8 @@ ATTEST_FAULT=os.environ.get("WOLFOS_ATTEST_FAULT","")
 EXPECTED_REFUSAL={"digest":"digest_mismatch","nonce":"bad_nonce",
                   "geometry":"wrong_geometry"}
 GUEST_REFUSAL=re.compile(
-    r"WOLFOS_GPU_ATTEST_FAIL stage=(\\w+) reason=(\\w+) "
-    r"bytes=(\\d+) source_digest=([0-9a-f]{8})")
+    r"WOLFOS_GPU_ATTEST_FAIL stage=(\w+) reason=(\w+) "
+    r"bytes=(\d+) source_digest=([0-9a-f]{8})")
 
 STAGES=("baseline","active","disabled")
 RELEASE={"baseline":b"B","active":b"A","disabled":b"D"}
