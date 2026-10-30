@@ -79,7 +79,7 @@ class RealPartialWidthContract(unittest.TestCase):
         self.assertTrue(validate_desktop_serial(valid))
         mutations=(
             valid.replace(DAMAGE_MARKER+"\n",""),
-            valid.replace(DAMAGE_MARKER+"\n",DAMAGE_MARKER+"\n"*2),
+            valid.replace(DAMAGE_MARKER+"\n",DAMAGE_MARKER+"\n"+DAMAGE_MARKER+"\n"),
             valid.replace("transfer_acks=2","transfer_acks=1"),
             valid.replace("flush_acks=2","flush_acks=1"),
             valid.replace("outside_pixels=785408","outside_pixels=785407"),
