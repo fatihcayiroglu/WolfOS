@@ -88,7 +88,7 @@ jobs:
         run: make qemu-virtio-gpu-native-rollback-smoke
       - name: Host pixel attestation must refuse a forged digest, nonce or geometry
         run: make qemu-virtio-gpu-attestation-negative
-      - name: Desktop transaction: real 1024x384 discovery, readback and host-confirmed 1024x768 change
+      - name: "Desktop transaction: real 1024x384 discovery, readback and host-confirmed 1024x768 change"
         run: make qemu-virtio-gpu-desktop-scanout-smoke
       - name: Desktop transaction must refuse a forged digest, nonce, geometry, early expiry and roll back after a real window
         run: make qemu-virtio-gpu-desktop-scanout-negative
