@@ -402,6 +402,8 @@ qemu-virtio-gpu-desktop-scanout-smoke:
 	$(MAKE) iso FLAVOR=qemu-virtio-gpu-desktop-scanout
 	rustc --edition=2024 --test kernel/src/virtio_gpu_desktop_wire.rs -o $(OUT)/virtio_gpu_desktop_wire_tests
 	$(OUT)/virtio_gpu_desktop_wire_tests
+	rustc --edition=2024 --test kernel/src/virtio_gpu_damage.rs -o $(OUT)/virtio_gpu_damage_tests
+	$(OUT)/virtio_gpu_damage_tests
 	python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_desktop_scanout.py
 	python3 scripts/qemu_virtio_gpu_desktop_scanout.py $(OUT)/wolfos-qemu-virtio-gpu-desktop-scanout.iso
 
