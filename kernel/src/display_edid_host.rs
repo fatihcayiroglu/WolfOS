@@ -10,3 +10,5 @@ mod display_edid_cta;
 mod virtio_gpu_edid_wire;
 #[path = "display_mode_catalog.rs"]
 mod display_mode_catalog;
+#[path = "display_mode_transaction.rs"]
+mod display_mode_transaction;

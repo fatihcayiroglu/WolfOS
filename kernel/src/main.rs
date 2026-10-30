@@ -126,6 +126,7 @@ mod pci;
 mod display_driver_policy;
 mod display_mode_policy;
 mod display_mode_catalog;
+mod display_mode_transaction;
 mod virtio_gpu_desktop_wire;
 mod display_edid_base;
 mod display_edid_cta;

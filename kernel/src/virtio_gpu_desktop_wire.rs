@@ -22,6 +22,22 @@ pub const FRAME_BYTES: u64 = 4096;
 
 pub const BAND_ROWS: u32 = 64;
 pub const BANDS: usize = (HEIGHT / BAND_ROWS) as usize;
+
+// ---- second native scanout geometry -------------------------------------
+//
+// The transactional mode-change proof needs a *second* geometry that the
+// device really shows and the host really verifies. It keeps the 1024-pixel
+// row, so a resource row is still exactly one 4 KiB page: the packed band
+// buffer the transfer command needs is the same page run the backing uses.
+// Any other width would make the transfer window and the resource layout
+// disagree, and a silently resampled or re-strided image is precisely what
+// the host digest is there to catch.
+pub const ALT_WIDTH: u32 = WIDTH;
+pub const ALT_HEIGHT: u32 = 384;
+/// Scanlines above this row are the only ones a 1024x384 presentation can
+/// overwrite, so restoring the desktop re-uploads exactly these bands.
+pub const ALT_BANDS: usize = (ALT_HEIGHT / BAND_ROWS) as usize;
+pub const ALT_PAGES: usize = ALT_HEIGHT as usize;
 pub const REQUEST_LIMIT: usize = 4096;
 pub const ATTACH_HEADER_BYTES: usize = 32;
 pub const ENTRY_BYTES: usize = 16;
@@ -192,6 +208,57 @@ pub fn flush(fence: u64) -> Result<[u8; RECT_BYTES], Error> {
     Ok(bytes)
 }
 
+/// `(y, rows, byte offset)` of one 1024x384 transfer band. Same stride as the
+/// full desktop, so the whole band is a contiguous run of resource pages.
+pub fn alt_band(index: usize) -> Result<(u32, u32, u64), Error> {
+    if index >= ALT_BANDS {
+        return Err(Error::InvalidBand);
+    }
+    let y = (index as u32) * BAND_ROWS;
+    let rows = (ALT_HEIGHT - y).min(BAND_ROWS);
+    if rows != BAND_ROWS {
+        return Err(Error::InvalidBand);
+    }
+    let offset = (u64::from(y))
+        .checked_mul(ROW_BYTES as u64)
+        .ok_or(Error::InvalidBand)?;
+    if offset + u64::from(rows) * ROW_BYTES as u64 > RESOURCE_BYTES as u64 {
+        return Err(Error::InvalidBand);
+    }
+    Ok((y, rows, offset))
+}
+
+pub fn alt_transfer(index: usize, fence: u64) -> Result<[u8; TRANSFER_BYTES], Error> {
+    let (y, rows, offset) = alt_band(index)?;
+    let mut bytes = [0u8; TRANSFER_BYTES];
+    header(CMD_TRANSFER_TO_HOST_2D, fence, &mut bytes)?;
+    bytes[28..32].copy_from_slice(&y.to_le_bytes());
+    bytes[32..36].copy_from_slice(&ALT_WIDTH.to_le_bytes());
+    bytes[36..40].copy_from_slice(&rows.to_le_bytes());
+    bytes[40..48].copy_from_slice(&offset.to_le_bytes());
+    bytes[48..52].copy_from_slice(&RESOURCE_ID.to_le_bytes());
+    Ok(bytes)
+}
+
+pub fn alt_set_scanout(fence: u64) -> Result<[u8; RECT_BYTES], Error> {
+    let mut bytes = [0u8; RECT_BYTES];
+    header(CMD_SET_SCANOUT, fence, &mut bytes)?;
+    bytes[32..36].copy_from_slice(&ALT_WIDTH.to_le_bytes());
+    bytes[36..40].copy_from_slice(&ALT_HEIGHT.to_le_bytes());
+    bytes[40..44].copy_from_slice(&SCANOUT_ID.to_le_bytes());
+    bytes[44..48].copy_from_slice(&RESOURCE_ID.to_le_bytes());
+    Ok(bytes)
+}
+
+pub fn alt_flush(fence: u64) -> Result<[u8; RECT_BYTES], Error> {
+    let mut bytes = [0u8; RECT_BYTES];
+    header(CMD_RESOURCE_FLUSH, fence, &mut bytes)?;
+    bytes[32..36].copy_from_slice(&ALT_WIDTH.to_le_bytes());
+    bytes[36..40].copy_from_slice(&ALT_HEIGHT.to_le_bytes());
+    bytes[40..44].copy_from_slice(&RESOURCE_ID.to_le_bytes());
+    Ok(bytes)
+}
+
 pub fn detach(fence: u64) -> Result<[u8; DETACH_BYTES], Error> {
     let mut bytes = [0u8; DETACH_BYTES];
     header(CMD_RESOURCE_DETACH_BACKING, fence, &mut bytes)?;
@@ -290,6 +357,22 @@ pub fn pixel_rgb(x: u32, y: u32) -> [u8; 3] {
 /// The exact 32-bit xRGB8888 word the driver stores in real framebuffer VRAM.
 pub fn pixel_word(x: u32, y: u32) -> u32 {
     let [r, g, b] = pixel_rgb(x, y);
+    ((r as u32) << RED_SHIFT) | ((g as u32) << GREEN_SHIFT) | (b as u32) << BLUE_SHIFT
+}
+
+/// The 1024x384 image. It must be visually different from the desktop image at
+/// the very same coordinate, so a device that kept showing the old scanout (or
+/// a host that compared the wrong capture) cannot pass the digest check.
+pub fn alt_pixel_rgb(x: u32, y: u32) -> [u8; 3] {
+    [
+        255u8.wrapping_sub((x.wrapping_mul(5).wrapping_add(y.wrapping_mul(3)).wrapping_add(11) & 0xff) as u8),
+        ((x.wrapping_mul(7).wrapping_add(y.wrapping_mul(9)).wrapping_add(53) & 0xff) as u8) ^ 0x5a,
+        ((x ^ y).wrapping_mul(3).wrapping_add(97) & 0xff) as u8,
+    ]
+}
+
+pub fn alt_pixel_word(x: u32, y: u32) -> u32 {
+    let [r, g, b] = alt_pixel_rgb(x, y);
     ((r as u32) << RED_SHIFT) | ((g as u32) << GREEN_SHIFT) | (b as u32) << BLUE_SHIFT
 }
 
@@ -498,6 +581,95 @@ mod tests {
         assert_ne!(r, g);
         assert_ne!(g, b);
         let word = pixel_word(37, 91);
+        assert_eq!((word >> 16) as u8, r);
+        assert_eq!((word >> 8) as u8, g);
+        assert_eq!(word as u8, b);
+    }
+
+    #[test]
+    fn second_geometry_keeps_the_page_per_row_layout() {
+        // A packed transfer band must equal the backing page run, otherwise the
+        // bytes the device gets are not the bytes that were verified.
+        assert_eq!(ALT_WIDTH, WIDTH);
+        assert_eq!((ALT_WIDTH as usize) * (BYTES_PER_PIXEL as usize), ROW_BYTES);
+        assert_eq!(ALT_HEIGHT, 384);
+        assert_eq!(ALT_BANDS, 6);
+        assert_eq!(ALT_PAGES, ALT_HEIGHT as usize);
+        assert_eq!(ALT_BANDS * BAND_ROWS as usize, ALT_HEIGHT as usize);
+        assert!(ALT_HEIGHT < HEIGHT);
+        assert_eq!(ALT_BANDS + 6, BANDS);
+    }
+
+    #[test]
+    fn alt_bands_cover_exactly_the_rows_the_alt_mode_owns() {
+        let mut covered = [0u8; HEIGHT as usize];
+        for index in 0..ALT_BANDS {
+            let (y, rows, offset) = alt_band(index).unwrap();
+            assert_eq!(y, index as u32 * BAND_ROWS);
+            assert_eq!(rows, BAND_ROWS);
+            assert_eq!(offset, y as u64 * ROW_BYTES as u64);
+            for row in y..y + rows {
+                covered[row as usize] += 1;
+            }
+        }
+        for row in 0..ALT_HEIGHT as usize {
+            assert_eq!(covered[row], 1, "row {row}");
+        }
+        assert!(covered[ALT_HEIGHT as usize..].iter().all(|n| *n == 0));
+        assert_eq!(alt_band(ALT_BANDS).err(), Some(Error::InvalidBand));
+        assert_eq!(alt_transfer(ALT_BANDS, 1).err(), Some(Error::InvalidBand));
+    }
+
+    #[test]
+    fn alt_scanout_flush_and_transfer_wire_is_exact() {
+        let band_bytes = alt_transfer(3, 0x4242).unwrap();
+        assert_eq!(u32at(&band_bytes, 0), CMD_TRANSFER_TO_HOST_2D);
+        assert_eq!(u64at(&band_bytes, 8), 0x4242);
+        assert_eq!(u32at(&band_bytes, 24), 0);
+        assert_eq!(u32at(&band_bytes, 28), 192);
+        assert_eq!(u32at(&band_bytes, 32), 1024);
+        assert_eq!(u32at(&band_bytes, 36), 64);
+        assert_eq!(u64at(&band_bytes, 40), 192 * ROW_BYTES as u64);
+        assert_eq!(u32at(&band_bytes, 48), RESOURCE_ID);
+        let set = alt_set_scanout(0x4343).unwrap();
+        assert_eq!(u32at(&set, 0), CMD_SET_SCANOUT);
+        assert_eq!(u32at(&set, 32), 1024);
+        assert_eq!(u32at(&set, 36), 384);
+        assert_eq!(u32at(&set, 40), SCANOUT_ID);
+        assert_eq!(u32at(&set, 44), RESOURCE_ID);
+        let flush_bytes = alt_flush(0x4444).unwrap();
+        assert_eq!(u32at(&flush_bytes, 0), CMD_RESOURCE_FLUSH);
+        assert_eq!(u32at(&flush_bytes, 36), 384);
+        assert_eq!(u32at(&flush_bytes, 40), RESOURCE_ID);
+        // The full-desktop wire is untouched by the alt geometry.
+        assert_eq!(u32at(&set_scanout(1).unwrap(), 36), 768);
+        assert_eq!(u32at(&transfer(0, 1).unwrap(), 36), 64);
+    }
+
+    #[test]
+    fn alt_bands_refuse_a_zero_fence() {
+        assert_eq!(alt_transfer(0, 0).err(), Some(Error::InvalidFence));
+        assert_eq!(alt_set_scanout(0).err(), Some(Error::InvalidFence));
+        assert_eq!(alt_flush(0).err(), Some(Error::InvalidFence));
+    }
+
+    #[test]
+    fn alt_image_differs_from_the_desktop_image_everywhere() {
+        for y in 0..ALT_HEIGHT {
+            for x in (0..ALT_WIDTH).step_by(17) {
+                assert_ne!(alt_pixel_rgb(x, y), pixel_rgb(x, y),
+                           "identical pixel at ({x},{y})");
+            }
+        }
+        for (x, y) in [(0u32, 0u32), (1023, 0), (0, 383), (512, 192), (1023, 383)] {
+            let centre = alt_pixel_rgb(x, y);
+            assert_ne!(centre, alt_pixel_rgb((x + 1) % ALT_WIDTH, y));
+            assert_ne!(centre, alt_pixel_rgb(x, (y + 1) % ALT_HEIGHT));
+        }
+        let [r, g, b] = alt_pixel_rgb(37, 91);
+        assert_ne!(r, g);
+        assert_ne!(g, b);
+        let word = alt_pixel_word(37, 91);
         assert_eq!((word >> 16) as u8, r);
         assert_eq!((word >> 8) as u8, g);
         assert_eq!(word as u8, b);

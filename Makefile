@@ -406,18 +406,31 @@ qemu-virtio-gpu-desktop-scanout-smoke:
 	python3 scripts/qemu_virtio_gpu_desktop_scanout.py $(OUT)/wolfos-qemu-virtio-gpu-desktop-scanout.iso
 
 .PHONY: qemu-virtio-gpu-desktop-scanout-negative
-# The desktop proof must be able to fail: a host that lies about the digest,
-# the nonce or the geometry has to be refused by the guest, loudly.
-# DESKTOP_FAULTS may be narrowed locally, e.g. "FAULT=digest".
-DESKTOP_FAULTS ?= digest nonce geometry
+# The desktop proof must be able to fail. Two independent classes:
+#  * a lying host corrupted attestation field must abort the whole proof;
+#  * a lying host verdict must be graded, not obeyed: an early "expired" claim
+#    is refused outright, and a really elapsed window forces a verified
+#    rollback to the previous mode.
+# DESKTOP_ATTEST_FAULTS / DESKTOP_MODE_FAULTS may be narrowed locally.
+DESKTOP_ATTEST_FAULTS ?= digest nonce geometry
+DESKTOP_MODE_FAULTS ?= mode_early mode_expired
 qemu-virtio-gpu-desktop-scanout-negative:
-	@for fault in $(DESKTOP_FAULTS); do \
+	@for fault in $(DESKTOP_ATTEST_FAULTS); do \
 	  if WOLFOS_DESKTOP_FAULT=$$fault python3 scripts/qemu_virtio_gpu_desktop_scanout.py \
 	       --require-refusal $(OUT)/wolfos-qemu-virtio-gpu-desktop-scanout.iso \
 	       > $(OUT)/desktop-$$fault.log 2>&1; then \
 	    echo "OK: desktop attestation fault $$fault refused by the guest"; \
 	  else \
 	    echo "FAIL: desktop attestation fault $$fault was accepted"; exit 1; \
+	  fi; \
+	done
+	@for fault in $(DESKTOP_MODE_FAULTS); do \
+	  if WOLFOS_DESKTOP_FAULT=$$fault python3 scripts/qemu_virtio_gpu_desktop_scanout.py \
+	       $(OUT)/wolfos-qemu-virtio-gpu-desktop-scanout.iso \
+	       > $(OUT)/desktop-$$fault.log 2>&1; then \
+	    echo "OK: desktop mode-transaction fault $$fault refused by the guest"; \
+	  else \
+	    echo "FAIL: desktop mode-transaction fault $$fault was accepted"; exit 1; \
 	  fi; \
 	done
 

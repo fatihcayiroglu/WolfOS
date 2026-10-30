@@ -513,6 +513,16 @@ impl Attestation {
     }
 }
 
+#[cfg(test)]
+impl Attestation {
+    /// Test-only: a synthetic accepted attestation for policy tests. Only the
+    /// `#[cfg(test)]` build has this constructor; the kernel binary can still
+    /// obtain an `Attestation` exclusively from `decode_attestation_reply`.
+    pub fn for_test(nonce: u64, width: u32, height: u32, digest: u32) -> Self {
+        Self { nonce, width, height, digest }
+    }
+}
+
 /// FNV-1a over width*height canonical `(r, g, b)` triples in scanline order.
 /// Both the driver (over its source pixels) and the host (over the captured
 /// screenshot) compute this same value, so any corruption diverges.
@@ -602,6 +612,9 @@ impl StageChallenge {
             b'M' => "reduced",
             b'E' => "reexpanded",
             b'P' => "desktop",
+            b'S' => "reduced",
+            b'T' => "applied",
+            b'R' => "rollback",
             _ => "unknown",
         }
     }
@@ -667,8 +680,15 @@ pub fn decode_attestation_reply(
 /// Stable summary of the attested-desktop selection proof.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DesktopSelection {
+    /// The geometry the primary attestation proved.
     pub width: u32,
     pub height: u32,
+    /// What automatic selection really picked (the largest proven geometry).
+    pub automatic_width: u32,
+    pub automatic_height: u32,
+    /// The second proven geometry, or zeroes when only one was attested.
+    pub second_width: u32,
+    pub second_height: u32,
     pub entries: usize,
     pub selectable: usize,
     pub device_reported: usize,
@@ -701,6 +721,7 @@ pub fn prove_desktop_selection(
     generation: u64,
     scanout: u8,
     attestation: Attestation,
+    second: Option<Attestation>,
     device: Option<(u32, u32)>,
     edid_rate_millihz: u32,
 ) -> Result<DesktopSelection, &'static str> {
@@ -713,6 +734,21 @@ pub fn prove_desktop_selection(
     modes
         .record(attested)
         .map_err(|_| "catalog_record_attested")?;
+    // A second geometry is only ever a *second* mode: same-geometry evidence
+    // with different metadata must conflict instead of silently replacing it.
+    let mut proven = [attested; 2];
+    let mut proven_len = 1usize;
+    if let Some(second) = second {
+        let entry = second.entry(scanout);
+        if entry.same_geometry(attested) {
+            return Err("catalog_second_not_distinct");
+        }
+        modes
+            .record(entry)
+            .map_err(|_| "catalog_record_second")?;
+        proven[1] = entry;
+        proven_len = 2;
+    }
     // An unattested catalog must remain non-selectable. This is checked against
     // a fresh catalog so it cannot be satisfied by the entry above.
     let empty = ModeCatalog::new(generation).map_err(|_| "catalog_generation")?;
@@ -745,18 +781,30 @@ pub fn prove_desktop_selection(
     let automatic = modes
         .choose(generation, UserChoice::AUTOMATIC)
         .map_err(|_| "catalog_automatic")?;
-    if automatic != attested {
+    // Automatic selection must be the largest *proven* geometry, recomputed
+    // from the entries themselves rather than assumed from the call order.
+    let mut largest = proven[0];
+    for entry in proven[..proven_len].iter().copied() {
+        if (entry.area(), u8::MAX - entry.scanout)
+            > (largest.area(), u8::MAX - largest.scanout)
+        {
+            largest = entry;
+        }
+    }
+    if automatic != largest {
         return Err("catalog_automatic_not_attested");
     }
     if automatic.refresh != RefreshEvidence::Unavailable {
         return Err("catalog_invented_refresh");
     }
-    if modes
-        .choose(generation, exact_geometry(attested.width, attested.height))
-        .map_err(|_| "catalog_manual_attested")?
-        != attested
-    {
-        return Err("catalog_manual_geometry");
+    for entry in proven[..proven_len].iter().copied() {
+        if modes
+            .choose(generation, exact_geometry(entry.width, entry.height))
+            .map_err(|_| "catalog_manual_attested")?
+            != entry
+        {
+            return Err("catalog_manual_geometry");
+        }
     }
     // A monitor's EDID rate is not a programmable GPU rate, for the exact
     // geometry as much as for automatic selection.
@@ -777,11 +825,12 @@ pub fn prove_desktop_selection(
             return Err("catalog_edid_refresh_accepted");
         }
     }
-    // The attested geometry is already applied, so a change request must not
-    // open a rollback window for a switch that never happens.
+    // The mode the catalog presents as current is already applied, so asking
+    // for it again must not open a rollback window for a switch that never
+    // happens.
     if modes.plan_change(
         generation,
-        attested,
+        automatic,
         UserChoice::AUTOMATIC,
         APPLIED_CHANGE_TOKEN,
         1_000,
@@ -789,9 +838,35 @@ pub fn prove_desktop_selection(
     {
         return Err("catalog_attested_change_not_noop");
     }
+    // With two proven geometries a real change plan must exist, keep the
+    // current mode as the rollback target and open exactly one window.
+    if proven_len == 2 {
+        let other = if proven[0].same_geometry(automatic) { proven[1] } else { proven[0] };
+        let plan = modes
+            .plan_change(
+                generation,
+                automatic,
+                exact_geometry(other.width, other.height),
+                APPLIED_CHANGE_TOKEN,
+                1_000,
+            )
+            .map_err(|_| "catalog_second_change_refused")?
+            .ok_or("catalog_second_change_missing")?;
+        if plan.previous != automatic
+            || plan.requested != other
+            || plan.rollback_target() != automatic
+            || plan.confirmation_deadline_ms != 1_000 + CONFIRM_WINDOW_MS
+        {
+            return Err("catalog_second_change_plan");
+        }
+    }
     Ok(DesktopSelection {
         width: attested.width,
         height: attested.height,
+        automatic_width: automatic.width,
+        automatic_height: automatic.height,
+        second_width: if proven_len == 2 { proven[1].width } else { 0 },
+        second_height: if proven_len == 2 { proven[1].height } else { 0 },
         entries: modes.entries().len(),
         selectable: modes.selectable_count(),
         device_reported,
@@ -1239,6 +1314,7 @@ mod tests {
             1,
             0,
             DESKTOP_ATTESTATION,
+            None,
             Some((1280, 800)),
             EDID_MILLIHZ,
         )
@@ -1262,7 +1338,7 @@ mod tests {
     fn a_smaller_attested_geometry_still_beats_a_larger_device_claim() {
         let small = Attestation { width: 64, height: 64, ..DESKTOP_ATTESTATION };
         let selection =
-            prove_desktop_selection(1, 0, small, Some((1280, 800)), EDID_MILLIHZ).unwrap();
+            prove_desktop_selection(1, 0, small, None, Some((1280, 800)), EDID_MILLIHZ).unwrap();
         assert_eq!((selection.width, selection.height), (64, 64));
         assert_eq!(selection.selectable, 1);
         assert_eq!(selection.device_reported, 1);
@@ -1274,6 +1350,7 @@ mod tests {
             1,
             0,
             DESKTOP_ATTESTATION,
+            None,
             Some((1024, 768)),
             EDID_MILLIHZ,
         )
@@ -1288,7 +1365,7 @@ mod tests {
     #[test]
     fn attested_desktop_without_a_device_claim_still_proves_the_refusals() {
         let selection =
-            prove_desktop_selection(1, 0, DESKTOP_ATTESTATION, None, EDID_MILLIHZ).unwrap();
+            prove_desktop_selection(1, 0, DESKTOP_ATTESTATION, None, None, EDID_MILLIHZ).unwrap();
         assert_eq!(selection.entries, 1);
         assert_eq!(selection.selectable, 1);
         assert_eq!(selection.device_claim, "not_present");
@@ -1319,10 +1396,116 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                prove_desktop_selection(generation, 0, attestation, Some((1280, 800)), rate),
+                prove_desktop_selection(generation, 0, attestation, None, Some((1280, 800)), rate),
                 Err(expected)
             );
         }
+    }
+
+    const REDUCED_ATTESTATION: Attestation = Attestation {
+        nonce: 0x574f_4445_534b_0005,
+        width: 1024,
+        height: 384,
+        digest: 0x1234_5678,
+    };
+
+    #[test]
+    fn two_proven_geometries_keep_automatic_on_the_largest() {
+        let selection = prove_desktop_selection(
+            1,
+            0,
+            DESKTOP_ATTESTATION,
+            Some(REDUCED_ATTESTATION),
+            Some((1280, 800)),
+            EDID_MILLIHZ,
+        )
+        .unwrap();
+        assert_eq!((selection.width, selection.height), (1024, 768));
+        assert_eq!((selection.second_width, selection.second_height), (1024, 384));
+        assert_eq!(
+            (selection.automatic_width, selection.automatic_height),
+            (1024, 768)
+        );
+        assert_eq!(selection.entries, 3);
+        assert_eq!(selection.selectable, 2);
+        assert_eq!(selection.device_reported, 1);
+        assert_eq!(selection.refresh, RefreshEvidence::Unavailable);
+    }
+
+    #[test]
+    fn the_larger_of_two_proven_geometries_wins_automatic() {
+        // Same two geometries, discovered in the other order: the result must
+        // come from the proven areas, not from which one was attested first.
+        let selection = prove_desktop_selection(
+            1,
+            0,
+            REDUCED_ATTESTATION,
+            Some(DESKTOP_ATTESTATION),
+            None,
+            EDID_MILLIHZ,
+        )
+        .unwrap();
+        assert_eq!(
+            (selection.automatic_width, selection.automatic_height),
+            (1024, 768)
+        );
+        assert_eq!(selection.width, 1024);
+        assert_eq!(selection.height, 384);
+        assert_eq!((selection.second_width, selection.second_height), (1024, 768));
+    }
+
+    #[test]
+    fn a_duplicate_second_geometry_is_refused() {
+        let same = Attestation { digest: 0x9999_0001, ..DESKTOP_ATTESTATION };
+        assert_eq!(
+            prove_desktop_selection(
+                1,
+                0,
+                DESKTOP_ATTESTATION,
+                Some(same),
+                None,
+                EDID_MILLIHZ
+            ),
+            Err("catalog_second_not_distinct")
+        );
+    }
+
+    #[test]
+    fn a_second_geometry_must_be_attested_to_enter_the_catalog() {
+        // Without the second attestation the same geometry the device can
+        // really display is still refused: only pixel proof creates an entry.
+        let selection = prove_desktop_selection(
+            1,
+            0,
+            DESKTOP_ATTESTATION,
+            None,
+            None,
+            EDID_MILLIHZ,
+        )
+        .unwrap();
+        assert_eq!((selection.second_width, selection.second_height), (0, 0));
+        assert_eq!(selection.selectable, 1);
+    }
+
+    #[test]
+    fn a_second_geometry_never_gains_an_invented_refresh() {
+        let with_rate = Attestation {
+            nonce: 0x574f_4445_534b_0005,
+            width: 1024,
+            height: 384,
+            digest: 0x1234_5678,
+        };
+        assert_eq!(with_rate.entry(0).refresh, RefreshEvidence::Unavailable);
+        let selection = prove_desktop_selection(
+            1,
+            0,
+            DESKTOP_ATTESTATION,
+            Some(with_rate),
+            None,
+            EDID_MILLIHZ,
+        )
+        .unwrap();
+        assert_eq!(selection.refresh, RefreshEvidence::Unavailable);
     }
 
     #[test]

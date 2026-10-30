@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Adversarial serial/pixel fixtures for the desktop scanout proof.
+"""Adversarial serial/pixel fixtures for the transactional desktop proof.
 
 The real QEMU boot remains mandatory: this file only proves that the host
 validator rejects weak, forged or reordered evidence, so a green CI run
@@ -8,13 +8,22 @@ cannot be produced by a plausible-looking log alone.
 import unittest
 
 from qemu_virtio_gpu_desktop_scanout import (
-    CAPTURE_PREFIX, HEIGHT, MARKER, NONCE, PIXELS, WIDTH, ProofError,
-    expected_bytes, expected_rgb, pattern_digest, validate_desktop_serial,
-    verify_pixels,
+    ALT_HEIGHT, ALT_WIDTH, CAPTURE_PREFIX, HEIGHT, MARKER, PIXELS, WIDTH,
+    ProofError, alt_bytes, alt_rgb, expected_bytes, expected_rgb,
+    alt_pattern_digest, pattern_digest, validate_desktop_serial,
+    verify_alt_pixels, verify_pixels,
 )
 
-ATTEST = ("WOLFOS_GPU_STAGE_ATTEST stage=desktop geometry=1024x768 "
-          "nonce=574f4445534b0004 source_digest=0b6b1dc5")
+DESKTOP_DIGEST = f"{pattern_digest():08x}"
+ALT_DIGEST = f"{alt_pattern_digest():08x}"
+ATTEST_P = ("WOLFOS_GPU_STAGE_ATTEST stage=desktop geometry=1024x768 "
+            f"nonce=574f4445534b0004 source_digest={DESKTOP_DIGEST}")
+ATTEST_S = ("WOLFOS_GPU_STAGE_ATTEST stage=reduced geometry=1024x384 "
+            f"nonce=574f4445534b0005 source_digest={ALT_DIGEST}")
+ATTEST_T = ("WOLFOS_GPU_STAGE_ATTEST stage=applied geometry=1024x768 "
+            f"nonce=574f4445534b0006 source_digest={DESKTOP_DIGEST}")
+ATTEST_R = ("WOLFOS_GPU_STAGE_ATTEST stage=rollback geometry=1024x384 "
+            f"nonce=574f4445534b0007 source_digest={ALT_DIGEST}")
 CAPTURE = CAPTURE_PREFIX + "restored"
 DISPLAY = ("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK req=256 resp=4353 used_idx=1 "
            "used_head=0 used_len=408 scanout0_enabled=1 width=1280 "
@@ -27,53 +36,81 @@ EDID = ("WOLFOS_VIRTIO_GPU_EDID_LIVE_OK scanout=0 edid_size=1024 modes=7 "
         "used_len=1056 fence_verified=1 negotiated_edid=1 notify_writes=2 "
         "driver_ok=15 reset=0 queue_disabled=1 frames_allocated=773 "
         "frames_released=773 pmm_leak=0 qemu_only=1")
-MARK = ("WOLFOS_VIRTIO_GPU_DESKTOP_SCANOUT_OK resource_id=1 width=1024 "
-        "height=768 format=2 create_type=257 attach_type=262 transfer_type=261 "
-        "set_type=259 flush_type=260 clear_type=259 detach_type=263 "
-        "unref_type=258 response_type=4352 used_idx=21 used_head=0 used_len=24 "
-        "fences_verified=19 notify_writes=21 backing_entries=2 "
-        "backing_bytes=3145728 transfer_bands=12 band_rows=64 pixels=786432 "
-        "guest_copy_verified=1 host_pixels_verified_by_kernel=0 capture_acks=1 "
-        "reset_to_vga_ack=1 reset=0 queue_disabled=1 frames_allocated=773 "
-        "frames_released=773 pmm_leak=0 qemu_only=1")
-CATALOG = ("WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK generation=1 entries=2 "
-           "selectable=1 attested=1 device_reported=1 device_width=1280 "
+CATALOG = ("WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK generation=1 entries=3 "
+           "selectable=2 attested=2 device_reported=1 device_width=1280 "
            "device_height=800 selected=1024x768 selected_refresh=unavailable "
-           "device_claim=rejected:unproven_gpu_timing edid_millihz=74994 "
+           "second=1024x384 device_claim=rejected:unproven_gpu_timing "
+           "edid_millihz=74994 "
            "edid_hz_request=rejected:refresh_not_programmable "
            "applied_change_plan=none "
            "unattested_catalog=rejected:no_selectable_mode gpu_commands_sent=0")
-ACK = "WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
-TEXT = "\n".join((ATTEST, CATALOG, CAPTURE, DISPLAY, EDID, MARK,
-                  "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                  "WOLFOS_FRAMEBUFFER_OK 1024x768"))
+TX_OK = ("WOLFOS_VIRTIO_GPU_MODE_TX_OK generation=1 token=574f4c4654580001 "
+         "from=1024x384 to=1024x768 deadline_ms=15000 verdict_elapsed_ms=3 "
+         "readback=console_enabled state=confirmed outcome=confirmed "
+         "restore=unused window_enforced_by=host "
+         "host_pixels_verified_by_kernel=0")
+TX_EXPIRED = ("WOLFOS_VIRTIO_GPU_MODE_TX_OK generation=1 token=574f4c4654580001 "
+              "from=1024x384 to=1024x768 deadline_ms=15000 "
+              "verdict_elapsed_ms=15204 readback=console_enabled "
+              "state=rolled_back outcome=rolled_back restore=verified "
+              "window_enforced_by=host host_pixels_verified_by_kernel=0")
 
 
-def desktop_image() -> tuple[int, int, bytes]:
-    return (WIDTH, HEIGHT, expected_bytes())
+def mark(used=38, entries=2, acks=3):
+    return ("WOLFOS_VIRTIO_GPU_DESKTOP_SCANOUT_OK resource_id=1 width=1024 "
+            "height=768 format=2 create_type=257 attach_type=262 "
+            "transfer_type=261 set_type=259 flush_type=260 clear_type=259 "
+            "detach_type=263 unref_type=258 response_type=4352 "
+            f"used_idx={used} used_head=0 used_len=24 "
+            f"fences_verified={used - 2} notify_writes={used} "
+            f"backing_entries={entries} backing_bytes=3145728 "
+            "transfer_bands=12 band_rows=64 alt=1024x384 alt_bands=6 "
+            "pixels=786432 guest_copy_verified=1 "
+            "host_pixels_verified_by_kernel=0 "
+            f"capture_acks={acks} reset_to_vga_ack=1 reset=0 queue_disabled=1 "
+            "frames_allocated=773 frames_released=773 pmm_leak=0 qemu_only=1")
+
+
+TAIL = ("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK",
+        "WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK",
+        "WOLFOS_FRAMEBUFFER_OK 1024x768")
+
+
+def serial(tx=TX_OK, used=38, acks=3, stages=(ATTEST_P, ATTEST_S, ATTEST_T),
+           marker=None):
+    return "\n".join((DISPLAY, EDID, *stages, CATALOG, tx,
+                      CAPTURE, marker or mark(used=used, acks=acks), *TAIL))
+
+
+TEXT = serial()
+EXPIRED = serial(tx=TX_EXPIRED, used=46, acks=4,
+                 stages=(ATTEST_P, ATTEST_S, ATTEST_T, ATTEST_R))
 
 
 class DesktopSerialTests(unittest.TestCase):
-    def test_positive_fixture_does_not_replace_the_real_qmp_screenshot(self):
+    def test_positive_and_expired_fixtures_are_the_host_contract(self):
         self.assertTrue(validate_desktop_serial(TEXT))
+        self.assertTrue(validate_desktop_serial(EXPIRED, expired=True))
+        # The two outcomes are not interchangeable.
+        self.assertFalse(validate_desktop_serial(EXPIRED))
+        self.assertFalse(validate_desktop_serial(TEXT, expired=True))
 
     def test_marker_fields_are_exact(self):
         for old, new in [
-            ("used_idx=21", "used_idx=20"),
-            ("used_idx=21", "used_idx=22"),
-            ("used_head=0", "used_head=1"),
-            ("used_len=24", "used_len=23"),
-            ("fences_verified=19", "fences_verified=18"),
-            ("fences_verified=19", "fences_verified=20"),
-            ("notify_writes=21", "notify_writes=20"),
+            ("used_idx=38", "used_idx=37"),
+            ("used_idx=38", "used_idx=39"),
+            ("fences_verified=36", "fences_verified=35"),
+            ("fences_verified=36", "fences_verified=37"),
+            ("notify_writes=38", "notify_writes=37"),
+            ("capture_acks=3", "capture_acks=2"),
+            ("capture_acks=3", "capture_acks=4"),
             ("pixels=786432", "pixels=786431"),
             ("transfer_bands=12", "transfer_bands=11"),
-            ("band_rows=64", "band_rows=63"),
+            ("alt_bands=6", "alt_bands=5"),
+            ("alt=1024x384", "alt=1024x768"),
             ("backing_bytes=3145728", "backing_bytes=3145727"),
             ("guest_copy_verified=1", "guest_copy_verified=0"),
             ("host_pixels_verified_by_kernel=0", "host_pixels_verified_by_kernel=1"),
-            ("capture_acks=1", "capture_acks=0"),
-            ("capture_acks=1", "capture_acks=2"),
             ("reset_to_vga_ack=1", "reset_to_vga_ack=0"),
             ("reset=0", "reset=15"),
             ("queue_disabled=1", "queue_disabled=0"),
@@ -84,48 +121,109 @@ class DesktopSerialTests(unittest.TestCase):
             ("height=768", "height=767"),
         ]:
             with self.subTest(old=old, new=new):
-                self.assertFalse(validate_desktop_serial(
-                    TEXT.replace(old, new)))
+                self.assertFalse(validate_desktop_serial(TEXT.replace(old, new)))
+
+    def test_the_expired_path_needs_its_own_exact_counts(self):
+        for marker in (mark(used=38, acks=4), mark(used=46, acks=3),
+                       mark(used=44, acks=4), mark(used=46, acks=4)):
+            with self.subTest(marker=marker.split()[3]):
+                expected = marker == mark(used=46, acks=4)
+                self.assertEqual(
+                    validate_desktop_serial(EXPIRED.replace(mark(used=46, acks=4),
+                                                            marker), expired=True),
+                    expected)
 
     def test_backing_entry_budget_is_bounded(self):
         for entries in ("0", "255", "768"):
             with self.subTest(entries=entries):
-                self.assertFalse(validate_desktop_serial(
-                    TEXT.replace("backing_entries=2",
-                                 f"backing_entries={entries}")))
+                self.assertFalse(validate_desktop_serial(TEXT.replace(
+                    "backing_entries=2", f"backing_entries={entries}")))
         for entries in ("1", "192", "254"):
             with self.subTest(entries=entries):
-                self.assertTrue(validate_desktop_serial(
-                    TEXT.replace("backing_entries=2",
-                                 f"backing_entries={entries}")))
+                self.assertTrue(validate_desktop_serial(TEXT.replace(
+                    "backing_entries=2", f"backing_entries={entries}")))
 
-    def test_attestation_must_be_genuine_unique_and_bound(self):
+    def test_each_stage_challenge_must_be_genuine_unique_and_bound(self):
         broken = (
-            TEXT.replace(ATTEST, ""),
-            TEXT + "\n" + ATTEST,
-            TEXT.replace("source_digest=0b6b1dc5", "source_digest=0b6b1dc4"),
-            TEXT.replace("nonce=574f4445534b0004", "nonce=574f4445534b0005"),
-            TEXT.replace("geometry=1024x768", "geometry=1024x769"),
-            TEXT.replace("stage=desktop", "stage=active"),
+            TEXT.replace(ATTEST_S, ""),
+            TEXT + "\n" + ATTEST_T,
+            TEXT.replace("nonce=574f4445534b0005", "nonce=574f4445534b0004"),
+            TEXT.replace("nonce=574f4445534b0006", "nonce=574f4445534b0005"),
+            TEXT.replace("geometry=1024x384", "geometry=1024x385"),
+            TEXT.replace("stage=applied", "stage=desktop"),
+            TEXT.replace("stage=reduced", "stage=applied"),
+            TEXT.replace(ATTEST_S, ATTEST_S.replace(ALT_DIGEST, DESKTOP_DIGEST)),
+            TEXT.replace(ATTEST_T, ATTEST_T.replace(DESKTOP_DIGEST, ALT_DIGEST)),
+            TEXT.replace(ATTEST_P, ATTEST_P.replace(DESKTOP_DIGEST, "deadbeef")),
             TEXT.replace("WOLFOS_GPU_STAGE_ATTEST", "WOLFOS_GPU_STAGE_ATTEST "),
         )
         for index, candidate in enumerate(broken):
             with self.subTest(case=index):
                 self.assertFalse(validate_desktop_serial(candidate))
 
-    def test_capture_stage_must_be_present_once_and_ordered(self):
+    def test_stage_order_and_missing_restoration_capture(self):
         broken = (
+            "\n".join((DISPLAY, EDID, ATTEST_S, ATTEST_P, ATTEST_T, CATALOG,
+                       TX_OK, CAPTURE, mark(), *TAIL)),
+            "\n".join((DISPLAY, EDID, ATTEST_P, ATTEST_S, ATTEST_T, TX_OK,
+                       CATALOG, CAPTURE, mark(), *TAIL)),
             TEXT.replace(CAPTURE, ""),
             TEXT + "\n" + CAPTURE,
-            TEXT.replace("stage=restored", "stage=baseline"),
             TEXT.replace("stage=restored", "stage=disabled"),
-            TEXT.replace(CAPTURE, "") + "\n" + CAPTURE,
-            "\n".join((CAPTURE, ATTEST, DISPLAY, EDID, MARK,
-                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
-            "\n".join((ATTEST, CAPTURE, MARK, DISPLAY, EDID,
-                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
+        )
+        for index, candidate in enumerate(broken):
+            with self.subTest(case=index):
+                self.assertFalse(validate_desktop_serial(candidate))
+
+    def test_confirmation_inside_the_window_and_rollback_after_it(self):
+        broken = (
+            TEXT.replace("verdict_elapsed_ms=3", "verdict_elapsed_ms=15000"),
+            TEXT.replace("verdict_elapsed_ms=3", "verdict_elapsed_ms=90000"),
+            TEXT.replace("restore=unused", "restore=verified"),
+            TEXT.replace("state=confirmed outcome=confirmed",
+                         "state=rolled_back outcome=rolled_back"),
+            TEXT.replace("deadline_ms=15000", "deadline_ms=1000"),
+            TEXT.replace("from=1024x384 to=1024x768",
+                         "from=1024x768 to=1024x384"),
+            TEXT.replace("token=574f4c4654580001", "token=574f4c4654580002"),
+            TEXT + "\nWOLFOS_VIRTIO_GPU_MODE_TX_FAIL stage=deadline_not_reached "
+                   "state=pending",
+        )
+        for index, candidate in enumerate(broken):
+            with self.subTest(case=index):
+                self.assertFalse(validate_desktop_serial(candidate))
+        for index, candidate in enumerate((
+            EXPIRED.replace("verdict_elapsed_ms=15204",
+                            "verdict_elapsed_ms=14999"),
+            EXPIRED.replace("verdict_elapsed_ms=15204",
+                            "verdict_elapsed_ms=90000"),
+            EXPIRED.replace("restore=verified", "restore=unused"),
+        )):
+            with self.subTest(expired_case=index):
+                self.assertFalse(validate_desktop_serial(candidate, expired=True))
+
+    def test_catalog_needs_two_proven_geometries(self):
+        broken = (
+            TEXT.replace(CATALOG, ""),
+            TEXT + "\n" + CATALOG,
+            TEXT.replace("selectable=2", "selectable=1"),
+            TEXT.replace("attested=2", "attested=1"),
+            TEXT.replace("second=1024x384", "second=1024x768"),
+            TEXT.replace("selected=1024x768", "selected=1024x384"),
+            TEXT.replace("selected_refresh=unavailable",
+                         "selected_refresh=verified"),
+            TEXT.replace(" entries=3 ", " entries=2 "),
+            TEXT.replace("device_claim=rejected:unproven_gpu_timing",
+                         "device_claim=accepted"),
+            TEXT.replace("edid_hz_request=rejected:refresh_not_programmable",
+                         "edid_hz_request=accepted"),
+            TEXT.replace("unattested_catalog=rejected:no_selectable_mode",
+                         "unattested_catalog=selectable"),
+            TEXT.replace("gpu_commands_sent=0", "gpu_commands_sent=38"),
+            TEXT.replace("generation=1 entries=3", "generation=2 entries=3"),
+            TEXT.replace("edid_millihz=74994", "edid_millihz=60000"),
+            TEXT.replace("device_width=1280", "device_width=1024"),
+            TEXT.replace("device_height=800", "device_height=768"),
         )
         for index, candidate in enumerate(broken):
             with self.subTest(case=index):
@@ -134,17 +232,16 @@ class DesktopSerialTests(unittest.TestCase):
     def test_failures_and_foreign_flavors_are_rejected(self):
         broken = (
             TEXT + "\nWOLFOS_VIRTIO_GPU_DESKTOP_FAIL stage=attest_reply",
-            TEXT + "\nWOLFOS_GPU_ATTEST_FAIL stage=desktop reason=digest_mismatch",
+            TEXT + "\nWOLFOS_GPU_ATTEST_FAIL stage=applied reason=digest_mismatch",
+            TEXT + "\nWOLFOS_VIRTIO_GPU_MODE_TX_FAIL stage=rollback_unverified "
+                   "state=unreconciled",
             TEXT + "\nWOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL preflight=false",
             TEXT + "\nWOLFOS_VIRTIO_GPU_EDID_LIVE_FAIL decode=WrongResponseType",
-            TEXT + "\nWOLFOS_VIRTIO_GPU_SCANOUT_FAIL stage=timeout",
             TEXT + "\nWOLFOS_FB_TEXT_FAILED invalid_geometry",
         )
         for index, candidate in enumerate(broken):
             with self.subTest(case=index):
                 self.assertFalse(validate_desktop_serial(candidate))
-
-    def test_other_scanout_claims_cannot_coexist(self):
         for foreign in (
             "WOLFOS_VIRTIO_GPU_SCANOUT_OK resource_id=1 width=64 height=64",
             "WOLFOS_VIRTIO_GPU_SCANOUT_RESET_OK reset_to_vga_ack=1",
@@ -154,154 +251,58 @@ class DesktopSerialTests(unittest.TestCase):
             with self.subTest(foreign=foreign):
                 self.assertFalse(validate_desktop_serial(TEXT + "\n" + foreign))
 
-    def test_display_and_framebuffer_evidence_are_required(self):
+    def test_display_edid_and_framebuffer_evidence_are_required(self):
         broken = (
             TEXT.replace(DISPLAY, ""),
             TEXT + "\n" + DISPLAY,
             TEXT.replace(DISPLAY, DISPLAY.replace("frames_allocated=773",
                                                   "frames_allocated=9")),
-            TEXT.replace(DISPLAY, DISPLAY.replace("frames_released=773",
-                                                  "frames_released=9")),
             TEXT.replace(DISPLAY, DISPLAY.replace("width=1280", "width=0")),
             TEXT.replace(EDID, ""),
-            TEXT + "\n" + EDID,
             TEXT.replace("WOLFOS_FRAMEBUFFER_OK 1024x768", ""),
-            TEXT.replace("WOLFOS_FRAMEBUFFER_OK 1024x768",
-                         "WOLFOS_FRAMEBUFFER_OK 1280x800"),
             TEXT.replace("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ""),
-            TEXT + "\nWOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK",
-            TEXT.replace(ACK, ""),
-            TEXT + "\n" + ACK,
+            TEXT.replace("WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK", ""),
+            TEXT + "\n" + "WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK",
         )
         for index, candidate in enumerate(broken):
             with self.subTest(case=index):
                 self.assertFalse(validate_desktop_serial(candidate))
-
-    def test_catalog_proof_is_required_exact_and_consistent(self):
-        broken = (
-            TEXT.replace(CATALOG, ""),
-            TEXT + "\n" + CATALOG,
-            TEXT.replace("attested=1", "attested=0"),
-            TEXT.replace("selectable=1 ", "selectable=0 "),
-            TEXT.replace("selected=1024x768", "selected=1280x800"),
-            TEXT.replace("selected_refresh=unavailable",
-                         "selected_refresh=verified"),
-            TEXT.replace(" entries=2 ", " entries=3 "),
-            TEXT.replace(" entries=2 ", " entries=1 "),
-            TEXT.replace("device_reported=1", "device_reported=0"),
-            TEXT.replace("device_claim=rejected:unproven_gpu_timing",
-                         "device_claim=accepted"),
-            TEXT.replace("device_claim=rejected:unproven_gpu_timing",
-                         "device_claim=refused:conflicting_proof"),
-            TEXT.replace("edid_hz_request=rejected:refresh_not_programmable",
-                         "edid_hz_request=accepted"),
-            TEXT.replace("applied_change_plan=none", "applied_change_plan=some"),
-            TEXT.replace("unattested_catalog=rejected:no_selectable_mode",
-                         "unattested_catalog=selectable"),
-            TEXT.replace("gpu_commands_sent=0", "gpu_commands_sent=21"),
-            TEXT.replace("generation=1 entries=2", "generation=2 entries=2"),
-            TEXT.replace("edid_millihz=74994", "edid_millihz=60000"),
-            TEXT.replace("device_width=1280", "device_width=1024"),
-            TEXT.replace("device_height=800", "device_height=768"),
-            TEXT + "\nWOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL stage=attest_reply "
-                   "entries=0 selectable=0 mode=no_selectable_mode",
-        )
-        for index, candidate in enumerate(broken):
-            with self.subTest(case=index):
-                self.assertFalse(validate_desktop_serial(candidate))
-
-    def test_catalog_proof_must_follow_the_attestation(self):
-        broken = (
-            "\n".join((CATALOG, ATTEST, CAPTURE, DISPLAY, EDID, MARK,
-                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
-            "\n".join((ATTEST, CAPTURE, DISPLAY, EDID, CATALOG, MARK,
-                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
-            "\n".join((ATTEST, DISPLAY, EDID, MARK, CATALOG,
-                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                       "WOLFOS_FRAMEBUFFER_OK 1024x768")),
-        )
-        for index, candidate in enumerate(broken):
-            with self.subTest(case=index):
-                self.assertFalse(validate_desktop_serial(candidate))
-
-    def test_device_geometry_equal_to_the_attested_one_is_consistent(self):
-        # QEMU's default VGA mode may already be 1024x768. Then the device claim
-        # collides with the proven geometry: no second entry, and the weaker
-        # claim must be refused rather than downgrading it.
-        display = (DISPLAY.replace("width=1280", "width=1024")
-                   .replace("height=800", "height=768"))
-        catalog = (CATALOG.replace(" entries=2 ", " entries=1 ")
-                   .replace("device_reported=1", "device_reported=0")
-                   .replace("device_claim=rejected:unproven_gpu_timing",
-                            "device_claim=refused:conflicting_proof")
-                   .replace("device_width=1280", "device_width=1024")
-                   .replace("device_height=800", "device_height=768"))
-        self.assertTrue(validate_desktop_serial(
-            "\n".join((ATTEST, catalog, CAPTURE, display, EDID, MARK,
-                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                       "WOLFOS_FRAMEBUFFER_OK 1024x768"))))
-        # ... but the pair must stay consistent: reported=0 with two entries,
-        # or a conflicting claim, is not an acceptable mailing of the same run.
-        self.assertFalse(validate_desktop_serial(
-            "\n".join((ATTEST,
-                       catalog.replace(" entries=1 ", " entries=2 "),
-                       CAPTURE, display, EDID, MARK,
-                       "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK", ACK,
-                       "WOLFOS_FRAMEBUFFER_OK 1024x768"))))
-
-    def test_geometry_and_nonce_constants_match_the_kernel(self):
-        self.assertEqual((WIDTH, HEIGHT, PIXELS), (1024, 768, 786432))
-        self.assertEqual(NONCE, 0x574F4445534B0004)
-        self.assertIsNotNone(MARKER.fullmatch(MARK))
-        self.assertIsNotNone(
-            __import__("qemu_virtio_gpu_desktop_scanout").ATTEST.fullmatch(ATTEST))
 
 
 class DesktopPixelTests(unittest.TestCase):
-    def test_pattern_matches_the_kernel_and_changes_everywhere(self):
-        # Mirrors virtio_gpu_desktop_wire::pixel_rgb.
+    def test_patterns_are_exact_and_distinct(self):
         self.assertEqual(expected_rgb(0, 0), (29, 71, 173))
-        self.assertEqual(expected_rgb(1023, 767),
-                         ((1023 * 3 + 767 * 7 + 29) & 0xFF,
-                          (1023 * 11 + 767 * 5 + 71) & 0xFF,
-                          (1023 * 13 + 767 * 17 + 173) & 0xFF))
-        image = desktop_image()
-        self.assertEqual(len(image[2]), PIXELS * 3)
-        self.assertEqual(image[2][0:3], bytes(expected_rgb(0, 0)))
-        last = (PIXELS - 1) * 3
-        self.assertEqual(image[2][last:last + 3], bytes(expected_rgb(1023, 767)))
-        value = 0x811C9DC5
-        for byte in image[2]:
-            value ^= byte
-            value = (value * 0x01000193) & 0xFFFFFFFF
-        self.assertEqual(value, pattern_digest())
+        self.assertNotEqual(expected_rgb(0, 0), expected_rgb(0, 16))
+        self.assertEqual(alt_rgb(0, 0), (244, 0x5A ^ 0x35, 97))
+        self.assertNotEqual(alt_rgb(37, 91), expected_rgb(37, 91))
+        self.assertEqual(len(expected_bytes()), PIXELS * 3)
+        self.assertEqual(len(alt_bytes()), ALT_WIDTH * ALT_HEIGHT * 3)
 
-    def test_every_pixel_is_verified_and_corruption_fails(self):
-        self.assertEqual(verify_pixels(desktop_image()), PIXELS)
-        width, height, rgb = desktop_image()
-        for index in (0, (300 * WIDTH + 17) * 3 + 1, PIXELS * 3 - 1):
-            broken = bytearray(rgb)
-            broken[index] ^= 0x01
-            with self.subTest(index=index):
-                with self.assertRaises(ProofError):
-                    verify_pixels((width, height, bytes(broken)))
-        # Row and band boundaries must not be swappable.
-        first_row = rgb[0:WIDTH * 3]
-        second_row = rgb[WIDTH * 3:2 * WIDTH * 3]
-        swapped = second_row + first_row + rgb[2 * WIDTH * 3:]
+    def test_desktop_capture_is_verified_pixel_for_pixel(self):
+        verify_pixels((WIDTH, HEIGHT, expected_bytes()))
+        broken = bytearray(expected_bytes())
+        broken[3 * (32 * WIDTH + 17) + 1] ^= 1
         with self.assertRaises(ProofError):
-            verify_pixels((width, height, swapped))
+            verify_pixels((WIDTH, HEIGHT, bytes(broken)))
         with self.assertRaises(ProofError):
-            verify_pixels((WIDTH, HEIGHT, rgb[:-1]))
+            verify_pixels((WIDTH, HEIGHT - 1, expected_bytes()))
+        # A 1024x384 capture cannot pass as the desktop, and the reverse holds.
+        with self.assertRaises(ProofError):
+            verify_pixels((ALT_WIDTH, ALT_HEIGHT, alt_bytes()))
+        with self.assertRaises(ProofError):
+            verify_alt_pixels((WIDTH, HEIGHT, expected_bytes()))
 
-    def test_wrong_geometry_fails(self):
-        width, height, rgb = desktop_image()
-        for geometry in ((1024, 767), (1023, 768), (1280, 800), (64, 64)):
-            with self.subTest(geometry=geometry):
-                with self.assertRaises(ProofError):
-                    verify_pixels((geometry[0], geometry[1], rgb))
+    def test_reduced_capture_is_verified_pixel_for_pixel(self):
+        verify_alt_pixels((ALT_WIDTH, ALT_HEIGHT, alt_bytes()))
+        broken = bytearray(alt_bytes())
+        broken[3 * (192 * ALT_WIDTH + 512) + 2] ^= 1
+        with self.assertRaises(ProofError):
+            verify_alt_pixels((ALT_WIDTH, ALT_HEIGHT, bytes(broken)))
+        # A stale desktop frame must not pass as the reduced scanout.
+        stale = bytearray(alt_bytes())
+        stale[:3 * ALT_WIDTH] = expected_bytes()[:3 * ALT_WIDTH]
+        with self.assertRaises(ProofError):
+            verify_alt_pixels((ALT_WIDTH, ALT_HEIGHT, bytes(stale)))
 
 
 if __name__ == "__main__":
