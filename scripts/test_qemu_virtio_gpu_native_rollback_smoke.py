@@ -5,6 +5,7 @@ import unittest
 from qemu_virtio_gpu_scanout_live_smoke import (
     MARKER,NATIVE_MARKER,PREFIX,ProofError,validate_serial,
     expected_rgb,verify_active,verify_reduced,verify_reexpanded,verify_refused,
+    witness_guest_refusal,
 )
 from test_qemu_virtio_gpu_scanout_live_smoke import (
     CAPTURE1,CAPTURE2,TEXT,image,
@@ -53,6 +54,35 @@ def reduced_image():
     ))
 
 class NativeRollbackTests(unittest.TestCase):
+    def test_deliberate_fault_must_get_exact_guest_refusal_without_timeout(self):
+        # This is a strict witness, not "any guest failure makes CI green".
+        reasons={"digest":"digest_mismatch",
+                 "nonce":"bad_nonce",
+                 "geometry":"wrong_geometry"}
+        for fault,reason in reasons.items():
+            line=(f"WOLFOS_GPU_ATTEST_FAIL stage=active reason={reason} "
+                  f"bytes=34 source_digest=171cbca5")
+            self.assertTrue(witness_guest_refusal(line,fault,"active"))
+            self.assertFalse(witness_guest_refusal("WOLFOS_GPU_STAGE_ATTEST ...",
+                                                 fault,"active"))
+            with self.assertRaises(ProofError):
+                witness_guest_refusal(line,fault,None)  # Not yet injected.
+            with self.assertRaises(ProofError):
+                witness_guest_refusal(line,"","active")  # Positive run.
+            with self.assertRaises(ProofError):
+                witness_guest_refusal(line,fault,"reexpanded")  # Wrong stage.
+            with self.assertRaises(ProofError):
+                witness_guest_refusal(line.replace(f"reason={reason}",
+                                                   "reason=bad_nonce" if
+                                                   reason!="bad_nonce" else
+                                                   "reason=wrong_geometry"),
+                                      fault,"active")
+            with self.assertRaises(ProofError):
+                witness_guest_refusal(line.replace("bytes=34","bytes=0"),
+                                      fault,"active")
+            with self.assertRaises(ProofError):
+                witness_guest_refusal(line+" forged",fault,"active")
+
     def test_exact_seven_stage_proof_and_legacy_rejection(self):
         self.assertTrue(validate_serial(NATIVE_TEXT,native_rollback=True))
         self.assertFalse(validate_serial(NATIVE_TEXT))
