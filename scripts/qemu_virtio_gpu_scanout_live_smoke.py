@@ -43,6 +43,12 @@ ATTEST_TOKENS={"active":b"A","reduced":b"M","reexpanded":b"E"}
 # Deliberate-fault switch used by the negative test: the host lies about one
 # field so the guest's refusal must be observable, not assumed.
 ATTEST_FAULT=os.environ.get("WOLFOS_ATTEST_FAULT","")
+EXPECTED_REFUSAL={"digest":"digest_mismatch","nonce":"bad_nonce",
+                  "geometry":"wrong_geometry"}
+GUEST_REFUSAL=re.compile(
+    r"WOLFOS_GPU_ATTEST_FAIL stage=(\\w+) reason=(\\w+) "
+    r"bytes=(\\d+) source_digest=([0-9a-f]{8})")
+
 STAGES=("baseline","active","disabled")
 RELEASE={"baseline":b"B","active":b"A","disabled":b"D"}
 RESTORE_STAGES=STAGES+("restored",)
@@ -92,6 +98,24 @@ TEST_OK="WOLFOS_VIRTIO_GPU_SCANOUT_TEST_OK"
 
 class ProofError(Exception):
     pass
+
+
+def witness_guest_refusal(line:str, fault:str, injected_stage:str|None)->bool:
+    """Reject quickly *only* after the injected fault has provably been refused.
+
+    The kernel must name both the challenged stage and the expected precise
+    failure reason. A generic failure, a refusal before injection, or an
+    unrelated error cannot satisfy the negative QEMU acceptance gate.
+    """
+    if not line.startswith("WOLFOS_GPU_ATTEST_FAIL "):
+        return False
+    match=GUEST_REFUSAL.fullmatch(line)
+    if match is None or fault not in EXPECTED_REFUSAL or injected_stage is None:
+        raise ProofError("Unattributed or malformed guest attestation refusal")
+    stage,reason,length,_source=match.groups()
+    if (stage,reason)!=(injected_stage,EXPECTED_REFUSAL[fault]) or int(length)<1:
+        raise ProofError("Unexpected guest attestation refusal stage/reason")
+    return True
 
 def validate_catalog(output: str) -> tuple[int,int] | None:
     """Guest catalog evidence; the host still owns every pixel decision.
@@ -483,6 +507,7 @@ def run(iso:Path, reset_restore:bool=False, native_rollback:bool=False)->int:
                     ser.settimeout(0.2)
                     pending=b""
                     stages=0
+                    injected_stage=None
                     while time.monotonic()<deadline:
                         try:
                             chunk=ser.recv(8192)
@@ -496,6 +521,15 @@ def run(iso:Path, reset_restore:bool=False, native_rollback:bool=False)->int:
                             while b"\n" in pending:
                                 line,pending=pending.split(b"\n",1)
                                 clean=line.decode("ascii",errors="replace").strip()
+                                if witness_guest_refusal(
+                                        clean, ATTEST_FAULT, injected_stage):
+                                    # A known deliberate fault has been rejected
+                                    # by the guest, with its exact error. Stop
+                                    # this negative run immediately, retaining
+                                    # the serial witness in received below.
+                                    raise ProofError(
+                                        f"Expected guest refusal of {ATTEST_FAULT}"
+                                    )
                                 if clean.startswith(PREFIX):
                                     name=clean[len(PREFIX):]
                                     if stages>=len(stages_expected) or name!=stages_expected[stages]:
@@ -562,6 +596,8 @@ def run(iso:Path, reset_restore:bool=False, native_rollback:bool=False)->int:
                                     ser.sendall(
                                         f"{ATTEST_TOKENS[name].decode()} {width}x{height} "
                                         f"{nonce} {digest:08x}\n".encode("ascii"))
+                                    if ATTEST_FAULT:
+                                        injected_stage=name
                                     stages+=1
                         if proc.poll() is not None and not chunk:
                             break
