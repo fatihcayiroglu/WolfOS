@@ -314,9 +314,68 @@ fn source_digest(width:u32,height:u32)->Result<u32,&'static str>{
 /// all fail closed and leave the catalog without host-verified evidence.
 #[cfg(any(feature="qemu-virtio-gpu-native-rollback-smoke",
           feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
+/// Discards whatever the peer already sent but nobody asked for, up to a bound.
+///
+/// A user can confirm after the window closed, and that line lands in the
+/// receive buffer long after the driver stopped waiting for it. Treating it as
+/// the answer to the next challenge would let a late click be mistaken for a
+/// fresh attestation, so stale whole lines are dropped before a new challenge
+/// is issued. Only already-buffered data is touched: the read is non-blocking,
+/// so this can never stall waiting for a peer.
+fn drain_stale_input()->usize{
+    let mut dropped=0usize;
+    let mut bytes=0usize;
+    while bytes<4096{
+        match serial::read_byte_nonblocking(){
+            Some(byte)=>{
+                let _=byte;
+                bytes+=1;
+                if byte==b'\n'{dropped+=1;}
+            }
+            None=>break,
+        }
+    }
+    dropped
+}
+
+/// Gives the display one refresh interval to show what was just flushed.
+///
+/// Asking a peer to screenshot a frame the console has not picked up yet would
+/// grade timing rather than pixels. This only works with a validated clock; the
+/// wait is measured on that clock and is never a spin-count stand-in.
+const DISPLAY_SETTLE_MS:u64=40;
+
+fn settle_display(){
+    let Some(period_fs)=crate::hpet_clock::period_fs() else{return;};
+    let Some(start)=crate::hpet_clock::counter() else{return;};
+    let mut spins=0u32;
+    loop{
+        if spins%1024==0{
+            match crate::hpet_clock::counter(){
+                Some(now)=>{
+                    if crate::hpet_clock::deadline_reached(
+                        start,now,period_fs,DISPLAY_SETTLE_MS
+                    ){return;}
+                }
+                None=>return,
+            }
+        }
+        spins=spins.wrapping_add(1);
+        core::hint::spin_loop();
+    }
+}
+
 fn await_host_attestation(
     token:u8,nonce:u64,width:u32,height:u32,digest:u32,
 )->Result<crate::display_mode_catalog::Attestation,&'static str>{
+    settle_display();
+    let stale=drain_stale_input();
+    if stale>0{
+        serial::write_fmt(format_args!(
+            "WOLFOS_GPU_STALE_REPLY_DROPPED lines={} before_stage_token={}\n",
+            stale,token as char
+        ));
+    }
     use crate::display_mode_catalog::{
         StageChallenge,MAX_REPLY_BYTES,decode_attestation_reply,
     };
@@ -326,28 +385,93 @@ fn await_host_attestation(
         "WOLFOS_GPU_STAGE_ATTEST stage={} geometry={}x{} nonce={:016x} source_digest={:08x}\n",
         challenge.stage_label(),width,height,nonce,digest
     ));
-    let mut line=[0u8;MAX_REPLY_BYTES+1];
-    let mut len=0usize;
-    for _ in 0..600_000_000u32{
-        if let Some(byte)=serial::read_byte_nonblocking(){
-            if len==line.len(){return Err("attest_reply_too_long");}
-            line[len]=byte;
-            len+=1;
-            if byte==b'\n'{break;}
+    let mut late=0u32;
+    loop{
+        let mut line=[0u8;MAX_REPLY_BYTES+1];
+        let mut len=0usize;
+        for _ in 0..600_000_000u32{
+            if let Some(byte)=serial::read_byte_nonblocking(){
+                if len==line.len(){return Err("attest_reply_too_long");}
+                line[len]=byte;
+                len+=1;
+                if byte==b'\n'{break;}
+                continue;
+            }
+            core::hint::spin_loop();
+        }
+        // A verdict line that shows up after the window closed is a late
+        // decision, not evidence about pixels; it must not be mistaken for the
+        // attestation this stage is waiting for.
+        if len>1&&is_verdict_line(&line[..len])&&late<MAX_LATE_VERDICTS{
+            late+=1;
+            serial::write_fmt(format_args!(
+                "WOLFOS_GPU_STALE_REPLY_DROPPED lines={} late_verdict=1 before_stage_token={}\n",
+                late,token as char
+            ));
             continue;
         }
-        core::hint::spin_loop();
-    }
-    match decode_attestation_reply(&line[..len],challenge){
-        Ok(attestation)=>Ok(attestation),
-        Err(e)=>{
+        // Stage nonces only ever grow, so a reply that names an older one was
+        // produced for a stage that no longer exists and cannot answer this one.
+        if replies_to_older_stage(&line[..len],nonce)&&late<MAX_LATE_VERDICTS{
+            late+=1;
             serial::write_fmt(format_args!(
-                "WOLFOS_GPU_ATTEST_FAIL stage={} reason={} bytes={} source_digest={:08x}\n",
-                challenge.stage_label(),e.label(),len,digest
+                "WOLFOS_GPU_STALE_REPLY_DROPPED lines={} late_stage=1 before_stage_token={}\n",
+                late,token as char
             ));
-            Err("attest_reply")
+            continue;
+        }
+        match decode_attestation_reply(&line[..len],challenge){
+            Ok(attestation)=>return Ok(attestation),
+            Err(e)=>{
+                serial::write_fmt(format_args!(
+                    "WOLFOS_GPU_ATTEST_FAIL stage={} reason={} bytes={} source_digest={:08x}\n",
+                    challenge.stage_label(),e.label(),len,digest
+                ));
+                return Err("attest_reply");
+            }
         }
     }
+}
+
+/// How many late decision lines may be skipped before giving up.
+const MAX_LATE_VERDICTS:u32=4;
+
+fn is_verdict_line(line:&[u8])->bool{
+    line.len()>=2&&matches!(line[0],b'X'|b'E')&&line[1]==b' '
+}
+
+/// Reads the nonce field of a reply line without accepting or rejecting it.
+fn reply_nonce(line:&[u8])->Option<u64>{
+    let line=match line.last(){
+        Some(b'\n')=>&line[..line.len()-1],
+        _=>line,
+    };
+    let line=match line.last(){
+        Some(b'\r')=>&line[..line.len()-1],
+        _=>line,
+    };
+    let mut fields=line.split(|b|*b==b' ');
+    let token=fields.next()?;
+    fields.next()?;
+    let nonce=fields.next()?;
+    if token.len()!=1||!token[0].is_ascii_uppercase()||nonce.len()!=16{
+        return None;
+    }
+    let mut value=0u64;
+    for byte in nonce.iter().copied(){
+        let digit=match byte{
+            b'0'..=b'9'=>(byte-b'0')as u64,
+            b'a'..=b'f'=>(byte-b'a')as u64+10,
+            b'A'..=b'F'=>(byte-b'A')as u64+10,
+            _=>return None,
+        };
+        value=value.checked_mul(16)?.checked_add(digit)?;
+    }
+    (value!=0).then_some(value)
+}
+
+fn replies_to_older_stage(line:&[u8],nonce:u64)->bool{
+    matches!(reply_nonce(line),Some(got) if got<nonce)
 }
 
 #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
@@ -547,13 +671,66 @@ fn query_display_now(
 #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
 use crate::display_mode_catalog::Attestation;
 
+/// Who measured the elapsed time that ended the window. A deadline the peer
+/// alone measures is not a deadline, so this is carried in the evidence.
 #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
-enum StageVerdict{
-    InsideWindow(Attestation),
-    Expired{elapsed_ms:u64},
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum ExpiredBy{Host,Guest}
+
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+impl ExpiredBy{
+    fn label(self)->&'static str{
+        match self{ExpiredBy::Host=>"host",ExpiredBy::Guest=>"guest"}
+    }
 }
 
 #[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+enum StageVerdict{
+    InsideWindow(Attestation),
+    Expired{elapsed_ms:u64,by:ExpiredBy},
+}
+
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+#[cfg(feature="qemu-virtio-gpu-desktop-scanout-smoke")]
+enum ReplyFail{Timeout,TooLong,Deadline(u64)}
+
+/// Reads one reply line. When the guest owns a device clock the read is bounded
+/// by that clock, so a peer that simply goes silent cannot keep the guest in a
+/// half-applied mode: the guest ends the window itself and reports how long it
+/// really waited.
+fn read_reply_until(
+    capture:&mut [u8],start:Option<(u64,u32)>,window_ms:u64,
+)->Result<usize,ReplyFail>{
+    let mut len=0usize;
+    let mut spins=0u32;
+    for _ in 0..600_000_000u32{
+        if let Some(byte)=serial::read_byte_nonblocking(){
+            if len==capture.len(){return Err(ReplyFail::TooLong);}
+            capture[len]=byte;
+            len+=1;
+            if byte==b'\n'{return Ok(len);}
+            continue;
+        }
+        spins+=1;
+        if spins%4096==0{
+            if let Some((start,period_fs))=start{
+                if let Some(now)=crate::hpet_clock::counter(){
+                    if crate::hpet_clock::deadline_reached(
+                        start,now,period_fs,window_ms
+                    ){
+                        return Err(ReplyFail::Deadline(
+                            crate::hpet_clock::elapsed_ms(start,now,period_fs)
+                        ));
+                    }
+                }
+            }
+        }
+        core::hint::spin_loop();
+    }
+    Err(ReplyFail::Timeout)
+}
+
+#[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]
 fn read_reply(capture:&mut [u8])->Result<usize,&'static str>{
     let mut len=0usize;
     for _ in 0..600_000_000u32{
@@ -587,8 +764,21 @@ fn await_stage_verdict(
         "WOLFOS_GPU_STAGE_ATTEST stage={} geometry={}x{} nonce={:016x} source_digest={:08x}\n",
         challenge.stage_label(),width,height,nonce,digest
     ));
+    // The deadline belongs to the guest: it is checked against the validated
+    // device clock, never against the peer's own claim about elapsed time.
+    let start=match (crate::hpet_clock::present(),crate::hpet_clock::counter()){
+        (true,Some(counter))=>crate::hpet_clock::period_fs().map(|p|(counter,p)),
+        _=>None,
+    };
     let mut line=[0u8;MAX_REPLY_BYTES+1];
-    let len=read_reply(&mut line)?;
+    let len=match read_reply_until(&mut line,start,CONFIRM_WINDOW_MS){
+        Ok(len)=>len,
+        Err(ReplyFail::Deadline(elapsed))=>{
+            return Ok(StageVerdict::Expired{elapsed_ms:elapsed,by:ExpiredBy::Guest});
+        }
+        Err(ReplyFail::TooLong)=>return Err("attest_reply_too_long"),
+        Err(ReplyFail::Timeout)=>return Err("attest_timeout"),
+    };
     let verdict=line[..len].split(|b|*b==b'\n').next().unwrap_or(&[]);
     let verdict=verdict.strip_suffix(b"\r").unwrap_or(verdict);
     let mut fields=verdict.split(|b|*b==b' ');
@@ -609,9 +799,16 @@ fn await_stage_verdict(
     // The host says what happened; the state machine still decides whether that
     // verdict is legal for this window.
     if !confirmed||elapsed_ms>=CONFIRM_WINDOW_MS{
-        return Ok(StageVerdict::Expired{elapsed_ms});
+        return Ok(StageVerdict::Expired{elapsed_ms,by:ExpiredBy::Host});
     }
-    let len=read_reply(&mut line)?;
+    let len=match read_reply_until(&mut line,start,CONFIRM_WINDOW_MS){
+        Ok(len)=>len,
+        Err(ReplyFail::Deadline(elapsed))=>{
+            return Ok(StageVerdict::Expired{elapsed_ms:elapsed,by:ExpiredBy::Guest});
+        }
+        Err(ReplyFail::TooLong)=>return Err("attest_reply_too_long"),
+        Err(ReplyFail::Timeout)=>return Err("attest_timeout"),
+    };
     match decode_attestation_reply(&line[..len],challenge){
         Ok(attestation)=>Ok(StageVerdict::InsideWindow(attestation)),
         Err(e)=>{
@@ -650,6 +847,7 @@ pub(crate) struct DesktopEvidence{
     pub tx_to_height:u32,
     pub tx_deadline_ms:u64,
     pub tx_elapsed_ms:u64,
+    pub tx_verdict_source:&'static str,
     pub tx_readback:&'static str,
     pub tx_restore:&'static str,
 }
@@ -830,6 +1028,7 @@ fn present_desktop(
     )?;
     captures+=1;
     let mut elapsed_ms=0u64;
+    let mut verdict_source="host";
     let mut restore="unused";
     match verdict{
         StageVerdict::InsideWindow(attestation)=>{
@@ -851,12 +1050,13 @@ fn present_desktop(
                 return Err("mode_tx_confirm");
             }
         }
-        StageVerdict::Expired{elapsed_ms:host_elapsed}=>{
-            elapsed_ms=host_elapsed;
-            if let Err(e)=tx.expire(host_elapsed){
+        StageVerdict::Expired{elapsed_ms:measured,by}=>{
+            elapsed_ms=measured;
+            verdict_source=by.label();
+            if let Err(e)=tx.expire(measured){
                 serial::write_fmt(format_args!(
                     "WOLFOS_VIRTIO_GPU_MODE_TX_FAIL stage={} state={} elapsed_ms={}\n",
-                    e.label(),tx.state().label(),host_elapsed
+                    e.label(),tx.state().label(),measured
                 ));
                 return Err("mode_tx_expiry");
             }
@@ -925,6 +1125,7 @@ fn present_desktop(
         tx_to_height:tx.requested().height,
         tx_deadline_ms:tx.deadline_ms(),
         tx_elapsed_ms:elapsed_ms,
+        tx_verdict_source:verdict_source,
         tx_readback:tx.applied_label(),
         tx_restore:restore,
     })
@@ -1642,13 +1843,16 @@ pub fn verify(hhdm:u64,entries:&[&Entry],
                                         NoSelectableMode.label()
                                 ));
                                 serial::write_fmt(format_args!(
-                                    "WOLFOS_VIRTIO_GPU_MODE_TX_OK generation={} token={:016x} from={}x{} to={}x{} deadline_ms={} verdict_elapsed_ms={} readback={} state={} outcome={} restore={} window_enforced_by=host host_pixels_verified_by_kernel=0\n",
+                                    "WOLFOS_VIRTIO_GPU_MODE_TX_OK generation={} token={:016x} from={}x{} to={}x{} deadline_ms={} deadline_clock={} verdict_elapsed_ms={} verdict_source={} readback={} state={} outcome={} restore={} window_enforced_by={} host_pixels_verified_by_kernel=0\n",
                                     DESKTOP_GENERATION,TX_TOKEN,
                                     evidence.tx_from_width,evidence.tx_from_height,
                                     evidence.tx_to_width,evidence.tx_to_height,
-                                    evidence.tx_deadline_ms,evidence.tx_elapsed_ms,
+                                    evidence.tx_deadline_ms,
+                                    if crate::hpet_clock::present(){"hpet"}else{"absent"},
+                                    evidence.tx_elapsed_ms,evidence.tx_verdict_source,
                                     evidence.tx_readback,evidence.tx_state,
-                                    evidence.tx_outcome,evidence.tx_restore
+                                    evidence.tx_outcome,evidence.tx_restore,
+                                    if crate::hpet_clock::present(){"guest"}else{"host"}
                                 ));
                             });
                             #[cfg(not(feature="qemu-virtio-gpu-desktop-scanout-smoke"))]

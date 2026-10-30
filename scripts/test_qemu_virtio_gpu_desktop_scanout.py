@@ -44,16 +44,28 @@ CATALOG = ("WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_OK generation=1 entries=3 "
            "edid_hz_request=rejected:refresh_not_programmable "
            "applied_change_plan=none "
            "unattested_catalog=rejected:no_selectable_mode gpu_commands_sent=0")
+HPET = ("WOLFOS_HPET_CLOCK_OK vendor=0x8086 revision=1 timers=3 "
+        "counter_bits=64 period_fs=10000000 base=0xfed00000 uncached=1 "
+        "main_counter_enabled=1 mmio_writes=1 comparators_programmed=0 "
+        "interrupts_routed=0")
 TX_OK = ("WOLFOS_VIRTIO_GPU_MODE_TX_OK generation=1 token=574f4c4654580001 "
-         "from=1024x384 to=1024x768 deadline_ms=15000 verdict_elapsed_ms=3 "
+         "from=1024x384 to=1024x768 deadline_ms=15000 deadline_clock=hpet "
+         "verdict_elapsed_ms=3 verdict_source=host "
          "readback=console_enabled state=confirmed outcome=confirmed "
-         "restore=unused window_enforced_by=host "
+         "restore=unused window_enforced_by=guest "
          "host_pixels_verified_by_kernel=0")
 TX_EXPIRED = ("WOLFOS_VIRTIO_GPU_MODE_TX_OK generation=1 token=574f4c4654580001 "
-              "from=1024x384 to=1024x768 deadline_ms=15000 "
-              "verdict_elapsed_ms=15204 readback=console_enabled "
+              "from=1024x384 to=1024x768 deadline_ms=15000 deadline_clock=hpet "
+              "verdict_elapsed_ms=15204 verdict_source=guest "
+              "readback=console_enabled "
               "state=rolled_back outcome=rolled_back restore=verified "
-              "window_enforced_by=host host_pixels_verified_by_kernel=0")
+              "window_enforced_by=guest host_pixels_verified_by_kernel=0")
+TX_SILENT = ("WOLFOS_VIRTIO_GPU_MODE_TX_OK generation=1 token=574f4c4654580001 "
+             "from=1024x384 to=1024x768 deadline_ms=15000 deadline_clock=hpet "
+             "verdict_elapsed_ms=15009 verdict_source=guest "
+             "readback=console_enabled "
+             "state=rolled_back outcome=rolled_back restore=verified "
+             "window_enforced_by=guest host_pixels_verified_by_kernel=0")
 
 
 def mark(used=38, entries=2, acks=3):
@@ -77,14 +89,16 @@ TAIL = ("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK",
 
 
 def serial(tx=TX_OK, used=38, acks=3, stages=(ATTEST_P, ATTEST_S, ATTEST_T),
-           marker=None):
-    return "\n".join((DISPLAY, EDID, *stages, CATALOG, tx,
+           marker=None, clock=HPET):
+    return "\n".join((DISPLAY, EDID, clock, *stages, CATALOG, tx,
                       CAPTURE, marker or mark(used=used, acks=acks), *TAIL))
 
 
 TEXT = serial()
 EXPIRED = serial(tx=TX_EXPIRED, used=46, acks=4,
                  stages=(ATTEST_P, ATTEST_S, ATTEST_T, ATTEST_R))
+SILENT = serial(tx=TX_SILENT, used=46, acks=4,
+                stages=(ATTEST_P, ATTEST_S, ATTEST_T, ATTEST_R))
 
 
 class DesktopSerialTests(unittest.TestCase):
@@ -94,6 +108,53 @@ class DesktopSerialTests(unittest.TestCase):
         # The two outcomes are not interchangeable.
         self.assertFalse(validate_desktop_serial(EXPIRED))
         self.assertFalse(validate_desktop_serial(TEXT, expired=True))
+
+    def test_the_window_belongs_to_the_guest_clock(self):
+        self.assertTrue(validate_desktop_serial(SILENT, expired=True, silent=True))
+        # Serial evidence cannot tell "silent" from "answered late": both show a
+        # guest-expired window. Only the host knows which one it did, and both
+        # must validate for their own run.
+        self.assertTrue(validate_desktop_serial(SILENT, expired=True))
+        self.assertTrue(validate_desktop_serial(EXPIRED, expired=True, silent=True))
+        # A silent peer can never be reported as a peer-sourced verdict.
+        self.assertFalse(validate_desktop_serial(
+            SILENT.replace("verdict_source=guest", "verdict_source=host"),
+            expired=True, silent=True))
+        # The late answer may be graded by either clock, but only after a real
+        # elapsed window; the guest reports which one it used.
+        self.assertTrue(validate_desktop_serial(
+            EXPIRED.replace("verdict_source=guest", "verdict_source=host"),
+            expired=True))
+        # A peer answer can never confirm a change inside the window.
+        self.assertFalse(validate_desktop_serial(
+            TEXT.replace("verdict_source=host", "verdict_source=guest")))
+        # Neither outcome is acceptable without a validated guest clock.
+        for broken in (
+            TEXT.replace("deadline_clock=hpet", "deadline_clock=absent"),
+            TEXT.replace("window_enforced_by=guest", "window_enforced_by=host"),
+            TEXT.replace("verdict_source=host", "verdict_source=guest"),
+            TEXT.replace(HPET, ""),
+            TEXT.replace(HPET, "WOLFOS_HPET_CLOCK_ABSENT reason=bad_period"),
+            TEXT.replace(HPET, HPET + "\n" + HPET),
+            TEXT.replace("period_fs=10000000", "period_fs=0"),
+            TEXT.replace("period_fs=10000000", "period_fs=100000001"),
+            TEXT.replace("counter_bits=64", "counter_bits=32"),
+            TEXT.replace("vendor=0x8086", "vendor=0x1234"),
+            TEXT.replace("uncached=1", "uncached=0"),
+            TEXT.replace("comparators_programmed=0", "comparators_programmed=1"),
+            TEXT.replace("main_counter_enabled=1", "main_counter_enabled=0"),
+            TEXT.replace("interrupts_routed=0", "interrupts_routed=1"),
+        ):
+            with self.subTest(broken=broken[:48]):
+                self.assertFalse(validate_desktop_serial(broken))
+        # The clock must be established before the transaction it grades.
+        reordered = "\n".join((DISPLAY, EDID, ATTEST_P, ATTEST_S, ATTEST_T,
+                                CATALOG, TX_OK, HPET, CAPTURE, mark(), *TAIL))
+        self.assertFalse(validate_desktop_serial(reordered))
+        # A guest-measured expiry below the window is still a lie.
+        self.assertFalse(validate_desktop_serial(
+            SILENT.replace("verdict_elapsed_ms=15009", "verdict_elapsed_ms=9999"),
+            expired=True, silent=True))
 
     def test_marker_fields_are_exact(self):
         for old, new in [

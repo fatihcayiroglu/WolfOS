@@ -16,14 +16,21 @@ The host owns every pixel claim:
   `E <elapsed_ms>` when they did not, so the guest's own state machine grades
   the elapsed time instead of trusting the verdict;
 * a refused or expired change must really restore the previous mode, and that
-  restoration must again match a host screenshot byte for byte.
+  restoration must again match a host screenshot byte for byte;
+* the 15 s window is owned by the guest: it is graded with the validated HPET
+  counter, so a peer that never answers cannot hold the guest in a half-applied
+  mode.
 
 `WOLFOS_DESKTOP_FAULT` selects a deliberate lie:
 
 * `digest`, `nonce`, `geometry` corrupt one field of the FIRST reply;
 * `mode_early` claims the window expired after 1 s (it did not);
-* `mode_expired` really waits past the 15 s window and then reports it, so the
-  change must be rolled back and the restored frame re-verified.
+* `mode_expired` waits past the 15 s window and then confirms with a genuine,
+  nonce-bound attestation: the pixels are right but the answer is late, so the
+  change must still be rolled back and the restored frame re-verified;
+* `mode_silent` never answers: the guest must end the window on its own clock,
+  and its own measured elapsed time is cross-checked against the host's wall
+  clock.
 """
 from functools import lru_cache
 from pathlib import Path
@@ -81,11 +88,17 @@ CATALOG_FAIL = re.compile(
 TX_PREFIX = "WOLFOS_VIRTIO_GPU_MODE_TX_OK "
 TX = re.compile(
     r"WOLFOS_VIRTIO_GPU_MODE_TX_OK generation=1 token=574f4c4654580001 "
-    r"from=1024x384 to=1024x768 deadline_ms=(\d+) verdict_elapsed_ms=(\d+) "
+    r"from=1024x384 to=1024x768 deadline_ms=(\d+) deadline_clock=(hpet|absent) "
+    r"verdict_elapsed_ms=(\d+) verdict_source=(host|guest) "
     r"readback=console_enabled state=(confirmed|rolled_back) "
     r"outcome=(confirmed|rolled_back) "
-    r"restore=(unused|verified) window_enforced_by=host "
+    r"restore=(unused|verified) window_enforced_by=(host|guest) "
     r"host_pixels_verified_by_kernel=0")
+HPET = re.compile(
+    r"WOLFOS_HPET_CLOCK_OK vendor=0x8086 revision=(\d+) timers=(\d+) "
+    r"counter_bits=64 period_fs=(\d+) base=0xfed00000 uncached=1 "
+    r"main_counter_enabled=1 mmio_writes=1 comparators_programmed=0 "
+    r"interrupts_routed=0")
 TX_FAIL = re.compile(
     r"WOLFOS_VIRTIO_GPU_MODE_TX_FAIL stage=(deadline_not_reached|"
     r"confirmation_expired|device_did_not_apply|confirmation_unverified) "
@@ -217,6 +230,27 @@ def verify_pixels(image: tuple[int, int, bytes]) -> int:
     return _verify(image, (WIDTH, HEIGHT), expected_bytes(), "desktop")
 
 
+def verify_rollback_pixels(image: tuple[int, int, bytes]) -> str:
+    """The restored mode's frame must be on screen, byte for byte.
+
+    This device does not always shrink the console back to the restored
+    rectangle: it may keep the previous height and simply show the restored
+    frame in its top rows. Both are accepted, and which one happened is
+    reported, but the restored pixels themselves are always compared exactly.
+    """
+    w, h, data = image
+    alt = alt_bytes()
+    if (w, h) == (ALT_WIDTH, ALT_HEIGHT):
+        _verify(image, (ALT_WIDTH, ALT_HEIGHT), alt, "rollback")
+        return "shrunk"
+    if (w, h) == (WIDTH, HEIGHT):
+        if data[:len(alt)] != alt:
+            raise ProofError(
+                "Restored rows do not match the reduced frame byte for byte")
+        return "kept_console_height"
+    raise ProofError(f"Unexpected console geometry {w}x{h} at rollback")
+
+
 def verify_restored_pixels(image: tuple[int, int, bytes],
                            expired: bool) -> int:
     """The post-reset frame must be exactly what the driver last painted."""
@@ -229,11 +263,13 @@ def verify_alt_pixels(image: tuple[int, int, bytes]) -> int:
     return _verify(image, (ALT_WIDTH, ALT_HEIGHT), alt_bytes(), "reduced")
 
 
-def validate_desktop_serial(output: str, expired: bool = False) -> bool:
+def validate_desktop_serial(output: str, expired: bool = False,
+                            silent: bool = False) -> bool:
     """Host-owned serial contract for the desktop scanout flavor."""
     lines = output.splitlines()
     if any(line.startswith((
         "WOLFOS_VIRTIO_GPU_DESKTOP_FAIL", "WOLFOS_GPU_ATTEST_FAIL",
+        "WOLFOS_HPET_CLOCK_ABSENT",
         "WOLFOS_VIRTIO_GPU_DESKTOP_CATALOG_FAIL",
         "WOLFOS_VIRTIO_GPU_MODE_TX_FAIL",
         "WOLFOS_VIRTIO_GPU_DISPLAY_INFO_FAIL", "WOLFOS_VIRTIO_GPU_EDID_LIVE_FAIL",
@@ -327,10 +363,25 @@ def validate_desktop_serial(output: str, expired: bool = False) -> bool:
     if len(txs) != 1 or txs[0][1] is None:
         return False
     tx_index = txs[0][0]
-    deadline, elapsed, state, outcome, restore = txs[0][1].groups()
+    (deadline, clock, elapsed, source, state, outcome, restore,
+     enforced) = txs[0][1].groups()
     deadline, elapsed = int(deadline), int(elapsed)
     if deadline != WINDOW_MS:
         return False
+    # The window must be graded by a clock the guest owns, and the guest must
+    # say who produced the verdict it acted on.
+    if (clock, enforced) != ("hpet", "guest"):
+        return False
+    if silent and source != "guest":
+        return False
+    if not silent and not expired and source != "host":
+        return False
+    if source not in ("host", "guest"):
+        return False
+    if expired and silent:
+        # Nothing was sent: the guest ended the window on its own clock.
+        if elapsed < WINDOW_MS or elapsed > 60_000:
+            return False
     if expired:
         if (state, outcome, restore) != ("rolled_back", "rolled_back", "verified"):
             return False
@@ -354,6 +405,13 @@ def validate_desktop_serial(output: str, expired: bool = False) -> bool:
         return False
     if not displays[0][0] < edid_index < marker_index:
         return False
+    clocks = [(i, HPET.fullmatch(line)) for i, line in enumerate(lines)
+              if line.startswith("WOLFOS_HPET_CLOCK_OK ")]
+    if len(clocks) != 1 or clocks[0][1] is None:
+        return False
+    period_fs = int(clocks[0][1].group(3))
+    if not 0 < period_fs <= 100_000_000 or not clocks[0][0] < tx_index:
+        return False
     if lines.count(TEST_OK) != 1:
         return False
     if lines.count("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_TEST_OK") != 1:
@@ -375,6 +433,35 @@ def _capture(qmp, reader, root: Path, name: str):
     return ppm(target)
 
 
+def _capture_stage(qmp, reader, root: Path, stage: str, tries: int = 3):
+    """Capture a stage, allowing the display to settle before judging it.
+
+    The comparison is unchanged and exact; only a frame that has not been
+    pushed to the console yet is re-read, so a real pixel difference still
+    fails on the last attempt.
+    """
+    last: ProofError | None = None
+    for attempt in range(tries):
+        image = _capture(qmp, reader, root, stage)
+        # Keep the judged frame outside the temporary directory so a failing
+        # run leaves real evidence behind.
+        (Path("out") / f"last-{stage}.ppm").write_bytes(
+            b"P6\n%d %d\n255\n" % (image[0], image[1]) + image[2])
+        try:
+            if stage == "rollback":
+                return image, verify_rollback_pixels(image)
+            if stage == "reduced":
+                verify_alt_pixels(image)
+            else:
+                verify_pixels(image)
+            return image, stage
+        except ProofError as error:
+            last = error
+            if attempt + 1 < tries:
+                time.sleep(0.12)
+    raise last if last is not None else AssertionError("no capture")
+
+
 def _reply(ser, token: str, geometry: tuple[int, int], nonce: int, digest: int,
            fault: str) -> None:
     """Answer one stage. Only the FIRST stage can be corrupted by the
@@ -394,7 +481,8 @@ def _reply(ser, token: str, geometry: tuple[int, int], nonce: int, digest: int,
 
 def run(iso: Path, require_refusal: bool = False) -> int:
     prefix = "wolfos-virtio-gpu-desktop-"
-    expired = FAULT == "mode_expired"
+    expired = FAULT in ("mode_expired", "mode_silent")
+    silent = FAULT == "mode_silent"
     with tempfile.TemporaryDirectory(prefix=prefix) as work:
         root = Path(work)
         serial_path = root / "com1.sock"
@@ -450,6 +538,11 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                         raise ProofError(
                                             f"Malformed guest attestation: {clean!r}")
                                     stage = match.group(1)
+                                    if stage == "rollback" and silent and \
+                                            "silence_start" in measured:
+                                        measured["window_s"] = (
+                                            time.monotonic()
+                                            - measured["silence_start"])
                                     token, geometry, nonce = BY_NAME[stage]
                                     if (int(match.group(2)), int(match.group(3))) != geometry:
                                         raise ProofError(
@@ -458,12 +551,11 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                         raise ProofError(
                                             f"Stage {stage} reused a nonce")
                                     claimed = int(match.group(5), 16)
-                                    image = _capture(qmp, reader, root, stage)
-                                    if stage in ("reduced", "rollback"):
-                                        verify_alt_pixels(image)
-                                    else:
-                                        verify_pixels(image)
+                                    image, console = _capture_stage(
+                                        qmp, reader, root, stage)
                                     images[stage] = image
+                                    if stage == "rollback":
+                                        measured["restored_console"] = console
                                     digest = rgb_digest(*geometry, image)
                                     if not FAULT and digest != claimed:
                                         raise ProofError(
@@ -474,15 +566,26 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                         if FAULT == "mode_early":
                                             # A peer may not shorten the window.
                                             ser.sendall(b"E 1000\n")
+                                        elif silent:
+                                            # Say nothing at all: only the
+                                            # guest's own clock can end this.
+                                            measured["silence_start"] = (
+                                                time.monotonic())
                                         elif expired:
+                                            # The user confirms, but too late:
+                                            # the window is already over, so the
+                                            # pixels are right and the answer
+                                            # must still be refused.
                                             time.sleep(max(
                                                 0.0, EXPIRED_WAIT_S -
                                                 (time.monotonic() - start)))
                                             measured["window_s"] = (
                                                 time.monotonic() - start)
                                             ser.sendall(
-                                                f"E {int(measured['window_s']*1000)}\n"
+                                                f"X {int(measured['window_s']*1000)}\n"
                                                 .encode("ascii"))
+                                            _reply(ser, token, geometry, nonce,
+                                                   digest, FAULT)
                                         else:
                                             elapsed = int(
                                                 (time.monotonic() - start) * 1000)
@@ -581,8 +684,20 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                 raise ProofError(f"QEMU exit {proc.returncode}, expected 33")
             if output.count("WOLFOS_BOOT_OK") != 1:
                 raise ProofError("Boot acknowledgement missing or duplicated")
-            if not validate_desktop_serial(output, expired):
+            if not validate_desktop_serial(output, expired, silent):
                 raise ProofError("Desktop scanout serial proof invalid")
+            if silent:
+                tx_line = next(line for line in output.splitlines()
+                               if line.startswith(TX_PREFIX))
+                guest_ms = int(TX.fullmatch(tx_line).group(3))
+                host_ms = measured.get("window_s", 0.0) * 1000.0
+                if abs(guest_ms - host_ms) > 4000:
+                    raise ProofError(
+                        "Guest clock disagrees with the host wall clock: "
+                        f"guest={guest_ms} ms host={host_ms:.0f} ms")
+                print(f"PASS: with a silent peer the guest ended the window on "
+                      f"its own HPET clock after {guest_ms} ms (host wall clock "
+                      f"measured {host_ms:.0f} ms to the rollback, within 4 s)")
             print(f"PASS: QMP screenshots show all {PIXELS} pixels of the real "
                   f"{WIDTH}x{HEIGHT} framebuffer and all {ALT_PIXELS} pixels of "
                   f"the {ALT_WIDTH}x{ALT_HEIGHT} scanout")
@@ -593,7 +708,8 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                 print(f"PASS: after a real {measured.get('window_s', 0):.2f} s "
                       "window the guest rolled back, and the restored "
                       f"{ALT_WIDTH}x{ALT_HEIGHT} image matches the host capture "
-                      "byte for byte")
+                      "byte for byte "
+                      f"(restored_console={measured.get('restored_console')})")
             else:
                 print("PASS: the host-attested 1024x768 observation confirmed "
                       "the change inside the window; the catalog keeps both "

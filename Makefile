@@ -410,10 +410,12 @@ qemu-virtio-gpu-desktop-scanout-smoke:
 #  * a lying host corrupted attestation field must abort the whole proof;
 #  * a lying host verdict must be graded, not obeyed: an early "expired" claim
 #    is refused outright, and a really elapsed window forces a verified
-#    rollback to the previous mode.
+#    rollback to the previous mode;
+#  * a peer that says nothing at all must not strand the guest: the guest ends
+#    the window on its own HPET clock and rolls back.
 # DESKTOP_ATTEST_FAULTS / DESKTOP_MODE_FAULTS may be narrowed locally.
 DESKTOP_ATTEST_FAULTS ?= digest nonce geometry
-DESKTOP_MODE_FAULTS ?= mode_early mode_expired
+DESKTOP_MODE_FAULTS ?= mode_early mode_expired mode_silent
 qemu-virtio-gpu-desktop-scanout-negative:
 	@for fault in $(DESKTOP_ATTEST_FAULTS); do \
 	  if WOLFOS_DESKTOP_FAULT=$$fault python3 scripts/qemu_virtio_gpu_desktop_scanout.py \

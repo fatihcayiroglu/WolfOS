@@ -127,6 +127,7 @@ mod display_driver_policy;
 mod display_mode_policy;
 mod display_mode_catalog;
 mod display_mode_transaction;
+mod hpet_clock;
 mod virtio_gpu_desktop_wire;
 mod display_edid_base;
 mod display_edid_cta;
@@ -626,6 +627,10 @@ pub extern "C" fn kmain() -> ! {
                             .unwrap_or(virtio_gpu_desktop_wire::Framebuffer::NONE);
                         #[cfg(not(feature = "qemu-virtio-gpu-desktop-scanout-smoke"))]
                         let desktop_fb = virtio_gpu_desktop_wire::Framebuffer::NONE;
+                        // The confirmation window is enforced by the guest's own
+                        // validated clock, not by the peer that answers it.
+                        #[cfg(feature = "qemu-virtio-gpu-desktop-scanout-smoke")]
+                        hpet_clock::init(hhdm.offset,entries);
                         if !virtio_gpu_display_info::verify(
                             hhdm.offset,entries,window,notify_window,controlq_layout,
                             &desktop_fb
