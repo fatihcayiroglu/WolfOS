@@ -91,27 +91,48 @@ The geometry and pixel authority for the new mode remains the independent host
 capture. This is the same safety boundary as ADR-0095: nothing about a mode is
 believed because the driver or the device says so.
 
-### 4. The confirmation window is measured by the host, and graded by the guest
+### 4. The confirmation window is owned by the guest clock
 
-The kernel still has no wall clock on this path (no calibrated TSC, HPET or
-ACPI PM timer in the display flavor), so it will not pretend to own a 15 s
-timer. Protocol:
+The 15 s window used to be measured by the peer that answers it, which meant a
+peer that simply went silent could leave the guest in a half-applied mode
+forever. A window only the other side measures is not a window.
 
-* the driver prints the applied-mode challenge (nonce + its own source digest);
-* the host answers `X <elapsed_ms>` — the real time it measured between the
-  challenge and its verdict;
-* if `elapsed >= 15000` the host sends nothing else and the driver calls
-  `expire(elapsed)`, which re-checks the deadline itself;
-* otherwise the host sends the normal nonce-bound attestation and the driver
-  calls `confirm(..)`;
+The display flavor now validates the HPET at `0xFED00000` before trusting it:
+PCI vendor `0x8086`, revision ≥ 1, a 64-bit main counter, a device-reported
+counter period of at most 10^8 fs, and a liveness check that the counter really
+advances. Any rejection leaves `clock=absent`, prints the reason, and falls back
+to a host-measured window that is named as such in the evidence — fail-closed,
+never a silent substitution.
+
+Exactly one MMIO write is made: General Configuration bit 0 (`ENABLE_CNF`). No
+comparator is programmed, no interrupt is routed, and no other bit is touched.
+The write is necessary because the main counter does not run until it is set.
+
+Durations are computed only from the period the device reports (`period_fs`,
+128-bit math, wrap-tolerant); no nominal frequency is assumed. Evidence states
+`deadline_clock=hpet`, `verdict_source=guest`, `window_enforced_by=guest` and the
+guest's own `verdict_elapsed_ms`, which the harness cross-checks against its wall
+clock to within a few seconds.
+
+Before asking the peer to look at a stage, the driver waits one refresh on that
+same clock: grading a frame the console has not picked up yet would measure
+timing instead of pixels.
+
+Protocol:
+
+* the driver prints the stage challenge (nonce + its own source digest);
+* the host captures, compares, and answers `X <elapsed_ms>` (its own measurement)
+  or the nonce-bound attestation;
+* `X <elapsed_ms>` with `elapsed >= 15000` ends the window: the guest re-checks
+  the deadline itself and rolls back;
 * an early `X 1000` is refused by `expire` (`deadline_not_reached`) and the
-  transaction stays pending.
-
-Evidence therefore states `window_enforced_by=host`. This is a documented gap,
-not a claim: a hostile host can stall the driver, and the guest-side bound is a
-bounded poll budget, not a wall-clock deadline. The next step for this axis is
-a real monotonic clock (HPET or ACPI PM timer) so the guest can enforce the
-window on its own.
+  transaction stays pending;
+* a verdict that arrives *after* the guest already ended the window is dropped
+  and counted (`WOLFOS_GPU_STALE_REPLY_DROPPED late_verdict=1`), as is a reply
+  that names an older stage nonce (`late_stage=1`) — that reply answers a stage
+  that no longer exists. Stage nonces only grow, so this is a comparison, not a
+  guess. Buffered leftovers are also drained before a challenge, so the drain
+  can never stall on a line that does not arrive.
 
 ## Consequences
 
@@ -139,4 +160,13 @@ window on its own.
   resource (or a reallocation transaction) per mode.
 * Transfer is synchronous and blocking; there is no page-flip, no double
   buffering and no damage-region flush.
-* The window is enforced by the host (see §4).
+* The window is enforced by the guest only when the HPET validates; the
+  fallback to a host-measured window is printed, and the HPET is assumed to be
+  at its architectural address on `q35` (no ACPI table walk yet). There are no
+  comparator interrupts, so expiry is a polled deadline, not a timer IRQ.
+* `virtio-vga` does not always shrink its console back to the restored
+  rectangle: it may keep the previous height and show the restored frame in the
+  top rows. The harness therefore grades the restored frame by content (the
+  full image, byte for byte, in those rows) and prints which case the device
+  produced (`restored_console=shrunk|kept_console_height`) rather than assuming
+  a resize.
