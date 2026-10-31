@@ -217,7 +217,10 @@ fn send_resource_command(
     }
     // The upper bound is a flavor constant, so an unexpected completion
     // index is still refused instead of being accepted as this request.
-    #[cfg(feature="qemu-virtio-gpu-window-move-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-opaque-occlusion-smoke")]
+    let max_index=resource::OPAQUE_OCCLUSION_MAX_INDEX;
+    #[cfg(all(feature="qemu-virtio-gpu-window-move-smoke",
+              not(feature="qemu-virtio-gpu-opaque-occlusion-smoke")))]
     let max_index=resource::WINDOW_MOVE_MAX_INDEX;
     #[cfg(all(feature="qemu-virtio-gpu-two-dirty-rects-smoke",
               not(feature="qemu-virtio-gpu-window-move-smoke")))]
@@ -714,6 +717,54 @@ fn submit_two_dirty_regions(
     Ok(next)
 }
 
+/// Paint a clipped opaque surface with one deterministic color mask.
+/// The row stride always remains the full 1024x768 backing resource.
+/// A 32-bit pixel is never read-modify-written from host VGA state.
+#[cfg(feature="qemu-virtio-gpu-opaque-occlusion-smoke")]
+fn paint_opaque_region(
+    fb:&crate::virtio_gpu_desktop_wire::Framebuffer,
+    vas:&[u64;FRAMES],
+    rect:crate::virtio_gpu_desktop_wire::damage::Rect,
+    rgb_mask:u32,
+)->Result<(),&'static str>{
+    use crate::virtio_gpu_desktop_wire as desk;
+    fb.supported().map_err(|_|"occlusion_framebuffer")?;
+    for y in rect.y..rect.y+rect.height{
+        let row=vas[5+y as usize] as *mut u8;
+        for x in rect.x..rect.x+rect.width{
+            let word=desk::pixel_word(x,y)^rgb_mask;
+            unsafe{
+                (fb.address as *mut u8).add(fb.pitch as usize*y as usize+x as usize*4)
+                    .cast::<u32>().write_volatile(word);
+                row.add(x as usize*4).cast::<u32>().write_volatile(word);
+            }
+        }
+    }
+    fence(Ordering::SeqCst);
+    for y in rect.y..rect.y+rect.height{
+        let row=vas[5+y as usize] as *const u8;
+        for x in rect.x..rect.x+rect.width{
+            let expected=desk::pixel_word(x,y)^rgb_mask;
+            if unsafe{row.add(x as usize*4).cast::<u32>().read_volatile()}!=expected{
+                return Err("occlusion_backing_mismatch");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One rectangle, two independently verified GPU command completions.
+/// The dirty data stays pinned until both acknowledgements succeed.
+#[cfg(feature="qemu-virtio-gpu-opaque-occlusion-smoke")]
+fn submit_opaque_dirty(
+    vas:&[u64;FRAMES],frames:&[u64;FRAMES],notify_port:u64,selected:u16,
+    next:u16,rect:crate::virtio_gpu_desktop_wire::damage::Rect,base:u64,
+)->Result<u16,&'static str>{
+    let mut damage=crate::virtio_gpu_desktop_wire::damage::DamageTracker::new();
+    commit_partial_damage(&mut damage,rect,vas,frames,notify_port,
+                          selected,next,base+1,base+2)
+}
+
 /// A fresh GET_DISPLAY_INFO after a switch: the device's own statement about
 /// the scanout rectangle it now has configured. Fence-bound to this exact
 /// request, so an older completion cannot be mistaken for the readback.
@@ -1126,6 +1177,79 @@ fn present_desktop(
         }
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_WINDOW_MOVE_OK first=11,19,16,16 moved=211,119,16,16 fixed=811,401,32,16 visible_pixels=768 transfer_acks=6 flush_acks=6 capture_acks=3 host_pixel_authority=required no_union_transfer=1"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-opaque-occlusion-smoke")]
+    {
+        use desk::opaque_scene::OpaqueScene;
+        use desk::window_scene::{FIRST_ID,SECOND_ID};
+        let old=desk::damage::Rect::checked(11,19,16,16)
+            .map_err(|_|"opaque_old_rect")?;
+        let second=desk::damage::Rect::checked(811,401,32,16)
+            .map_err(|_|"opaque_fixed_rect")?;
+        let over=desk::damage::Rect::checked(819,401,16,16)
+            .map_err(|_|"opaque_over_rect")?;
+        let mut scene=OpaqueScene::new(old,second).map_err(|_|"opaque_scene")?;
+        // Red first window, blue second window: different RGB channel masks.
+        // This makes clipping and z-order measurable, not just geometry.
+        paint_opaque_region(fb,vas,scene.first().rect,0x00ff_0000)?;
+        paint_opaque_region(fb,vas,scene.second().rect,0x0000_00ff)?;
+        next=submit_two_dirty_regions(vas,frames,notify_port,selected,next,
+            old,second,0x574f_4f43_4300_1000)?;
+        await_host_capture("opaque_initial",b'B')?;
+        captures+=1;
+
+        // Red moves *inside* blue. The old red pixels are restored; in the
+        // overlap, red wins because first is top-most. Only old/new dirty.
+        let tx=scene.begin_move(FIRST_ID,over).map_err(|_|"opaque_move")?;
+        paint_opaque_region(fb,vas,old,0)?;
+        paint_opaque_region(fb,vas,over,0x00ff_0000)?;
+        next=submit_two_dirty_regions(vas,frames,notify_port,selected,next,
+            old,over,0x574f_4f43_4300_2000)?;
+        await_host_capture("opaque_overlap",b'C')?;
+        captures+=1;
+        scene.confirm(tx).map_err(|_|"opaque_move_confirm")?;
+        if scene.visible_owner(820,402)!=Some(FIRST_ID) {
+            return Err("opaque_first_not_front");
+        }
+
+        // Raise the blue window. Its whole 32x16 rectangle is the only
+        // damaged resource area, including the now-occluded red window.
+        let lower=scene.begin_raise(SECOND_ID).map_err(|_|"opaque_lower")?;
+        paint_opaque_region(fb,vas,second,0x0000_00ff)?;
+        next=submit_opaque_dirty(vas,frames,notify_port,selected,next,
+            second,0x574f_4f43_4300_3000)?;
+        await_host_capture("opaque_blue_front",b'D')?;
+        captures+=1;
+        scene.confirm(lower).map_err(|_|"opaque_blue_confirm")?;
+        if scene.visible_owner(820,402)!=Some(SECOND_ID) {
+            return Err("opaque_blue_not_front");
+        }
+
+        // Raise red again, repainting only the formerly hidden 16x16 patch.
+        let raise=scene.begin_raise(FIRST_ID).map_err(|_|"opaque_raise")?;
+        paint_opaque_region(fb,vas,over,0x00ff_0000)?;
+        next=submit_opaque_dirty(vas,frames,notify_port,selected,next,
+            over,0x574f_4f43_4300_4000)?;
+        await_host_capture("opaque_red_front",b'F')?;
+        captures+=1;
+        scene.confirm(raise).map_err(|_|"opaque_red_confirm")?;
+        if scene.visible_owner(820,402)!=Some(FIRST_ID) {
+            return Err("opaque_red_not_front");
+        }
+
+        // Blue's full region covers the overlaid red. One bounded transfer
+        // erases both without an intermediate full framebuffer upload.
+        paint_opaque_region(fb,vas,second,0)?;
+        next=submit_opaque_dirty(vas,frames,notify_port,selected,next,
+            second,0x574f_4f43_4300_5000)?;
+        await_host_capture("opaque_restored",b'K')?;
+        captures+=1;
+        if page_digest(vas,desk::HEIGHT)!=desktop_digest {
+            return Err("opaque_restore_digest");
+        }
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_OPAQUE_OK front=red_then_blue_then_red overlap=16x16 changed=768 outside=785664 transfer_acks=7 flush_acks=7 capture_acks=5 host_pixel_authority=required no_full_frame=1"
         );
     }
     // 2. Second real geometry: the same resource presented as 1024x384. Only
