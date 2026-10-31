@@ -143,6 +143,10 @@ fn main() {
     } else if env::var_os("CARGO_FEATURE_USER_FILE_IO_SMOKE").is_some() {
         checked("as", &["--64", "--defsym", "WOLFOS_FILE_IO_SMOKE=1",
             "-o", obj.to_str().unwrap(), "user/hello.S"]);
+    } else if env::var_os("CARGO_FEATURE_USER_SURFACE_WRITER_SMOKE").is_some() {
+        checked("as", &["--64", "--defsym", "WOLFOS_USERCOPY_SMOKE=1",
+            "--defsym", "WOLFOS_USER_SURFACE_WRITER=1",
+            "-o", obj.to_str().unwrap(), "user/hello.S"]);
     } else if env::var_os("CARGO_FEATURE_USER_COPY_SMOKE").is_some() {
         checked("as", &["--64", "--defsym", "WOLFOS_USERCOPY_SMOKE=1",
             "-o", obj.to_str().unwrap(), "user/hello.S"]);
