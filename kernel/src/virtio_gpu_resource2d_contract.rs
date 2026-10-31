@@ -96,6 +96,8 @@ pub const PROBE_MAX_INDEX: u16 = 14;
 pub const DESKTOP_MAX_INDEX: u16 = 46;
 /// 32x32 changed and restored: two fenced transfer/flush pairs (four extra).
 pub const DAMAGE_LIVE_MAX_INDEX: u16 = 50;
+/// Two disjoint dirty rectangles + exact restoration: 8 fenced commands.
+pub const TWO_DIRTY_MAX_INDEX: u16 = 58;
 
 /// A sent request or plausible 24-byte DMA buffer is never completion.
 /// Require exact used idx/head/len plus the echoed nonzero request fence.
