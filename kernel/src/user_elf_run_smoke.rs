@@ -1189,6 +1189,10 @@ fn verify_guest_written_surface_stack(
         fail("user_surface_writer_real_stack_pointers")
     }
     let mut surfaces=SurfaceLedger::<2>::new();
+    // Snapshot only composed immutable kernel words, NEVER user-VA pointers.
+    // The QMP handshake happens AFTER the process registry lock is dropped.
+    #[cfg(feature = "user-surface-writer-display-smoke")]
+    let mut display_snapshot = [0u32; 15];
     let verified=PROCESS_TABLE.with(|table| -> bool {
         let Some(record)=table.snapshot(pid) else {return false};
         if record.state!=ProcessState::Running || record.cr3_root!=active {
@@ -1240,6 +1244,8 @@ fn verify_guest_written_surface_stack(
                 if out[y*5+x]!=expected {return false}
             }
         }
+        #[cfg(feature = "user-surface-writer-display-smoke")]
+        { display_snapshot = out; }
         if surfaces.close_owner(pid,pid)!=Ok(2) {return false}
         out.fill(0x00fe_edab);
         if user_surface_copy::compose_user_snapshots(
@@ -1252,6 +1258,8 @@ fn verify_guest_written_surface_stack(
         true
     });
     if verified!=Ok(true) {fail("user_surface_writer_owner_or_pixels")}
+    #[cfg(feature = "user-surface-writer-display-smoke")]
+    crate::attest_cpl3_pixels_on_stdvga(&display_snapshot);
     serial::write_line(
         "WOLFOS_USER_SURFACE_WRITER_CPL3_OK guest_stack_written=1 user_rw_nx=1 saved_r12_r13=1 real_user_cr3=1 exact_owner_frames=1 composed_pixels=15 revoked_denied=1 pmm_no_leak_pending_exit=1 real_gpu_dma=0"
     );
