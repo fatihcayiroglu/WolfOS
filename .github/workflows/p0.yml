@@ -150,6 +150,10 @@ jobs:
         run: make user-elf-run-smoke
       - name: Real CPL3 INT80 EXIT surface-drain gate with counted 7-frame PMM cleanup (synthetic GPU acknowledgements)
         run: make user-surface-exit-smoke
+      - name: Real CPL3 #UD terminal surface-drain gate, exact SIGILL status and PMM cleanup (synthetic GPU acknowledgements)
+        run: make user-surface-ud-retire-smoke
+      - name: Real CPL3 #PF terminal surface-drain gate, exact SIGSEGV status and PMM cleanup (synthetic GPU acknowledgements)
+        run: make user-surface-pf-retire-smoke
       - name: P2 real single-LOAD RX ELF executes in CPL3 with NX stack and exact six-frame reap
         run: make user-elf-one-load-run-smoke
       - name: P2 relocated two-PT ELF64 actually executes in CPL3, restores CR3 and reaps eight frames
