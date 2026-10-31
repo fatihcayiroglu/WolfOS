@@ -20,8 +20,9 @@ conditions without pretending to own device or process resources.
   `Identity { slot, surface_generation, pid, process_generation }`.
   An empty slot remembers its last generation after release.
 - `begin_submit` accepts two strictly increasing nonzero fence numbers,
-  greater than the last GPU fence issued for that **slot**, including previous
-  generations. The backing must be considered pinned from this point.
+  greater than the last GPU fence issued **globally across every slot** and
+  every previous generation. A completion fence cannot be recycled between
+  two different surfaces. The backing is considered pinned from this point.
 - `ack_transfer` and `ack_flush` are separate, ordered transitions.
   Duplicate, stale, wrong-fence, early-flush and mismatched-handle
   acknowledgements do not advance state. The real driver MUST first validate
@@ -51,7 +52,7 @@ until real hardware reset and teardown are independently verified.
 
 The Rust tests cover two-window composition and failed renders, exact
 per-process generation matching, immediate revocation, two-stage in-flight
-draining, wrong/duplicate/out-of-order fences, repeated close, slot reuse
+draining, wrong/duplicate/out-of-order or cross-surface reused fences, repeated close, slot reuse
 against ABA and stale PID/handle references, bounded capacity and empty
 ledger. The new module is included by `virtio_gpu_desktop_wire.rs`, which
 the existing mandatory `make test` and QEMU smoke targets already compile.
