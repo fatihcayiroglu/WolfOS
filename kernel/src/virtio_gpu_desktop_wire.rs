@@ -20,6 +20,11 @@ pub mod opaque_scene;
 pub mod surface_pixels;
 #[path = "virtio_gpu_surface_ledger.rs"]
 pub mod surface_ledger;
+// The production process registry is feature-gated; never force it into
+// ordinary GPU/boot flavors merely by compiling this pure contract.
+#[cfg(any(test, feature = "process-table-smoke"))]
+#[path = "virtio_gpu_surface_process_bridge.rs"]
+pub mod surface_process_bridge;
 
 pub const WIDTH: u32 = 1024;
 pub const HEIGHT: u32 = 768;
