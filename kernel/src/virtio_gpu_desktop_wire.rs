@@ -18,6 +18,8 @@ pub mod window_scene;
 pub mod opaque_scene;
 #[path = "virtio_gpu_surface_pixels.rs"]
 pub mod surface_pixels;
+#[path = "virtio_gpu_surface_ledger.rs"]
+pub mod surface_ledger;
 
 pub const WIDTH: u32 = 1024;
 pub const HEIGHT: u32 = 768;
