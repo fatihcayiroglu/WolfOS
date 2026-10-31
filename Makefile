@@ -695,6 +695,11 @@ user-surface-writer-smoke:
 	$(MAKE) iso FLAVOR=user-surface-writer
 	WOLFOS_USER_SURFACE_HARDWARE=1 WOLFOS_USER_SURFACE_WRITER=1 python3 scripts/user_copy_smoke.py $(OUT)/wolfos-user-surface-writer.iso
 
+.PHONY: user-surface-writer-display-smoke
+user-surface-writer-display-smoke:
+	$(MAKE) iso FLAVOR=user-surface-writer-display
+	python3 scripts/user_surface_writer_display_smoke.py $(OUT)/wolfos-user-surface-writer-display.iso
+
 user-file-io-smoke:
 	$(MAKE) iso FLAVOR=user-file-io
 	python3 scripts/user_file_io_smoke.py $(OUT)/wolfos-user-file-io.iso
