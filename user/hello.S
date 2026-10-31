@@ -170,6 +170,18 @@ _after_putc:
     // New opt-in real user-POINTER syscall. The kernel cannot trust RDI;
     // it must WALK the live independent user CR3 and copy via HHDM.
 .ifdef WOLFOS_USERCOPY_SMOKE
+.ifdef WOLFOS_USER_SURFACE_WRITER
+    // Guest-authored xRGB8888 bytes in the real RW/NX private CPL3 stack.
+    // Preserve the existing WRITE(RDI=hello_text) syscall unchanged and
+    // supply the TWO user surface pointers in saved R12/R13 registers.
+    // Both 8-byte ranges are disjoint and below the untouched user RSP.
+    mov dword ptr [rsp - 64], 0x00e21409
+    mov dword ptr [rsp - 60], 0x00121212
+    mov dword ptr [rsp - 48], 0x000c1eda
+    mov dword ptr [rsp - 44], 0x00abcdef
+    lea r12, [rsp - 64]
+    lea r13, [rsp - 48]
+.endif
     lea rdi, [rip + hello_text]
     mov esi, hello_end - hello_text
     xor edx, edx      # RDX reserved: caller must initialize to zero

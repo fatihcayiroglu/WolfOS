@@ -172,6 +172,8 @@ jobs:
         run: make user-copy-smoke
       - name: Real CPL3 user ELF pointer feeds owner-checked surface pixel snapshot (no GPU DMA)
         run: make user-surface-copy-hardware-smoke
+      - name: Real CPL3 guest ELF writes RW/NX surface pixels and passes R12/R13 user pointers
+        run: make user-surface-writer-smoke
       - name: P2 genuine CPL3 OPEN READ CLOSE, bad pointers, stale fd, exact 7-frame cleanup
         run: make user-file-io-smoke
       - name: P2 three simultaneous reserved PIDs with disjoint real PMM frames and safe cancellation

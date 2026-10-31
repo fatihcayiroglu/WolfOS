@@ -197,6 +197,8 @@ else ifeq ($(FLAVOR),process-table)
 FEATURES := --features process-table-smoke
 else ifeq ($(FLAVOR),user-file-io)
 FEATURES := --features user-file-io-smoke
+else ifeq ($(FLAVOR),user-surface-writer)
+FEATURES := --features user-surface-writer-smoke
 else ifeq ($(FLAVOR),user-surface-copy-hardware)
 FEATURES := --features user-surface-copy-hardware-smoke
 else ifeq ($(FLAVOR),user-copy)
@@ -685,6 +687,11 @@ user-copy-smoke:
 user-surface-copy-hardware-smoke:
 	$(MAKE) iso FLAVOR=user-surface-copy-hardware
 	WOLFOS_USER_SURFACE_HARDWARE=1 python3 scripts/user_copy_smoke.py $(OUT)/wolfos-user-surface-copy-hardware.iso
+
+.PHONY: user-surface-writer-smoke
+user-surface-writer-smoke:
+	$(MAKE) iso FLAVOR=user-surface-writer
+	WOLFOS_USER_SURFACE_HARDWARE=1 WOLFOS_USER_SURFACE_WRITER=1 python3 scripts/user_copy_smoke.py $(OUT)/wolfos-user-surface-writer.iso
 
 user-file-io-smoke:
 	$(MAKE) iso FLAVOR=user-file-io
