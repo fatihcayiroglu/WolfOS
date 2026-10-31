@@ -22,9 +22,14 @@ pub mod surface_pixels;
 pub mod surface_ledger;
 // The production process registry is feature-gated; never force it into
 // ordinary GPU/boot flavors merely by compiling this pure contract.
-#[cfg(any(test, feature = "process-table-smoke"))]
+#[cfg(any(test, feature = "process-table-smoke", feature = "user-copy-smoke"))]
 #[path = "virtio_gpu_surface_process_bridge.rs"]
 pub mod surface_process_bridge;
+// User virtual-memory surface copies only compile in host-test and the
+// existing isolated Ring3 user-copy QEMU flavor, never in the normal boot.
+#[cfg(any(test, feature = "user-copy-smoke"))]
+#[path = "virtio_gpu_user_surface_copy.rs"]
+pub mod user_surface_copy;
 
 pub const WIDTH: u32 = 1024;
 pub const HEIGHT: u32 = 768;
