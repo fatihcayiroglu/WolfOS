@@ -54,9 +54,28 @@ FINAL = (
     "frames_freed=14 pmm_no_leak=1"
 )
 
+SURFACE_OPEN1 = (
+    "WOLFOS_RING3_SURFACE_OPEN_OK pid=1 registry=1 owner_generation=1 "
+    "software_submit=1 gpu_dma=0"
+)
+SURFACE_OPEN2 = SURFACE_OPEN1.replace("pid=1", "pid=2")
+SURFACE_GUARD1 = (
+    "WOLFOS_RING3_SURFACE_EXIT_GUARD_OK pid=1 real_cpl3=1 restored_cr3=1 "
+    "early_reap_denied=1 half_ack_denied=1 retained_handle_denied=1 "
+    "software_acks=1 guarded_reap=1 real_pmm_frames=7 gpu_dma=0"
+)
+SURFACE_GUARD2 = SURFACE_GUARD1.replace("pid=1", "pid=2")
+SURFACE_REUSE = (
+    "WOLFOS_RING3_SURFACE_REUSE_OK old_pid=1 new_pid=2 slot_reused=1 "
+    "generation_advanced=1 stale_handle_denied=1 stale_fence_denied=1"
+)
+
 def main() -> int:
-    if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
-        print("Usage: user_process_fault_recovery_smoke.py path/to/recovery.iso")
+    surface = len(sys.argv) == 3 and sys.argv[2] == "--surface"
+    if (len(sys.argv) not in (2,3)
+            or (len(sys.argv) == 3 and not surface)
+            or not Path(sys.argv[1]).is_file()):
+        print("Usage: user_process_fault_recovery_smoke.py path/to/recovery.iso [--surface]")
         return 2
     with tempfile.TemporaryDirectory(prefix="wolfos-pf-recovery-") as temp:
         serial = Path(temp) / "serial.log"
@@ -86,10 +105,17 @@ def main() -> int:
             print("FAIL: two independent hardware ELF/CR3 entries required")
             return 1
         ordered = [
-            "WOLFOS_BOOT_OK", START1, entries[0].group(0),
-            ID, ADD, HELLO, HELLO_OK, PF, PF_REAP, CLEAN, TABLE1, PF_RESULT,
-            REAP1, RELAUNCH, START2, entries[1].group(0),
-            ID, ADD, HELLO, HELLO_OK, EXIT0, CLEAN, TABLE2, SUCCESS0, REAP2, FINAL,
+            "WOLFOS_BOOT_OK",
+            *([SURFACE_OPEN1] if surface else []),
+            START1, entries[0].group(0),
+            ID, ADD, HELLO, HELLO_OK, PF,
+            *([SURFACE_GUARD1] if surface else []),
+            PF_REAP, CLEAN, TABLE1, PF_RESULT, REAP1, RELAUNCH,
+            *([SURFACE_REUSE, SURFACE_OPEN2] if surface else []),
+            START2, entries[1].group(0),
+            ID, ADD, HELLO, HELLO_OK, EXIT0,
+            *([SURFACE_GUARD2] if surface else []),
+            CLEAN, TABLE2, SUCCESS0, REAP2, FINAL,
         ]
         cursor = 0
         for token in ordered:
@@ -107,6 +133,20 @@ def main() -> int:
             if output.count(token) != 1:
                 print("FAIL: missing or duplicated unique recovery marker: " + token)
                 return 1
+        if surface:
+            if any(output.count(m) != 1 for m in (
+                SURFACE_OPEN1, SURFACE_OPEN2, SURFACE_GUARD1,
+                SURFACE_GUARD2, SURFACE_REUSE,
+            )):
+                print("FAIL: duplicate/missing PID-generation and fence-replay evidence")
+                return 1
+        elif any(m in output for m in (
+            "WOLFOS_RING3_SURFACE_OPEN_OK",
+            "WOLFOS_RING3_SURFACE_EXIT_GUARD_OK",
+            "WOLFOS_RING3_SURFACE_REUSE_OK",
+        )):
+            print("FAIL: unrequested surface fixture leaked into legacy recovery")
+            return 1
         for bad in [
             "WOLFOS_ELF_RUN_ERROR", "WOLFOS_RING_PREP_ERROR",
             "WOLFOS_PANIC", "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_GP",
@@ -121,6 +161,8 @@ def main() -> int:
             print(result.stderr.decode(errors="replace"))
             return 1
         print("PASS: PID1 real CPL3 #PF/status139 -> exact reap -> new healthy ELF PID2 EXIT0; 43 INT80, 14 PMM frames freed")
+        if surface:
+            print("PASS: PID2 recycled surface slot with new generation, stale PID1 handle/fences refused; synthetic GPU replies, real CPL3 and PMM")
         return 0
 
 if __name__ == "__main__":
