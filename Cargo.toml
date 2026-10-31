@@ -149,6 +149,10 @@ user-copy-smoke = ["smoke-exit"]
 user-surface-copy-hardware-smoke = ["user-copy-smoke"]
 # Genuine CPL3 ELF writes RGBA words into RW/NX stack and passes R12/R13 pointers.
 user-surface-writer-smoke = ["user-surface-copy-hardware-smoke"]
+# Real CPL3-written stack pixels -> CPU-composited kernel snapshot ->
+# checked Limine standard VGA framebuffer -> independent QMP screenshot.
+# No VirtIO DMA, hardware GPU fences, or production GUI syscall.
+user-surface-writer-display-smoke = ["user-surface-writer-smoke"]
 user-file-io-smoke = ["smoke-exit"]
 process-table-smoke = ["smoke-exit"]
 # Real PMM backing allocation, two registry PIDs and synthetic GPU-fence

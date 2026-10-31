@@ -389,6 +389,110 @@ mod timer;
           feature = "apic-calibration-smoke", feature = "apic-preempt-smoke"))]
 mod timer_tasks;
 
+/// An isolated QEMU std-VGA *host screenshot* acceptance adapter.
+/// User-authored pixels were already snapshotted via the authenticated
+/// four-level user PTE walk. This adapter only touches the Limine-provided
+/// 32bpp boot framebuffer, never a VirtIO command queue or guest user VA.
+/// All coordinates, masks and mapped byte extents are validated first.
+/// The host must capture baseline, present and restored QMP images before
+/// the guest is allowed to finish. No physical GPU driver is implied.
+#[cfg(feature = "user-surface-writer-display-smoke")]
+pub(crate) fn attest_cpl3_pixels_on_stdvga(pixels: &[u32; 15]) {
+    const X: u64 = 200;
+    const Y: u64 = 150;
+    let Some(fb) = FRAMEBUFFER_REQUEST.response()
+        .and_then(|response| response.framebuffers().first()) else {
+        serial::write_line("WOLFOS_CPL3_DISPLAY_FAIL missing_framebuffer");
+        halt_forever()
+    };
+    let Some(layout) = framebuffer_text::Layout::new(fb.width, fb.height, fb.pitch)
+        else { serial::write_line("WOLFOS_CPL3_DISPLAY_FAIL geometry"); halt_forever() };
+    if fb.width < X + 5 || fb.height < Y + 3
+        || fb.bpp != 32
+        || fb.memory_model != limine::framebuffer::FRAMEBUFFER_RGB
+        || fb.red_mask_size != 8 || fb.green_mask_size != 8
+        || fb.blue_mask_size != 8
+        || fb.red_mask_shift > 24 || fb.green_mask_shift > 24
+        || fb.blue_mask_shift > 24
+        || fb.red_mask_shift == fb.green_mask_shift
+        || fb.red_mask_shift == fb.blue_mask_shift
+        || fb.green_mask_shift == fb.blue_mask_shift
+        || (fb.address() as usize) & 3 != 0
+    {
+        serial::write_line("WOLFOS_CPL3_DISPLAY_FAIL unsupported_rgb");
+        halt_forever()
+    }
+
+    let offsets = core::array::from_fn::<_,15,_>(|n|
+        layout.pixel_offset(X + (n % 5) as u64, Y + (n / 5) as u64)
+            .unwrap_or_else(|| {
+                serial::write_line("WOLFOS_CPL3_DISPLAY_FAIL out_of_bounds");
+                halt_forever()
+            }));
+    // Restore exactly what was on the host display, not a made-up fallback.
+    let saved = core::array::from_fn::<_,15,_>(|n| {
+        // SAFETY: Limine maps the entire framebuffer; validated layout
+        // constrains every aligned offset to its accessible 32-bit extent.
+        unsafe { fb.address().cast::<u8>().add(offsets[n]).cast::<u32>().read_volatile() }
+    });
+
+    fn host_ack(expected: u8) {
+        // Bounded BSP-only polling. Timeout NEVER constitutes an attestation.
+        for _ in 0..400_000_000u32 {
+            if let Some(ch) = serial::read_byte_nonblocking() {
+                if ch == expected { return }
+                serial::write_line("WOLFOS_CPL3_DISPLAY_FAIL invalid_host_ack");
+                crate::halt_forever()
+            }
+            core::hint::spin_loop();
+        }
+        serial::write_line("WOLFOS_CPL3_DISPLAY_FAIL timeout");
+        crate::halt_forever()
+    }
+
+    serial::write_line("WOLFOS_CPL3_DISPLAY_CAPTURE stage=baseline");
+    host_ack(b'B');
+
+    for (n,px) in pixels.iter().copied().enumerate() {
+        let rgb = px & 0x00ff_ffff;
+        let value = (((rgb >> 16) & 0xff) << fb.red_mask_shift)
+            | (((rgb >> 8) & 0xff) << fb.green_mask_shift)
+            | ((rgb & 0xff) << fb.blue_mask_shift);
+        // SAFETY: full output is a fixed, checked, 5x3 patch in mapped
+        // Limine RGB framebuffer; no user pointer reaches this write.
+        unsafe {
+            fb.address().cast::<u8>().add(offsets[n]).cast::<u32>()
+                .write_volatile(value);
+        }
+    }
+    serial::write_line("WOLFOS_CPL3_DISPLAY_CAPTURE stage=active");
+    host_ack(b'A');
+
+    for (n,old) in saved.iter().copied().enumerate() {
+        // SAFETY: exactly the same 15 checked mapped framebuffer addresses.
+        unsafe {
+            fb.address().cast::<u8>().add(offsets[n]).cast::<u32>()
+                .write_volatile(old);
+        }
+    }
+    serial::write_line("WOLFOS_CPL3_DISPLAY_CAPTURE stage=restored");
+    host_ack(b'R');
+    for (n,old) in saved.iter().copied().enumerate() {
+        // SAFETY: same validated 15 offsets and mapped 32-bit read.
+        let actual = unsafe {
+            fb.address().cast::<u8>().add(offsets[n]).cast::<u32>()
+                .read_volatile()
+        };
+        if actual != old {
+            serial::write_line("WOLFOS_CPL3_DISPLAY_FAIL restoration");
+            halt_forever()
+        }
+    }
+    serial::write_line(
+        "WOLFOS_CPL3_DISPLAY_OK source=real_cpl3_stack copied_via_4level_pte=1 stdvga_framebuffer=1 host_qmp_captures=3 changed_pixels=15 restored=1 real_virtio_dma=0"
+    );
+}
+
 #[used]
 #[unsafe(link_section = ".requests_start_marker")]
 static START_MARKER: RequestsStartMarker = RequestsStartMarker::new();
