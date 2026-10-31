@@ -147,6 +147,9 @@ user-invalid-opcode-retire-smoke = ["user-elf-run-smoke"]
 user-page-fault-retire-smoke = ["user-elf-run-smoke"]
 # Faulted PID1 -> fully reaped -> separately linked healthy PID2 on real CPL3.
 user-process-fault-recovery-smoke = ["user-page-fault-retire-smoke", "user-process-smoke"]
+# Two genuinely executing CPL3 PIDs: first faults #PF, second exits normally.
+# Surface handle ABA and globally unique synthetic-fence refusal at PID reuse.
+user-surface-fault-recovery-smoke = ["user-process-fault-recovery-smoke"]
 user-process-smoke = ["smoke-exit"]
 user-ramfs-smoke = ["smoke-exit"]
 user-vfs-smoke = ["smoke-exit"]
