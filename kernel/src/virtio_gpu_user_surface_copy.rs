@@ -207,10 +207,10 @@ mod tests {
             else {Some(entry)}
         }
         fn byte(&self,at:u64)->Option<u8>{
-            if (0x5000..0x5100).contains(&at) {
-                self.a.get((at-0x5000) as usize).copied()
-            } else if (0xa000..0xa100).contains(&at) {
-                self.b.get((at-0xa000) as usize).copied()
+            if (0x5000..0x6000).contains(&at) {
+                Some(*self.a.get((at-0x5000) as usize).unwrap_or(&0))
+            } else if (0xa000..0xb000).contains(&at) {
+                Some(*self.b.get((at-0xa000) as usize).unwrap_or(&0))
             } else {None}
         }
     }
