@@ -57,6 +57,8 @@ else ifeq ($(FLAVOR),qemu-virtio-gpu-damage-live)
 FEATURES := --features qemu-virtio-gpu-damage-live-smoke
 else ifeq ($(FLAVOR),qemu-virtio-gpu-two-dirty-rects)
 FEATURES := --features qemu-virtio-gpu-two-dirty-rects-smoke
+else ifeq ($(FLAVOR),qemu-virtio-gpu-window-move)
+FEATURES := --features qemu-virtio-gpu-window-move-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-enable-tx)
 FEATURES := --features qemu-stdvga-enable-tx-smoke
 else ifeq ($(FLAVOR),qemu-stdvga-full-state)
@@ -428,6 +430,15 @@ qemu-virtio-gpu-two-dirty-rects-smoke:
 	$(OUT)/virtio_gpu_damage_tests
 	PYTHONPATH=scripts WOLFOS_DAMAGE_LIVE=1 WOLFOS_MULTIDAMAGE_LIVE=1 python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_two_dirty_rects_smoke.py
 	WOLFOS_DAMAGE_LIVE=1 WOLFOS_MULTIDAMAGE_LIVE=1 python3 scripts/qemu_virtio_gpu_desktop_scanout.py $(OUT)/wolfos-qemu-virtio-gpu-two-dirty-rects.iso
+
+
+.PHONY: qemu-virtio-gpu-window-move-smoke
+qemu-virtio-gpu-window-move-smoke:
+	$(MAKE) iso FLAVOR=qemu-virtio-gpu-window-move
+	rustc --edition=2024 --test kernel/src/virtio_gpu_desktop_wire.rs -o $(OUT)/virtio_gpu_desktop_wire_tests
+	$(OUT)/virtio_gpu_desktop_wire_tests
+	PYTHONPATH=scripts WOLFOS_DAMAGE_LIVE=1 WOLFOS_MULTIDAMAGE_LIVE=1 WOLFOS_WINDOW_MOVE_LIVE=1 python3 -m unittest discover -s scripts -p test_qemu_virtio_gpu_window_move_smoke.py
+	WOLFOS_DAMAGE_LIVE=1 WOLFOS_MULTIDAMAGE_LIVE=1 WOLFOS_WINDOW_MOVE_LIVE=1 python3 scripts/qemu_virtio_gpu_desktop_scanout.py $(OUT)/wolfos-qemu-virtio-gpu-window-move.iso
 
 .PHONY: qemu-virtio-gpu-desktop-scanout-negative
 # The desktop proof must be able to fail. Two independent classes:
