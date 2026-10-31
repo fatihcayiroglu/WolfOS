@@ -1067,6 +1067,102 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     serial::qemu_exit_success()
 }
 
+/// Real single-BSP CPL3->INT80 proof: the guest provided a valid pointer
+/// into its *genuine linked ELF RX user page*. Translate two disjoint
+/// 8-byte source slices via the actual active private 4-level CR3, validate
+/// every physical byte against the live ProcessTable PMM lease, and compose
+/// the resulting xRGB8888 words in a bounded kernel stack viewport.
+///
+/// Not a graphics syscall, not user-written pixel data, not GPU scanout,
+/// not DMA, and not an SMP-safe production compositor.
+#[cfg(feature = "user-surface-copy-hardware-smoke")]
+fn verify_live_user_surface_pointer(pid:u64, active:u64, guest_ptr:u64) {
+    use crate::virtio_gpu_desktop_wire::{
+        damage::Rect,
+        surface_ledger::{SurfaceLedger,Error as LedgerError},
+        surface_pixels::{CompositionReport,Identity},
+        surface_process_bridge,
+        user_surface_copy::{self,UserSurface,Error as SurfaceCopyError},
+    };
+    require_serial_bsp();
+    let (cr3,_) = Cr3::read();
+    if cr3.start_address().as_u64()!=active || pid==0 {
+        fail("cpl3_surface_authenticated_cr3")
+    }
+    // NO process/PMM lock is dropped between owner validation, page walks,
+    // bytes read and compositor completion. The test is BSP-only, IF=0.
+    let mut ledger=SurfaceLedger::<2>::new();
+    let verified=PROCESS_TABLE.with(|processes| -> bool {
+        let Some(record)=processes.snapshot(pid) else {return false};
+        if record.state != ProcessState::Running || record.cr3_root!=active {
+            return false
+        }
+        let Ok(a)=surface_process_bridge::open_registered(processes,&mut ledger,pid)
+            else {return false};
+        let Ok(b)=surface_process_bridge::open_registered(processes,&mut ledger,pid)
+            else {return false};
+        let Ok(a_rect)=Rect::checked(1,1,2,1) else {return false};
+        let Ok(b_rect)=Rect::checked(2,1,2,1) else {return false};
+        let Ok(view)=Rect::checked(0,0,5,3) else {return false};
+        let first=UserSurface {
+            identity:a,rect:a_rect,stride:2,user_va:guest_ptr,
+        };
+        let second=UserSurface {
+            identity:b,rect:b_rect,stride:2,user_va:guest_ptr+8,
+        };
+        let background=[0x0012_3456;15];
+        let mut output=[0x00fe_edab;15];
+        let result=user_surface_copy::compose_user_snapshots(
+            processes,&ledger,&mut output,&background,view,5,view,
+            first,second,b,private_pte,private_byte,
+        );
+        if result!=Ok(CompositionReport{first:1,second:2,background:12}) {
+            return false
+        }
+        // These first 16 bytes originate in the real validated user ELF,
+        // passed from CPL3 in RDI at the syscall trap—not a kernel
+        // synthetic pixel array or a disconnected host-only fixture.
+        let word_a=u32::from_le_bytes(HELLO[0..4].try_into().unwrap());
+        let word_b=u32::from_le_bytes(HELLO[8..12].try_into().unwrap());
+        let word_c=u32::from_le_bytes(HELLO[12..16].try_into().unwrap());
+        for y in 0..3usize {
+            for x in 0..5usize {
+                let expected=match (x,y) {
+                    (1,1)=>word_a,
+                    (2,1)=>word_b,
+                    (3,1)=>word_c,
+                    _=>0x0012_3456,
+                };
+                if output[y*5+x]!=expected {return false}
+            }
+        }
+        if ledger.close_owner(pid,pid)!=Ok(2) {return false}
+        output.fill(0x00fe_edab);
+        if user_surface_copy::compose_user_snapshots(
+            processes,&ledger,&mut output,&background,view,5,view,
+            first,second,b,private_pte,private_byte,
+        )!=Err(SurfaceCopyError::Ledger(LedgerError::NotLive))
+            || output != [0x00fe_edab;15]
+        {return false}
+        // Stale generation cannot access the same still-mapped ELF bytes.
+        let stale=UserSurface {
+            identity:Identity{process_generation:pid+1,..a},
+            ..first
+        };
+        if user_surface_copy::compose_user_snapshots(
+            processes,&ledger,&mut output,&background,view,5,view,
+            stale,second,b,private_pte,private_byte,
+        )!=Err(SurfaceCopyError::InvalidOwnerGeneration)
+            || output != [0x00fe_edab;15]
+        {return false}
+        true
+    });
+    if verified!=Ok(true) { fail("cpl3_surface_user_pte_owner_or_pixels") }
+    serial::write_line(
+        "WOLFOS_USER_SURFACE_CPL3_OK guest_rdi_pointer=1 real_user_cr3=1 exact_owner_frames=1 source_bytes=16 two_surfaces=1 composed_pixels=15 revoked_denied=1 synthetic_gpu_acks=0 real_gpu_dma=0"
+    );
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wolfos_int80_syscall_dispatch(
     raw: *mut UserSyscallFrame,
@@ -1263,6 +1359,10 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         STAGE.store(stage + 1, Ordering::Release);
         serial::write_fmt(format_args!("{}", core::str::from_utf8(&buffer).unwrap()));
         serial::write_line("WOLFOS_USERCOPY_WRITE_OK guest_pointer=1 user_cr3_walk=4 copied=19 kernel_denied=1 rx_write_denied=1 stack_copy_roundtrip=1");
+        #[cfg(feature = "user-surface-copy-hardware-smoke")]
+        verify_live_user_surface_pointer(
+            RUN_INDEX.load(Ordering::Acquire) as u64+1,active,frame.registers.rdi,
+        );
         frame.registers.rax = HELLO.len() as u64;
         return raw;
     }
