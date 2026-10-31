@@ -65,6 +65,16 @@ THREE_LOAD_MARKERS = (
     "frames_freed=9 pmm_no_leak=1",
 )
 
+SURFACE_OPEN_MARKER = (
+    "WOLFOS_RING3_SURFACE_OPEN_OK pid=1 registry=1 owner_generation=1 "
+    "software_submit=1 gpu_dma=0"
+)
+SURFACE_EXIT_MARKER = (
+    "WOLFOS_RING3_SURFACE_EXIT_GUARD_OK pid=1 real_cpl3=1 restored_cr3=1 "
+    "early_reap_denied=1 half_ack_denied=1 retained_handle_denied=1 "
+    "software_acks=1 guarded_reap=1 real_pmm_frames=7 gpu_dma=0"
+)
+
 STATUS_MARKERS = (
     *MARKERS[:4],
     "WOLFOS_ELF_EXIT_STATUS_OK code=42 cpl3=1 calls=22 saved_rdi=42",
@@ -133,10 +143,11 @@ def main() -> int:
     two_pt_mode = mode == "--two-pt"
     three_load_mode = mode == "--three-load"
     status_mode = mode == "--exit-status"
+    surface_mode = mode == "--surface-exit"
     fault_mode = mode == "--user-ud-fault"
     pf_mode = mode == "--user-pf-fault"
-    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or fault_mode or pf_mode or one_load_mode or two_pt_mode or three_load_mode)) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--one-load|--two-pt|--three-load|--exit-status|--user-ud-fault|--user-pf-fault]")
+    if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or surface_mode or fault_mode or pf_mode or one_load_mode or two_pt_mode or three_load_mode)) or not Path(sys.argv[1]).is_file():
+        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--one-load|--two-pt|--three-load|--exit-status|--surface-exit|--user-ud-fault|--user-pf-fault]")
         return 2
     markers = ONE_LOAD_MARKERS if one_load_mode else THREE_LOAD_MARKERS if three_load_mode else TWO_PT_MARKERS if two_pt_mode else PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
     with tempfile.TemporaryDirectory(prefix="wolfos-real-elf-run-") as tmp:
@@ -215,6 +226,21 @@ def main() -> int:
             if output.count(marker) != 1:
                 print("FAIL: missing/duplicate native ELF proof: " + marker)
                 return 1
+        if surface_mode:
+            proof_positions = [
+                output.find("WOLFOS_BOOT_OK"),
+                output.find(SURFACE_OPEN_MARKER),
+                entry.start(),
+                output.find("WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22"),
+                output.find(SURFACE_EXIT_MARKER),
+                output.find("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1"),
+            ]
+            if (any(at < 0 for at in proof_positions)
+                or proof_positions != sorted(proof_positions)
+                or output.count(SURFACE_OPEN_MARKER) != 1
+                or output.count(SURFACE_EXIT_MARKER) != 1):
+                print("FAIL: Ring3 surface admission/exit/guarded-reap or PMM order")
+                return 1
         for bad in [
             "WOLFOS_ELF_RUN_ERROR", "WOLFOS_RING_PREP_ERROR",
             "WOLFOS_PANIC", "WOLFOS_EXCEPTION_PF",
@@ -239,6 +265,8 @@ def main() -> int:
             print(f"FAIL: expected clean QEMU debug-exit 33, got {result.returncode}")
             print(result.stderr.decode(errors="replace"))
             return 1
+        if surface_mode:
+            print("PASS: genuine ELF64 CPL3 -> EXIT -> surface-guarded counted reap -> 7 real PMM frames freed (synthetic GPU acknowledgements only)")
         if one_load_mode:
             if (any(marker in output for marker in (
                 "WOLFOS_ELF_RUN_OK ", "WOLFOS_ELF_TWO_PT_RUN_OK ",
