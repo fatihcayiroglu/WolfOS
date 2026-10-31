@@ -147,6 +147,16 @@ impl<const N: usize> SurfaceLedger<N> {
         Ok(())
     }
 
+    /// Remaining logical surface handles, including closing and in-flight
+    /// entries, for one exact process generation. This is a conservative
+    /// retirement barrier, not proof of CPU/DMA quiescence.
+    pub fn owner_remaining(&self, pid: u64, process_generation: u64) -> usize {
+        self.entries.iter().filter(|entry| matches!(entry.identity,
+            Some(identity) if identity.pid == pid
+                && identity.process_generation == process_generation
+        )).count()
+    }
+
     /// Enqueue contract: caller must still submit two genuinely fenced GPU
     /// commands, preserve backing pages and validate both hardware replies.
     /// Fence numbers strictly increase globally across ALL surface slots,
