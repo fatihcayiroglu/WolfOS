@@ -12,6 +12,8 @@
 
 #[path = "virtio_gpu_damage.rs"]
 pub mod damage;
+#[path = "virtio_gpu_window_scene.rs"]
+pub mod window_scene;
 
 pub const WIDTH: u32 = 1024;
 pub const HEIGHT: u32 = 768;

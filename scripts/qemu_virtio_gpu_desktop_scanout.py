@@ -128,8 +128,16 @@ FAULT = os.environ.get("WOLFOS_DESKTOP_FAULT", "")
 ATTEST_FAULTS = ("digest", "nonce", "geometry")
 DAMAGE_LIVE = os.environ.get("WOLFOS_DAMAGE_LIVE") == "1"
 MULTI_DAMAGE_LIVE = os.environ.get("WOLFOS_MULTIDAMAGE_LIVE") == "1"
+WINDOW_MOVE_LIVE = os.environ.get("WOLFOS_WINDOW_MOVE_LIVE") == "1"
 DAMAGE_RECT = (73, 91, 32, 32)
 MULTI_RECTS = ((11, 19, 16, 16), (811, 401, 32, 16))
+WINDOW_OLD = (11, 19, 16, 16)
+WINDOW_FIXED = (811, 401, 32, 16)
+WINDOW_NEW = (211, 119, 16, 16)
+WINDOW_MARKER = ("WOLFOS_VIRTIO_GPU_WINDOW_MOVE_OK first=11,19,16,16 "
+                 "moved=211,119,16,16 fixed=811,401,32,16 visible_pixels=768 "
+                 "transfer_acks=6 flush_acks=6 capture_acks=3 "
+                 "host_pixel_authority=required no_union_transfer=1")
 MULTI_MARKER = ("WOLFOS_VIRTIO_GPU_MULTI_DAMAGE_OK first=11,19,16,16 "
                 "second=811,401,32,16 regions=2 pixels_changed=768 "
                 "outside_pixels=785664 transfer_acks=4 flush_acks=4 "
@@ -348,6 +356,23 @@ def verify_multi_damage_pixels(image: tuple[int,int,bytes]) -> int:
     return _verify(image, (WIDTH,HEIGHT), multi_damage_bytes(), "multi")
 
 
+@lru_cache(maxsize=1)
+def moved_window_bytes() -> bytes:
+    """After movement, old window area is baseline; fixed window unchanged."""
+    result = bytearray(expected_bytes())
+    for x0, y0, w, h in (WINDOW_NEW, WINDOW_FIXED):
+        for y in range(y0, y0+h):
+            for x in range(x0, x0+w):
+                at = (y*WIDTH+x)*3
+                for channel in range(3):
+                    result[at+channel] ^= 0xff
+    return bytes(result)
+
+
+def verify_moved_window(image: tuple[int,int,bytes]) -> int:
+    return _verify(image, (WIDTH, HEIGHT), moved_window_bytes(), "window_moved")
+
+
 def verify_alt_pixels(image: tuple[int, int, bytes]) -> int:
     """Every pixel of the real 1024x384 image must match."""
     return _verify(image, (ALT_WIDTH, ALT_HEIGHT), alt_bytes(), "reduced")
@@ -377,12 +402,16 @@ def validate_desktop_serial(output: str, expired: bool = False,
     used_idx, fences, writes, entries, capture_acks = map(int, markers[0].groups())
     # 1 x GET_DISPLAY_INFO, 1 x GET_EDID, then the desktop resource work. The
     # expired path adds one extra switch+restore cycle of exactly 8 commands.
-    expected_idx = (46 if expired else 38) + (4 if DAMAGE_LIVE else 0) + (8 if MULTI_DAMAGE_LIVE else 0)
+    expected_idx = ((46 if expired else 38) + (4 if DAMAGE_LIVE else 0)
+                    + (8 if MULTI_DAMAGE_LIVE else 0)
+                    + (12 if WINDOW_MOVE_LIVE else 0))
     if (used_idx, writes) != (expected_idx, expected_idx) or fences != expected_idx - 2:
         return False
     if not 1 <= entries <= 254:
         return False
-    if capture_acks != (4 if expired else 3) + (2 if DAMAGE_LIVE else 0) + (2 if MULTI_DAMAGE_LIVE else 0):
+    if capture_acks != ((4 if expired else 3) + (2 if DAMAGE_LIVE else 0)
+                        + (2 if MULTI_DAMAGE_LIVE else 0)
+                        + (3 if WINDOW_MOVE_LIVE else 0)):
         return False
     displays = [(i, DISPLAY.fullmatch(line)) for i, line in enumerate(lines)
                 if line.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
@@ -436,6 +465,10 @@ def validate_desktop_serial(output: str, expired: bool = False,
         if not DAMAGE_LIVE:
             return False
         expected_captures.extend(["multi","multi_restored"])
+    if WINDOW_MOVE_LIVE:
+        if not MULTI_DAMAGE_LIVE:
+            return False
+        expected_captures.extend(["windows","window_moved","windows_restored"])
     expected_captures.append("restored")
     if captures != expected_captures:
         return False
@@ -463,6 +496,19 @@ def validate_desktop_serial(output: str, expired: bool = False,
         if not prior<first<second<multi_markers[0][0]<attested[1][0]:
             return False
     elif multi_markers:
+        return False
+    window_markers=[(i,line) for i,line in enumerate(lines)
+                    if line.startswith("WOLFOS_VIRTIO_GPU_WINDOW_MOVE_OK ")]
+    if WINDOW_MOVE_LIVE:
+        if len(window_markers)!=1 or window_markers[0][1]!=WINDOW_MARKER:
+            return False
+        started=lines.index(CAPTURE_PREFIX+"windows")
+        moved=lines.index(CAPTURE_PREFIX+"window_moved")
+        restored=lines.index(CAPTURE_PREFIX+"windows_restored")
+        multi_ok=multi_markers[0][0]
+        if not multi_ok<started<moved<restored<window_markers[0][0]<attested[1][0]:
+            return False
+    elif window_markers:
         return False
     restored_index = lines.index(CAPTURE_PREFIX + "restored")
     catalogs = [(i, CATALOG.fullmatch(line)) for i, line in enumerate(lines)
@@ -763,6 +809,30 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                         ser.sendall(b"M" if name == "multi" else b"N")
                                         captured.append(name)
                                         continue
+                                    if WINDOW_MOVE_LIVE and name in (
+                                            "windows", "window_moved", "windows_restored"):
+                                        previous = {
+                                            "windows": "multi_restored",
+                                            "window_moved": "windows",
+                                            "windows_restored": "window_moved",
+                                        }[name]
+                                        if captured[-1:] != [previous]:
+                                            raise ProofError("Window scene capture out of order")
+                                        image = _capture(qmp, reader, root, name)
+                                        if name == "windows":
+                                            verify_multi_damage_pixels(image)
+                                        elif name == "window_moved":
+                                            verify_moved_window(image)
+                                        else:
+                                            verify_pixels(image)
+                                            if image != images.get("desktop"):
+                                                raise ProofError("Window scene restore differs from baseline")
+                                        images[name] = image
+                                        ser.sendall({"windows": b"W",
+                                                     "window_moved": b"V",
+                                                     "windows_restored": b"J"}[name])
+                                        captured.append(name)
+                                        continue
                                     if name != "restored" or captured[-1:] != ["applied"] \
                                             and captured[-1:] != ["rollback"]:
                                         raise ProofError(
@@ -800,6 +870,8 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                         prefix=["desktop","damage","damage_restored"]
                         if MULTI_DAMAGE_LIVE:
                             prefix+=["multi","multi_restored"]
+                        if WINDOW_MOVE_LIVE:
+                            prefix+=["windows","window_moved","windows_restored"]
                         expected=prefix+expected[1:]
                     if FAULT not in ATTEST_FAULTS and captured != expected:
                         raise ProofError(

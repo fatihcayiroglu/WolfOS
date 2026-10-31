@@ -94,6 +94,8 @@ jobs:
         run: make qemu-virtio-gpu-damage-live-smoke
       - name: "Real QEMU two disjoint dirty rectangles: exact changed and unchanged pixels, separate fences"
         run: make qemu-virtio-gpu-two-dirty-rects-smoke
+      - name: "Real QEMU move one window: exact old/new/fixed surface RGB and GPU fences"
+        run: make qemu-virtio-gpu-window-move-smoke
       - name: Desktop transaction must refuse a forged digest, nonce, geometry, early expiry and roll back after a real window
         run: make qemu-virtio-gpu-desktop-scanout-negative
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
