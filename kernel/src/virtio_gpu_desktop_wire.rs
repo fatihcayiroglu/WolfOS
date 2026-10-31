@@ -16,6 +16,8 @@ pub mod damage;
 pub mod window_scene;
 #[path = "virtio_gpu_opaque_scene.rs"]
 pub mod opaque_scene;
+#[path = "virtio_gpu_surface_pixels.rs"]
+pub mod surface_pixels;
 
 pub const WIDTH: u32 = 1024;
 pub const HEIGHT: u32 = 768;
