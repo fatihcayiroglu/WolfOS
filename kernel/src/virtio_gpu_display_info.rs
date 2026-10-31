@@ -217,7 +217,10 @@ fn send_resource_command(
     }
     // The upper bound is a flavor constant, so an unexpected completion
     // index is still refused instead of being accepted as this request.
-    #[cfg(feature="qemu-virtio-gpu-two-dirty-rects-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-window-move-smoke")]
+    let max_index=resource::WINDOW_MOVE_MAX_INDEX;
+    #[cfg(all(feature="qemu-virtio-gpu-two-dirty-rects-smoke",
+              not(feature="qemu-virtio-gpu-window-move-smoke")))]
     let max_index=resource::TWO_DIRTY_MAX_INDEX;
     #[cfg(all(feature="qemu-virtio-gpu-damage-live-smoke",
               not(feature="qemu-virtio-gpu-two-dirty-rects-smoke")))]
@@ -1077,6 +1080,52 @@ fn present_desktop(
         }
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_MULTI_DAMAGE_OK first=11,19,16,16 second=811,401,32,16 regions=2 pixels_changed=768 outside_pixels=785664 transfer_acks=4 flush_acks=4 capture_acks=2 no_bounding_transfer=1"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-window-move-smoke")]
+    {
+        use desk::window_scene::{Scene, FIRST_ID};
+        let old=desk::damage::Rect::checked(11,19,16,16)
+            .map_err(|_|"window_old_rect")?;
+        let fixed=desk::damage::Rect::checked(811,401,32,16)
+            .map_err(|_|"window_fixed_rect")?;
+        let moved=desk::damage::Rect::checked(211,119,16,16)
+            .map_err(|_|"window_new_rect")?;
+        let mut scene=Scene::new(old,fixed).map_err(|_|"window_scene")?;
+        // Two independent window surfaces, no full resource transfer.
+        paint_partial_damage(fb,vas,scene.first().rect,true)?;
+        paint_partial_damage(fb,vas,scene.second().rect,true)?;
+        next=submit_two_dirty_regions(vas,frames,notify_port,selected,next,
+            old,fixed,0x574f_444d_4700_5000)?;
+        await_host_capture("windows",b'W')?;
+        captures+=1;
+
+        // Transactional movement: repaint old background and the new
+        // foreground position, while the fixed window remains byte-identical.
+        let plan=scene.begin_move(FIRST_ID,moved).map_err(|_|"window_begin")?;
+        paint_partial_damage(fb,vas,plan.old,false)?;
+        paint_partial_damage(fb,vas,plan.new,true)?;
+        next=submit_two_dirty_regions(vas,frames,notify_port,selected,next,
+            plan.old,plan.new,0x574f_444d_4700_6000)?;
+        await_host_capture("window_moved",b'V')?;
+        captures+=1;
+        scene.confirm_move(plan).map_err(|_|"window_confirm")?;
+        if scene.first().rect!=moved||scene.second().rect!=fixed||
+           scene.pending().is_some(){return Err("window_scene_commit");}
+
+        // Revert both windows by sending only their own old drawn pixels;
+        // the host must independently attest the entire 1024x768 screen.
+        paint_partial_damage(fb,vas,scene.first().rect,false)?;
+        paint_partial_damage(fb,vas,scene.second().rect,false)?;
+        next=submit_two_dirty_regions(vas,frames,notify_port,selected,next,
+            moved,fixed,0x574f_444d_4700_7000)?;
+        await_host_capture("windows_restored",b'J')?;
+        captures+=1;
+        if page_digest(vas,desk::HEIGHT)!=desktop_digest{
+            return Err("window_restore_digest");
+        }
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_WINDOW_MOVE_OK first=11,19,16,16 moved=211,119,16,16 fixed=811,401,32,16 visible_pixels=768 transfer_acks=6 flush_acks=6 capture_acks=3 host_pixel_authority=required no_union_transfer=1"
         );
     }
     // 2. Second real geometry: the same resource presented as 1024x384. Only
