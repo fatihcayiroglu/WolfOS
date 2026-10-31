@@ -26,7 +26,7 @@ pub enum Error {
 pub struct Identity {
     pub slot: u32,
     pub surface_generation: u64,
-    pub pid: u32,
+    pub pid: u64,
     pub process_generation: u64,
 }
 
@@ -191,7 +191,7 @@ mod tests {
         Rect::checked(x, y, w, h).unwrap()
     }
 
-    fn id(slot: u32, generation: u64, pid: u32, process_generation: u64)
+    fn id(slot: u32, generation: u64, pid: u64, process_generation: u64)
         -> Identity
     {
         Identity {
