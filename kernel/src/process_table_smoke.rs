@@ -296,7 +296,9 @@ fn verify_owned_pmm_pixels(
     // owned PMM pages, after initial writes and before any PMM free/unmap.
     let a_data=unsafe{core::slice::from_raw_parts(a_address.as_ptr::<u32>(),4)};
     let b_data=unsafe{core::slice::from_raw_parts(b_address.as_ptr::<u32>(),4)};
-    if a_data != [0x00d7_2200;4] || b_data != [0x0007_27e1;4] {
+    if a_data.iter().any(|pixel| *pixel != 0x00d7_2200)
+        || b_data.iter().any(|pixel| *pixel != 0x0007_27e1)
+    {
         fail("surface_pixels_real_physical_contents")
     }
     let Ok(r_a)=Rect::checked(1,1,2,2) else {fail("surface_rect_a")};
