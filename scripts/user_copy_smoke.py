@@ -42,6 +42,12 @@ SURFACE_PROOF = (
     "revoked_denied=1 synthetic_gpu_acks=0 real_gpu_dma=0"
 )
 
+WRITER_PROOF = (
+    "WOLFOS_USER_SURFACE_WRITER_CPL3_OK guest_stack_written=1 user_rw_nx=1 "
+    "saved_r12_r13=1 real_user_cr3=1 exact_owner_frames=1 "
+    "composed_pixels=15 revoked_denied=1 pmm_no_leak_pending_exit=1 real_gpu_dma=0"
+)
+
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
         print("Usage: user_copy_smoke.py path/to/wolfos-user-copy.iso")
@@ -73,7 +79,10 @@ def main() -> int:
             print("FAIL: missing actual hardware Ring3 sanitized CR3 entry")
             return 1
         loc = [output.find("WOLFOS_BOOT_OK"), enter.start()]
-        proofs = PROOFS[:4] + ([SURFACE_PROOF] if os.environ.get("WOLFOS_USER_SURFACE_HARDWARE") == "1" else []) + PROOFS[4:]
+        proofs = (PROOFS[:4]
+                  + ([SURFACE_PROOF] if os.environ.get("WOLFOS_USER_SURFACE_HARDWARE") == "1" else [])
+                  + ([WRITER_PROOF] if os.environ.get("WOLFOS_USER_SURFACE_WRITER") == "1" else [])
+                  + PROOFS[4:])
         loc += [output.find(x) for x in proofs]
         if any(p < 0 for p in loc) or loc != sorted(loc):
             print("FAIL: user ELF pointer/deny/roundtrip/exit/reap order invalid")
@@ -98,6 +107,8 @@ def main() -> int:
         print("PASS: genuine ELF passes user pointer -> checked CR3 PTE walk -> WRITE -> EXIT -> 7 PMM frame cleanup")
         if os.environ.get("WOLFOS_USER_SURFACE_HARDWARE") == "1":
             print("PASS: CPL3 guest-provided ELF data -> real user CR3 owner-checked surface composition; GPU scanout not exercised")
+        if os.environ.get("WOLFOS_USER_SURFACE_WRITER") == "1":
+            print("PASS: genuine CPL3 guest ELF wrote RW/NX stack pixels and supplied saved R12/R13 virtual pointers; no GPU DMA")
         return 0
 
 if __name__ == "__main__":
