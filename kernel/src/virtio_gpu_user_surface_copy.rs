@@ -197,10 +197,15 @@ mod tests {
                 0x2000=>0x3000|7,
                 0x3010=>0x4000|7,
                 0x4000=>if self.steal_a_leaf {0xa000|7} else {0x5000|7},
+                // A present PMM-owned PT frame can legitimately contain
+                // an empty second leaf. Return the zero PTE, rather than
+                // pretending the physical page-table read itself failed.
+                0x4008=>0,
                 0x6000=>0x7000|7,
                 0x7000=>0x8000|7,
                 0x8010=>0x9000|7,
                 0x9000=>0xa000|7,
+                0x9008=>0,
                 _=>return None
             };
             if self.supervisor_pte && at==0x3010 {Some(entry & !4)}
