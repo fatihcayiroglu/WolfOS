@@ -28,6 +28,8 @@ pub enum Error {
     InFlight,
     UnexpectedAck,
     FlushBeforeTransfer,
+    Full,
+    OverlappingDamage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +73,11 @@ impl Rect {
         let x1 = (self.x + self.width).max(other.x + other.width);
         let y1 = (self.y + self.height).max(other.y + other.height);
         Self::checked(x0, y0, x1 - x0, y1 - y0)
+    }
+
+    pub fn overlaps(self, other: Self) -> bool {
+        self.x < other.x + other.width && other.x < self.x + self.width
+            && self.y < other.y + other.height && other.y < self.y + self.height
     }
 
     pub fn pixels(self) -> u64 {
@@ -190,6 +197,64 @@ impl DamageTracker {
     }
 }
 
+/// Fixed-capacity queue for independent, disjoint dirty rectangles.
+/// Never replace disjoint rectangles with their bounding box. The queue only
+/// retires one rectangle after *two* separately validated GPU completions.
+/// No heap, implicit retry or DMA access happens here.
+#[derive(Debug)]
+pub struct DamageQueue<const N: usize> {
+    slots: [Option<Rect>; N],
+    head: usize,
+    count: usize,
+    active: DamageTracker,
+}
+
+impl<const N: usize> DamageQueue<N> {
+    pub fn new() -> Self {
+        Self { slots: [None; N], head: 0, count: 0, active: DamageTracker::new() }
+    }
+
+    pub fn count(&self) -> usize { self.count }
+    pub fn must_keep_resource_pinned(&self) -> bool {
+        self.count != 0 || self.active.must_keep_resource_pinned()
+    }
+
+    pub fn push(&mut self, rect: Rect) -> Result<(), Error> {
+        rect.validate()?;
+        if self.active.must_keep_resource_pinned() { return Err(Error::InFlight); }
+        if N == 0 || self.count == N { return Err(Error::Full); }
+        for i in 0..self.count {
+            let queued=self.slots[(self.head+i)%N].ok_or(Error::UnexpectedAck)?;
+            if queued.overlaps(rect) { return Err(Error::OverlappingDamage); }
+        }
+        self.slots[(self.head+self.count)%N]=Some(rect);
+        self.count+=1;
+        Ok(())
+    }
+
+    pub fn begin(&mut self, transfer_fence:u64, flush_fence:u64)
+        ->Result<Submission,Error>
+    {
+        if self.active.must_keep_resource_pinned() { return Err(Error::InFlight); }
+        if self.count==0 { return Err(Error::NoDamage); }
+        let rect=self.slots[self.head].ok_or(Error::UnexpectedAck)?;
+        self.active.mark(rect)?;
+        self.active.begin(transfer_fence,flush_fence)
+    }
+
+    pub fn ack_transfer(&mut self, fence:u64)->Result<(),Error>{
+        self.active.ack_transfer(fence)
+    }
+
+    pub fn ack_flush(&mut self,fence:u64)->Result<(),Error>{
+        self.active.ack_flush(fence)?;
+        self.slots[self.head]=None;
+        self.head=(self.head+1)%N;
+        self.count-=1;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +263,65 @@ mod tests {
     }
     fn u64at(b: &[u8], i: usize) -> u64 {
         u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+    }
+
+
+    #[test]
+    fn two_disjoint_rectangles_remain_separate_and_need_four_acks() {
+        let a=Rect::checked(11,19,16,16).unwrap();
+        let b=Rect::checked(811,401,32,16).unwrap();
+        let mut q=DamageQueue::<2>::new();
+        assert_eq!(q.begin(10,11),Err(Error::NoDamage));
+        q.push(a).unwrap();
+        q.push(b).unwrap();
+        assert_eq!(q.count(),2);
+        assert_eq!(q.push(Rect::checked(2,2,1,1).unwrap()),Err(Error::Full));
+        let first=q.begin(0x100,0x101).unwrap();
+        assert_eq!(first.rect,a);
+        assert_eq!(u64at(&first.transfer,40),19*STRIDE_BYTES+11*4);
+        assert_eq!(q.ack_flush(0x101),Err(Error::FlushBeforeTransfer));
+        assert_eq!(q.ack_transfer(0x101),Err(Error::UnexpectedAck));
+        assert_eq!(q.ack_transfer(0x100),Ok(()));
+        assert!(q.must_keep_resource_pinned());
+        assert_eq!(q.count(),2);
+        assert_eq!(q.ack_flush(0x102),Err(Error::UnexpectedAck));
+        assert_eq!(q.ack_flush(0x101),Ok(()));
+        assert_eq!(q.count(),1);
+        let second=q.begin(0x200,0x201).unwrap();
+        assert_eq!(second.rect,b);
+        assert_eq!(u64at(&second.transfer,40),401*STRIDE_BYTES+811*4);
+        assert_eq!(q.ack_transfer(0x200),Ok(()));
+        assert_eq!(q.ack_flush(0x201),Ok(()));
+        assert_eq!(q.count(),0);
+        assert!(!q.must_keep_resource_pinned());
+        assert_eq!(q.begin(3,4),Err(Error::NoDamage));
+        q.push(a).unwrap();
+        assert_eq!(q.begin(5,6).unwrap().rect,a);
+    }
+
+    #[test]
+    fn refuse_overlap_and_duplicate_and_inflight_damage() {
+        let a=Rect::checked(10,20,16,16).unwrap();
+        let mut q=DamageQueue::<3>::new();
+        q.push(a).unwrap();
+        assert_eq!(q.push(a),Err(Error::OverlappingDamage));
+        assert_eq!(q.push(Rect::checked(25,35,2,2).unwrap()),
+                   Err(Error::OverlappingDamage));
+        q.push(Rect::checked(26,20,1,16).unwrap()).unwrap();
+        assert_eq!(q.count(),2);
+        assert_eq!(q.begin(0,4),Err(Error::InvalidFence));
+        assert_eq!(q.begin(4,4),Err(Error::DuplicateFence));
+        q.begin(7,8).unwrap();
+        assert_eq!(q.push(Rect::checked(100,100,1,1).unwrap()),Err(Error::InFlight));
+        assert_eq!(q.begin(9,10),Err(Error::InFlight));
+        q.ack_transfer(7).unwrap();
+        assert_eq!(q.ack_flush(9),Err(Error::UnexpectedAck));
+        assert_eq!(q.count(),2);
+        q.ack_flush(8).unwrap();
+        assert_eq!(q.count(),1);
+        let mut empty=DamageQueue::<0>::new();
+        assert_eq!(empty.push(a),Err(Error::Full));
+        assert_eq!(empty.begin(1,2),Err(Error::NoDamage));
     }
 
     #[test]
