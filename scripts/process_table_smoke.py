@@ -5,6 +5,7 @@ No CPL3 execution occurs in this particular feature. Existing distinct
 CPL3 file/syscall and sequential PID runs remain CI requirements.
 """
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,11 @@ PROOFS = [
     "WOLFOS_PROCESS_TABLE_CONTEXT_REUSE_OK live_contexts=3 retired_pid2=1 fresh_pid4=1 rsp0_reused_safely=1",
     "WOLFOS_PROCESS_TABLE_CLEANUP_OK issued_pids=4 frames_freed=28 pmm_no_leak=1 boot_cr3_preserved=1 cpl3_executed=0",
 ]
+SURFACE_REAP_PROOF = (
+    "WOLFOS_SURFACE_REAP_PMM_OK pids=2 real_pmm_pages=4 early_release_denied=1 "
+    "half_ack_denied=1 cross_pid_isolated=1 synthetic_gpu_acks=1 "
+    "pmm_no_leak=1 cpl3_executed=0 real_gpu_dma=0"
+)
 BAD = [
     "WOLFOS_PROCESS_TABLE_ERROR", "WOLFOS_PANIC", "WOLFOS_EXCEPTION_PF",
     "WOLFOS_EXCEPTION_GP", "WOLFOS_EXCEPTION_DF", "WOLFOS_EXCEPTION_UD",
@@ -47,11 +53,12 @@ def main() -> int:
             return 2
         output = serial.read_text(errors="replace") if serial.exists() else ""
         print(output)
-        locations = [output.find(marker) for marker in PROOFS]
+        proofs = PROOFS + ([SURFACE_REAP_PROOF] if os.environ.get("WOLFOS_SURFACE_REAP_PMM") == "1" else [])
+        locations = [output.find(marker) for marker in proofs]
         if any(at < 0 for at in locations) or locations != sorted(locations):
             print("FAIL: missing/out of order multi-resident PMM evidence")
             return 1
-        if any(output.count(marker) != 1 for marker in PROOFS):
+        if any(output.count(marker) != 1 for marker in proofs):
             print("FAIL: duplicated proof marker")
             return 1
         if any(bad in output for bad in BAD):
@@ -62,6 +69,8 @@ def main() -> int:
             print(run.stderr.decode(errors="replace"))
             return 1
         print("PASS: real PMM, jointly staged PID/bootstrap metadata, strict rollback, context/stack reuse and zero leaks")
+        if os.environ.get("WOLFOS_SURFACE_REAP_PMM") == "1":
+            print("PASS: real PMM surface retirement and leak-free counted cancellation; GPU completions simulated, no real GPU DMA")
         return 0
 
 if __name__ == "__main__":

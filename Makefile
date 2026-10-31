@@ -191,6 +191,8 @@ else ifeq ($(FLAVOR),kernel-stack-lease)
 FEATURES := --features kernel-stack-lease-smoke
 else ifeq ($(FLAVOR),user-context)
 FEATURES := --features user-context-smoke
+else ifeq ($(FLAVOR),qemu-surface-reap-pmm)
+FEATURES := --features qemu-surface-reap-pmm-smoke
 else ifeq ($(FLAVOR),process-table)
 FEATURES := --features process-table-smoke
 else ifeq ($(FLAVOR),user-file-io)
@@ -684,6 +686,11 @@ user-file-io-smoke:
 process-table-smoke:
 	$(MAKE) iso FLAVOR=process-table
 	python3 scripts/process_table_smoke.py $(OUT)/wolfos-process-table.iso
+
+.PHONY: qemu-surface-reap-pmm-smoke
+qemu-surface-reap-pmm-smoke:
+	$(MAKE) iso FLAVOR=qemu-surface-reap-pmm
+	WOLFOS_SURFACE_REAP_PMM=1 python3 scripts/process_table_smoke.py $(OUT)/wolfos-qemu-surface-reap-pmm.iso
 
 user-context-smoke:
 	$(MAKE) iso FLAVOR=user-context

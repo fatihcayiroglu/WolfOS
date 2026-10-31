@@ -146,6 +146,9 @@ user-vfs-smoke = ["smoke-exit"]
 user-copy-smoke = ["smoke-exit"]
 user-file-io-smoke = ["smoke-exit"]
 process-table-smoke = ["smoke-exit"]
+# Real PMM backing allocation, two registry PIDs and synthetic GPU-fence
+# retirement ordering. No CPL3, GPU DMA or physical GPU claims.
+qemu-surface-reap-pmm-smoke = ["process-table-smoke"]
 user-context-smoke = ["smoke-exit"]
 kernel-stack-lease-smoke = ["smoke-exit"]
 kernel-stack-guard-smoke = ["smoke-exit"]

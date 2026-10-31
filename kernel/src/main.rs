@@ -1040,6 +1040,11 @@ pub extern "C" fn kmain() -> ! {
     #[cfg(feature = "process-table-smoke")]
     process_table_smoke::verify();
 
+    // Separate opt-in proof: real PMM leases must not be reclaimed while
+    // surface metadata awaits synthetic (NOT hardware) fence acknowledgements.
+    #[cfg(feature = "qemu-surface-reap-pmm-smoke")]
+    process_table_smoke::verify_surface_reap_pmm();
+
     #[cfg(feature = "user-context-smoke")]
     user_context_smoke::verify();
 
