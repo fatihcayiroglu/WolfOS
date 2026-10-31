@@ -239,3 +239,123 @@ pub fn verify() {
         "WOLFOS_PROCESS_TABLE_CLEANUP_OK issued_pids=4 frames_freed=28 pmm_no_leak=1 boot_cr3_preserved=1 cpl3_executed=0"
     );
 }
+
+
+/// Real QEMU PMM integration for the *software-only* surface retirement gate.
+/// These four physical pages are exclusively owned by two READY PID leases;
+/// they are NOT user-mapped pixels and never submitted to VirtIO-GPU.
+/// GPU transfer/flush acknowledgements below are SYNTHETIC policy exercises
+/// after verifying that the guarded cancel refuses to return the PMM lease.
+/// No real DMA or CPL3 claim is made by this separate feature.
+#[cfg(feature = "qemu-surface-reap-pmm-smoke")]
+pub fn verify_surface_reap_pmm() {
+    use crate::virtio_gpu_desktop_wire::surface_ledger::{
+        SurfaceLedger, Error as GpuError, State as SurfaceState,
+    };
+    use crate::virtio_gpu_desktop_wire::surface_process_bridge::{
+        open_registered, cancel_ready_counted_guarded, Error as BridgeError,
+    };
+
+    let (actual, _) = Cr3::read();
+    let supervisor_cr3 = actual.start_address().as_u64();
+    if supervisor_cr3 == 0 { fail("surface_supervisor_cr3") }
+    let baseline = pmm::statistics().allocated_frames;
+
+    // Allocate real owned physical pages; reject aliases to boot CR3.
+    let mut frames=[0u64;4];
+    for index in 0..frames.len() {
+        let Some(frame)=pmm::allocate_frame() else {
+            fail("surface_pmm_allocate")
+        };
+        if frame == 0 || frame & 4095 != 0 || frame == supervisor_cr3
+            || frames[..index].contains(&frame) {
+            fail("surface_pmm_unique_frame")
+        }
+        frames[index]=frame;
+    }
+    if pmm::statistics().allocated_frames != baseline+4 {
+        fail("surface_pmm_initial_count")
+    }
+    let mut processes=ProcessTable::<2,2>::new();
+    let mut surfaces=SurfaceLedger::<2>::new();
+    let Ok(pid1)=processes.reserve(frames[0],[frames[0],frames[1]]) else {
+        fail("surface_process_admit_one")
+    };
+    let Ok(pid2)=processes.reserve(frames[2],[frames[2],frames[3]]) else {
+        fail("surface_process_admit_two")
+    };
+    let Ok(a)=open_registered(&processes,&mut surfaces,pid1) else {
+        fail("surface_open_owner_one")
+    };
+    let Ok(b)=open_registered(&processes,&mut surfaces,pid2) else {
+        fail("surface_open_owner_two")
+    };
+    if surfaces.begin_submit(a,100,101).is_err() {
+        fail("surface_submit_software_contract")
+    }
+
+    // A policy ledger awaiting genuine device replies must deny a frame
+    // lease. This fixture uses explicit synthetic completions afterwards to
+    // test only the ordering logic, not any hardware evidence.
+    if cancel_ready_counted_guarded(&mut processes,&mut surfaces,pid1,supervisor_cr3)
+        != Err(BridgeError::OutstandingSurfaces)
+        || surfaces.state(a)!=Ok(SurfaceState::ClosingSubmitted)
+        || surfaces.state(b)!=Ok(SurfaceState::Live)
+        || processes.snapshot(pid1).is_none()
+        || pmm::statistics().allocated_frames!=baseline+4
+    { fail("surface_early_pmm_release_refusal") }
+
+    if surfaces.ack_flush(a,101)!=Err(GpuError::FlushBeforeTransfer)
+        || surfaces.ack_transfer(a,100).is_err()
+    { fail("surface_transfer_order") }
+    if cancel_ready_counted_guarded(&mut processes,&mut surfaces,pid1,supervisor_cr3)
+        != Err(BridgeError::OutstandingSurfaces)
+        || surfaces.state(a)!=Ok(SurfaceState::ClosingTransferred)
+    { fail("surface_half_ack_must_keep_pmm") }
+
+    if surfaces.ack_flush(a,101).is_err()
+        || surfaces.release(a)!=Ok(a)
+    { fail("surface_synthetic_completion_and_release") }
+    let Ok(lease1)=cancel_ready_counted_guarded(
+        &mut processes,&mut surfaces,pid1,supervisor_cr3
+    ) else { fail("surface_cancel_one_after_drain") };
+    if lease1.as_slice()!=&frames[0..2]
+        || processes.snapshot(pid1).is_some()
+        || surfaces.require_live(a)!=Err(GpuError::StaleHandle)
+        || pmm::statistics().allocated_frames!=baseline+4
+    { fail("surface_first_lease_authority") }
+
+    // Real PMM pages must be freed EXACTLY once, and second PID still owns
+    // its pages. This proves a real physical accounting boundary only.
+    for &frame in lease1.as_slice() {
+        if pmm::free_frame(frame).is_err() { fail("surface_free_one") }
+    }
+    if pmm::statistics().allocated_frames!=baseline+2
+        || processes.snapshot(pid2).is_none()
+        || surfaces.state(b)!=Ok(SurfaceState::Live)
+    { fail("surface_other_pid_isolation") }
+
+    // PID2 never sent GPU work and must not require a fabricated fence.
+    if cancel_ready_counted_guarded(&mut processes,&mut surfaces,pid2,supervisor_cr3)
+        != Err(BridgeError::OutstandingSurfaces)
+        || surfaces.state(b)!=Ok(SurfaceState::Closing)
+        || surfaces.release(b)!=Ok(b)
+    { fail("surface_no_gpu_cleanup") }
+    let Ok(lease2)=cancel_ready_counted_guarded(
+        &mut processes,&mut surfaces,pid2,supervisor_cr3
+    ) else { fail("surface_cancel_two_after_drain") };
+    if lease2.as_slice()!=&frames[2..4] {
+        fail("surface_second_lease_authority")
+    }
+    for &frame in lease2.as_slice() {
+        if pmm::free_frame(frame).is_err() { fail("surface_free_two") }
+    }
+    if processes.occupied()!=0 || surfaces.owner_remaining(pid1,pid1)!=0
+        || surfaces.owner_remaining(pid2,pid2)!=0
+        || pmm::statistics().allocated_frames!=baseline
+    { fail("surface_cleanup_pmm_leak") }
+
+    serial::write_line(
+        "WOLFOS_SURFACE_REAP_PMM_OK pids=2 real_pmm_pages=4 early_release_denied=1 half_ack_denied=1 cross_pid_isolated=1 synthetic_gpu_acks=1 pmm_no_leak=1 cpl3_executed=0 real_gpu_dma=0"
+    );
+}
