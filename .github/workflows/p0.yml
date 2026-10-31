@@ -92,6 +92,8 @@ jobs:
         run: make qemu-virtio-gpu-desktop-scanout-smoke
       - name: "Real QEMU bounded 32x32 partial GPU damage, full-screen host pixels and restoration"
         run: make qemu-virtio-gpu-damage-live-smoke
+      - name: "Real QEMU two disjoint dirty rectangles: exact changed and unchanged pixels, separate fences"
+        run: make qemu-virtio-gpu-two-dirty-rects-smoke
       - name: Desktop transaction must refuse a forged digest, nonce, geometry, early expiry and roll back after a real window
         run: make qemu-virtio-gpu-desktop-scanout-negative
       - name: Genuine QEMU standard VGA Bochs VBE port probe, selector restored with no mode writes
