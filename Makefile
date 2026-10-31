@@ -153,6 +153,8 @@ else ifeq ($(FLAVOR),user-page-fault-retire)
 FEATURES := --features user-page-fault-retire-smoke
 else ifeq ($(FLAVOR),user-process-fault-recovery)
 FEATURES := --features user-process-fault-recovery-smoke
+else ifeq ($(FLAVOR),user-surface-fault-recovery)
+FEATURES := --features user-surface-fault-recovery-smoke
 else ifeq ($(FLAVOR),user-process)
 FEATURES := --features user-process-smoke
 else ifeq ($(FLAVOR),user-ramfs)
@@ -682,6 +684,11 @@ user-page-fault-retire-smoke:
 user-process-fault-recovery-smoke:
 	$(MAKE) iso FLAVOR=user-process-fault-recovery
 	python3 scripts/user_process_fault_recovery_smoke.py $(OUT)/wolfos-user-process-fault-recovery.iso
+
+.PHONY: user-surface-fault-recovery-smoke
+user-surface-fault-recovery-smoke:
+	$(MAKE) iso FLAVOR=user-surface-fault-recovery
+	python3 scripts/user_process_fault_recovery_smoke.py $(OUT)/wolfos-user-surface-fault-recovery.iso --surface
 
 user-process-smoke:
 	$(MAKE) iso FLAVOR=user-process
