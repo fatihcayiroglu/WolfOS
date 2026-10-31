@@ -135,6 +135,10 @@ else ifeq ($(FLAVOR),user-elf-run)
 FEATURES := --features user-elf-run-smoke
 else ifeq ($(FLAVOR),user-surface-exit)
 FEATURES := --features user-surface-exit-smoke
+else ifeq ($(FLAVOR),user-surface-ud)
+FEATURES := --features user-surface-ud-retire-smoke
+else ifeq ($(FLAVOR),user-surface-pf)
+FEATURES := --features user-surface-pf-retire-smoke
 else ifeq ($(FLAVOR),user-elf-one-load-run)
 FEATURES := --features user-elf-one-load-run-smoke
 else ifeq ($(FLAVOR),user-elf-two-pt-run)
@@ -641,6 +645,15 @@ user-elf-run-smoke:
 user-surface-exit-smoke:
 	$(MAKE) iso FLAVOR=user-surface-exit
 	python3 scripts/user_elf_run_smoke.py $(OUT)/wolfos-user-surface-exit.iso --surface-exit
+
+.PHONY: user-surface-ud-retire-smoke user-surface-pf-retire-smoke
+user-surface-ud-retire-smoke:
+	$(MAKE) iso FLAVOR=user-surface-ud
+	python3 scripts/user_elf_run_smoke.py $(OUT)/wolfos-user-surface-ud.iso --surface-ud
+
+user-surface-pf-retire-smoke:
+	$(MAKE) iso FLAVOR=user-surface-pf
+	python3 scripts/user_elf_run_smoke.py $(OUT)/wolfos-user-surface-pf.iso --surface-pf
 
 user-elf-two-pt-run-smoke:
 	$(MAKE) iso FLAVOR=user-elf-two-pt-run
