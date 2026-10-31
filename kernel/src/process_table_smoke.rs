@@ -241,6 +241,125 @@ pub fn verify() {
 }
 
 
+/// The two PMM data pages are owned by different READY registry PIDs.
+/// They are intentionally *not* mapped to CPL3 or attached to VirtIO GPU.
+/// Read actual HHDM physical RAM pixels and prove cross-process z-order plus
+/// fail-before-write denial after PID1 is revoked. The whole operation is
+/// BSP-only with IRQs off, no AP CPU, and both PMM leases still held.
+#[cfg(feature = "qemu-surface-reap-pmm-smoke")]
+fn verify_owned_pmm_pixels(
+    hhdm: u64,
+    frames: &[u64; 4],
+    processes: &ProcessTable<2, 2>,
+    surfaces: &crate::virtio_gpu_desktop_wire::surface_ledger::SurfaceLedger<2>,
+    a: crate::virtio_gpu_desktop_wire::surface_pixels::Identity,
+    b: crate::virtio_gpu_desktop_wire::surface_pixels::Identity,
+    expect_live: bool,
+) {
+    use crate::virtio_gpu_desktop_wire::{
+        damage::Rect,
+        surface_ledger::Error as LedgerError,
+        surface_pixels::{CompositionReport, Error as PixelError, Identity, SurfacePixels},
+        surface_process_bridge::{compose_registered, Error as BridgeError},
+    };
+    if x86_64::instructions::interrupts::are_enabled() {
+        fail("surface_pixels_irqs_enabled")
+    }
+    let Some(a_address)=hhdm.checked_add(frames[1])
+        .and_then(|x|x86_64::VirtAddr::try_new(x).ok()) else {
+        fail("surface_pixels_a_hhdm")
+    };
+    let Some(b_address)=hhdm.checked_add(frames[3])
+        .and_then(|x|x86_64::VirtAddr::try_new(x).ok()) else {
+        fail("surface_pixels_b_hhdm")
+    };
+    if a_address==b_address || a_address.as_u64() & 4095 != 0
+        || b_address.as_u64() & 4095 != 0
+    { fail("surface_pixels_alias_or_alignment") }
+
+    // Initial writes touch only the data frame (second page) of each
+    // independently-owned two-page ProcessTable lease. The first frame
+    // of each lease is the registry's CR3-root *metadata* frame, untouched.
+    // These PMM data pages remain leased until BOTH source slices expire.
+    if expect_live {
+        for i in 0..4usize {
+            // SAFETY: frames[1]/frames[3] are distinct, exclusively allocated
+            // real PMM pages, mapped as kernel RAM through boot HHDM, not user
+            // or MMIO. BSP-only under IRQ-disabled test. No reader is live.
+            unsafe {
+                a_address.as_mut_ptr::<u32>().add(i).write_volatile(0x00d7_2200);
+                b_address.as_mut_ptr::<u32>().add(i).write_volatile(0x0007_27e1);
+            }
+        }
+    }
+    // SAFETY: both spans are aligned 4-word prefixes within separate 4 KiB
+    // owned PMM pages, after initial writes and before any PMM free/unmap.
+    let a_data=unsafe{core::slice::from_raw_parts(a_address.as_ptr::<u32>(),4)};
+    let b_data=unsafe{core::slice::from_raw_parts(b_address.as_ptr::<u32>(),4)};
+    if a_data != [0x00d7_2200;4] || b_data != [0x0007_27e1;4] {
+        fail("surface_pixels_real_physical_contents")
+    }
+    let Ok(r_a)=Rect::checked(1,1,2,2) else {fail("surface_rect_a")};
+    let Ok(r_b)=Rect::checked(2,1,2,2) else {fail("surface_rect_b")};
+    let Ok(view)=Rect::checked(0,0,8,8) else {fail("surface_view")};
+    let Ok(first)=SurfacePixels::new(a,r_a,2,a_data) else {fail("surface_a_ref")};
+    let Ok(second)=SurfacePixels::new(b,r_b,2,b_data) else {fail("surface_b_ref")};
+    let background=[0x0033_3355;64];
+    let mut output=[0x00ce_efed;64];
+
+    let rendered=compose_registered(
+        processes,surfaces,&mut output,&background,view,8,view,
+        first,second,b
+    );
+    if expect_live {
+        if rendered!=Ok(CompositionReport{
+            background:58,first:2,second:4,
+        }) {
+            fail("surface_live_compose_report")
+        }
+        for y in 0..8usize {
+            for x in 0..8usize {
+                let expected=if (2..4).contains(&x) && (1..3).contains(&y) {
+                    0x0007_27e1
+                } else if (1..3).contains(&x) && (1..3).contains(&y) {
+                    0x00d7_2200
+                } else {
+                    0x0033_3355
+                };
+                if output[y*8+x]!=expected {
+                    fail("surface_live_compose_real_pmm_pixel")
+                }
+            }
+        }
+    } else if rendered!=Err(BridgeError::Ledger(LedgerError::NotLive))
+        || output!=[0x00ce_efed;64]
+    {
+        fail("surface_closed_owner_touched_pixels")
+    }
+    // Even if the owner is still READY, a forged process generation must
+    // fail BEFORE changing a destination pixel.
+    output.fill(0x00ce_efed);
+    let forged=Identity{process_generation:a.pid+1,..a};
+    let Ok(forged_first)=SurfacePixels::new(forged,r_a,2,a_data) else {
+        fail("surface_forged_fixture")
+    };
+    if compose_registered(processes,surfaces,&mut output,&background,
+        view,8,view,forged_first,second,b)
+        !=Err(BridgeError::InvalidProcessIdentity)
+        || output!=[0x00ce_efed;64]
+    { fail("surface_forged_process_generation_mutated_pixels") }
+
+    if expect_live {
+        let invalid_top=Identity{slot:999,..b};
+        if compose_registered(processes,surfaces,&mut output,&background,
+            view,8,view,first,second,invalid_top)
+            !=Err(BridgeError::Ledger(LedgerError::Pixel(PixelError::InvalidTop)))
+            || output!=[0x00ce_efed;64]
+        { fail("surface_invalid_z_order_mutated_pixels") }
+    }
+    // Never retain any borrowed PMM pixel slice after this function exits.
+}
+
 /// Real QEMU PMM integration for the *software-only* surface retirement gate.
 /// These four physical pages are exclusively owned by two READY PID leases;
 /// they are NOT user-mapped pixels and never submitted to VirtIO-GPU.
@@ -248,7 +367,7 @@ pub fn verify() {
 /// after verifying that the guarded cancel refuses to return the PMM lease.
 /// No real DMA or CPL3 claim is made by this separate feature.
 #[cfg(feature = "qemu-surface-reap-pmm-smoke")]
-pub fn verify_surface_reap_pmm() {
+pub fn verify_surface_reap_pmm(hhdm: u64) {
     use crate::virtio_gpu_desktop_wire::surface_ledger::{
         SurfaceLedger, Error as GpuError, State as SurfaceState,
     };
@@ -290,6 +409,7 @@ pub fn verify_surface_reap_pmm() {
     let Ok(b)=open_registered(&processes,&mut surfaces,pid2) else {
         fail("surface_open_owner_two")
     };
+    verify_owned_pmm_pixels(hhdm,&frames,&processes,&surfaces,a,b,true);
     if surfaces.begin_submit(a,100,101).is_err() {
         fail("surface_submit_software_contract")
     }
@@ -304,6 +424,10 @@ pub fn verify_surface_reap_pmm() {
         || processes.snapshot(pid1).is_none()
         || pmm::statistics().allocated_frames!=baseline+4
     { fail("surface_early_pmm_release_refusal") }
+
+    // CPU-side pixels remain present in actual PMM pages, but a closing
+    // owner cannot present even a single pixel after revocation.
+    verify_owned_pmm_pixels(hhdm,&frames,&processes,&surfaces,a,b,false);
 
     if surfaces.ack_flush(a,101)!=Err(GpuError::FlushBeforeTransfer)
         || surfaces.ack_transfer(a,100).is_err()
@@ -356,6 +480,6 @@ pub fn verify_surface_reap_pmm() {
     { fail("surface_cleanup_pmm_leak") }
 
     serial::write_line(
-        "WOLFOS_SURFACE_REAP_PMM_OK pids=2 real_pmm_pages=4 early_release_denied=1 half_ack_denied=1 cross_pid_isolated=1 synthetic_gpu_acks=1 pmm_no_leak=1 cpl3_executed=0 real_gpu_dma=0"
+        "WOLFOS_SURFACE_REAP_PMM_OK pids=2 real_pmm_pages=4 early_release_denied=1 half_ack_denied=1 cross_pid_isolated=1 synthetic_gpu_acks=1 owner_pixel_composition=1 stale_owner_pixels_denied=1 pmm_no_leak=1 cpl3_executed=0 real_gpu_dma=0"
     );
 }
