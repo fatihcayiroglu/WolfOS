@@ -688,6 +688,11 @@ user-surface-copy-hardware-smoke:
 	$(MAKE) iso FLAVOR=user-surface-copy-hardware
 	WOLFOS_USER_SURFACE_HARDWARE=1 python3 scripts/user_copy_smoke.py $(OUT)/wolfos-user-surface-copy-hardware.iso
 
+.PHONY: user-surface-writer-smoke
+user-surface-writer-smoke:
+	$(MAKE) iso FLAVOR=user-surface-writer
+	WOLFOS_USER_SURFACE_HARDWARE=1 WOLFOS_USER_SURFACE_WRITER=1 python3 scripts/user_copy_smoke.py $(OUT)/wolfos-user-surface-writer.iso
+
 user-file-io-smoke:
 	$(MAKE) iso FLAVOR=user-file-io
 	python3 scripts/user_file_io_smoke.py $(OUT)/wolfos-user-file-io.iso
