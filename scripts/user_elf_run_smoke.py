@@ -143,11 +143,11 @@ def main() -> int:
     two_pt_mode = mode == "--two-pt"
     three_load_mode = mode == "--three-load"
     status_mode = mode == "--exit-status"
-    surface_mode = mode == "--surface-exit"
-    fault_mode = mode == "--user-ud-fault"
-    pf_mode = mode == "--user-pf-fault"
+    surface_mode = mode in ("--surface-exit", "--surface-ud", "--surface-pf")
+    fault_mode = mode in ("--user-ud-fault", "--surface-ud")
+    pf_mode = mode in ("--user-pf-fault", "--surface-pf")
     if len(sys.argv) not in (2, 3) or (mode is not None and not (status_mode or surface_mode or fault_mode or pf_mode or one_load_mode or two_pt_mode or three_load_mode)) or not Path(sys.argv[1]).is_file():
-        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--one-load|--two-pt|--three-load|--exit-status|--surface-exit|--user-ud-fault|--user-pf-fault]")
+        print("Usage: user_elf_run_smoke.py path/to/wolfos-user-elf-run.iso [--one-load|--two-pt|--three-load|--exit-status|--surface-exit|--surface-ud|--surface-pf|--user-ud-fault|--user-pf-fault]")
         return 2
     markers = ONE_LOAD_MARKERS if one_load_mode else THREE_LOAD_MARKERS if three_load_mode else TWO_PT_MARKERS if two_pt_mode else PF_FAULT_MARKERS if pf_mode else UD_FAULT_MARKERS if fault_mode else STATUS_MARKERS if status_mode else MARKERS
     with tempfile.TemporaryDirectory(prefix="wolfos-real-elf-run-") as tmp:
@@ -227,11 +227,14 @@ def main() -> int:
                 print("FAIL: missing/duplicate native ELF proof: " + marker)
                 return 1
         if surface_mode:
+            actual_terminal = (PF_FAULT_MARKERS[4] if pf_mode else
+                               UD_FAULT_MARKERS[4] if fault_mode else
+                               "WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22")
             proof_positions = [
                 output.find("WOLFOS_BOOT_OK"),
                 output.find(SURFACE_OPEN_MARKER),
                 entry.start(),
-                output.find("WOLFOS_ELF_EXIT_OK code=0 cpl3=1 calls=22"),
+                output.find(actual_terminal),
                 output.find(SURFACE_EXIT_MARKER),
                 output.find("WOLFOS_ELF_CLEANUP_OK restored_cr3=1 frames_freed=7 pmm_no_leak=1"),
             ]
@@ -239,7 +242,7 @@ def main() -> int:
                 or proof_positions != sorted(proof_positions)
                 or output.count(SURFACE_OPEN_MARKER) != 1
                 or output.count(SURFACE_EXIT_MARKER) != 1):
-                print("FAIL: Ring3 surface admission/exit/guarded-reap or PMM order")
+                print("FAIL: Ring3 surface admission/terminal EXIT or #UD/#PF guarded-reap PMM order")
                 return 1
         for bad in [
             "WOLFOS_ELF_RUN_ERROR", "WOLFOS_RING_PREP_ERROR",
@@ -266,7 +269,7 @@ def main() -> int:
             print(result.stderr.decode(errors="replace"))
             return 1
         if surface_mode:
-            print("PASS: genuine ELF64 CPL3 -> EXIT -> surface-guarded counted reap -> 7 real PMM frames freed (synthetic GPU acknowledgements only)")
+            print("PASS: genuine ELF64 CPL3 -> EXIT/#UD/#PF -> surface-guarded counted reap -> 7 real PMM frames freed (synthetic GPU acknowledgements only)")
         if one_load_mode:
             if (any(marker in output for marker in (
                 "WOLFOS_ELF_RUN_OK ", "WOLFOS_ELF_TWO_PT_RUN_OK ",
