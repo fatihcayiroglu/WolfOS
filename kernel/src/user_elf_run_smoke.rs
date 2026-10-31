@@ -39,6 +39,12 @@ use crate::{
 };
 #[cfg(feature = "user-elf-two-pt-run-smoke")]
 use crate::{user_vm_two_pt, user_image_admission::{self, BackingPage}};
+#[cfg(feature = "user-surface-exit-smoke")]
+use crate::virtio_gpu_desktop_wire::{
+    surface_ledger::{Error as SurfaceError, SurfaceLedger, State as SurfaceState},
+    surface_pixels::Identity,
+    surface_process_bridge::{open_registered, reap_counted_guarded, Error as SurfaceBridgeError},
+};
 
 mod symbols {
     include!(concat!(env!("OUT_DIR"), "/wolfos_elf_symbols.rs"));
@@ -164,6 +170,29 @@ struct OwnerCell(UnsafeCell<Option<LiveElf>>);
 // No reference escapes a slot access; retirement takes the owner permanently.
 unsafe impl Sync for OwnerCell {}
 static LIVE_ELF: OwnerCell = OwnerCell(UnsafeCell::new(None));
+
+/// Isolated smoke-only metadata surface, not physical GPU backing or a
+/// userspace mapping. No AP ever runs this BSP-only IF=0 path. All access
+/// occurs before the first IRET or after the final terminal trap, never
+/// concurrently. Production must use the trusted process/GUI lock.
+#[cfg(feature = "user-surface-exit-smoke")]
+struct SurfaceSmoke {
+    ledger: SurfaceLedger<1>,
+    handle: Option<Identity>,
+}
+#[cfg(feature = "user-surface-exit-smoke")]
+struct SurfaceSmokeCell(UnsafeCell<SurfaceSmoke>);
+// SAFETY: entry and terminal exit are serial BSP-only, with interrupts
+// disabled. The stored mutable reference never escapes either critical
+// section, and no AP can access this isolated fixture.
+#[cfg(feature = "user-surface-exit-smoke")]
+unsafe impl Sync for SurfaceSmokeCell {}
+#[cfg(feature = "user-surface-exit-smoke")]
+static SURFACE_SMOKE: SurfaceSmokeCell =
+    SurfaceSmokeCell(UnsafeCell::new(SurfaceSmoke {
+        ledger: SurfaceLedger::new(),
+        handle: None,
+    }));
 
 // Fallible ELF preparation has deeper stack use than a terminal trap. Never
 // recursively prepare PID2 on the fixed 16-KiB TSS.RSP0 exception stack.
@@ -778,6 +807,29 @@ pub extern "C" fn enter(hhdm: u64) -> ! {
         if !matches!(PROCESS_TABLE.with(|t| t.mark_running(pid, frames[0])), Ok(Ok(()))) {
             fail("process_table_running_transition")
         }
+        #[cfg(feature = "user-surface-exit-smoke")]
+        {
+            // Authenticated against the SAME real process registry that
+            // marks this private CR3 RUNNING. No userspace pointer is used.
+            // The two fences are synthetic policy placeholders ONLY. No
+            // VirtIO queue is touched in this feature.
+            let fixture = &mut *SURFACE_SMOKE.0.get();
+            if fixture.handle.is_some() { fail("surface_fixture_stale_handle") }
+            let id = match PROCESS_TABLE.with(|t|
+                open_registered(t, &mut fixture.ledger, pid)
+            ) {
+                Ok(Ok(id)) if id.pid == pid && id.process_generation == pid => id,
+                _ => fail("surface_fixture_registry_admission"),
+            };
+            if fixture.ledger.begin_submit(id,1,2)!=Ok(()) {
+                fail("surface_fixture_fence_admission")
+            }
+            fixture.handle=Some(id);
+            serial::write_fmt(format_args!(
+                "WOLFOS_RING3_SURFACE_OPEN_OK pid={} registry=1 owner_generation=1 software_submit=1 gpu_dma=0\n",
+                pid,
+            ));
+        }
         // Read the actual hardware CR3 above; this table check must reject
         // freeing a RUNNING user root or any of its own PMM frames.
         if !matches!(PROCESS_TABLE.with(|t| (
@@ -950,6 +1002,60 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     { fail("boot_cr3_not_restored_or_acknowledged") }
     // The audited PID ledger authorizes release ONLY after CR3
     // restoration, only for this exact owning PID, exactly once.
+    #[cfg(feature = "user-surface-exit-smoke")]
+    let owned_by_pid = {
+        // Actual hardware CPL3 has already exited through INT80 and
+        // actual boot CR3 has been restored. The only synthetic part
+        // is the deliberately unsubmitted GPU fence sequence.
+        let fixture = unsafe { &mut *SURFACE_SMOKE.0.get() };
+        let id = fixture.handle.unwrap_or_else(|| fail("surface_fixture_missing"));
+        if !matches!(
+            PROCESS_TABLE.with(|t|
+                reap_counted_guarded(t, &mut fixture.ledger, pid, boot)),
+            Ok(Err(SurfaceBridgeError::OutstandingSurfaces))
+        ) || fixture.ledger.state(id) != Ok(SurfaceState::ClosingSubmitted)
+            || fixture.ledger.release(id) != Err(SurfaceError::StillPinned)
+            || pmm::statistics().allocated_frames !=
+                ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
+        { fail("surface_first_guard_did_not_pin_real_ring3_pmm") }
+
+        if fixture.ledger.ack_flush(id,2) != Err(SurfaceError::FlushBeforeTransfer)
+            || fixture.ledger.ack_transfer(id,1) != Ok(())
+            || !matches!(
+                PROCESS_TABLE.with(|t|
+                    reap_counted_guarded(t, &mut fixture.ledger, pid, boot)),
+                Ok(Err(SurfaceBridgeError::OutstandingSurfaces))
+            )
+            || fixture.ledger.state(id) != Ok(SurfaceState::ClosingTransferred)
+        { fail("surface_half_gpu_ack_early_ring3_reap") }
+
+        if fixture.ledger.ack_flush(id,2) != Ok(())
+            || !matches!(
+                PROCESS_TABLE.with(|t|
+                    reap_counted_guarded(t, &mut fixture.ledger, pid, boot)),
+                Ok(Err(SurfaceBridgeError::OutstandingSurfaces))
+            )
+            || fixture.ledger.release(id) != Ok(id)
+        { fail("surface_retained_handle_early_ring3_reap") }
+
+        let lease = match PROCESS_TABLE.with(|t|
+            reap_counted_guarded(t, &mut fixture.ledger, pid, boot))
+        {
+            Ok(Ok((code,lease))) if code==exit_status && lease.count==FRAMES => lease,
+            _ => fail("surface_guarded_ring3_reap_or_status"),
+        };
+        if fixture.ledger.owner_remaining(pid,pid)!=0
+            || pmm::statistics().allocated_frames !=
+                ALLOCATED_BEFORE.load(Ordering::Acquire) + FRAMES
+        { fail("surface_reap_before_cpu_or_pmm_release") }
+        fixture.handle=None;
+        serial::write_fmt(format_args!(
+            "WOLFOS_RING3_SURFACE_EXIT_GUARD_OK pid={} real_cpl3=1 restored_cr3=1 early_reap_denied=1 half_ack_denied=1 retained_handle_denied=1 software_acks=1 guarded_reap=1 real_pmm_frames={} gpu_dma=0\n",
+            pid, FRAMES,
+        ));
+        lease
+    };
+    #[cfg(not(feature = "user-surface-exit-smoke"))]
     let owned_by_pid = match PROCESS_TABLE.with(|t| t.reap_with_status_counted(pid, boot)) {
         Ok(Ok((code, lease))) if code == exit_status && lease.count == FRAMES => lease,
         _ => fail("process_reap_or_exit_status"),

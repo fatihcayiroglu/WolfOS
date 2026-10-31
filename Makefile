@@ -133,6 +133,8 @@ else ifeq ($(FLAVOR),user-syscall)
 FEATURES := --features user-syscall-smoke
 else ifeq ($(FLAVOR),user-elf-run)
 FEATURES := --features user-elf-run-smoke
+else ifeq ($(FLAVOR),user-surface-exit)
+FEATURES := --features user-surface-exit-smoke
 else ifeq ($(FLAVOR),user-elf-one-load-run)
 FEATURES := --features user-elf-one-load-run-smoke
 else ifeq ($(FLAVOR),user-elf-two-pt-run)
@@ -634,6 +636,11 @@ user-syscall-smoke:
 user-elf-run-smoke:
 	$(MAKE) iso FLAVOR=user-elf-run
 	python3 scripts/user_elf_run_smoke.py $(OUT)/wolfos-user-elf-run.iso
+
+.PHONY: user-surface-exit-smoke
+user-surface-exit-smoke:
+	$(MAKE) iso FLAVOR=user-surface-exit
+	python3 scripts/user_elf_run_smoke.py $(OUT)/wolfos-user-surface-exit.iso --surface-exit
 
 user-elf-two-pt-run-smoke:
 	$(MAKE) iso FLAVOR=user-elf-two-pt-run

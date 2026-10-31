@@ -126,6 +126,9 @@ user-ring3-smoke = ["smoke-exit"]
 user-ring3-isolation-smoke = ["smoke-exit"]
 user-syscall-smoke = ["smoke-exit"]
 user-elf-run-smoke = ["smoke-exit"]
+# Opt-in REAL CPL3 EXIT retirement via authenticated surface ledger, but GPU
+# fences in this fixture are synthetic and no DMA or pixels are submitted.
+user-surface-exit-smoke = ["user-elf-run-smoke"]
 # Genuine single RX PT_LOAD + isolated RW/NX stack in hardware CPL3, six PMM frames.
 user-elf-one-load-run-smoke = ["user-elf-run-smoke"]
 # Genuine relocated two-PT ELF64 in hardware CPL3, eight PMM frames; isolated QEMU gate.
