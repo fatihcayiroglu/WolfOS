@@ -217,7 +217,10 @@ fn send_resource_command(
     }
     // The upper bound is a flavor constant, so an unexpected completion
     // index is still refused instead of being accepted as this request.
-    #[cfg(feature="qemu-virtio-gpu-damage-live-smoke")]
+    #[cfg(feature="qemu-virtio-gpu-two-dirty-rects-smoke")]
+    let max_index=resource::TWO_DIRTY_MAX_INDEX;
+    #[cfg(all(feature="qemu-virtio-gpu-damage-live-smoke",
+              not(feature="qemu-virtio-gpu-two-dirty-rects-smoke")))]
     let max_index=resource::DAMAGE_LIVE_MAX_INDEX;
     #[cfg(all(feature="qemu-virtio-gpu-desktop-scanout-smoke",
               not(feature="qemu-virtio-gpu-damage-live-smoke")))]
@@ -676,6 +679,38 @@ fn commit_partial_damage(
     Ok(first+2)
 }
 
+/// Flush an ordered, disjoint queue, never a single bounding rectangle.
+/// Every request must finish its real fenced controlq completion before its
+/// corresponding rectangle is retired. No memory is released here.
+#[cfg(feature="qemu-virtio-gpu-two-dirty-rects-smoke")]
+fn submit_two_dirty_regions(
+    vas:&[u64;FRAMES],frames:&[u64;FRAMES],notify_port:u64,selected:u16,
+    mut next:u16,first:crate::virtio_gpu_desktop_wire::damage::Rect,
+    second:crate::virtio_gpu_desktop_wire::damage::Rect,
+    fence_base:u64,
+)->Result<u16,&'static str>{
+    use crate::virtio_gpu_desktop_wire::damage::DamageQueue;
+    let mut queue=DamageQueue::<2>::new();
+    queue.push(first).map_err(|_|"multi_queue_first")?;
+    queue.push(second).map_err(|_|"multi_queue_second")?;
+    for region in 0..2u64{
+        let batch=queue.begin(fence_base+region*2+1,fence_base+region*2+2)
+            .map_err(|_|"multi_begin")?;
+        send_resource_command(vas,frames,notify_port,selected,next,
+            &batch.transfer,batch.transfer_fence)?;
+        queue.ack_transfer(batch.transfer_fence).map_err(|_|"multi_transfer_ack")?;
+        next+=1;
+        send_resource_command(vas,frames,notify_port,selected,next,
+            &batch.flush,batch.flush_fence)?;
+        queue.ack_flush(batch.flush_fence).map_err(|_|"multi_flush_ack")?;
+        next+=1;
+    }
+    if queue.count()!=0||queue.must_keep_resource_pinned(){
+        return Err("multi_unsettled");
+    }
+    Ok(next)
+}
+
 /// A fresh GET_DISPLAY_INFO after a switch: the device's own statement about
 /// the scanout rectangle it now has configured. Fence-bound to this exact
 /// request, so an older completion cannot be mistaken for the readback.
@@ -1014,6 +1049,34 @@ fn present_desktop(
         }
         serial::write_line(
             "WOLFOS_VIRTIO_GPU_DAMAGE_LIVE_OK x=73 y=91 width=32 height=32 transfer_acks=2 flush_acks=2 capture_acks=2 host_pixel_authority=required outside_pixels=785408"
+        );
+    }
+    #[cfg(feature="qemu-virtio-gpu-two-dirty-rects-smoke")]
+    {
+        // Two distant independently fenced rectangles. No full-width band,
+        // union bounding box, extra SET_SCANOUT or reset is sent in this phase.
+        let first=desk::damage::Rect::checked(11,19,16,16)
+            .map_err(|_|"multi_rect_first")?;
+        let second=desk::damage::Rect::checked(811,401,32,16)
+            .map_err(|_|"multi_rect_second")?;
+        if first.overlaps(second){return Err("multi_overlapping_regions");}
+        paint_partial_damage(fb,vas,first,true)?;
+        paint_partial_damage(fb,vas,second,true)?;
+        next=submit_two_dirty_regions(vas,frames,notify_port,selected,next,
+            first,second,0x574f_444d_4700_3000)?;
+        await_host_capture("multi",b'M')?;
+        captures+=1;
+        paint_partial_damage(fb,vas,first,false)?;
+        paint_partial_damage(fb,vas,second,false)?;
+        next=submit_two_dirty_regions(vas,frames,notify_port,selected,next,
+            first,second,0x574f_444d_4700_4000)?;
+        await_host_capture("multi_restored",b'N')?;
+        captures+=1;
+        if page_digest(vas,desk::HEIGHT)!=desktop_digest{
+            return Err("multi_restore_digest");
+        }
+        serial::write_line(
+            "WOLFOS_VIRTIO_GPU_MULTI_DAMAGE_OK first=11,19,16,16 second=811,401,32,16 regions=2 pixels_changed=768 outside_pixels=785664 transfer_acks=4 flush_acks=4 capture_acks=2 no_bounding_transfer=1"
         );
     }
     // 2. Second real geometry: the same resource presented as 1024x384. Only
