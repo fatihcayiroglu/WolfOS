@@ -129,6 +129,10 @@ user-elf-run-smoke = ["smoke-exit"]
 # Opt-in REAL CPL3 EXIT retirement via authenticated surface ledger, but GPU
 # fences in this fixture are synthetic and no DMA or pixels are submitted.
 user-surface-exit-smoke = ["user-elf-run-smoke"]
+# Actual hardware CPL3 #UD/#PF, genuine CPU/CR3 and seven-frame PMM
+# retirement; only GPU completion steps are isolated synthetic metadata.
+user-surface-ud-retire-smoke = ["user-invalid-opcode-retire-smoke"]
+user-surface-pf-retire-smoke = ["user-page-fault-retire-smoke"]
 # Genuine single RX PT_LOAD + isolated RW/NX stack in hardware CPL3, six PMM frames.
 user-elf-one-load-run-smoke = ["user-elf-run-smoke"]
 # Genuine relocated two-PT ELF64 in hardware CPL3, eight PMM frames; isolated QEMU gate.

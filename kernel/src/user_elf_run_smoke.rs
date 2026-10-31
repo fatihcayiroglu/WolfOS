@@ -39,7 +39,7 @@ use crate::{
 };
 #[cfg(feature = "user-elf-two-pt-run-smoke")]
 use crate::{user_vm_two_pt, user_image_admission::{self, BackingPage}};
-#[cfg(feature = "user-surface-exit-smoke")]
+#[cfg(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke"))]
 use crate::virtio_gpu_desktop_wire::{
     surface_ledger::{Error as SurfaceError, SurfaceLedger, State as SurfaceState},
     surface_pixels::Identity,
@@ -175,19 +175,19 @@ static LIVE_ELF: OwnerCell = OwnerCell(UnsafeCell::new(None));
 /// userspace mapping. No AP ever runs this BSP-only IF=0 path. All access
 /// occurs before the first IRET or after the final terminal trap, never
 /// concurrently. Production must use the trusted process/GUI lock.
-#[cfg(feature = "user-surface-exit-smoke")]
+#[cfg(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke"))]
 struct SurfaceSmoke {
     ledger: SurfaceLedger<1>,
     handle: Option<Identity>,
 }
-#[cfg(feature = "user-surface-exit-smoke")]
+#[cfg(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke"))]
 struct SurfaceSmokeCell(UnsafeCell<SurfaceSmoke>);
 // SAFETY: entry and terminal exit are serial BSP-only, with interrupts
 // disabled. The stored mutable reference never escapes either critical
 // section, and no AP can access this isolated fixture.
-#[cfg(feature = "user-surface-exit-smoke")]
+#[cfg(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke"))]
 unsafe impl Sync for SurfaceSmokeCell {}
-#[cfg(feature = "user-surface-exit-smoke")]
+#[cfg(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke"))]
 static SURFACE_SMOKE: SurfaceSmokeCell =
     SurfaceSmokeCell(UnsafeCell::new(SurfaceSmoke {
         ledger: SurfaceLedger::new(),
@@ -807,7 +807,7 @@ pub extern "C" fn enter(hhdm: u64) -> ! {
         if !matches!(PROCESS_TABLE.with(|t| t.mark_running(pid, frames[0])), Ok(Ok(()))) {
             fail("process_table_running_transition")
         }
-        #[cfg(feature = "user-surface-exit-smoke")]
+        #[cfg(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke"))]
         {
             // Authenticated against the SAME real process registry that
             // marks this private CR3 RUNNING. No userspace pointer is used.
@@ -1002,7 +1002,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
     { fail("boot_cr3_not_restored_or_acknowledged") }
     // The audited PID ledger authorizes release ONLY after CR3
     // restoration, only for this exact owning PID, exactly once.
-    #[cfg(feature = "user-surface-exit-smoke")]
+    #[cfg(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke"))]
     let owned_by_pid = {
         // Actual hardware CPL3 has already exited through INT80 and
         // actual boot CR3 has been restored. The only synthetic part
@@ -1055,7 +1055,7 @@ fn finish_exited(pid: u64, exit_status: u32, active: u64) -> ! {
         ));
         lease
     };
-    #[cfg(not(feature = "user-surface-exit-smoke"))]
+    #[cfg(not(any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke")))]
     let owned_by_pid = match PROCESS_TABLE.with(|t| t.reap_with_status_counted(pid, boot)) {
         Ok(Ok((code, lease))) if code == exit_status && lease.count == FRAMES => lease,
         _ => fail("process_reap_or_exit_status"),
