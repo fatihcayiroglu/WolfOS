@@ -199,6 +199,8 @@ else ifeq ($(FLAVOR),user-file-io)
 FEATURES := --features user-file-io-smoke
 else ifeq ($(FLAVOR),user-surface-writer)
 FEATURES := --features user-surface-writer-smoke
+else ifeq ($(FLAVOR),user-surface-writer-display)
+FEATURES := --features user-surface-writer-display-smoke
 else ifeq ($(FLAVOR),user-surface-copy-hardware)
 FEATURES := --features user-surface-copy-hardware-smoke
 else ifeq ($(FLAVOR),user-copy)
