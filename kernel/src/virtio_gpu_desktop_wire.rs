@@ -22,7 +22,7 @@ pub mod surface_pixels;
 pub mod surface_ledger;
 // The production process registry is feature-gated; never force it into
 // ordinary GPU/boot flavors merely by compiling this pure contract.
-#[cfg(any(test, feature = "process-table-smoke", any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke")))]
+#[cfg(any(test, feature = "process-table-smoke", any(feature = "user-surface-exit-smoke", feature = "user-surface-ud-retire-smoke", feature = "user-surface-pf-retire-smoke", feature = "user-surface-fault-recovery-smoke")))]
 #[path = "virtio_gpu_surface_process_bridge.rs"]
 pub mod surface_process_bridge;
 
