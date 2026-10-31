@@ -12,7 +12,7 @@ use super::surface_pixels::{CompositionReport, Identity, SurfacePixels};
 
 #[cfg(test)]
 #[path = "process_table.rs"]
-mod standalone_registry;
+pub(super) mod standalone_registry;
 #[cfg(test)]
 use standalone_registry::{ProcessTable, TableError};
 #[cfg(test)]
