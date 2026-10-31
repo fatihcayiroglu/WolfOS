@@ -21,8 +21,8 @@ PROOFS = [
 ]
 SURFACE_REAP_PROOF = (
     "WOLFOS_SURFACE_REAP_PMM_OK pids=2 real_pmm_pages=4 early_release_denied=1 "
-    "half_ack_denied=1 cross_pid_isolated=1 synthetic_gpu_acks=1 "
-    "pmm_no_leak=1 cpl3_executed=0 real_gpu_dma=0"
+    "half_ack_denied=1 cross_pid_isolated=1 synthetic_gpu_acks=1 owner_pixel_composition=1 "
+    "stale_owner_pixels_denied=1 pmm_no_leak=1 cpl3_executed=0 real_gpu_dma=0"
 )
 BAD = [
     "WOLFOS_PROCESS_TABLE_ERROR", "WOLFOS_PANIC", "WOLFOS_EXCEPTION_PF",
