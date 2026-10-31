@@ -74,7 +74,7 @@ class IndependentDirtyRegions(unittest.TestCase):
         self.assertTrue(validate_desktop_serial(valid))
         mutations=[
             valid.replace(MULTI_MARKER+"\n",""),
-            valid.replace(MULTI_MARKER+"\n",MULTI_MARKER+"\n"*2),
+            valid.replace(MULTI_MARKER+"\n",MULTI_MARKER+"\n"+MULTI_MARKER+"\n"),
             valid.replace("pixels_changed=768","pixels_changed=769"),
             valid.replace("outside_pixels=785664","outside_pixels=785665"),
             valid.replace("no_bounding_transfer=1","no_bounding_transfer=0"),
