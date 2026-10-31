@@ -129,11 +129,17 @@ ATTEST_FAULTS = ("digest", "nonce", "geometry")
 DAMAGE_LIVE = os.environ.get("WOLFOS_DAMAGE_LIVE") == "1"
 MULTI_DAMAGE_LIVE = os.environ.get("WOLFOS_MULTIDAMAGE_LIVE") == "1"
 WINDOW_MOVE_LIVE = os.environ.get("WOLFOS_WINDOW_MOVE_LIVE") == "1"
+OCCLUSION_LIVE = os.environ.get("WOLFOS_OCCLUSION_LIVE") == "1"
 DAMAGE_RECT = (73, 91, 32, 32)
 MULTI_RECTS = ((11, 19, 16, 16), (811, 401, 32, 16))
 WINDOW_OLD = (11, 19, 16, 16)
 WINDOW_FIXED = (811, 401, 32, 16)
 WINDOW_NEW = (211, 119, 16, 16)
+OPAQUE_OVERLAP = (819, 401, 16, 16)
+OPAQUE_MARKER = ("WOLFOS_VIRTIO_GPU_OPAQUE_OK front=red_then_blue_then_red "
+                 "overlap=16x16 changed=768 outside=785664 "
+                 "transfer_acks=7 flush_acks=7 capture_acks=5 "
+                 "host_pixel_authority=required no_full_frame=1")
 WINDOW_MARKER = ("WOLFOS_VIRTIO_GPU_WINDOW_MOVE_OK first=11,19,16,16 "
                  "moved=211,119,16,16 fixed=811,401,32,16 visible_pixels=768 "
                  "transfer_acks=6 flush_acks=6 capture_acks=3 "
@@ -373,6 +379,41 @@ def verify_moved_window(image: tuple[int,int,bytes]) -> int:
     return _verify(image, (WIDTH, HEIGHT), moved_window_bytes(), "window_moved")
 
 
+@lru_cache(maxsize=4)
+def opaque_bytes(phase: str) -> bytes:
+    """Independent full-frame pixel reference for two differently colored windows.
+
+    Red foreground toggles only red RGB, blue background only blue RGB.
+    The overlapping 16x16 area must have exactly ONE owner (not XOR both).
+    """
+    if phase not in ("initial", "overlap", "blue_front", "red_front"):
+        raise ProofError("Invalid opaque surface phase")
+    out=bytearray(expected_bytes())
+    if phase=="initial":
+        front=WINDOW_OLD
+    else:
+        front=OPAQUE_OVERLAP
+    # Back plane: blue second surface, including its occluded area.
+    bx,by,bw,bh=WINDOW_FIXED
+    for y in range(by,by+bh):
+        for x in range(bx,bx+bw):
+            out[(y*WIDTH+x)*3+2]^=0xff
+    # Full-cover opaque front red, replacing the blue beneath the overlap.
+    if phase!="blue_front":
+        rx,ry,rw,rh=front
+        for y in range(ry,ry+rh):
+            for x in range(rx,rx+rw):
+                i=(y*WIDTH+x)*3
+                out[i+2]=expected_bytes()[i+2]
+                out[i]^=0xff
+    return bytes(out)
+
+
+def verify_opaque_pixels(image: tuple[int,int,bytes], phase:str) -> int:
+    return _verify(image,(WIDTH,HEIGHT),opaque_bytes(phase),
+                   "opaque_"+phase)
+
+
 def verify_alt_pixels(image: tuple[int, int, bytes]) -> int:
     """Every pixel of the real 1024x384 image must match."""
     return _verify(image, (ALT_WIDTH, ALT_HEIGHT), alt_bytes(), "reduced")
@@ -404,14 +445,16 @@ def validate_desktop_serial(output: str, expired: bool = False,
     # expired path adds one extra switch+restore cycle of exactly 8 commands.
     expected_idx = ((46 if expired else 38) + (4 if DAMAGE_LIVE else 0)
                     + (8 if MULTI_DAMAGE_LIVE else 0)
-                    + (12 if WINDOW_MOVE_LIVE else 0))
+                    + (12 if WINDOW_MOVE_LIVE else 0)
+                    + (14 if OCCLUSION_LIVE else 0))
     if (used_idx, writes) != (expected_idx, expected_idx) or fences != expected_idx - 2:
         return False
     if not 1 <= entries <= 254:
         return False
     if capture_acks != ((4 if expired else 3) + (2 if DAMAGE_LIVE else 0)
                         + (2 if MULTI_DAMAGE_LIVE else 0)
-                        + (3 if WINDOW_MOVE_LIVE else 0)):
+                        + (3 if WINDOW_MOVE_LIVE else 0)
+                        + (5 if OCCLUSION_LIVE else 0)):
         return False
     displays = [(i, DISPLAY.fullmatch(line)) for i, line in enumerate(lines)
                 if line.startswith("WOLFOS_VIRTIO_GPU_DISPLAY_INFO_OK ")]
@@ -469,6 +512,11 @@ def validate_desktop_serial(output: str, expired: bool = False,
         if not MULTI_DAMAGE_LIVE:
             return False
         expected_captures.extend(["windows","window_moved","windows_restored"])
+    if OCCLUSION_LIVE:
+        if not WINDOW_MOVE_LIVE:
+            return False
+        expected_captures.extend(["opaque_initial","opaque_overlap",
+            "opaque_blue_front","opaque_red_front","opaque_restored"])
     expected_captures.append("restored")
     if captures != expected_captures:
         return False
@@ -509,6 +557,20 @@ def validate_desktop_serial(output: str, expired: bool = False,
         if not multi_ok<started<moved<restored<window_markers[0][0]<attested[1][0]:
             return False
     elif window_markers:
+        return False
+    opaque_markers=[(i,line) for i,line in enumerate(lines)
+                    if line.startswith("WOLFOS_VIRTIO_GPU_OPAQUE_OK ")]
+    if OCCLUSION_LIVE:
+        if len(opaque_markers)!=1 or opaque_markers[0][1]!=OPAQUE_MARKER:
+            return False
+        stages=["opaque_initial","opaque_overlap","opaque_blue_front",
+                "opaque_red_front","opaque_restored"]
+        positions=[lines.index(CAPTURE_PREFIX+n) for n in stages]
+        if not (window_markers[0][0]<positions[0]
+                and all(a<b for a,b in zip(positions,positions[1:]))
+                and positions[-1]<opaque_markers[0][0]<attested[1][0]):
+            return False
+    elif opaque_markers:
         return False
     restored_index = lines.index(CAPTURE_PREFIX + "restored")
     catalogs = [(i, CATALOG.fullmatch(line)) for i, line in enumerate(lines)
@@ -833,6 +895,36 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                                                      "windows_restored": b"J"}[name])
                                         captured.append(name)
                                         continue
+                                    if OCCLUSION_LIVE and name in (
+                                            "opaque_initial","opaque_overlap",
+                                            "opaque_blue_front","opaque_red_front",
+                                            "opaque_restored"):
+                                        prior={
+                                            "opaque_initial":"windows_restored",
+                                            "opaque_overlap":"opaque_initial",
+                                            "opaque_blue_front":"opaque_overlap",
+                                            "opaque_red_front":"opaque_blue_front",
+                                            "opaque_restored":"opaque_red_front",
+                                        }[name]
+                                        if captured[-1:]!=[prior]:
+                                            raise ProofError("Opaque overlap QMP stage out of order")
+                                        image=_capture(qmp,reader,root,name)
+                                        if name=="opaque_restored":
+                                            verify_pixels(image)
+                                            if image!=images.get("desktop"):
+                                                raise ProofError("Opaque restored is not initial background")
+                                        else:
+                                            verify_opaque_pixels(image,name.removeprefix("opaque_"))
+                                        images[name]=image
+                                        ser.sendall({
+                                            "opaque_initial":b"B",
+                                            "opaque_overlap":b"C",
+                                            "opaque_blue_front":b"D",
+                                            "opaque_red_front":b"F",
+                                            "opaque_restored":b"K",
+                                        }[name])
+                                        captured.append(name)
+                                        continue
                                     if name != "restored" or captured[-1:] != ["applied"] \
                                             and captured[-1:] != ["rollback"]:
                                         raise ProofError(
@@ -872,6 +964,9 @@ def run(iso: Path, require_refusal: bool = False) -> int:
                             prefix+=["multi","multi_restored"]
                         if WINDOW_MOVE_LIVE:
                             prefix+=["windows","window_moved","windows_restored"]
+                        if OCCLUSION_LIVE:
+                            prefix+=["opaque_initial","opaque_overlap",
+                                "opaque_blue_front","opaque_red_front","opaque_restored"]
                         expected=prefix+expected[1:]
                     if FAULT not in ATTEST_FAULTS and captured != expected:
                         raise ProofError(
