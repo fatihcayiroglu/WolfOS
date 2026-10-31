@@ -8,6 +8,7 @@ writes, RW stack copied to/from, then EXIT(0), clean CR3 and PMM restore.
 No actual generic POSIX write nor concurrent/untrusted app loading yet.
 """
 from pathlib import Path
+import os
 import re
 import subprocess
 import sys
@@ -34,6 +35,12 @@ PROOFS = [
     "WOLFOS_USERCOPY_RUN_OK linked_elf=1 hardware_cpl3=1 real_user_pointer=1 "
     "int80_calls=4 exit=0 resources_released=1 production_user_copy=0",
 ]
+
+SURFACE_PROOF = (
+    "WOLFOS_USER_SURFACE_CPL3_OK guest_rdi_pointer=1 real_user_cr3=1 "
+    "exact_owner_frames=1 source_bytes=16 two_surfaces=1 composed_pixels=15 "
+    "revoked_denied=1 synthetic_gpu_acks=0 real_gpu_dma=0"
+)
 
 def main() -> int:
     if len(sys.argv) != 2 or not Path(sys.argv[1]).is_file():
@@ -66,11 +73,12 @@ def main() -> int:
             print("FAIL: missing actual hardware Ring3 sanitized CR3 entry")
             return 1
         loc = [output.find("WOLFOS_BOOT_OK"), enter.start()]
-        loc += [output.find(x) for x in PROOFS]
+        proofs = PROOFS[:4] + ([SURFACE_PROOF] if os.environ.get("WOLFOS_USER_SURFACE_HARDWARE") == "1" else []) + PROOFS[4:]
+        loc += [output.find(x) for x in proofs]
         if any(p < 0 for p in loc) or loc != sorted(loc):
             print("FAIL: user ELF pointer/deny/roundtrip/exit/reap order invalid")
             return 1
-        for marker in PROOFS:
+        for marker in proofs:
             if output.count(marker) != 1:
                 print("FAIL: missing or duplicate proof: " + marker)
                 return 1
@@ -88,6 +96,8 @@ def main() -> int:
             print(run.stderr.decode(errors="replace"))
             return 1
         print("PASS: genuine ELF passes user pointer -> checked CR3 PTE walk -> WRITE -> EXIT -> 7 PMM frame cleanup")
+        if os.environ.get("WOLFOS_USER_SURFACE_HARDWARE") == "1":
+            print("PASS: CPL3 guest-provided ELF data -> real user CR3 owner-checked surface composition; GPU scanout not exercised")
         return 0
 
 if __name__ == "__main__":

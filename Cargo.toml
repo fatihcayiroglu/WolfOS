@@ -144,6 +144,9 @@ user-process-smoke = ["smoke-exit"]
 user-ramfs-smoke = ["smoke-exit"]
 user-vfs-smoke = ["smoke-exit"]
 user-copy-smoke = ["smoke-exit"]
+# Isolated genuine CPL3 guest-provided ELF pointer -> checked surface snapshot.
+# No application-authored pixels or physical VirtIO-GPU scanout.
+user-surface-copy-hardware-smoke = ["user-copy-smoke"]
 user-file-io-smoke = ["smoke-exit"]
 process-table-smoke = ["smoke-exit"]
 # Real PMM backing allocation, two registry PIDs and synthetic GPU-fence
