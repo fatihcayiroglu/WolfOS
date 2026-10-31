@@ -1163,6 +1163,100 @@ fn verify_live_user_surface_pointer(pid:u64, active:u64, guest_ptr:u64) {
     );
 }
 
+/// A stronger isolated QEMU proof: actual CPL3 ELF instructions wrote
+/// xRGB8888 pixel words into its private RW/NX user stack BEFORE the INT80.
+/// R12/R13 contain two independent real user virtual pointers. The trusted
+/// kernel may only read those bytes through the current CR3's four-level
+/// USER walk and through the exact ProcessTable-owned PMM physical frames.
+/// No production user-surface syscall or real VirtIO GPU use is implied.
+#[cfg(feature = "user-surface-writer-smoke")]
+fn verify_guest_written_surface_stack(
+    pid:u64, active:u64, rsp:u64, first_va:u64, second_va:u64,
+) {
+    use crate::virtio_gpu_desktop_wire::{
+        damage::Rect,
+        surface_ledger::{SurfaceLedger,Error as LedgerError},
+        surface_pixels::CompositionReport,
+        surface_process_bridge,
+        user_surface_copy::{self,UserSurface,Error as SurfaceCopyError},
+    };
+    require_serial_bsp();
+    let (real_cr3,_) = Cr3::read();
+    if real_cr3.start_address().as_u64()!=active ||
+        first_va!=rsp-64 || second_va!=rsp-48 ||
+        first_va&3!=0 || second_va&3!=0 ||
+        first_va==second_va {
+        fail("user_surface_writer_real_stack_pointers")
+    }
+    let mut surfaces=SurfaceLedger::<2>::new();
+    let verified=PROCESS_TABLE.with(|table| -> bool {
+        let Some(record)=table.snapshot(pid) else {return false};
+        if record.state!=ProcessState::Running || record.cr3_root!=active {
+            return false
+        }
+        // Hardware-authenticated RW user-page permissions, not merely a
+        // supervisor HHDM write to a privately-owned physical data page.
+        let Ok(phys_a)=crate::user_copy::walk(
+            active,first_va,crate::user_copy::Access::Write,private_pte
+        ) else {return false};
+        let Ok(phys_b)=crate::user_copy::walk(
+            active,second_va,crate::user_copy::Access::Write,private_pte
+        ) else {return false};
+        if phys_a&!4095 != phys_b&!4095 ||
+            !record.owned_frames().contains(&(phys_a&!4095)) ||
+            !record.owned_frames().contains(&(phys_b&!4095)) ||
+            phys_a&4095>4096-8 || phys_b&4095>4096-8 {
+            return false
+        }
+        let Ok(a)=surface_process_bridge::open_registered(
+            table,&mut surfaces,pid) else {return false};
+        let Ok(b)=surface_process_bridge::open_registered(
+            table,&mut surfaces,pid) else {return false};
+        let Ok(a_rect)=Rect::checked(1,1,2,1) else {return false};
+        let Ok(b_rect)=Rect::checked(2,1,2,1) else {return false};
+        let Ok(view)=Rect::checked(0,0,5,3) else {return false};
+        let first=UserSurface {
+            identity:a,rect:a_rect,stride:2,user_va:first_va,
+        };
+        let second=UserSurface {
+            identity:b,rect:b_rect,stride:2,user_va:second_va,
+        };
+        let bg=[0x0012_3456;15];
+        let mut out=[0x00fe_edab;15];
+        if user_surface_copy::compose_user_snapshots(
+            table,&surfaces,&mut out,&bg,view,5,view,
+            first,second,b,private_pte,private_byte,
+        )!=Ok(CompositionReport {first:1,second:2,background:12}) {
+            return false
+        }
+        for y in 0..3usize {
+            for x in 0..5usize {
+                let expected=match (x,y) {
+                    (1,1)=>0x00e2_1409,
+                    (2,1)=>0x000c_1eda,
+                    (3,1)=>0x00ab_cdef,
+                    _=>0x0012_3456,
+                };
+                if out[y*5+x]!=expected {return false}
+            }
+        }
+        if surfaces.close_owner(pid,pid)!=Ok(2) {return false}
+        out.fill(0x00fe_edab);
+        if user_surface_copy::compose_user_snapshots(
+            table,&surfaces,&mut out,&bg,view,5,view,
+            first,second,b,private_pte,private_byte,
+        )!=Err(SurfaceCopyError::Ledger(LedgerError::NotLive))
+           || out!=[0x00fe_edab;15] {
+            return false
+        }
+        true
+    });
+    if verified!=Ok(true) {fail("user_surface_writer_owner_or_pixels")}
+    serial::write_line(
+        "WOLFOS_USER_SURFACE_WRITER_CPL3_OK guest_stack_written=1 user_rw_nx=1 saved_r12_r13=1 real_user_cr3=1 exact_owner_frames=1 composed_pixels=15 revoked_denied=1 pmm_no_leak_pending_exit=1 real_gpu_dma=0"
+    );
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn wolfos_int80_syscall_dispatch(
     raw: *mut UserSyscallFrame,
@@ -1362,6 +1456,11 @@ pub extern "C" fn wolfos_int80_syscall_dispatch(
         #[cfg(feature = "user-surface-copy-hardware-smoke")]
         verify_live_user_surface_pointer(
             RUN_INDEX.load(Ordering::Acquire) as u64+1,active,frame.registers.rdi,
+        );
+        #[cfg(feature = "user-surface-writer-smoke")]
+        verify_guest_written_surface_stack(
+            RUN_INDEX.load(Ordering::Acquire) as u64+1,
+            active,user_top,frame.registers.r12,frame.registers.r13,
         );
         frame.registers.rax = HELLO.len() as u64;
         return raw;
