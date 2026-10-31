@@ -36,6 +36,12 @@ the real `ProcessTable::snapshot` API:
   across all retained metadata states, not the current occupancy of an
   unrelated process.
 
+The bridge is compiled only for `rustc --test` or the existing
+`process-table-smoke` feature, because normal boot and standalone GPU
+flavors intentionally do not link `crate::process_table` or
+`crate::process_lifecycle`. It must not unconditionally pull those
+feature-gated kernel modules into ordinary GPU boots.
+
 Rust adversarial tests use the actual `ProcessTable` implementation
 (included as a nested test fixture under standalone `rustc --test`),
 including genuine table reserve/mark-running/exit/reap and cancel transitions.
