@@ -70,6 +70,9 @@ impl Entry {
 /// ABA / replayed GPU acknowledgements after it is reused.
 pub struct SurfaceLedger<const N: usize> {
     entries: [Entry; N],
+    /// Global monotonically increasing GPU fence high watermark. A fence
+    /// issued to surface A cannot be reused for surface B, even when A exits.
+    last_fence: u64,
 }
 
 impl<const N: usize> Default for SurfaceLedger<N> {
@@ -78,7 +81,7 @@ impl<const N: usize> Default for SurfaceLedger<N> {
 
 impl<const N: usize> SurfaceLedger<N> {
     pub const fn new() -> Self {
-        Self { entries: [Entry::empty(); N] }
+        Self { entries: [Entry::empty(); N], last_fence: 0 }
     }
 
     /// The PID and its generation must come from the authenticated process
@@ -146,17 +149,19 @@ impl<const N: usize> SurfaceLedger<N> {
 
     /// Enqueue contract: caller must still submit two genuinely fenced GPU
     /// commands, preserve backing pages and validate both hardware replies.
-    /// Fence numbers strictly increase for the lifetime of a *slot*, even
-    /// after that slot is recycled for a different owner.
+    /// Fence numbers strictly increase globally across ALL surface slots,
+    /// including after any of those slots are recycled for another owner.
     pub fn begin_submit(&mut self, identity: Identity,
                         transfer_fence: u64, flush_fence: u64)
         -> Result<(), Error>
     {
+        let global_last_fence = self.last_fence;
         let entry = self.entry_mut(identity)?;
         if entry.state != Some(State::Live) {
             return Err(Error::NotLive);
         }
         if transfer_fence == 0 || transfer_fence <= entry.last_fence
+            || transfer_fence <= global_last_fence
             || flush_fence <= transfer_fence
         {
             return Err(Error::InvalidFence);
@@ -165,6 +170,7 @@ impl<const N: usize> SurfaceLedger<N> {
         entry.flush_fence = flush_fence;
         entry.last_fence = flush_fence;
         entry.state = Some(State::Submitted);
+        self.last_fence = flush_fence;
         Ok(())
     }
 
@@ -427,6 +433,27 @@ mod tests {
         ledger.ack_flush(a,2).unwrap();
         assert_eq!(ledger.compose_live(&mut dest,&background,view,5,view,
                     first,second,a).unwrap().first,4);
+    }
+
+    #[test]
+    fn a_gpu_fence_must_never_be_shared_across_two_live_surfaces() {
+        let mut ledger = SurfaceLedger::<2>::new();
+        let a = ledger.open(41,1).unwrap();
+        let b = ledger.open(42,1).unwrap();
+        ledger.begin_submit(a,51,52).unwrap();
+        // If the second buffer reused 51/52, a real hardware completion
+        // could be accidentally associated with the wrong owner.
+        assert_eq!(ledger.begin_submit(b,51,52),Err(Error::InvalidFence));
+        assert_eq!(ledger.begin_submit(b,52,53),Err(Error::InvalidFence));
+        ledger.begin_submit(b,53,54).unwrap();
+        assert_eq!(ledger.ack_transfer(b,51),Err(Error::WrongFence));
+        assert_eq!(ledger.ack_transfer(a,53),Err(Error::WrongFence));
+        ledger.ack_transfer(a,51).unwrap();
+        ledger.ack_flush(a,52).unwrap();
+        ledger.ack_transfer(b,53).unwrap();
+        ledger.ack_flush(b,54).unwrap();
+        assert_eq!(ledger.state(a),Ok(State::Live));
+        assert_eq!(ledger.state(b),Ok(State::Live));
     }
 
     #[test]
