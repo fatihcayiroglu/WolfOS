@@ -47,6 +47,8 @@ At a genuine user INT80 trap, while the real user CR3 is still active:
 
 The test harness uses QEMU's real QMP `screendump` command on **std
 VGA**, not a screenshot constructed from guest-claimed source pixels.
+Every mandatory Ring3/ELF proof marker must be one complete, unique serial
+line in strict order; merely containing a proof substring is rejected.
 It independently verifies RGB geometry, all channels, all untouched
 screen pixels, all 15 pixels actually differing from the baseline, and exact
 rollback, one stage in strict serial order. A pre-existing color match is not

@@ -229,6 +229,38 @@ class SerialEvidenceTests(unittest.TestCase):
         with self.assertRaises(ProofError):
             validate_serial(forged, 33)
 
+    def test_embedded_boot_marker_rejected(self):
+        text = serial_evidence().replace("WOLFOS_BOOT_OK\n", "fake-WOLFOS_BOOT_OK\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_embedded_usercopy_write_marker_rejected(self):
+        text = serial_evidence().replace(PROOFS[3] + "\n", "fake-" + PROOFS[3] + "\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_extra_content_on_elf_entry_rejected(self):
+        text = serial_evidence().replace(ENTER + "\n", ENTER + " extra\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_embedded_hello_from_wolfos_rejected(self):
+        text = serial_evidence().replace(
+            "Hello from WolfOS!\n", "fake-Hello from WolfOS!\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_embedded_usercopy_run_marker_rejected(self):
+        text = serial_evidence().replace(PROOFS[-1] + "\n", "fake-" + PROOFS[-1] + "\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_duplicate_usercopy_id_marker_rejected(self):
+        text = serial_evidence() + PROOFS[0] + "\n"
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
     def test_guest_panic_rejected_even_with_success_log(self):
         with self.assertRaises(ProofError):
             validate_serial(serial_evidence() + "WOLFOS_PANIC\n", 33)

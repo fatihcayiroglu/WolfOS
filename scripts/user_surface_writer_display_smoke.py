@@ -144,14 +144,19 @@ def validate_serial(output: str, code: int) -> None:
         WRITER_PROOF,
         *PROOFS[4:],
     ]
+    # Each mandatory marker must be an exact, independent serial line.
+    # Substring hits in other logs (including fabricated prefixes/suffixes)
+    # are not evidence that the real guest executed that stage.
+    lines = output.splitlines()
     cursor = 0
     for marker in markers:
-        at = output.find(marker, cursor)
-        if at < 0:
-            raise ProofError(f"Missing/out-of-order genuine guest proof: {marker}")
-        cursor = at + len(marker)
-        if output.count(marker) != 1:
-            raise ProofError(f"Duplicate proof: {marker}")
+        canonical = marker.removesuffix("\n")
+        matches = [i for i, line in enumerate(lines) if line == canonical]
+        if len(matches) != 1 or matches[0] < cursor:
+            raise ProofError(
+                f"Missing, duplicate or out-of-order guest proof: {canonical}"
+            )
+        cursor = matches[0] + 1
     forbidden = (
         "WOLFOS_ELF_RUN_ERROR", "WOLFOS_PANIC",
         "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_GP",
