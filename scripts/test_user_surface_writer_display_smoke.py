@@ -284,6 +284,20 @@ class PixelEvidenceTests(unittest.TestCase):
 
 
 class BoundedSerialChunkTests(unittest.TestCase):
+    def test_non_ascii_chunk_refused_before_buffer_mutation(self):
+        received = bytearray()
+        with self.assertRaisesRegex(ProofError, "Non-ASCII byte"):
+            append_serial_chunk(received, b"", b"WOLFOS_BOOT_OK\n\xff")
+        self.assertEqual(received, bytearray())
+
+    def test_corrupt_followup_chunk_keeps_previous_evidence(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"prefix")
+        self.assertEqual(lines, [])
+        with self.assertRaisesRegex(ProofError, "Non-ASCII byte"):
+            append_serial_chunk(received, pending, b"\xfe\n")
+        self.assertEqual(received, bytearray(b"prefix"))
+
     def test_lines_in_one_chunk(self):
         received = bytearray()
         pending, lines = append_serial_chunk(received, b"", b"a\nb\npartial")
