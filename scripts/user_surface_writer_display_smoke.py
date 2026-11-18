@@ -143,6 +143,16 @@ def validate_serial(output: str, code: int) -> None:
     for fragment in forbidden:
         if fragment in output:
             raise ProofError(f"Forbidden failure/old behavior marker: {fragment}")
+    # Substring-only matching accepts log injections such as
+    # "prefixWOLFOS_CPL3_DISPLAY_OK ...", or extra capture stages.
+    # Host screenshot evidence must be complete, standalone serial lines.
+    lines = output.splitlines()
+    expected_stages = [PREFIX + stage for stage in STAGES]
+    actual_stages = [line for line in lines if line.startswith(PREFIX)]
+    if actual_stages != expected_stages:
+        raise ProofError("Missing, duplicated, or malformed QMP capture stage line")
+    if lines.count(DISPLAY_OK) != 1 or lines.count(WRITER_PROOF) != 1:
+        raise ProofError("Missing or embedded CPL3 display/writer proof line")
 
 
 def main() -> int:

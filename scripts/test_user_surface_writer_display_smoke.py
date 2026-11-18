@@ -129,6 +129,43 @@ class SerialEvidenceTests(unittest.TestCase):
                 serial_evidence().replace("root_slot=1", "root_slot=256"), 33
             )
 
+    def test_embedded_display_success_rejected(self):
+        forged = serial_evidence().replace(
+            DISPLAY_OK + "\n", "prefix-" + DISPLAY_OK + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_embedded_writer_proof_rejected(self):
+        forged = serial_evidence().replace(
+            WRITER_PROOF + "\n", "prefix-" + WRITER_PROOF + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_capture_stage_embedded_in_other_line_rejected(self):
+        forged = serial_evidence().replace(
+            PREFIX + "baseline" + "\n", "prefix-" + PREFIX + "baseline" + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_unexpected_extra_stage_rejected(self):
+        forged = serial_evidence().replace(
+            PREFIX + "active" + "\n",
+            PREFIX + "unknown" + "\n" + PREFIX + "active" + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_duplicate_capture_stage_rejected(self):
+        forged = serial_evidence().replace(
+            PREFIX + "active" + "\n",
+            PREFIX + "active" + "\n" + PREFIX + "active" + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
     def test_guest_panic_rejected_even_with_success_log(self):
         with self.assertRaises(ProofError):
             validate_serial(serial_evidence() + "WOLFOS_PANIC\n", 33)
