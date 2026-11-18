@@ -46,6 +46,21 @@ def append_serial_chunk(received: bytearray, pending: bytes,
 STAGES = ("baseline", "active", "restored")
 REPLIES = {"baseline": b"B", "active": b"A", "restored": b"R"}
 PREFIX = "WOLFOS_CPL3_DISPLAY_CAPTURE stage="
+def parse_capture_stage_line(line: bytes, expected: str | None) -> str | None:
+    """Require exact raw COM1 stage bytes before any screenshot ACK is sent.
+
+    A forged log line may contain a plausible capture substring. It must not
+    cause the host to send B/A/R or be treated as a real guest stage.
+    CRLF framing from the serial transport is the only allowed suffix.
+    """
+    marker = PREFIX.encode("ascii")
+    if marker not in line:
+        return None
+    if expected is None or line.removesuffix(b"\r") != marker + expected.encode("ascii"):
+        raise ProofError("Malformed, unexpected or out-of-order QMP capture stage")
+    return expected
+
+
 DISPLAY_OK = (
     "WOLFOS_CPL3_DISPLAY_OK source=real_cpl3_stack "
     "copied_via_4level_pte=1 stdvga_framebuffer=1 host_qmp_captures=3 "
@@ -224,11 +239,9 @@ def main() -> int:
                             pending, serial_lines = append_serial_chunk(
                                 received, pending, chunk)
                             for line in serial_lines:
-                                row = line.decode("ascii", errors="replace").strip()
-                                if row.startswith(PREFIX):
-                                    stage = row[len(PREFIX):]
-                                    if len(stages) >= len(STAGES) or stage != STAGES[len(stages)]:
-                                        raise ProofError(f"Unexpected QMP screenshot stage: {stage}")
+                                expected = STAGES[len(stages)] if len(stages) < len(STAGES) else None
+                                stage = parse_capture_stage_line(line, expected)
+                                if stage is not None:
                                     images[stage] = capture(
                                         stage, qmp, reader, temp, images.get("baseline"))
                                     serial.sendall(REPLIES[stage])

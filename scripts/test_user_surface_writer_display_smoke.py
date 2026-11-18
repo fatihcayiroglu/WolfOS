@@ -7,7 +7,7 @@ from user_copy_smoke import PROOFS, WRITER_PROOF
 from user_surface_writer_display_smoke import (
     BACKGROUND, DISPLAY_OK, H, PIXELS, PREFIX, STAGES, W, X, Y,
     MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
-    ProofError, expect_active, validate_serial,
+    ProofError, expect_active, validate_serial, parse_capture_stage_line,
 )
 
 WIDTH, HEIGHT = X + W + 5, Y + H + 5
@@ -150,6 +150,47 @@ class BoundedSerialChunkTests(unittest.TestCase):
         pending, lines = append_serial_chunk(received, b"", b"X" * MAX_SERIAL_LINE_BYTES + b"\n")
         self.assertEqual(len(lines[0]), MAX_SERIAL_LINE_BYTES)
         self.assertEqual(pending, b"")
+
+
+class RawCaptureStageTests(unittest.TestCase):
+    def test_normal_baseline(self):
+        self.assertEqual(
+            parse_capture_stage_line(PREFIX.encode() + b"baseline", "baseline"), "baseline")
+
+    def test_accept_crlf_framing(self):
+        self.assertEqual(
+            parse_capture_stage_line(PREFIX.encode() + b"active\r", "active"), "active")
+
+    def test_ignore_unrelated_serial_line(self):
+        self.assertIsNone(parse_capture_stage_line(b"WOLFOS_BOOT_OK", "baseline"))
+
+    def test_reject_leading_spaces(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(b" " + PREFIX.encode() + b"baseline", "baseline")
+
+    def test_reject_trailing_spaces(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline ", "baseline")
+
+    def test_reject_out_of_order_stage(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"active", "baseline")
+
+    def test_reject_extra_stage(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline", None)
+
+    def test_reject_embedded_stage(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(b"fake-" + PREFIX.encode() + b"baseline", "baseline")
+
+    def test_reject_non_ascii_suffix(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline\xff", "baseline")
+
+    def test_reject_stage_with_extra_tokens(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline stage=active", "baseline")
 
 
 class SerialEvidenceTests(unittest.TestCase):
