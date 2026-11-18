@@ -73,6 +73,10 @@ exact raw, newline-delimited capture stage (optional CRLF) in sequence;
 malformed, embedded, duplicate or out-of-order stage text fails before ACK. The QEMU serial stream is capped at
 1 MiB total, with each complete or pending line limited to 16 KiB. Oversized
 serial evidence aborts the host acceptance without sending a stage ACK.
+QEMU stdout is discarded and stderr streams to a temporary file instead
+of unconsumed PIPEs, preventing a full subprocess pipe from deadlocking the
+test. On failure only the last 8 KiB of QEMU stderr is printed. The COM1
+proof remains the independent, bounded source for guest serial evidence.
 
 ## Acceptance
 

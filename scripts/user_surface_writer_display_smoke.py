@@ -24,6 +24,20 @@ from qemu_virtio_gpu_scanout_live_smoke import (
 )
 from user_copy_smoke import ENTER, PROOFS, WRITER_PROOF
 
+MAX_QEMU_STDERR_TAIL = 8192
+
+
+def qemu_stderr_tail(path: Path) -> str:
+    """Keep runner diagnostics bounded, including noisy QEMU error output."""
+    try:
+        with path.open("rb") as source:
+            source.seek(0, 2)
+            source.seek(max(0, source.tell() - MAX_QEMU_STDERR_TAIL))
+            return source.read(MAX_QEMU_STDERR_TAIL).decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
 # Serial evidence is untrusted until both the host QMP pixels and the real
 # guest lifecycle have been independently checked. Bound hostile/malformed
 # serial output before keeping it in memory or scanning for stage messages.
@@ -217,8 +231,13 @@ def main() -> int:
         stages = []
         images = {}
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE)
+            # Never leave PIPE descriptors unread while waiting for QEMU.
+            # A noisy emulator can fill a pipe and deadlock before exit.
+            # Its serial evidence is captured independently via COM1.
+            with (temp / "qemu.stderr").open("wb") as qemu_stderr:
+                process = subprocess.Popen(
+                    command, stdout=subprocess.DEVNULL, stderr=qemu_stderr
+                )
             deadline = time.monotonic() + 65
             with connect_unix(serial_socket, process, deadline) as serial:
                 with connect_unix(qmp_socket, process, deadline) as qmp:
@@ -265,6 +284,9 @@ def main() -> int:
         except (ProofError, OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"FAIL: CPL3 QMP std-VGA visual acceptance: {exc}")
             print(received.decode("ascii", errors="replace"))
+            stderr = qemu_stderr_tail(temp / "qemu.stderr")
+            if stderr:
+                print("QEMU stderr (bounded tail):\n" + stderr)
             return 1
         finally:
             if process is not None and process.poll() is None:

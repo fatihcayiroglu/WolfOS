@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Adversarial pixel and serial fixtures; never substitutes for real QEMU."""
 import unittest
+import tempfile
+from pathlib import Path
 
 from elf_launch_evidence import transaction_rows
 from user_copy_smoke import PROOFS, WRITER_PROOF
@@ -8,6 +10,7 @@ from user_surface_writer_display_smoke import (
     BACKGROUND, DISPLAY_OK, H, PIXELS, PREFIX, STAGES, W, X, Y,
     MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
     ProofError, expect_active, validate_serial, parse_capture_stage_line,
+    MAX_QEMU_STDERR_TAIL, qemu_stderr_tail,
 )
 
 WIDTH, HEIGHT = X + W + 5, Y + H + 5
@@ -25,6 +28,32 @@ def serial_evidence():
         DISPLAY_OK, WRITER_PROOF, rows[2], rows[3], *PROOFS[4:],
     ]
     return "\n".join(lines) + "\n"
+
+
+class QemuStderrTailTests(unittest.TestCase):
+    def test_missing_stderr_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(qemu_stderr_tail(Path(tmp) / "missing"), "")
+
+    def test_empty_stderr_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stderr"
+            path.write_bytes(b"")
+            self.assertEqual(qemu_stderr_tail(path), "")
+
+    def test_large_stderr_keeps_only_bounded_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stderr"
+            path.write_bytes(b"A" * (2 * MAX_QEMU_STDERR_TAIL) + b"last-line")
+            tail = qemu_stderr_tail(path)
+            self.assertEqual(len(tail), MAX_QEMU_STDERR_TAIL)
+            self.assertTrue(tail.endswith("last-line"))
+
+    def test_invalid_utf8_stderr_is_reportable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stderr"
+            path.write_bytes(b"bad\\xff".replace(b"\\xff", b"\xff"))
+            self.assertEqual(qemu_stderr_tail(path), "bad\ufffd")
 
 
 class PixelEvidenceTests(unittest.TestCase):
