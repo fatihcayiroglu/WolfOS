@@ -10,6 +10,7 @@ from user_copy_smoke import PROOFS, WRITER_PROOF
 from user_surface_writer_display_smoke import (
     BACKGROUND, DISPLAY_OK, H, PIXELS, PREFIX, STAGES, W, X, Y,
     MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
+    decode_serial_evidence,
     ProofError, expect_active, capture, validate_serial, parse_capture_stage_line,
     MAX_QEMU_STDERR_TAIL, qemu_stderr_tail,
     MAX_QMP_PPM_BYTES, checked_qmp_ppm, read_image,
@@ -500,6 +501,20 @@ class SerialEvidenceTests(unittest.TestCase):
 
     def test_crlf_serial_evidence_accepted(self):
         validate_serial(serial_evidence().replace("\n", "\r\n"), 33)
+
+    def test_raw_ascii_com1_decodes_without_changes(self):
+        raw = serial_evidence().encode("ascii")
+        self.assertEqual(decode_serial_evidence(raw), serial_evidence())
+
+    def test_raw_com1_high_bit_octet_fails_closed(self):
+        raw = serial_evidence().encode("ascii") + b"\xff"
+        with self.assertRaisesRegex(ProofError, "Non-ASCII byte"):
+            decode_serial_evidence(raw)
+
+    def test_unicode_serial_string_cannot_supply_proof(self):
+        with self.assertRaisesRegex(ProofError, "Non-ASCII text"):
+            validate_serial(serial_evidence() + "unrelated=\u00e9\n", 33)
+
 
     def test_unterminated_final_record_rejected(self):
         with self.assertRaisesRegex(ProofError, "unterminated"):
