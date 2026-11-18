@@ -12,7 +12,7 @@ from user_surface_writer_display_smoke import (
     MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
     ProofError, expect_active, capture, validate_serial, parse_capture_stage_line,
     MAX_QEMU_STDERR_TAIL, qemu_stderr_tail,
-    MAX_QMP_PPM_BYTES, checked_qmp_ppm,
+    MAX_QMP_PPM_BYTES, checked_qmp_ppm, read_image,
 )
 
 WIDTH, HEIGHT = X + W + 5, Y + H + 5
@@ -97,6 +97,49 @@ class QemuStderrTailTests(unittest.TestCase):
             path = Path(tmp) / "stderr"
             path.write_bytes(b"bad\\xff".replace(b"\\xff", b"\xff"))
             self.assertEqual(qemu_stderr_tail(path), "bad\ufffd")
+
+
+class FreshQmpScreenshotTests(unittest.TestCase):
+    def test_stale_ppm_cannot_pass_without_new_qmp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.ppm"
+            path.write_bytes(b"P6\\n1 1\\n255\\n\\x01\\x02\\x03")
+            with patch("user_surface_writer_display_smoke.qmp_call") as qmp:
+                with self.assertRaisesRegex(ProofError, "fresh screenshot"):
+                    read_image(None, None, path)
+                qmp.assert_called_once_with(
+                    None, None, "screendump", {"filename": str(path)})
+            self.assertFalse(path.exists())
+
+    def test_genuine_new_qmp_file_is_decoded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.ppm"
+            payload = b"P6\\n1 1\\n255\\n\\x10\\x20\\x30"
+
+            def qmp_writes_file(_sock, _reader, command, args):
+                self.assertEqual(command, "screendump")
+                self.assertEqual(args, {"filename": str(path)})
+                self.assertFalse(path.exists())
+                path.write_bytes(payload)
+
+            with patch("user_surface_writer_display_smoke.qmp_call",
+                       side_effect=qmp_writes_file):
+                self.assertEqual(read_image(None, None, path),
+                                 (1, 1, b"\\x10\\x20\\x30"))
+
+    def test_repeated_qmp_capture_cannot_read_old_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.ppm"
+            path.write_bytes(b"P6\\n1 1\\n255\\n\\x01\\x02\\x03")
+
+            def qmp_writes_replacement(_sock, _reader, _command, _args):
+                self.assertFalse(path.exists())
+                path.write_bytes(b"P6\\n1 1\\n255\\n\\x04\\x05\\x06")
+
+            with patch("user_surface_writer_display_smoke.qmp_call",
+                       side_effect=qmp_writes_replacement):
+                self.assertEqual(read_image(None, None, path),
+                                 (1, 1, b"\\x04\\x05\\x06"))
 
 
 class PixelEvidenceTests(unittest.TestCase):
