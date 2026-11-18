@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 
-from elf_launch_evidence import valid_launch_transactions
+from elf_launch_evidence import transaction_rows, valid_launch_transactions
 from qemu_virtio_gpu_scanout_live_smoke import (
     ProofError, connect_unix, ppm, qmp_call,
 )
@@ -173,6 +173,13 @@ def capture(stage: str, qmp, reader, directory: Path,
 
 
 def validate_serial(output: str, code: int) -> None:
+    # A proof is one complete raw COM1 line, not a Unicode splitlines() token.
+    # CRLF is normal framing; reject bare CR and an unterminated final record.
+    if not output.endswith("\n"):
+        raise ProofError("QEMU serial evidence has an unterminated final record")
+    output = output.replace("\r\n", "\n")
+    if "\r" in output:
+        raise ProofError("QEMU serial evidence contains a bare carriage return")
     if code != 33:
         raise ProofError(f"QEMU expected clean ISA-debug-exit 33, got {code}")
     if not valid_launch_transactions(output, 7, (1,)):
@@ -191,7 +198,12 @@ def validate_serial(output: str, code: int) -> None:
     # Each mandatory marker must be an exact, independent serial line.
     # Substring hits in other logs (including fabricated prefixes/suffixes)
     # are not evidence that the real guest executed that stage.
-    lines = output.splitlines()
+    lines = output.split("\n")
+    # The transaction helper validates lifecycle ordering; additionally require
+    # exact newline-delimited TX records, not embedded control-character lines.
+    tx_lines = [line for line in lines if "WOLFOS_ELF_TX_" in line]
+    if tx_lines != transaction_rows(1, 7):
+        raise ProofError("Counted transaction records are not exact serial lines")
     cursor = 0
     for marker in markers:
         canonical = marker.removesuffix("\n")
@@ -214,7 +226,7 @@ def validate_serial(output: str, code: int) -> None:
     # Substring-only matching accepts log injections such as
     # "prefixWOLFOS_CPL3_DISPLAY_OK ...", or extra capture stages.
     # Host screenshot evidence must be complete, standalone serial lines.
-    lines = output.splitlines()
+    lines = output.split("\n")
     expected_stages = [PREFIX + stage for stage in STAGES]
     actual_stages = [line for line in lines if line.startswith(PREFIX)]
     if actual_stages != expected_stages:
