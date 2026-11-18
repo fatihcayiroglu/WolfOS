@@ -19,7 +19,7 @@ use saved_context_retirement::{Error as ContextError, Phase as ContextPhase};
 use ring3_context_retirement::{Error as BindError, Ring3SavedBinding};
 use ring3_runqueue::{Error as QueueError, Ring3RunQueue, State as QueueState};
 use address_space_retirement::{Error, Phase};
-use pmm_frame_batch::{FrameBatch, FrameSource, ReleaseReport};
+use pmm_frame_batch::{AcquireError, FrameBatch, FrameSource, ReleaseReport};
 use process_table::ProcessTable;
 use std::{cell::RefCell, collections::BTreeSet, rc::Rc};
 
@@ -167,13 +167,29 @@ fn malformed_provider_addresses_never_become_active() {
 }
 
 #[test]
-fn empty_batch_cannot_own_a_root() {
-    let mut source = Source::new(&[]);
-    let batch = FrameBatch::<_, 0>::acquire(&mut source).unwrap_or_else(|_| panic!());
-    match ActiveAddressSpace::<_, 0, 1>::publish(batch, 7, 0x1000, 0x9000) {
-        Err((_, error)) => assert_eq!(error, PublishError::RootNotOwned),
-        Ok(_) => panic!("empty owner"),
-    }
+fn zero_capacity_batch_is_rejected_before_owner_publication() {
+    let mut source = Source::new(&[0x1000]);
+    let trace = source.trace.clone();
+    // Neither API may manufacture an empty owned lease, even when
+    // the backing provider could supply a valid physical root.
+    assert_eq!(
+        FrameBatch::<_, 0>::acquire(&mut source).err(),
+        Some(AcquireError::InvalidCount { requested: 0, capacity: 0 }),
+    );
+    assert_eq!(
+        FrameBatch::<_, 0>::acquire_count(&mut source, 0).err(),
+        Some(AcquireError::InvalidCount { requested: 0, capacity: 0 }),
+    );
+    assert!(trace.borrow().owned.is_empty());
+    assert!(trace.borrow().releases.is_empty());
+
+    // The refused zero-lease must not consume or disturb the next
+    // real PMM frame; a valid owner can still acquire and release it.
+    let batch = FrameBatch::<_, 1>::acquire(&mut source).unwrap();
+    assert_eq!(batch.leased_frames(), &[0x1000]);
+    assert_eq!(batch.close(), ReleaseReport { released: 1, failed: 0 });
+    assert_eq!(trace.borrow().releases, [0x1000]);
+    assert!(trace.borrow().owned.is_empty());
 }
 
 #[test]

@@ -47,7 +47,10 @@ impl<'a, S: FrameSource, const N: usize> FrameBatch<'a, S, N> {
     /// loop, all preceding successful allocations are rolled back in reverse
     /// order before returning an error with explicit cleanup evidence.
     pub fn acquire(source: &'a mut S) -> Result<Self, AcquireError> {
-        Self::acquire_bounded(source, N)
+        // The full-capacity constructor must not manufacture an empty
+        // success lease. Reuse the counted constructor's pre-allocation
+        // guard, including the zero-capacity case.
+        Self::acquire_count(source, N)
     }
 
     /// Allocate precisely `requested` frames, not the full array capacity.
