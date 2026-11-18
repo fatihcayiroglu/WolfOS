@@ -87,6 +87,17 @@ of unconsumed PIPEs, preventing a full subprocess pipe from deadlocking the
 test. On failure only the last 8 KiB of QEMU stderr is printed. The COM1
 proof remains the independent, bounded source for guest serial evidence.
 
+Before sending **any** of the B/A/R screenshot ACK bytes, the host requires
+an exact, unique, ordered sequence of LF-delimited, standalone COM1 records:
+boot success, counted ELF rollback and ownership activation, bounded real
+ELF entry, CPL3 ID/ADD and authentic user-pointer WRITE verification, then
+the stage markers observed so far. Unrelated diagnostics are tolerated;
+missing, duplicate, malformed or out-of-order mandatory records deny ACK.
+The guest's final EXIT, CR3 restoration and seven-frame PMM reclamation
+remain separately mandatory after all three screenshots. This ordering
+check strengthens host evidence, but does not claim production attestation
+or defend against a compromised emulator/host.
+
 ## Acceptance
 
 The mandatory P0 step `make user-surface-writer-display-smoke` must
