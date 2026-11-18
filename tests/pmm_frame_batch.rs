@@ -58,7 +58,7 @@ fn injected_fourth_allocation_failure_rolls_back_three_frames() {
 }
 
 #[test]
-fn early_scope_exit_and_empty_batch_do_not_double_free() {
+fn early_scope_exit_does_not_double_free_and_zero_capacity_fails_closed() {
     let mut source = MockFrames::with_ceiling(8);
     {
         let batch = FrameBatch::<_, 4>::acquire(&mut source).unwrap_or_else(|_| panic!("allocate"));
@@ -66,10 +66,32 @@ fn early_scope_exit_and_empty_batch_do_not_double_free() {
         // Deliberately no close(): Drop must roll the staged frames back.
     }
     assert_eq!(&source.freed[..source.frees], &[16384, 12288, 8192, 4096]);
-    let empty = FrameBatch::<_, 0>::acquire(&mut source).unwrap_or_else(|_| panic!("zero"));
-    assert_eq!(empty.frames(), &[]);
-    assert_eq!(empty.close(), ReleaseReport { released: 0, failed: 0 });
+    // There is no root frame in a zero-capacity PMM owner: reject before
+    // calling the allocator. Repeated failures do not publish a phantom
+    // lease, allocate frames or change the existing release accounting.
+    for _ in 0..3 {
+        assert_eq!(
+            FrameBatch::<_, 0>::acquire(&mut source).err(),
+            Some(AcquireError::InvalidCount { requested: 0, capacity: 0 }),
+        );
+        assert_eq!(
+            FrameBatch::<_, 0>::acquire_count(&mut source, 0).err(),
+            Some(AcquireError::InvalidCount { requested: 0, capacity: 0 }),
+        );
+    }
+    assert_eq!(source.issued, 4);
     assert_eq!(source.frees, 4);
+}
+
+#[test]
+fn zero_capacity_owner_rejects_without_touching_a_fresh_provider() {
+    let mut source = MockFrames::with_ceiling(16);
+    assert_eq!(
+        FrameBatch::<_, 0>::acquire(&mut source).err(),
+        Some(AcquireError::InvalidCount { requested: 0, capacity: 0 }),
+    );
+    assert_eq!(source.issued, 0);
+    assert_eq!(source.frees, 0);
 }
 
 #[test]
