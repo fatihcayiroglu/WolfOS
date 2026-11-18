@@ -84,5 +84,8 @@ The mandatory P0 step `make user-surface-writer-display-smoke` must
 complete on its exact PR head; all existing GPU, Ring3, real-PMM and
 SMP regressions remain. The host must capture baseline, active and
 restored QMP screenshots; a serial-only claim, timeout, skip or kernel
-log string cannot substitute for pixel evidence. No release or merge to
+log string cannot substitute for pixel evidence. Before PPM decoding, the
+isolated host adapter refuses screenshot files smaller than the minimum 1x1
+P6 frame (14 bytes) or larger than 64 MiB; this avoids loading QMP's
+otherwise permitted ~192 MiB 8192x8192 PPM into test-runner memory. No release or merge to
 `main`; no physical installation disk access.

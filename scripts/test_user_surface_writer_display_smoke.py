@@ -3,6 +3,7 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from elf_launch_evidence import transaction_rows
 from user_copy_smoke import PROOFS, WRITER_PROOF
@@ -11,6 +12,7 @@ from user_surface_writer_display_smoke import (
     MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
     ProofError, expect_active, validate_serial, parse_capture_stage_line,
     MAX_QEMU_STDERR_TAIL, qemu_stderr_tail,
+    MAX_QMP_PPM_BYTES, checked_qmp_ppm,
 )
 
 WIDTH, HEIGHT = X + W + 5, Y + H + 5
@@ -28,6 +30,47 @@ def serial_evidence():
         DISPLAY_OK, WRITER_PROOF, rows[2], rows[3], *PROOFS[4:],
     ]
     return "\n".join(lines) + "\n"
+
+
+class BoundedQmpPpmTests(unittest.TestCase):
+    def test_minimum_valid_ppm_reaches_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "minimum.ppm"
+            path.write_bytes(b"P6\n1 1\n255\n\x01\x02\x03")
+            with patch("user_surface_writer_display_smoke.ppm",
+                       return_value=(1, 1, b"\x01\x02\x03")) as decode:
+                self.assertEqual(checked_qmp_ppm(path), (1, 1, b"\x01\x02\x03"))
+                decode.assert_called_once_with(path)
+
+    def test_empty_ppm_rejected_without_decode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.ppm"
+            path.write_bytes(b"")
+            with patch("user_surface_writer_display_smoke.ppm") as decode:
+                with self.assertRaisesRegex(ProofError, "outside safe range"):
+                    checked_qmp_ppm(path)
+                decode.assert_not_called()
+
+    def test_oversized_sparse_ppm_rejected_before_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oversized.ppm"
+            with path.open("wb") as stream:
+                stream.seek(MAX_QMP_PPM_BYTES)
+                stream.write(b"x")
+            with patch("user_surface_writer_display_smoke.ppm") as decode:
+                with self.assertRaisesRegex(ProofError, "outside safe range"):
+                    checked_qmp_ppm(path)
+                decode.assert_not_called()
+
+    def test_exact_maximum_ppm_size_reaches_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "at_limit.ppm"
+            with path.open("wb") as stream:
+                stream.truncate(MAX_QMP_PPM_BYTES)
+            with patch("user_surface_writer_display_smoke.ppm",
+                       return_value=(1, 1, b"abc")) as decode:
+                self.assertEqual(checked_qmp_ppm(path), (1, 1, b"abc"))
+                decode.assert_called_once_with(path)
 
 
 class QemuStderrTailTests(unittest.TestCase):

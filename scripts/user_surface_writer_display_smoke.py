@@ -122,9 +122,24 @@ def expect_active(image: tuple[int, int, bytes],
         )
 
 
+MAX_QMP_PPM_BYTES = 64 << 20
+
+
+def checked_qmp_ppm(path: Path) -> tuple[int, int, bytes]:
+    """Bound QMP screenshot memory use before the shared PPM decoder reads it.
+
+    Even a nominally supported 8192x8192 RGB frame can consume ~192 MiB.
+    The isolated std-VGA acceptance needs nowhere near that much RAM.
+    """
+    size = path.stat().st_size
+    if not 14 <= size <= MAX_QMP_PPM_BYTES:
+        raise ProofError("QMP screenshot PPM file size outside safe range")
+    return ppm(path)
+
+
 def read_image(qmp, reader, path: Path) -> tuple[int, int, bytes]:
     qmp_call(qmp, reader, "screendump", {"filename": str(path)})
-    return ppm(path)
+    return checked_qmp_ppm(path)
 
 
 def capture(stage: str, qmp, reader, directory: Path,
