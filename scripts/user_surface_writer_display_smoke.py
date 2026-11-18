@@ -189,6 +189,49 @@ def capture(stage: str, qmp, reader, directory: Path,
     raise ProofError(f"Host QMP stage {stage} failed: {last_error}")
 
 
+
+def validate_capture_prefix(history: list[bytes], stage: str) -> None:
+    """Deny stage ACKs until the actual guest's preceding ELF proof is complete.
+
+    The COM1 stream has independent LF-delimited proof records. Ignore unrelated
+    diagnostics, but never accept duplicate, reordered, partial, or embedded
+    mandatory markers. Later EXIT/PMM retirement still has its separate final
+    QEMU and serial verification.
+    """
+    if stage not in STAGES:
+        raise ProofError("Unknown QMP capture stage")
+    try:
+        lines = [line.removesuffix(b"\r").decode("ascii") for line in history]
+    except UnicodeDecodeError as exc:
+        raise ProofError("Non-ASCII QMP capture prefix") from exc
+    if any("\r" in line for line in lines):
+        raise ProofError("Malformed carriage return in QMP capture prefix")
+    if not lines or lines[-1] != PREFIX + stage:
+        raise ProofError("QMP stage does not terminate its evidence prefix")
+    expected = [
+        "WOLFOS_BOOT_OK", *transaction_rows(1, 7)[:2],
+        None,  # ELF entry includes a bounded runtime-selected root slot.
+        *(proof.removesuffix("\n") for proof in PROOFS[:4]),
+        *(PREFIX + item for item in STAGES[:STAGES.index(stage) + 1]),
+    ]
+    cursor = 0
+    for marker in expected:
+        if marker is None:
+            matches = [(i, ENTER.fullmatch(line)) for i, line in enumerate(lines)]
+            matches = [(i, match) for i, match in matches if match is not None]
+            if len(matches) != 1 or not 1 <= int(matches[0][1].group(1)) <= 255:
+                raise ProofError("Missing, duplicate, or invalid CPL3 ELF entry before QMP ACK")
+            found = matches[0][0]
+        else:
+            matches = [i for i, line in enumerate(lines) if line == marker]
+            if len(matches) != 1:
+                raise ProofError(f"Missing or duplicate pre-ACK proof: {marker}")
+            found = matches[0]
+        if found < cursor:
+            raise ProofError("Out-of-order BSP/ELF proof before QMP ACK")
+        cursor = found + 1
+
+
 def validate_serial(output: str, code: int) -> None:
     if not output.isascii():
         raise ProofError("Non-ASCII text in QEMU serial evidence")
@@ -293,6 +336,7 @@ def main() -> int:
                     qmp_call(qmp, reader, "qmp_capabilities")
                     serial.settimeout(0.25)
                     pending = b""
+                    observed_lines: list[bytes] = []
                     while time.monotonic() < deadline:
                         try:
                             chunk = serial.recv(65536)
@@ -304,9 +348,12 @@ def main() -> int:
                             pending, serial_lines = append_serial_chunk(
                                 received, pending, chunk)
                             for line in serial_lines:
+                                observed_lines.append(line)
                                 expected = STAGES[len(stages)] if len(stages) < len(STAGES) else None
                                 stage = parse_capture_stage_line(line, expected)
                                 if stage is not None:
+                                    # No real screenshot ACK for a fake/partial guest prefix.
+                                    validate_capture_prefix(observed_lines, stage)
                                     images[stage] = capture(
                                         stage, qmp, reader, temp, images.get("baseline"))
                                     serial.sendall(REPLIES[stage])
