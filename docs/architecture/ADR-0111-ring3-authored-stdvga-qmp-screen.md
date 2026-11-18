@@ -53,6 +53,11 @@ It independently verifies RGB geometry, all channels, all untouched
 screen pixels, all 15 pixels actually differing from the baseline, and exact
 rollback, one stage in strict serial order. A pre-existing color match is not
 counted as a changed pixel.
+To prevent a stale local screenshot from being accepted on a repeated QMP
+poll, the host removes the previous stage PPM before each screendump
+request. A QMP success response without a newly created file is rejected;
+only the new file's decoded RGB can satisfy the acceptance gate. This
+guards against local file reuse, **not** against a compromised QMP host.
 
 ## Trust boundary
 
