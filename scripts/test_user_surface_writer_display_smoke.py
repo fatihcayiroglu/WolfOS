@@ -93,7 +93,7 @@ class PixelEvidenceTests(unittest.TestCase):
 class BoundedSerialChunkTests(unittest.TestCase):
     def test_lines_in_one_chunk(self):
         received = bytearray()
-        pending, lines = append_serial_chunk(received, b"", b"a\\nb\\npartial".replace(b"\\n", b"\n"))
+        pending, lines = append_serial_chunk(received, b"", b"a\nb\npartial")
         self.assertEqual(lines, [b"a", b"b"])
         self.assertEqual(pending, b"partial")
         self.assertEqual(received, b"a\nb\npartial")
@@ -136,6 +136,14 @@ class BoundedSerialChunkTests(unittest.TestCase):
         with self.assertRaisesRegex(ProofError, "bounded size"):
             append_serial_chunk(received, b"abc", b"XY")
         self.assertEqual(len(received), MAX_SERIAL_BYTES - 1)
+
+    def test_fragmented_line_rejected_without_extra_bytes(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"X" * MAX_SERIAL_LINE_BYTES)
+        self.assertEqual(lines, [])
+        with self.assertRaisesRegex(ProofError, "line"):
+            append_serial_chunk(received, pending, b"Y")
+        self.assertEqual(len(received), MAX_SERIAL_LINE_BYTES)
 
     def test_exact_line_boundary_allowed(self):
         received = bytearray()
