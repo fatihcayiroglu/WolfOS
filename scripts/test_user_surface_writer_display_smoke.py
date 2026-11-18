@@ -197,7 +197,7 @@ class PixelEvidenceTests(unittest.TestCase):
              patch("user_surface_writer_display_smoke.time.monotonic",
                    side_effect=[0.0, 1.0, 9.0]), \
              patch("user_surface_writer_display_smoke.time.sleep"):
-            with self.assertRaisesRegex(ProofError, "did not change"):
+            with self.assertRaisesRegex(ProofError, "differs outside expected precise"):
                 capture("active", None, None, Path("/unused"), self.baseline)
 
     def test_active_qmp_capture_requires_prior_baseline(self):
@@ -227,7 +227,7 @@ class PixelEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ProofError, "NOT the original"):
                 capture("restored", None, None, Path("/unused"), self.baseline)
 
-    def test_qmp_capture_errors_fail_closed_without_acking(self):
+    def test_qmp_capture_errors_fail_before_stage_completes(self):
         with patch("user_surface_writer_display_smoke.read_image",
                    side_effect=ProofError("QMP screenshot refused")) as screenshot:
             with self.assertRaisesRegex(ProofError, "QMP screenshot refused"):
