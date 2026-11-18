@@ -10,7 +10,7 @@ from user_copy_smoke import PROOFS, WRITER_PROOF
 from user_surface_writer_display_smoke import (
     BACKGROUND, DISPLAY_OK, H, PIXELS, PREFIX, STAGES, W, X, Y,
     MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
-    decode_serial_evidence,
+    decode_serial_evidence, validate_capture_prefix,
     ProofError, expect_active, capture, validate_serial, parse_capture_stage_line,
     MAX_QEMU_STDERR_TAIL, qemu_stderr_tail,
     MAX_QMP_PPM_BYTES, checked_qmp_ppm, read_image,
@@ -281,6 +281,75 @@ class PixelEvidenceTests(unittest.TestCase):
     def test_too_small_geometry_rejected(self):
         with self.assertRaises(ProofError):
             expect_active((X + W - 1, Y + H, self.active[2]), self.baseline)
+
+
+
+class PreAckGuestEvidenceTests(unittest.TestCase):
+    def prefix(self, stage: str) -> list[bytes]:
+        output = serial_evidence()
+        marker = PREFIX + stage + "\n"
+        end = output.index(marker) + len(marker)
+        return [line.encode("ascii") for line in output[:end].split("\n")[:-1]]
+
+    def test_each_genuine_stage_prefix_accepted(self):
+        for stage in STAGES:
+            with self.subTest(stage=stage):
+                validate_capture_prefix(self.prefix(stage), stage)
+
+    def test_baseline_without_actual_boot_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.remove(b"WOLFOS_BOOT_OK")
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_missing_counted_rollback_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.remove(transaction_rows(1, 7)[0].encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_duplicate_counted_activation_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.insert(2, transaction_rows(1, 7)[1].encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_missing_real_usercopy_write_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.remove(PROOFS[3].encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_reordered_syscall_proofs_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        first, second = PROOFS[0].encode(), PROOFS[1].encode()
+        a, b = lines.index(first), lines.index(second)
+        lines[a], lines[b] = lines[b], lines[a]
+        with self.assertRaisesRegex(ProofError, "Out-of-order"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_invalid_private_root_slot_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines = [line.replace(b"root_slot=1 ", b"root_slot=256 ")
+                 for line in lines]
+        with self.assertRaisesRegex(ProofError, "invalid CPL3 ELF entry"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_active_cannot_ack_without_prior_baseline(self):
+        lines = self.prefix("active")
+        lines.remove((PREFIX + "baseline").encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "active")
+
+    def test_crlf_stage_prefix_is_accepted(self):
+        lines = [line + b"\r" for line in self.prefix("restored")]
+        validate_capture_prefix(lines, "restored")
+
+    def test_embedded_cr_rejected_before_ack(self):
+        lines = self.prefix("baseline")
+        lines[1] += b"\rforged"
+        with self.assertRaisesRegex(ProofError, "carriage return"):
+            validate_capture_prefix(lines, "baseline")
 
 
 class BoundedSerialChunkTests(unittest.TestCase):
