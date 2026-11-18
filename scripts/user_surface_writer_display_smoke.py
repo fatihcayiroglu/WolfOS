@@ -45,6 +45,14 @@ MAX_SERIAL_BYTES = 1 << 20
 MAX_SERIAL_LINE_BYTES = 16 << 10
 
 
+def decode_serial_evidence(raw: bytes) -> str:
+    """Decode real COM1 bytes losslessly; do not turn corrupt octets into proof."""
+    try:
+        return raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ProofError("Non-ASCII byte in QEMU serial evidence") from exc
+
+
 def append_serial_chunk(received: bytearray, pending: bytes,
                         chunk: bytes) -> tuple[bytes, list[bytes]]:
     """Return complete serial lines; reject oversized output before buffering."""
@@ -179,6 +187,8 @@ def capture(stage: str, qmp, reader, directory: Path,
 
 
 def validate_serial(output: str, code: int) -> None:
+    if not output.isascii():
+        raise ProofError("Non-ASCII text in QEMU serial evidence")
     # A proof is one complete raw COM1 line, not a Unicode splitlines() token.
     # CRLF is normal framing; reject bare CR and an unterminated final record.
     if not output.endswith("\n"):
@@ -306,7 +316,7 @@ def main() -> int:
                 process.wait(timeout=4)
             except subprocess.TimeoutExpired:
                 raise ProofError("QEMU never returned after guest PMM cleanup")
-            output = received.decode("ascii", errors="replace").replace("\r\n", "\n")
+            output = decode_serial_evidence(received).replace("\r\n", "\n")
             print(output)
             validate_serial(output, process.returncode)
             print(
