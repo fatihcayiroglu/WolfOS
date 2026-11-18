@@ -378,6 +378,31 @@ class SerialEvidenceTests(unittest.TestCase):
         with self.assertRaises(ProofError):
             validate_serial(serial_evidence() + "WOLFOS_PANIC\n", 33)
 
+    def test_crlf_serial_evidence_accepted(self):
+        validate_serial(serial_evidence().replace("\n", "\r\n"), 33)
+
+    def test_unterminated_final_record_rejected(self):
+        with self.assertRaisesRegex(ProofError, "unterminated"):
+            validate_serial(serial_evidence()[:-1], 33)
+
+    def test_bare_carriage_return_rejected(self):
+        rows = transaction_rows(1, 7)
+        forged = serial_evidence().replace(rows[0] + "\n", rows[0] + "\r")
+        with self.assertRaisesRegex(ProofError, "bare carriage return"):
+            validate_serial(forged, 33)
+
+    def test_control_line_separator_cannot_forge_transaction(self):
+        # str.splitlines() would accept VT as if it were a genuine COM1 LF.
+        rows = transaction_rows(1, 7)
+        forged = serial_evidence().replace(rows[0] + "\n", rows[0] + "\x0b")
+        with self.assertRaisesRegex(ProofError, "exact serial lines"):
+            validate_serial(forged, 33)
+
+    def test_control_line_separator_cannot_forge_boot(self):
+        forged = serial_evidence().replace("WOLFOS_BOOT_OK\n", "WOLFOS_BOOT_OK\x0b")
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
 
 if __name__ == "__main__":
     unittest.main()
