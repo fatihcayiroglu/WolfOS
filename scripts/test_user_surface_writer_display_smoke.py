@@ -10,7 +10,7 @@ from user_copy_smoke import PROOFS, WRITER_PROOF
 from user_surface_writer_display_smoke import (
     BACKGROUND, DISPLAY_OK, H, PIXELS, PREFIX, STAGES, W, X, Y,
     MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
-    ProofError, expect_active, validate_serial, parse_capture_stage_line,
+    ProofError, expect_active, capture, validate_serial, parse_capture_stage_line,
     MAX_QEMU_STDERR_TAIL, qemu_stderr_tail,
     MAX_QMP_PPM_BYTES, checked_qmp_ppm,
 )
@@ -156,6 +156,83 @@ class PixelEvidenceTests(unittest.TestCase):
     def test_wrong_geometry_rejected(self):
         with self.assertRaises(ProofError):
             expect_active((WIDTH + 1, HEIGHT, self.active[2]), self.baseline)
+
+    def test_baseline_qmp_capture_accepts_valid_frame(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.baseline) as screenshot:
+            result = capture("baseline", None, None, Path("/unused"), None)
+        self.assertEqual(result, self.baseline)
+        screenshot.assert_called_once_with(None, None, Path("/unused/baseline.ppm"))
+
+    def test_baseline_qmp_capture_rejects_truncated_payload(self):
+        bad = (WIDTH, HEIGHT, self.baseline[2][:-1])
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=bad), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "pixel buffer truncated"):
+                capture("baseline", None, None, Path("/unused"), None)
+
+    def test_baseline_qmp_capture_rejects_small_geometry(self):
+        width, height = X + W - 1, Y + H
+        bad = (width, height, bytes(3 * width * height))
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=bad), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "too small"):
+                capture("baseline", None, None, Path("/unused"), None)
+
+    def test_active_qmp_capture_accepts_guest_patch(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.active):
+            result = capture("active", None, None, Path("/unused"), self.baseline)
+        self.assertEqual(result, self.active)
+
+    def test_active_qmp_capture_refuses_unchanged_frame(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.baseline), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "did not change"):
+                capture("active", None, None, Path("/unused"), self.baseline)
+
+    def test_active_qmp_capture_requires_prior_baseline(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.active), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "without baseline"):
+                capture("active", None, None, Path("/unused"), None)
+
+    def test_restored_qmp_capture_accepts_exact_original(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.baseline):
+            result = capture("restored", None, None, Path("/unused"), self.baseline)
+        self.assertEqual(result, self.baseline)
+
+    def test_restored_qmp_capture_rejects_outside_patch_residue(self):
+        bad_bytes = bytearray(self.baseline[2])
+        bad_bytes[0] = 0xFE
+        altered = (WIDTH, HEIGHT, bytes(bad_bytes))
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=altered), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "NOT the original"):
+                capture("restored", None, None, Path("/unused"), self.baseline)
+
+    def test_qmp_capture_errors_fail_closed_without_acking(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   side_effect=ProofError("QMP screenshot refused")) as screenshot:
+            with self.assertRaisesRegex(ProofError, "QMP screenshot refused"):
+                capture("active", None, None, Path("/unused"), self.baseline)
+        self.assertEqual(screenshot.call_count, 1)
 
     def test_too_small_geometry_rejected(self):
         with self.assertRaises(ProofError):
