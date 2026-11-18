@@ -103,7 +103,7 @@ class FreshQmpScreenshotTests(unittest.TestCase):
     def test_stale_ppm_cannot_pass_without_new_qmp_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "capture.ppm"
-            path.write_bytes(b"P6\\n1 1\\n255\\n\\x01\\x02\\x03")
+            path.write_bytes(b"P6\n1 1\n255\n\x01\x02\x03")
             with patch("user_surface_writer_display_smoke.qmp_call") as qmp:
                 with self.assertRaisesRegex(ProofError, "fresh screenshot"):
                     read_image(None, None, path)
@@ -114,7 +114,7 @@ class FreshQmpScreenshotTests(unittest.TestCase):
     def test_genuine_new_qmp_file_is_decoded(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "capture.ppm"
-            payload = b"P6\\n1 1\\n255\\n\\x10\\x20\\x30"
+            payload = b"P6\n1 1\n255\n\x10\x20\x30"
 
             def qmp_writes_file(_sock, _reader, command, args):
                 self.assertEqual(command, "screendump")
@@ -125,21 +125,21 @@ class FreshQmpScreenshotTests(unittest.TestCase):
             with patch("user_surface_writer_display_smoke.qmp_call",
                        side_effect=qmp_writes_file):
                 self.assertEqual(read_image(None, None, path),
-                                 (1, 1, b"\\x10\\x20\\x30"))
+                                 (1, 1, b"\x10\x20\x30"))
 
     def test_repeated_qmp_capture_cannot_read_old_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "capture.ppm"
-            path.write_bytes(b"P6\\n1 1\\n255\\n\\x01\\x02\\x03")
+            path.write_bytes(b"P6\n1 1\n255\n\x01\x02\x03")
 
             def qmp_writes_replacement(_sock, _reader, _command, _args):
                 self.assertFalse(path.exists())
-                path.write_bytes(b"P6\\n1 1\\n255\\n\\x04\\x05\\x06")
+                path.write_bytes(b"P6\n1 1\n255\n\x04\x05\x06")
 
             with patch("user_surface_writer_display_smoke.qmp_call",
                        side_effect=qmp_writes_replacement):
                 self.assertEqual(read_image(None, None, path),
-                                 (1, 1, b"\\x04\\x05\\x06"))
+                                 (1, 1, b"\x04\x05\x06"))
 
 
 class PixelEvidenceTests(unittest.TestCase):
