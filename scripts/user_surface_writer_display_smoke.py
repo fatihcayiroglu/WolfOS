@@ -138,8 +138,14 @@ def checked_qmp_ppm(path: Path) -> tuple[int, int, bytes]:
 
 
 def read_image(qmp, reader, path: Path) -> tuple[int, int, bytes]:
+    # Repeated stage polling must not reuse the previous capture as evidence.
+    # Delete the old file *before* requesting another genuine QMP screenshot.
+    path.unlink(missing_ok=True)
     qmp_call(qmp, reader, "screendump", {"filename": str(path)})
-    return checked_qmp_ppm(path)
+    try:
+        return checked_qmp_ppm(path)
+    except FileNotFoundError as exc:
+        raise ProofError("QMP screendump returned without a fresh screenshot") from exc
 
 
 def capture(stage: str, qmp, reader, directory: Path,
