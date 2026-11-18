@@ -58,6 +58,9 @@ def append_serial_chunk(received: bytearray, pending: bytes,
     """Return complete serial lines; reject oversized output before buffering."""
     if len(chunk) > MAX_SERIAL_BYTES - len(received):
         raise ProofError("QEMU serial evidence exceeds bounded size")
+    # Reject corrupt octets before any capture-stage line can trigger an ACK.
+    if not chunk.isascii():
+        raise ProofError("Non-ASCII byte in QEMU serial evidence")
     parts = (pending + chunk).split(b"\n")
     if any(len(line) > MAX_SERIAL_LINE_BYTES for line in parts):
         raise ProofError("QEMU serial evidence line exceeds bounded size")
