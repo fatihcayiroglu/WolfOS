@@ -48,7 +48,9 @@ At a genuine user INT80 trap, while the real user CR3 is still active:
 The test harness uses QEMU's real QMP `screendump` command on **std
 VGA**, not a screenshot constructed from guest-claimed source pixels.
 It independently verifies RGB geometry, all channels, all untouched
-screen pixels and exact rollback, one stage in strict serial order.
+screen pixels, all 15 pixels actually differing from the baseline, and exact
+rollback, one stage in strict serial order. A pre-existing color match is not
+counted as a changed pixel.
 
 ## Trust boundary
 

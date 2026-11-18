@@ -46,11 +46,22 @@ def expect_active(image: tuple[int, int, bytes],
     width, height, rgb = image
     if (width, height) != baseline[:2] or width < X + W or height < Y + H:
         raise ProofError(f"QMP active display geometry {width}x{height} invalid")
+    # A matching post-write color is not evidence that the pixel changed.
+    # Independently verify the claim "changed_pixels=15" against the host
+    # baseline, rather than accepting a previously identical rectangle.
+    expected_len = width * height * 3
+    if len(rgb) != expected_len or len(baseline[2]) != expected_len:
+        raise ProofError("QMP active or baseline RGB payload length invalid")
     wanted = bytearray(baseline[2])
     for y in range(H):
         for x in range(W):
             at = 3 * ((Y + y) * width + X + x)
-            wanted[at:at + 3] = bytes(PIXELS.get((x, y), BACKGROUND))
+            color = bytes(PIXELS.get((x, y), BACKGROUND))
+            if baseline[2][at:at + 3] == color:
+                raise ProofError(
+                    f"QMP patch pixel x={X+x}, y={Y+y} did not change from baseline"
+                )
+            wanted[at:at + 3] = color
     if rgb != wanted:
         mismatches = (at for at, (actual, target) in
                       enumerate(zip(rgb, wanted)) if actual != target)
