@@ -6,6 +6,7 @@ from elf_launch_evidence import transaction_rows
 from user_copy_smoke import PROOFS, WRITER_PROOF
 from user_surface_writer_display_smoke import (
     BACKGROUND, DISPLAY_OK, H, PIXELS, PREFIX, STAGES, W, X, Y,
+    MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
     ProofError, expect_active, validate_serial,
 )
 
@@ -87,6 +88,60 @@ class PixelEvidenceTests(unittest.TestCase):
     def test_too_small_geometry_rejected(self):
         with self.assertRaises(ProofError):
             expect_active((X + W - 1, Y + H, self.active[2]), self.baseline)
+
+
+class BoundedSerialChunkTests(unittest.TestCase):
+    def test_lines_in_one_chunk(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"a\\nb\\npartial".replace(b"\\n", b"\n"))
+        self.assertEqual(lines, [b"a", b"b"])
+        self.assertEqual(pending, b"partial")
+        self.assertEqual(received, b"a\nb\npartial")
+
+    def test_line_split_across_chunks(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"base")
+        self.assertEqual(lines, [])
+        pending, lines = append_serial_chunk(received, pending, b"line\nactive\n")
+        self.assertEqual(lines, [b"baseline", b"active"])
+        self.assertEqual(pending, b"")
+
+    def test_exact_total_byte_boundary_allowed(self):
+        received = bytearray(b"x" * (MAX_SERIAL_BYTES - 2))
+        pending, lines = append_serial_chunk(received, b"", b"\nq")
+        self.assertEqual(lines, [b""])
+        self.assertEqual(pending, b"q")
+        self.assertEqual(len(received), MAX_SERIAL_BYTES)
+
+    def test_total_byte_limit_rejected_without_mutation(self):
+        received = bytearray(b"x" * MAX_SERIAL_BYTES)
+        with self.assertRaisesRegex(ProofError, "bounded size"):
+            append_serial_chunk(received, b"", b"X")
+        self.assertEqual(len(received), MAX_SERIAL_BYTES)
+
+    def test_overlong_unterminated_line_rejected(self):
+        received = bytearray()
+        with self.assertRaisesRegex(ProofError, "line"):
+            append_serial_chunk(received, b"", b"X" * (MAX_SERIAL_LINE_BYTES + 1))
+        self.assertEqual(len(received), 0)
+
+    def test_overlong_terminated_line_rejected(self):
+        received = bytearray()
+        with self.assertRaisesRegex(ProofError, "line"):
+            append_serial_chunk(received, b"", b"X" * (MAX_SERIAL_LINE_BYTES + 1) + b"\n")
+        self.assertEqual(len(received), 0)
+
+    def test_byte_limit_with_pending_chunk_rejected(self):
+        received = bytearray(b"z" * (MAX_SERIAL_BYTES - 1))
+        with self.assertRaisesRegex(ProofError, "bounded size"):
+            append_serial_chunk(received, b"abc", b"XY")
+        self.assertEqual(len(received), MAX_SERIAL_BYTES - 1)
+
+    def test_exact_line_boundary_allowed(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"X" * MAX_SERIAL_LINE_BYTES + b"\n")
+        self.assertEqual(len(lines[0]), MAX_SERIAL_LINE_BYTES)
+        self.assertEqual(pending, b"")
 
 
 class SerialEvidenceTests(unittest.TestCase):

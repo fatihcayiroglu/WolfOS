@@ -66,7 +66,9 @@ SMP display lock, frame-ready IRQ or physical GPU driver is included.
 
 The synchronous COM1 acknowledgement protocol and polling are only
 compiled in this opt-in single-BSP IF=0 QEMU test. It is deliberately
-not a general rendering or event loop.
+not a general rendering or event loop. The QEMU serial stream is capped at
+1 MiB total, with each complete or pending line limited to 16 KiB. Oversized
+serial evidence aborts the host acceptance without sending a stage ACK.
 
 ## Acceptance
 

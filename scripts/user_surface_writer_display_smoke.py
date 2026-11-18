@@ -24,6 +24,25 @@ from qemu_virtio_gpu_scanout_live_smoke import (
 )
 from user_copy_smoke import ENTER, PROOFS, WRITER_PROOF
 
+# Serial evidence is untrusted until both the host QMP pixels and the real
+# guest lifecycle have been independently checked. Bound hostile/malformed
+# serial output before keeping it in memory or scanning for stage messages.
+MAX_SERIAL_BYTES = 1 << 20
+MAX_SERIAL_LINE_BYTES = 16 << 10
+
+
+def append_serial_chunk(received: bytearray, pending: bytes,
+                        chunk: bytes) -> tuple[bytes, list[bytes]]:
+    """Return complete serial lines; reject oversized output before buffering."""
+    if len(chunk) > MAX_SERIAL_BYTES - len(received):
+        raise ProofError("QEMU serial evidence exceeds bounded size")
+    parts = (pending + chunk).split(b"\n")
+    if any(len(line) > MAX_SERIAL_LINE_BYTES for line in parts):
+        raise ProofError("QEMU serial evidence line exceeds bounded size")
+    received.extend(chunk)
+    return parts[-1], parts[:-1]
+
+
 STAGES = ("baseline", "active", "restored")
 REPLIES = {"baseline": b"B", "active": b"A", "restored": b"R"}
 PREFIX = "WOLFOS_CPL3_DISPLAY_CAPTURE stage="
@@ -197,10 +216,9 @@ def main() -> int:
                         if chunk == b"":
                             break
                         if chunk:
-                            received.extend(chunk)
-                            pending += chunk
-                            while b"\n" in pending:
-                                line, pending = pending.split(b"\n", 1)
+                            pending, serial_lines = append_serial_chunk(
+                                received, pending, chunk)
+                            for line in serial_lines:
                                 row = line.decode("ascii", errors="replace").strip()
                                 if row.startswith(PREFIX):
                                     stage = row[len(PREFIX):]
