@@ -18,15 +18,83 @@ import sys
 import tempfile
 import time
 
-from elf_launch_evidence import valid_launch_transactions
+from elf_launch_evidence import transaction_rows, valid_launch_transactions
 from qemu_virtio_gpu_scanout_live_smoke import (
     ProofError, connect_unix, ppm, qmp_call,
 )
 from user_copy_smoke import ENTER, PROOFS, WRITER_PROOF
 
+MAX_QEMU_STDERR_TAIL = 8192
+
+
+def qemu_stderr_tail(path: Path) -> str:
+    """Keep runner diagnostics bounded, including noisy QEMU error output."""
+    try:
+        with path.open("rb") as source:
+            source.seek(0, 2)
+            source.seek(max(0, source.tell() - MAX_QEMU_STDERR_TAIL))
+            return source.read(MAX_QEMU_STDERR_TAIL).decode("utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+# Serial evidence is untrusted until both the host QMP pixels and the real
+# guest lifecycle have been independently checked. Bound hostile/malformed
+# serial output before keeping it in memory or scanning for stage messages.
+MAX_SERIAL_BYTES = 1 << 20
+MAX_SERIAL_LINE_BYTES = 16 << 10
+
+
+def decode_serial_evidence(raw: bytes) -> str:
+    """Decode real COM1 bytes losslessly; do not turn corrupt octets into proof."""
+    try:
+        return raw.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ProofError("Non-ASCII byte in QEMU serial evidence") from exc
+
+
+def append_serial_chunk(received: bytearray, pending: bytes,
+                        chunk: bytes) -> tuple[bytes, list[bytes]]:
+    """Return complete serial lines; reject oversized output before buffering."""
+    if len(chunk) > MAX_SERIAL_BYTES - len(received):
+        raise ProofError("QEMU serial evidence exceeds bounded size")
+    # Reject corrupt octets before any capture-stage line can trigger an ACK.
+    if not chunk.isascii():
+        raise ProofError("Non-ASCII byte in QEMU serial evidence")
+    parts = (pending + chunk).split(b"\n")
+    if any(len(line) > MAX_SERIAL_LINE_BYTES for line in parts):
+        raise ProofError("QEMU serial evidence line exceeds bounded size")
+    received.extend(chunk)
+    return parts[-1], parts[:-1]
+
+
 STAGES = ("baseline", "active", "restored")
 REPLIES = {"baseline": b"B", "active": b"A", "restored": b"R"}
 PREFIX = "WOLFOS_CPL3_DISPLAY_CAPTURE stage="
+# An error record is never part of a successful guest-authored display
+# handshake. Refuse it before host ACK, not only at final run verification.
+FORBIDDEN_COM1_MARKERS = (
+    "WOLFOS_ELF_RUN_ERROR", "WOLFOS_PANIC",
+    "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_GP",
+    "WOLFOS_EXCEPTION_UD", "WOLFOS_EXCEPTION_DF",
+    "WOLFOS_CPL3_DISPLAY_FAIL", "WOLFOS_RING_PREP_ERROR",
+    "WOLFOS_ELF_HELLO_OK",
+)
+def parse_capture_stage_line(line: bytes, expected: str | None) -> str | None:
+    """Require exact raw COM1 stage bytes before any screenshot ACK is sent.
+
+    A forged log line may contain a plausible capture substring. It must not
+    cause the host to send B/A/R or be treated as a real guest stage.
+    CRLF framing from the serial transport is the only allowed suffix.
+    """
+    marker = PREFIX.encode("ascii")
+    if marker not in line:
+        return None
+    if expected is None or line.removesuffix(b"\r") != marker + expected.encode("ascii"):
+        raise ProofError("Malformed, unexpected or out-of-order QMP capture stage")
+    return expected
+
+
 DISPLAY_OK = (
     "WOLFOS_CPL3_DISPLAY_OK source=real_cpl3_stack "
     "copied_via_4level_pte=1 stdvga_framebuffer=1 host_qmp_captures=3 "
@@ -46,11 +114,22 @@ def expect_active(image: tuple[int, int, bytes],
     width, height, rgb = image
     if (width, height) != baseline[:2] or width < X + W or height < Y + H:
         raise ProofError(f"QMP active display geometry {width}x{height} invalid")
+    # A matching post-write color is not evidence that the pixel changed.
+    # Independently verify the claim "changed_pixels=15" against the host
+    # baseline, rather than accepting a previously identical rectangle.
+    expected_len = width * height * 3
+    if len(rgb) != expected_len or len(baseline[2]) != expected_len:
+        raise ProofError("QMP active or baseline RGB payload length invalid")
     wanted = bytearray(baseline[2])
     for y in range(H):
         for x in range(W):
             at = 3 * ((Y + y) * width + X + x)
-            wanted[at:at + 3] = bytes(PIXELS.get((x, y), BACKGROUND))
+            color = bytes(PIXELS.get((x, y), BACKGROUND))
+            if baseline[2][at:at + 3] == color:
+                raise ProofError(
+                    f"QMP patch pixel x={X+x}, y={Y+y} did not change from baseline"
+                )
+            wanted[at:at + 3] = color
     if rgb != wanted:
         mismatches = (at for at, (actual, target) in
                       enumerate(zip(rgb, wanted)) if actual != target)
@@ -63,9 +142,30 @@ def expect_active(image: tuple[int, int, bytes],
         )
 
 
-def read_image(qmp, reader, path: Path) -> tuple[int, int, bytes]:
-    qmp_call(qmp, reader, "screendump", {"filename": str(path)})
+MAX_QMP_PPM_BYTES = 64 << 20
+
+
+def checked_qmp_ppm(path: Path) -> tuple[int, int, bytes]:
+    """Bound QMP screenshot memory use before the shared PPM decoder reads it.
+
+    Even a nominally supported 8192x8192 RGB frame can consume ~192 MiB.
+    The isolated std-VGA acceptance needs nowhere near that much RAM.
+    """
+    size = path.stat().st_size
+    if not 14 <= size <= MAX_QMP_PPM_BYTES:
+        raise ProofError("QMP screenshot PPM file size outside safe range")
     return ppm(path)
+
+
+def read_image(qmp, reader, path: Path) -> tuple[int, int, bytes]:
+    # Repeated stage polling must not reuse the previous capture as evidence.
+    # Delete the old file *before* requesting another genuine QMP screenshot.
+    path.unlink(missing_ok=True)
+    qmp_call(qmp, reader, "screendump", {"filename": str(path)})
+    try:
+        return checked_qmp_ppm(path)
+    except FileNotFoundError as exc:
+        raise ProofError("QMP screendump returned without a fresh screenshot") from exc
 
 
 def capture(stage: str, qmp, reader, directory: Path,
@@ -98,7 +198,62 @@ def capture(stage: str, qmp, reader, directory: Path,
     raise ProofError(f"Host QMP stage {stage} failed: {last_error}")
 
 
+
+def validate_capture_prefix(history: list[bytes], stage: str) -> None:
+    """Deny stage ACKs until the actual guest's preceding ELF proof is complete.
+
+    The COM1 stream has independent LF-delimited proof records. Ignore unrelated
+    diagnostics, but never accept duplicate, reordered, partial, or embedded
+    mandatory markers. Later EXIT/PMM retirement still has its separate final
+    QEMU and serial verification.
+    """
+    if stage not in STAGES:
+        raise ProofError("Unknown QMP capture stage")
+    try:
+        lines = [line.removesuffix(b"\r").decode("ascii") for line in history]
+    except UnicodeDecodeError as exc:
+        raise ProofError("Non-ASCII QMP capture prefix") from exc
+    if any("\r" in line for line in lines):
+        raise ProofError("Malformed carriage return in QMP capture prefix")
+    if any(fragment in line for line in lines
+           for fragment in FORBIDDEN_COM1_MARKERS):
+        raise ProofError("Fatal guest evidence before QMP ACK")
+    if not lines or lines[-1] != PREFIX + stage:
+        raise ProofError("QMP stage does not terminate its evidence prefix")
+    expected = [
+        "WOLFOS_BOOT_OK", *transaction_rows(1, 7)[:2],
+        None,  # ELF entry includes a bounded runtime-selected root slot.
+        *(proof.removesuffix("\n") for proof in PROOFS[:4]),
+        *(PREFIX + item for item in STAGES[:STAGES.index(stage) + 1]),
+    ]
+    cursor = 0
+    for marker in expected:
+        if marker is None:
+            matches = [(i, ENTER.fullmatch(line)) for i, line in enumerate(lines)]
+            matches = [(i, match) for i, match in matches if match is not None]
+            if len(matches) != 1 or not 1 <= int(matches[0][1].group(1)) <= 255:
+                raise ProofError("Missing, duplicate, or invalid CPL3 ELF entry before QMP ACK")
+            found = matches[0][0]
+        else:
+            matches = [i for i, line in enumerate(lines) if line == marker]
+            if len(matches) != 1:
+                raise ProofError(f"Missing or duplicate pre-ACK proof: {marker}")
+            found = matches[0]
+        if found < cursor:
+            raise ProofError("Out-of-order BSP/ELF proof before QMP ACK")
+        cursor = found + 1
+
+
 def validate_serial(output: str, code: int) -> None:
+    if not output.isascii():
+        raise ProofError("Non-ASCII text in QEMU serial evidence")
+    # A proof is one complete raw COM1 line, not a Unicode splitlines() token.
+    # CRLF is normal framing; reject bare CR and an unterminated final record.
+    if not output.endswith("\n"):
+        raise ProofError("QEMU serial evidence has an unterminated final record")
+    output = output.replace("\r\n", "\n")
+    if "\r" in output:
+        raise ProofError("QEMU serial evidence contains a bare carriage return")
     if code != 33:
         raise ProofError(f"QEMU expected clean ISA-debug-exit 33, got {code}")
     if not valid_launch_transactions(output, 7, (1,)):
@@ -114,24 +269,37 @@ def validate_serial(output: str, code: int) -> None:
         WRITER_PROOF,
         *PROOFS[4:],
     ]
+    # Each mandatory marker must be an exact, independent serial line.
+    # Substring hits in other logs (including fabricated prefixes/suffixes)
+    # are not evidence that the real guest executed that stage.
+    lines = output.split("\n")
+    # The transaction helper validates lifecycle ordering; additionally require
+    # exact newline-delimited TX records, not embedded control-character lines.
+    tx_lines = [line for line in lines if "WOLFOS_ELF_TX_" in line]
+    if tx_lines != transaction_rows(1, 7):
+        raise ProofError("Counted transaction records are not exact serial lines")
     cursor = 0
     for marker in markers:
-        at = output.find(marker, cursor)
-        if at < 0:
-            raise ProofError(f"Missing/out-of-order genuine guest proof: {marker}")
-        cursor = at + len(marker)
-        if output.count(marker) != 1:
-            raise ProofError(f"Duplicate proof: {marker}")
-    forbidden = (
-        "WOLFOS_ELF_RUN_ERROR", "WOLFOS_PANIC",
-        "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_GP",
-        "WOLFOS_EXCEPTION_UD", "WOLFOS_EXCEPTION_DF",
-        "WOLFOS_CPL3_DISPLAY_FAIL", "WOLFOS_RING_PREP_ERROR",
-        "WOLFOS_ELF_HELLO_OK",
-    )
-    for fragment in forbidden:
+        canonical = marker.removesuffix("\n")
+        matches = [i for i, line in enumerate(lines) if line == canonical]
+        if len(matches) != 1 or matches[0] < cursor:
+            raise ProofError(
+                f"Missing, duplicate or out-of-order guest proof: {canonical}"
+            )
+        cursor = matches[0] + 1
+    for fragment in FORBIDDEN_COM1_MARKERS:
         if fragment in output:
             raise ProofError(f"Forbidden failure/old behavior marker: {fragment}")
+    # Substring-only matching accepts log injections such as
+    # "prefixWOLFOS_CPL3_DISPLAY_OK ...", or extra capture stages.
+    # Host screenshot evidence must be complete, standalone serial lines.
+    lines = output.split("\n")
+    expected_stages = [PREFIX + stage for stage in STAGES]
+    actual_stages = [line for line in lines if line.startswith(PREFIX)]
+    if actual_stages != expected_stages:
+        raise ProofError("Missing, duplicated, or malformed QMP capture stage line")
+    if lines.count(DISPLAY_OK) != 1 or lines.count(WRITER_PROOF) != 1:
+        raise ProofError("Missing or embedded CPL3 display/writer proof line")
 
 
 def main() -> int:
@@ -157,8 +325,13 @@ def main() -> int:
         stages = []
         images = {}
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE)
+            # Never leave PIPE descriptors unread while waiting for QEMU.
+            # A noisy emulator can fill a pipe and deadlock before exit.
+            # Its serial evidence is captured independently via COM1.
+            with (temp / "qemu.stderr").open("wb") as qemu_stderr:
+                process = subprocess.Popen(
+                    command, stdout=subprocess.DEVNULL, stderr=qemu_stderr
+                )
             deadline = time.monotonic() + 65
             with connect_unix(serial_socket, process, deadline) as serial:
                 with connect_unix(qmp_socket, process, deadline) as qmp:
@@ -168,6 +341,7 @@ def main() -> int:
                     qmp_call(qmp, reader, "qmp_capabilities")
                     serial.settimeout(0.25)
                     pending = b""
+                    observed_lines: list[bytes] = []
                     while time.monotonic() < deadline:
                         try:
                             chunk = serial.recv(65536)
@@ -176,15 +350,15 @@ def main() -> int:
                         if chunk == b"":
                             break
                         if chunk:
-                            received.extend(chunk)
-                            pending += chunk
-                            while b"\n" in pending:
-                                line, pending = pending.split(b"\n", 1)
-                                row = line.decode("ascii", errors="replace").strip()
-                                if row.startswith(PREFIX):
-                                    stage = row[len(PREFIX):]
-                                    if len(stages) >= len(STAGES) or stage != STAGES[len(stages)]:
-                                        raise ProofError(f"Unexpected QMP screenshot stage: {stage}")
+                            pending, serial_lines = append_serial_chunk(
+                                received, pending, chunk)
+                            for line in serial_lines:
+                                observed_lines.append(line)
+                                expected = STAGES[len(stages)] if len(stages) < len(STAGES) else None
+                                stage = parse_capture_stage_line(line, expected)
+                                if stage is not None:
+                                    # No real screenshot ACK for a fake/partial guest prefix.
+                                    validate_capture_prefix(observed_lines, stage)
                                     images[stage] = capture(
                                         stage, qmp, reader, temp, images.get("baseline"))
                                     serial.sendall(REPLIES[stage])
@@ -197,7 +371,7 @@ def main() -> int:
                 process.wait(timeout=4)
             except subprocess.TimeoutExpired:
                 raise ProofError("QEMU never returned after guest PMM cleanup")
-            output = received.decode("ascii", errors="replace").replace("\r\n", "\n")
+            output = decode_serial_evidence(received).replace("\r\n", "\n")
             print(output)
             validate_serial(output, process.returncode)
             print(
@@ -208,6 +382,9 @@ def main() -> int:
         except (ProofError, OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"FAIL: CPL3 QMP std-VGA visual acceptance: {exc}")
             print(received.decode("ascii", errors="replace"))
+            stderr = qemu_stderr_tail(temp / "qemu.stderr")
+            if stderr:
+                print("QEMU stderr (bounded tail):\n" + stderr)
             return 1
         finally:
             if process is not None and process.poll() is None:

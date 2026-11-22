@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+"""Adversarial pixel and serial fixtures; never substitutes for real QEMU."""
+import unittest
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from elf_launch_evidence import transaction_rows
+from user_copy_smoke import PROOFS, WRITER_PROOF
+from user_surface_writer_display_smoke import (
+    BACKGROUND, DISPLAY_OK, H, PIXELS, PREFIX, STAGES, W, X, Y,
+    MAX_SERIAL_BYTES, MAX_SERIAL_LINE_BYTES, append_serial_chunk,
+    decode_serial_evidence, validate_capture_prefix,
+    ProofError, expect_active, capture, validate_serial, parse_capture_stage_line,
+    MAX_QEMU_STDERR_TAIL, qemu_stderr_tail,
+    MAX_QMP_PPM_BYTES, checked_qmp_ppm, read_image,
+)
+
+WIDTH, HEIGHT = X + W + 5, Y + H + 5
+ENTER = (
+    "WOLFOS_ELF_RUN_ENTER elf64=1 et_exec=1 pt_load=2 rx=1 rw_nx=2 "
+    "bss_zero=1 cr3_new=1 root_slot=1 user_entry=0x401000"
+)
+
+
+def serial_evidence():
+    rows = transaction_rows(1, 7)
+    lines = [
+        "WOLFOS_BOOT_OK", rows[0], rows[1], ENTER,
+        *PROOFS[:4], *(PREFIX + stage for stage in STAGES),
+        DISPLAY_OK, WRITER_PROOF, rows[2], rows[3], *PROOFS[4:],
+    ]
+    return "\n".join(lines) + "\n"
+
+
+class BoundedQmpPpmTests(unittest.TestCase):
+    def test_minimum_valid_ppm_reaches_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "minimum.ppm"
+            path.write_bytes(b"P6\n1 1\n255\n\x01\x02\x03")
+            with patch("user_surface_writer_display_smoke.ppm",
+                       return_value=(1, 1, b"\x01\x02\x03")) as decode:
+                self.assertEqual(checked_qmp_ppm(path), (1, 1, b"\x01\x02\x03"))
+                decode.assert_called_once_with(path)
+
+    def test_empty_ppm_rejected_without_decode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.ppm"
+            path.write_bytes(b"")
+            with patch("user_surface_writer_display_smoke.ppm") as decode:
+                with self.assertRaisesRegex(ProofError, "outside safe range"):
+                    checked_qmp_ppm(path)
+                decode.assert_not_called()
+
+    def test_oversized_sparse_ppm_rejected_before_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "oversized.ppm"
+            with path.open("wb") as stream:
+                stream.seek(MAX_QMP_PPM_BYTES)
+                stream.write(b"x")
+            with patch("user_surface_writer_display_smoke.ppm") as decode:
+                with self.assertRaisesRegex(ProofError, "outside safe range"):
+                    checked_qmp_ppm(path)
+                decode.assert_not_called()
+
+    def test_exact_maximum_ppm_size_reaches_decoder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "at_limit.ppm"
+            with path.open("wb") as stream:
+                stream.truncate(MAX_QMP_PPM_BYTES)
+            with patch("user_surface_writer_display_smoke.ppm",
+                       return_value=(1, 1, b"abc")) as decode:
+                self.assertEqual(checked_qmp_ppm(path), (1, 1, b"abc"))
+                decode.assert_called_once_with(path)
+
+
+class QemuStderrTailTests(unittest.TestCase):
+    def test_missing_stderr_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(qemu_stderr_tail(Path(tmp) / "missing"), "")
+
+    def test_empty_stderr_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stderr"
+            path.write_bytes(b"")
+            self.assertEqual(qemu_stderr_tail(path), "")
+
+    def test_large_stderr_keeps_only_bounded_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stderr"
+            path.write_bytes(b"A" * (2 * MAX_QEMU_STDERR_TAIL) + b"last-line")
+            tail = qemu_stderr_tail(path)
+            self.assertEqual(len(tail), MAX_QEMU_STDERR_TAIL)
+            self.assertTrue(tail.endswith("last-line"))
+
+    def test_invalid_utf8_stderr_is_reportable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "stderr"
+            path.write_bytes(b"bad\\xff".replace(b"\\xff", b"\xff"))
+            self.assertEqual(qemu_stderr_tail(path), "bad\ufffd")
+
+
+class FreshQmpScreenshotTests(unittest.TestCase):
+    def test_stale_ppm_cannot_pass_without_new_qmp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.ppm"
+            path.write_bytes(b"P6\n1 1\n255\n\x01\x02\x03")
+            with patch("user_surface_writer_display_smoke.qmp_call") as qmp:
+                with self.assertRaisesRegex(ProofError, "fresh screenshot"):
+                    read_image(None, None, path)
+                qmp.assert_called_once_with(
+                    None, None, "screendump", {"filename": str(path)})
+            self.assertFalse(path.exists())
+
+    def test_genuine_new_qmp_file_is_decoded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.ppm"
+            payload = b"P6\n1 1\n255\n\x10\x20\x30"
+
+            def qmp_writes_file(_sock, _reader, command, args):
+                self.assertEqual(command, "screendump")
+                self.assertEqual(args, {"filename": str(path)})
+                self.assertFalse(path.exists())
+                path.write_bytes(payload)
+
+            with patch("user_surface_writer_display_smoke.qmp_call",
+                       side_effect=qmp_writes_file):
+                self.assertEqual(read_image(None, None, path),
+                                 (1, 1, b"\x10\x20\x30"))
+
+    def test_repeated_qmp_capture_cannot_read_old_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "capture.ppm"
+            path.write_bytes(b"P6\n1 1\n255\n\x01\x02\x03")
+
+            def qmp_writes_replacement(_sock, _reader, _command, _args):
+                self.assertFalse(path.exists())
+                path.write_bytes(b"P6\n1 1\n255\n\x04\x05\x06")
+
+            with patch("user_surface_writer_display_smoke.qmp_call",
+                       side_effect=qmp_writes_replacement):
+                self.assertEqual(read_image(None, None, path),
+                                 (1, 1, b"\x04\x05\x06"))
+
+
+class PixelEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.baseline = (WIDTH, HEIGHT, bytes(WIDTH * HEIGHT * 3))
+        pixels = bytearray(self.baseline[2])
+        for y in range(H):
+            for x in range(W):
+                offset = 3 * ((Y + y) * WIDTH + X + x)
+                pixels[offset:offset + 3] = bytes(
+                    PIXELS.get((x, y), BACKGROUND)
+                )
+        self.active = (WIDTH, HEIGHT, bytes(pixels))
+
+    def test_full_exact_changed_patch_accepted(self):
+        expect_active(self.active, self.baseline)
+
+    def test_outside_patch_corruption_rejected(self):
+        pixels = bytearray(self.active[2])
+        pixels[0] = 1
+        with self.assertRaises(ProofError):
+            expect_active((WIDTH, HEIGHT, bytes(pixels)), self.baseline)
+
+    def test_changed_patch_channel_rejected(self):
+        pixels = bytearray(self.active[2])
+        offset = 3 * ((Y + 1) * WIDTH + X + 1)
+        pixels[offset + 2] ^= 1
+        with self.assertRaises(ProofError):
+            expect_active((WIDTH, HEIGHT, bytes(pixels)), self.baseline)
+
+    def test_missing_patch_write_rejected(self):
+        pixels = bytearray(self.active[2])
+        offset = 3 * (Y * WIDTH + X)
+        pixels[offset:offset + 3] = self.baseline[2][offset:offset + 3]
+        with self.assertRaises(ProofError):
+            expect_active((WIDTH, HEIGHT, bytes(pixels)), self.baseline)
+
+    def test_preexisting_exact_color_is_not_a_change(self):
+        baseline = bytearray(self.baseline[2])
+        offset = 3 * ((Y + 1) * WIDTH + X + 1)
+        baseline[offset:offset + 3] = self.active[2][offset:offset + 3]
+        with self.assertRaisesRegex(ProofError, "did not change"):
+            expect_active(self.active, (WIDTH, HEIGHT, bytes(baseline)))
+
+    def test_truncated_payload_rejected(self):
+        with self.assertRaisesRegex(ProofError, "payload length"):
+            expect_active((WIDTH, HEIGHT, self.active[2][:-1]), self.baseline)
+
+    def test_extra_payload_rejected(self):
+        with self.assertRaisesRegex(ProofError, "payload length"):
+            expect_active((WIDTH, HEIGHT, self.active[2] + b"x"), self.baseline)
+
+    def test_truncated_baseline_rejected(self):
+        with self.assertRaisesRegex(ProofError, "payload length"):
+            expect_active(self.active, (WIDTH, HEIGHT, self.baseline[2][:-1]))
+
+    def test_wrong_geometry_rejected(self):
+        with self.assertRaises(ProofError):
+            expect_active((WIDTH + 1, HEIGHT, self.active[2]), self.baseline)
+
+    def test_baseline_qmp_capture_accepts_valid_frame(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.baseline) as screenshot:
+            result = capture("baseline", None, None, Path("/unused"), None)
+        self.assertEqual(result, self.baseline)
+        screenshot.assert_called_once_with(None, None, Path("/unused/baseline.ppm"))
+
+    def test_baseline_qmp_capture_rejects_truncated_payload(self):
+        bad = (WIDTH, HEIGHT, self.baseline[2][:-1])
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=bad), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "pixel buffer truncated"):
+                capture("baseline", None, None, Path("/unused"), None)
+
+    def test_baseline_qmp_capture_rejects_small_geometry(self):
+        width, height = X + W - 1, Y + H
+        bad = (width, height, bytes(3 * width * height))
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=bad), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "too small"):
+                capture("baseline", None, None, Path("/unused"), None)
+
+    def test_active_qmp_capture_accepts_guest_patch(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.active):
+            result = capture("active", None, None, Path("/unused"), self.baseline)
+        self.assertEqual(result, self.active)
+
+    def test_active_qmp_capture_refuses_unchanged_frame(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.baseline), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "differs outside expected precise"):
+                capture("active", None, None, Path("/unused"), self.baseline)
+
+    def test_active_qmp_capture_requires_prior_baseline(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.active), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "without baseline"):
+                capture("active", None, None, Path("/unused"), None)
+
+    def test_restored_qmp_capture_accepts_exact_original(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=self.baseline):
+            result = capture("restored", None, None, Path("/unused"), self.baseline)
+        self.assertEqual(result, self.baseline)
+
+    def test_restored_qmp_capture_rejects_outside_patch_residue(self):
+        bad_bytes = bytearray(self.baseline[2])
+        bad_bytes[0] = 0xFE
+        altered = (WIDTH, HEIGHT, bytes(bad_bytes))
+        with patch("user_surface_writer_display_smoke.read_image",
+                   return_value=altered), \
+             patch("user_surface_writer_display_smoke.time.monotonic",
+                   side_effect=[0.0, 1.0, 9.0]), \
+             patch("user_surface_writer_display_smoke.time.sleep"):
+            with self.assertRaisesRegex(ProofError, "NOT the original"):
+                capture("restored", None, None, Path("/unused"), self.baseline)
+
+    def test_qmp_capture_errors_fail_before_stage_completes(self):
+        with patch("user_surface_writer_display_smoke.read_image",
+                   side_effect=ProofError("QMP screenshot refused")) as screenshot:
+            with self.assertRaisesRegex(ProofError, "QMP screenshot refused"):
+                capture("active", None, None, Path("/unused"), self.baseline)
+        self.assertEqual(screenshot.call_count, 1)
+
+    def test_too_small_geometry_rejected(self):
+        with self.assertRaises(ProofError):
+            expect_active((X + W - 1, Y + H, self.active[2]), self.baseline)
+
+
+
+class PreAckGuestEvidenceTests(unittest.TestCase):
+    def prefix(self, stage: str) -> list[bytes]:
+        output = serial_evidence()
+        marker = PREFIX + stage + "\n"
+        end = output.index(marker) + len(marker)
+        return [line.encode("ascii") for line in output[:end].split("\n")[:-1]]
+
+    def test_each_genuine_stage_prefix_accepted(self):
+        for stage in STAGES:
+            with self.subTest(stage=stage):
+                validate_capture_prefix(self.prefix(stage), stage)
+
+    def test_baseline_without_actual_boot_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.remove(b"WOLFOS_BOOT_OK")
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_missing_counted_rollback_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.remove(transaction_rows(1, 7)[0].encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_duplicate_counted_activation_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.insert(2, transaction_rows(1, 7)[1].encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_missing_real_usercopy_write_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines.remove(PROOFS[3].encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_reordered_syscall_proofs_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        first, second = PROOFS[0].encode(), PROOFS[1].encode()
+        a, b = lines.index(first), lines.index(second)
+        lines[a], lines[b] = lines[b], lines[a]
+        with self.assertRaisesRegex(ProofError, "Out-of-order"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_invalid_private_root_slot_denied_before_ack(self):
+        lines = self.prefix("baseline")
+        lines = [line.replace(b"root_slot=1 ", b"root_slot=256 ")
+                 for line in lines]
+        with self.assertRaisesRegex(ProofError, "invalid CPL3 ELF entry"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_active_cannot_ack_without_prior_baseline(self):
+        lines = self.prefix("active")
+        lines.remove((PREFIX + "baseline").encode())
+        with self.assertRaisesRegex(ProofError, "pre-ACK"):
+            validate_capture_prefix(lines, "active")
+
+    def test_crlf_stage_prefix_is_accepted(self):
+        lines = [line + b"\r" for line in self.prefix("restored")]
+        validate_capture_prefix(lines, "restored")
+
+    def test_embedded_cr_rejected_before_ack(self):
+        lines = self.prefix("baseline")
+        lines[1] += b"\rforged"
+        with self.assertRaisesRegex(ProofError, "carriage return"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_fatal_guest_record_rejected_before_any_stage_ack(self):
+        for stage in STAGES:
+            for marker in (
+                b"WOLFOS_ELF_RUN_ERROR",
+                b"WOLFOS_PANIC",
+                b"WOLFOS_EXCEPTION_PF",
+                b"WOLFOS_EXCEPTION_GP",
+                b"WOLFOS_EXCEPTION_UD",
+                b"WOLFOS_EXCEPTION_DF",
+                b"WOLFOS_CPL3_DISPLAY_FAIL timeout",
+                b"WOLFOS_RING_PREP_ERROR",
+                b"WOLFOS_ELF_HELLO_OK",
+            ):
+                with self.subTest(stage=stage, marker=marker):
+                    lines = self.prefix(stage)
+                    lines.insert(-1, marker)
+                    with self.assertRaisesRegex(ProofError, "Fatal guest evidence"):
+                        validate_capture_prefix(lines, stage)
+
+    def test_masquerading_fatal_record_in_diagnostic_rejected(self):
+        lines = self.prefix("baseline")
+        lines.insert(-1, b"diagnostic: WOLFOS_PANIC unexpected")
+        with self.assertRaisesRegex(ProofError, "Fatal guest evidence"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_unrelated_diagnostic_before_capture_is_tolerated(self):
+        lines = self.prefix("active")
+        lines.insert(-1, b"guest diagnostic without mandatory marker")
+        validate_capture_prefix(lines, "active")
+
+
+
+class BoundedSerialChunkTests(unittest.TestCase):
+    def test_non_ascii_chunk_refused_before_buffer_mutation(self):
+        received = bytearray()
+        with self.assertRaisesRegex(ProofError, "Non-ASCII byte"):
+            append_serial_chunk(received, b"", b"WOLFOS_BOOT_OK\n\xff")
+        self.assertEqual(received, bytearray())
+
+    def test_corrupt_followup_chunk_keeps_previous_evidence(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"prefix")
+        self.assertEqual(lines, [])
+        with self.assertRaisesRegex(ProofError, "Non-ASCII byte"):
+            append_serial_chunk(received, pending, b"\xfe\n")
+        self.assertEqual(received, bytearray(b"prefix"))
+
+    def test_lines_in_one_chunk(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"a\nb\npartial")
+        self.assertEqual(lines, [b"a", b"b"])
+        self.assertEqual(pending, b"partial")
+        self.assertEqual(received, b"a\nb\npartial")
+
+    def test_line_split_across_chunks(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"base")
+        self.assertEqual(lines, [])
+        pending, lines = append_serial_chunk(received, pending, b"line\nactive\n")
+        self.assertEqual(lines, [b"baseline", b"active"])
+        self.assertEqual(pending, b"")
+
+    def test_exact_total_byte_boundary_allowed(self):
+        received = bytearray(b"x" * (MAX_SERIAL_BYTES - 2))
+        pending, lines = append_serial_chunk(received, b"", b"\nq")
+        self.assertEqual(lines, [b""])
+        self.assertEqual(pending, b"q")
+        self.assertEqual(len(received), MAX_SERIAL_BYTES)
+
+    def test_total_byte_limit_rejected_without_mutation(self):
+        received = bytearray(b"x" * MAX_SERIAL_BYTES)
+        with self.assertRaisesRegex(ProofError, "bounded size"):
+            append_serial_chunk(received, b"", b"X")
+        self.assertEqual(len(received), MAX_SERIAL_BYTES)
+
+    def test_overlong_unterminated_line_rejected(self):
+        received = bytearray()
+        with self.assertRaisesRegex(ProofError, "line"):
+            append_serial_chunk(received, b"", b"X" * (MAX_SERIAL_LINE_BYTES + 1))
+        self.assertEqual(len(received), 0)
+
+    def test_overlong_terminated_line_rejected(self):
+        received = bytearray()
+        with self.assertRaisesRegex(ProofError, "line"):
+            append_serial_chunk(received, b"", b"X" * (MAX_SERIAL_LINE_BYTES + 1) + b"\n")
+        self.assertEqual(len(received), 0)
+
+    def test_byte_limit_with_pending_chunk_rejected(self):
+        received = bytearray(b"z" * (MAX_SERIAL_BYTES - 1))
+        with self.assertRaisesRegex(ProofError, "bounded size"):
+            append_serial_chunk(received, b"abc", b"XY")
+        self.assertEqual(len(received), MAX_SERIAL_BYTES - 1)
+
+    def test_fragmented_line_rejected_without_extra_bytes(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"X" * MAX_SERIAL_LINE_BYTES)
+        self.assertEqual(lines, [])
+        with self.assertRaisesRegex(ProofError, "line"):
+            append_serial_chunk(received, pending, b"Y")
+        self.assertEqual(len(received), MAX_SERIAL_LINE_BYTES)
+
+    def test_exact_line_boundary_allowed(self):
+        received = bytearray()
+        pending, lines = append_serial_chunk(received, b"", b"X" * MAX_SERIAL_LINE_BYTES + b"\n")
+        self.assertEqual(len(lines[0]), MAX_SERIAL_LINE_BYTES)
+        self.assertEqual(pending, b"")
+
+
+class RawCaptureStageTests(unittest.TestCase):
+    def test_normal_baseline(self):
+        self.assertEqual(
+            parse_capture_stage_line(PREFIX.encode() + b"baseline", "baseline"), "baseline")
+
+    def test_accept_crlf_framing(self):
+        self.assertEqual(
+            parse_capture_stage_line(PREFIX.encode() + b"active\r", "active"), "active")
+
+    def test_ignore_unrelated_serial_line(self):
+        self.assertIsNone(parse_capture_stage_line(b"WOLFOS_BOOT_OK", "baseline"))
+
+    def test_reject_leading_spaces(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(b" " + PREFIX.encode() + b"baseline", "baseline")
+
+    def test_reject_trailing_spaces(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline ", "baseline")
+
+    def test_reject_out_of_order_stage(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"active", "baseline")
+
+    def test_reject_extra_stage(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline", None)
+
+    def test_reject_embedded_stage(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(b"fake-" + PREFIX.encode() + b"baseline", "baseline")
+
+    def test_reject_non_ascii_suffix(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline\xff", "baseline")
+
+    def test_reject_stage_with_extra_tokens(self):
+        with self.assertRaises(ProofError):
+            parse_capture_stage_line(PREFIX.encode() + b"baseline stage=active", "baseline")
+
+
+class SerialEvidenceTests(unittest.TestCase):
+    def test_complete_hardware_evidence_accepted(self):
+        validate_serial(serial_evidence(), 33)
+
+    def test_debug_exit_must_be_exact(self):
+        with self.assertRaises(ProofError):
+            validate_serial(serial_evidence(), 0)
+
+    def test_missing_actual_transaction_rejected(self):
+        rows = transaction_rows(1, 7)
+        with self.assertRaises(ProofError):
+            validate_serial(serial_evidence().replace(rows[2] + "\n", ""), 33)
+
+    def test_duplicate_display_ok_rejected(self):
+        with self.assertRaises(ProofError):
+            validate_serial(serial_evidence() + DISPLAY_OK + "\n", 33)
+
+    def test_reordered_capture_stages_rejected(self):
+        output = serial_evidence().replace(
+            PREFIX + "baseline", PREFIX + "_temporary"
+        ).replace(
+            PREFIX + "active", PREFIX + "baseline"
+        ).replace(
+            PREFIX + "_temporary", PREFIX + "active"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(output, 33)
+
+    def test_missing_stage_rejected(self):
+        with self.assertRaises(ProofError):
+            validate_serial(
+                serial_evidence().replace(PREFIX + "active" + "\n", ""), 33
+            )
+
+    def test_out_of_range_user_cr3_slot_rejected(self):
+        with self.assertRaises(ProofError):
+            validate_serial(
+                serial_evidence().replace("root_slot=1", "root_slot=256"), 33
+            )
+
+    def test_embedded_display_success_rejected(self):
+        forged = serial_evidence().replace(
+            DISPLAY_OK + "\n", "prefix-" + DISPLAY_OK + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_embedded_writer_proof_rejected(self):
+        forged = serial_evidence().replace(
+            WRITER_PROOF + "\n", "prefix-" + WRITER_PROOF + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_capture_stage_embedded_in_other_line_rejected(self):
+        forged = serial_evidence().replace(
+            PREFIX + "baseline" + "\n", "prefix-" + PREFIX + "baseline" + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_unexpected_extra_stage_rejected(self):
+        forged = serial_evidence().replace(
+            PREFIX + "active" + "\n",
+            PREFIX + "unknown" + "\n" + PREFIX + "active" + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_duplicate_capture_stage_rejected(self):
+        forged = serial_evidence().replace(
+            PREFIX + "active" + "\n",
+            PREFIX + "active" + "\n" + PREFIX + "active" + "\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+    def test_embedded_boot_marker_rejected(self):
+        text = serial_evidence().replace("WOLFOS_BOOT_OK\n", "fake-WOLFOS_BOOT_OK\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_embedded_usercopy_write_marker_rejected(self):
+        text = serial_evidence().replace(PROOFS[3] + "\n", "fake-" + PROOFS[3] + "\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_extra_content_on_elf_entry_rejected(self):
+        text = serial_evidence().replace(ENTER + "\n", ENTER + " extra\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_embedded_hello_from_wolfos_rejected(self):
+        text = serial_evidence().replace(
+            "Hello from WolfOS!\n", "fake-Hello from WolfOS!\n"
+        )
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_embedded_usercopy_run_marker_rejected(self):
+        text = serial_evidence().replace(PROOFS[-1] + "\n", "fake-" + PROOFS[-1] + "\n")
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_duplicate_usercopy_id_marker_rejected(self):
+        text = serial_evidence() + PROOFS[0] + "\n"
+        with self.assertRaises(ProofError):
+            validate_serial(text, 33)
+
+    def test_guest_panic_rejected_even_with_success_log(self):
+        with self.assertRaises(ProofError):
+            validate_serial(serial_evidence() + "WOLFOS_PANIC\n", 33)
+
+    def test_crlf_serial_evidence_accepted(self):
+        validate_serial(serial_evidence().replace("\n", "\r\n"), 33)
+
+    def test_raw_ascii_com1_decodes_without_changes(self):
+        raw = serial_evidence().encode("ascii")
+        self.assertEqual(decode_serial_evidence(raw), serial_evidence())
+
+    def test_raw_com1_high_bit_octet_fails_closed(self):
+        raw = serial_evidence().encode("ascii") + b"\xff"
+        with self.assertRaisesRegex(ProofError, "Non-ASCII byte"):
+            decode_serial_evidence(raw)
+
+    def test_unicode_serial_string_cannot_supply_proof(self):
+        with self.assertRaisesRegex(ProofError, "Non-ASCII text"):
+            validate_serial(serial_evidence() + "unrelated=\u00e9\n", 33)
+
+
+    def test_unterminated_final_record_rejected(self):
+        with self.assertRaisesRegex(ProofError, "unterminated"):
+            validate_serial(serial_evidence()[:-1], 33)
+
+    def test_bare_carriage_return_rejected(self):
+        rows = transaction_rows(1, 7)
+        forged = serial_evidence().replace(rows[0] + "\n", rows[0] + "\r")
+        with self.assertRaisesRegex(ProofError, "bare carriage return"):
+            validate_serial(forged, 33)
+
+    def test_control_line_separator_cannot_forge_transaction(self):
+        # str.splitlines() would accept VT as if it were a genuine COM1 LF.
+        rows = transaction_rows(1, 7)
+        forged = serial_evidence().replace(rows[0] + "\n", rows[0] + "\x0b")
+        with self.assertRaisesRegex(ProofError, "exact serial lines"):
+            validate_serial(forged, 33)
+
+    def test_control_line_separator_cannot_forge_boot(self):
+        forged = serial_evidence().replace("WOLFOS_BOOT_OK\n", "WOLFOS_BOOT_OK\x0b")
+        with self.assertRaises(ProofError):
+            validate_serial(forged, 33)
+
+
+if __name__ == "__main__":
+    unittest.main()

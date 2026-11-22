@@ -47,8 +47,17 @@ At a genuine user INT80 trap, while the real user CR3 is still active:
 
 The test harness uses QEMU's real QMP `screendump` command on **std
 VGA**, not a screenshot constructed from guest-claimed source pixels.
+Every mandatory Ring3/ELF proof marker must be one complete, unique serial
+line in strict order; merely containing a proof substring is rejected.
 It independently verifies RGB geometry, all channels, all untouched
-screen pixels and exact rollback, one stage in strict serial order.
+screen pixels, all 15 pixels actually differing from the baseline, and exact
+rollback, one stage in strict serial order. A pre-existing color match is not
+counted as a changed pixel.
+To prevent a stale local screenshot from being accepted on a repeated QMP
+poll, the host removes the previous stage PPM before each screendump
+request. A QMP success response without a newly created file is rejected;
+only the new file's decoded RGB can satisfy the acceptance gate. This
+guards against local file reuse, **not** against a compromised QMP host.
 
 ## Trust boundary
 
@@ -64,7 +73,34 @@ SMP display lock, frame-ready IRQ or physical GPU driver is included.
 
 The synchronous COM1 acknowledgement protocol and polling are only
 compiled in this opt-in single-BSP IF=0 QEMU test. It is deliberately
-not a general rendering or event loop.
+not a general rendering or event loop. Host ACKs are sent only for an
+exact raw, newline-delimited capture stage (optional CRLF) in sequence;
+malformed, embedded, duplicate or out-of-order stage text fails before ACK. The QEMU serial stream is capped at
+1 MiB total, with each complete or pending line limited to 16 KiB. Oversized
+serial evidence aborts the host acceptance without sending a stage ACK.
+All COM1 bytes must be ASCII: a high-bit octet is refused while receiving,
+before any screenshot-stage ACK can be sent. The final proof decoder also
+rejects invalid ASCII, rather than silently replacing bytes. This applies
+only to this bounded ASCII serial-evidence protocol, not a general console.
+QEMU stdout is discarded and stderr streams to a temporary file instead
+of unconsumed PIPEs, preventing a full subprocess pipe from deadlocking the
+test. On failure only the last 8 KiB of QEMU stderr is printed. The COM1
+proof remains the independent, bounded source for guest serial evidence.
+
+Before sending **any** of the B/A/R screenshot ACK bytes, the host requires
+an exact, unique, ordered sequence of LF-delimited, standalone COM1 records:
+boot success, counted ELF rollback and ownership activation, bounded real
+ELF entry, CPL3 ID/ADD and authentic user-pointer WRITE verification, then
+the stage markers observed so far. Unrelated diagnostics are tolerated;
+missing, duplicate, malformed or out-of-order mandatory records deny ACK.
+Any COM1 evidence of a guest panic, processor exception (PF/GP/UD/DF),
+ELF launch failure, Ring3 preparation error, or display failure also
+denies the B/A/R ACK immediately, even if all success markers appear.
+The same forbidden-marker set applies at final serial verification.
+The guest's final EXIT, CR3 restoration and seven-frame PMM reclamation
+remain separately mandatory after all three screenshots. This ordering
+check strengthens host evidence, but does not claim production attestation
+or defend against a compromised emulator/host.
 
 ## Acceptance
 
@@ -72,5 +108,8 @@ The mandatory P0 step `make user-surface-writer-display-smoke` must
 complete on its exact PR head; all existing GPU, Ring3, real-PMM and
 SMP regressions remain. The host must capture baseline, active and
 restored QMP screenshots; a serial-only claim, timeout, skip or kernel
-log string cannot substitute for pixel evidence. No release or merge to
+log string cannot substitute for pixel evidence. Before PPM decoding, the
+isolated host adapter refuses screenshot files smaller than the minimum 1x1
+P6 frame (14 bytes) or larger than 64 MiB; this avoids loading QMP's
+otherwise permitted ~192 MiB 8192x8192 PPM into test-runner memory. No release or merge to
 `main`; no physical installation disk access.

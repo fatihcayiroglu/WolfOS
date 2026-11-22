@@ -843,6 +843,7 @@ test:
 	rustc --edition=2024 --test kernel/src/virtio_gpu_desktop_wire.rs -o $(OUT)/virtio_gpu_desktop_wire_tests
 	$(OUT)/virtio_gpu_desktop_wire_tests
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_virtio_gpu_desktop_scanout.py' -v
+	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_user_surface_writer_display_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_display_driver_evidence.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_virtio_gpu_pci_smoke.py' -v
 	PYTHONPATH=scripts python3 -m unittest discover -s scripts -p 'test_qemu_stdvga_dispi_smoke.py' -v
