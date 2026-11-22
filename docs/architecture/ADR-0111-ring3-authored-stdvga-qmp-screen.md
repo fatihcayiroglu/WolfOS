@@ -93,6 +93,10 @@ boot success, counted ELF rollback and ownership activation, bounded real
 ELF entry, CPL3 ID/ADD and authentic user-pointer WRITE verification, then
 the stage markers observed so far. Unrelated diagnostics are tolerated;
 missing, duplicate, malformed or out-of-order mandatory records deny ACK.
+Any COM1 evidence of a guest panic, processor exception (PF/GP/UD/DF),
+ELF launch failure, Ring3 preparation error, or display failure also
+denies the B/A/R ACK immediately, even if all success markers appear.
+The same forbidden-marker set applies at final serial verification.
 The guest's final EXIT, CR3 restoration and seven-frame PMM reclamation
 remain separately mandatory after all three screenshots. This ordering
 check strengthens host evidence, but does not claim production attestation
