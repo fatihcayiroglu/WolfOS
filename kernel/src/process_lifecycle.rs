@@ -153,6 +153,9 @@ impl<const N: usize> ProcessRecord<N> {
     }
 
     /// Wake only an existing BLOCKED owner from a trusted kernel event.
+    /// A supervisor CR3 cannot be ANY frame in this process's live PMM
+    /// lease, not just its PML4 root. The table-wide caller must also check
+    /// every other resident process's lease before a hardware handoff.
     /// Caller must independently verify the actual supervisor CR3 and event;
     /// this metadata check alone cannot authenticate an interrupt/wakeup.
     pub fn wake_blocked(&mut self, pid: u64, supervisor_cr3: u64)
@@ -163,7 +166,7 @@ impl<const N: usize> ProcessRecord<N> {
             return Err(ProcessError::WrongState)
         }
         if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
-            || supervisor_cr3 >= MAX_PHYSICAL || supervisor_cr3 == self.cr3_root
+            || supervisor_cr3 >= MAX_PHYSICAL || self.owned_frames().contains(&supervisor_cr3)
         { return Err(ProcessError::ActiveCr3) }
         self.state = ProcessState::Ready;
         Ok(())
@@ -197,13 +200,15 @@ impl<const N: usize> ProcessRecord<N> {
 
     /// Shared release authorization; the caller must independently prove
     /// actual hardware CR3 and quiescence before releasing PMM frames.
+    /// An owned non-root page-table or data frame can NEVER masquerade as
+    /// the trusted supervisor CR3; no mutation on any such rejected attempt.
     fn release_allowed(&self, pid: u64, expected: ProcessState, supervisor_cr3: u64)
         -> Result<(), ProcessError>
     {
         self.identity(pid)?;
         if self.state != expected { return Err(ProcessError::WrongState) }
         if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
-            || supervisor_cr3 >= MAX_PHYSICAL || supervisor_cr3 == self.cr3_root
+            || supervisor_cr3 >= MAX_PHYSICAL || self.owned_frames().contains(&supervisor_cr3)
         { return Err(ProcessError::ActiveCr3) }
         Ok(())
     }
@@ -626,6 +631,72 @@ mod tests {
         p.exit_zero(18, nine[0]).unwrap();
         assert_eq!(p.reap(18, 0x90000), Ok(nine));
         assert_eq!(p.frame_count, 0);
+    }
+
+    #[test]
+    fn direct_ready_cancel_refuses_each_owned_nonroot_frame() {
+        let frames = owned();
+        let mut process = ProcessRecord::<7>::empty();
+        process.admit(19, frames[0], frames).unwrap();
+        let before = process;
+        for supervisor in [frames[1], frames[3], frames[6]] {
+            assert_ne!(supervisor, frames[0]);
+            assert_eq!(process.cancel_ready(19, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process.cancel_ready_counted(19, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process, before,
+                       "denial must preserve the exact seven-frame lease");
+        }
+        assert_eq!(process.cancel_ready(19, 0x9000), Ok(frames));
+        assert_eq!(process.state, ProcessState::Reaped);
+        assert_eq!(process.frame_count, 0);
+    }
+
+    #[test]
+    fn direct_blocked_wake_and_cancel_refuse_counted_owned_nonroot_frames() {
+        let mut process = ProcessRecord::<9>::empty();
+        let frames = padded(0x1000, 6);
+        process.admit_counted(20, frames[0], frames, 6).unwrap();
+        process.mark_running(20, frames[0]).unwrap();
+        process.block_running(20, frames[0]).unwrap();
+        let before = process;
+        for supervisor in [frames[1], frames[3], frames[5]] {
+            assert_eq!(process.wake_blocked(20, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process.cancel_blocked_counted(20, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process, before,
+                       "a nonroot owned frame must not wake or release the lease");
+        }
+        assert_eq!(process.wake_blocked(20, 0x90000), Ok(()));
+        process.mark_running(20, frames[0]).unwrap();
+        process.block_running(20, frames[0]).unwrap();
+        let returned = process.cancel_blocked_counted(20, 0x90000).unwrap();
+        assert_eq!(returned.as_slice(), &frames[..6]);
+        assert_eq!(returned.frames[6..], [0; 3]);
+        assert_eq!(process.frame_count, 0);
+    }
+
+    #[test]
+    fn direct_exited_reap_refuses_owned_nonroot_frame_and_keeps_status() {
+        let mut process = ProcessRecord::<7>::empty();
+        let frames = owned();
+        process.admit(21, frames[0], frames).unwrap();
+        process.mark_running(21, frames[0]).unwrap();
+        process.exit_with_status(21, frames[0], 0x8000_002a).unwrap();
+        let before = process;
+        for supervisor in [frames[1], frames[4], frames[6]] {
+            assert_eq!(process.reap_with_status(21, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process.reap_with_status_counted(21, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process, before,
+                       "failed reap cannot lose the PID, status, or PMM frames");
+        }
+        assert_eq!(process.reap_with_status(21, 0x9000),
+                   Ok((0x8000_002a, frames)));
+        assert_eq!(process.reap(21, 0x9000), Err(ProcessError::WrongState));
     }
 
     #[test]
