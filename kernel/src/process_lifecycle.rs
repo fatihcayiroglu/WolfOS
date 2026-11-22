@@ -634,6 +634,72 @@ mod tests {
     }
 
     #[test]
+    fn direct_ready_cancel_refuses_each_owned_nonroot_frame() {
+        let frames = owned();
+        let mut process = ProcessRecord::<7>::empty();
+        process.admit(19, frames[0], frames).unwrap();
+        let before = process;
+        for supervisor in [frames[1], frames[3], frames[6]] {
+            assert_ne!(supervisor, frames[0]);
+            assert_eq!(process.cancel_ready(19, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process.cancel_ready_counted(19, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process, before,
+                       "denial must preserve the exact seven-frame lease");
+        }
+        assert_eq!(process.cancel_ready(19, 0x9000), Ok(frames));
+        assert_eq!(process.state, ProcessState::Reaped);
+        assert_eq!(process.frame_count, 0);
+    }
+
+    #[test]
+    fn direct_blocked_wake_and_cancel_refuse_counted_owned_nonroot_frames() {
+        let mut process = ProcessRecord::<9>::empty();
+        let frames = padded(0x1000, 6);
+        process.admit_counted(20, frames[0], frames, 6).unwrap();
+        process.mark_running(20, frames[0]).unwrap();
+        process.block_running(20, frames[0]).unwrap();
+        let before = process;
+        for supervisor in [frames[1], frames[3], frames[5]] {
+            assert_eq!(process.wake_blocked(20, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process.cancel_blocked_counted(20, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process, before,
+                       "a nonroot owned frame must not wake or release the lease");
+        }
+        assert_eq!(process.wake_blocked(20, 0x90000), Ok(()));
+        process.mark_running(20, frames[0]).unwrap();
+        process.block_running(20, frames[0]).unwrap();
+        let returned = process.cancel_blocked_counted(20, 0x90000).unwrap();
+        assert_eq!(returned.as_slice(), &frames[..6]);
+        assert_eq!(returned.frames[6..], [0; 3]);
+        assert_eq!(process.frame_count, 0);
+    }
+
+    #[test]
+    fn direct_exited_reap_refuses_owned_nonroot_frame_and_keeps_status() {
+        let mut process = ProcessRecord::<7>::empty();
+        let frames = owned();
+        process.admit(21, frames[0], frames).unwrap();
+        process.mark_running(21, frames[0]).unwrap();
+        process.exit_with_status(21, frames[0], 0x8000_002a).unwrap();
+        let before = process;
+        for supervisor in [frames[1], frames[4], frames[6]] {
+            assert_eq!(process.reap_with_status(21, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process.reap_with_status_counted(21, supervisor),
+                       Err(ProcessError::ActiveCr3));
+            assert_eq!(process, before,
+                       "failed reap cannot lose the PID, status, or PMM frames");
+        }
+        assert_eq!(process.reap_with_status(21, 0x9000),
+                   Ok((0x8000_002a, frames)));
+        assert_eq!(process.reap(21, 0x9000), Err(ProcessError::WrongState));
+    }
+
+    #[test]
     fn process_cell_carries_state_and_rejects_reentrancy() {
         let cell = ProcessCell::<7>::new();
         cell.with(|p| {
