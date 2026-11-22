@@ -71,6 +71,15 @@ def append_serial_chunk(received: bytearray, pending: bytes,
 STAGES = ("baseline", "active", "restored")
 REPLIES = {"baseline": b"B", "active": b"A", "restored": b"R"}
 PREFIX = "WOLFOS_CPL3_DISPLAY_CAPTURE stage="
+# An error record is never part of a successful guest-authored display
+# handshake. Refuse it before host ACK, not only at final run verification.
+FORBIDDEN_COM1_MARKERS = (
+    "WOLFOS_ELF_RUN_ERROR", "WOLFOS_PANIC",
+    "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_GP",
+    "WOLFOS_EXCEPTION_UD", "WOLFOS_EXCEPTION_DF",
+    "WOLFOS_CPL3_DISPLAY_FAIL", "WOLFOS_RING_PREP_ERROR",
+    "WOLFOS_ELF_HELLO_OK",
+)
 def parse_capture_stage_line(line: bytes, expected: str | None) -> str | None:
     """Require exact raw COM1 stage bytes before any screenshot ACK is sent.
 
@@ -206,6 +215,9 @@ def validate_capture_prefix(history: list[bytes], stage: str) -> None:
         raise ProofError("Non-ASCII QMP capture prefix") from exc
     if any("\r" in line for line in lines):
         raise ProofError("Malformed carriage return in QMP capture prefix")
+    if any(fragment in line for line in lines
+           for fragment in FORBIDDEN_COM1_MARKERS):
+        raise ProofError("Fatal guest evidence before QMP ACK")
     if not lines or lines[-1] != PREFIX + stage:
         raise ProofError("QMP stage does not terminate its evidence prefix")
     expected = [
@@ -275,14 +287,7 @@ def validate_serial(output: str, code: int) -> None:
                 f"Missing, duplicate or out-of-order guest proof: {canonical}"
             )
         cursor = matches[0] + 1
-    forbidden = (
-        "WOLFOS_ELF_RUN_ERROR", "WOLFOS_PANIC",
-        "WOLFOS_EXCEPTION_PF", "WOLFOS_EXCEPTION_GP",
-        "WOLFOS_EXCEPTION_UD", "WOLFOS_EXCEPTION_DF",
-        "WOLFOS_CPL3_DISPLAY_FAIL", "WOLFOS_RING_PREP_ERROR",
-        "WOLFOS_ELF_HELLO_OK",
-    )
-    for fragment in forbidden:
+    for fragment in FORBIDDEN_COM1_MARKERS:
         if fragment in output:
             raise ProofError(f"Forbidden failure/old behavior marker: {fragment}")
     # Substring-only matching accepts log injections such as
