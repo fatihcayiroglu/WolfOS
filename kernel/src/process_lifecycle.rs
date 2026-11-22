@@ -153,6 +153,9 @@ impl<const N: usize> ProcessRecord<N> {
     }
 
     /// Wake only an existing BLOCKED owner from a trusted kernel event.
+    /// A supervisor CR3 cannot be ANY frame in this process's live PMM
+    /// lease, not just its PML4 root. The table-wide caller must also check
+    /// every other resident process's lease before a hardware handoff.
     /// Caller must independently verify the actual supervisor CR3 and event;
     /// this metadata check alone cannot authenticate an interrupt/wakeup.
     pub fn wake_blocked(&mut self, pid: u64, supervisor_cr3: u64)
@@ -163,7 +166,7 @@ impl<const N: usize> ProcessRecord<N> {
             return Err(ProcessError::WrongState)
         }
         if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
-            || supervisor_cr3 >= MAX_PHYSICAL || supervisor_cr3 == self.cr3_root
+            || supervisor_cr3 >= MAX_PHYSICAL || self.owned_frames().contains(&supervisor_cr3)
         { return Err(ProcessError::ActiveCr3) }
         self.state = ProcessState::Ready;
         Ok(())
@@ -197,13 +200,15 @@ impl<const N: usize> ProcessRecord<N> {
 
     /// Shared release authorization; the caller must independently prove
     /// actual hardware CR3 and quiescence before releasing PMM frames.
+    /// An owned non-root page-table or data frame can NEVER masquerade as
+    /// the trusted supervisor CR3; no mutation on any such rejected attempt.
     fn release_allowed(&self, pid: u64, expected: ProcessState, supervisor_cr3: u64)
         -> Result<(), ProcessError>
     {
         self.identity(pid)?;
         if self.state != expected { return Err(ProcessError::WrongState) }
         if supervisor_cr3 == 0 || supervisor_cr3 & (PAGE - 1) != 0
-            || supervisor_cr3 >= MAX_PHYSICAL || supervisor_cr3 == self.cr3_root
+            || supervisor_cr3 >= MAX_PHYSICAL || self.owned_frames().contains(&supervisor_cr3)
         { return Err(ProcessError::ActiveCr3) }
         Ok(())
     }
