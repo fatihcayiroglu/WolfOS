@@ -351,6 +351,37 @@ class PreAckGuestEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ProofError, "carriage return"):
             validate_capture_prefix(lines, "baseline")
 
+    def test_fatal_guest_record_rejected_before_any_stage_ack(self):
+        for stage in STAGES:
+            for marker in (
+                b"WOLFOS_ELF_RUN_ERROR",
+                b"WOLFOS_PANIC",
+                b"WOLFOS_EXCEPTION_PF",
+                b"WOLFOS_EXCEPTION_GP",
+                b"WOLFOS_EXCEPTION_UD",
+                b"WOLFOS_EXCEPTION_DF",
+                b"WOLFOS_CPL3_DISPLAY_FAIL timeout",
+                b"WOLFOS_RING_PREP_ERROR",
+                b"WOLFOS_ELF_HELLO_OK",
+            ):
+                with self.subTest(stage=stage, marker=marker):
+                    lines = self.prefix(stage)
+                    lines.insert(-1, marker)
+                    with self.assertRaisesRegex(ProofError, "Fatal guest evidence"):
+                        validate_capture_prefix(lines, stage)
+
+    def test_masquerading_fatal_record_in_diagnostic_rejected(self):
+        lines = self.prefix("baseline")
+        lines.insert(-1, b"diagnostic: WOLFOS_PANIC unexpected")
+        with self.assertRaisesRegex(ProofError, "Fatal guest evidence"):
+            validate_capture_prefix(lines, "baseline")
+
+    def test_unrelated_diagnostic_before_capture_is_tolerated(self):
+        lines = self.prefix("active")
+        lines.insert(-1, b"guest diagnostic without mandatory marker")
+        validate_capture_prefix(lines, "active")
+
+
 
 class BoundedSerialChunkTests(unittest.TestCase):
     def test_non_ascii_chunk_refused_before_buffer_mutation(self):
