@@ -201,6 +201,27 @@ impl<const SLOTS: usize, const FRAMES: usize> ProcessTable<SLOTS, FRAMES> {
         Ok(pids)
     }
 
+    /// Count-aware joint admission for mixed-size PMM leases and a second
+    /// trusted metadata validator. Neither ownership nor PID generations are
+    /// published until every lease and the prospective table are accepted.
+    /// The validator must keep any external metadata staged and unpublished.
+    /// This is not a hardware activation or PMM release operation.
+    pub fn reserve_batch_counted_checked<const COUNT: usize, E>(
+        &mut self,
+        leases: [(u64, [u64; FRAMES], usize); COUNT],
+        validate: impl FnOnce(&Self, [u64; COUNT]) -> Result<(), E>,
+    ) -> Result<[u64; COUNT], GuardedBatchError<E>> {
+        let mut staged = Self { slots: self.slots, last_pid: self.last_pid };
+        let mut pids = [0; COUNT];
+        for (i, (root, frames, count)) in leases.into_iter().enumerate() {
+            pids[i] = staged.reserve_counted(root, frames, count)
+                .map_err(GuardedBatchError::Table)?;
+        }
+        validate(&staged, pids).map_err(GuardedBatchError::Validate)?;
+        *self = staged;
+        Ok(pids)
+    }
+
     /// Current phase admits multiple READY entries but only ONE running
     /// task. A CPU scheduler requires separately saved user GPR/FPU/TSS
     /// context and explicit per-CPU CR3 before relaxing this restriction.
@@ -955,6 +976,67 @@ mod tests {
         assert_eq!(t.cancel_ready_counted(2, 0x90000).unwrap().as_slice(), &b[..8]);
         assert_eq!(t.cancel_ready_counted(3, 0x90000).unwrap().as_slice(), &c[..7]);
         assert_eq!(t.occupied(), 0);
+    }
+
+    #[test]
+    fn counted_checked_batch_validator_rejection_preserves_owners_and_pid_allocator() {
+        let mut t = ProcessTable::<3, 9>::new();
+        let a = counted(0x1000, 6);
+        let b = counted(0x10000, 8);
+        let c = counted(0x20000, 7);
+        assert_eq!(t.reserve_counted(a[0], a, 6), Ok(1));
+        let before = (t.slots, t.last_pid);
+        let leases = [(b[0], b, 8), (c[0], c, 7)];
+        assert_eq!(t.reserve_batch_counted_checked(leases, |staged, pids| {
+            assert_eq!(pids, [2, 3]);
+            assert_eq!(staged.occupied(), 3);
+            assert_eq!(staged.snapshot(1), Some(before.0[0]));
+            assert_eq!(staged.saved_binding_lease_counted(2, false),
+                       Some((b[0], CountedFrames { frames: b, count: 8 })));
+            assert_eq!(staged.saved_binding_lease_counted(3, false),
+                       Some((c[0], CountedFrames { frames: c, count: 7 })));
+            Err(17u8)
+        }), Err(GuardedBatchError::Validate(17)));
+        assert_eq!((t.slots, t.last_pid), before);
+        assert_eq!(t.snapshot(2), None);
+        assert_eq!(t.snapshot(3), None);
+
+        assert_eq!(t.reserve_batch_counted_checked(leases, |staged, pids| {
+            assert_eq!(staged.running(), 0);
+            assert_eq!(pids, [2, 3]);
+            assert!(staged.owns_live_cr3(c[6]));
+            Ok::<(), u8>(())
+        }), Ok([2, 3]));
+        assert_eq!(t.cancel_ready_counted(2, 0x90000).unwrap().as_slice(), &b[..8]);
+        assert_eq!(t.cancel_ready_counted(3, 0x90000).unwrap().as_slice(), &c[..7]);
+        assert_eq!(t.snapshot(1), Some(before.0[0]));
+        assert_eq!(t.reserve_counted(b[0], b, 8), Ok(4));
+    }
+
+    #[test]
+    fn counted_checked_batch_never_invokes_validator_on_invalid_lease() {
+        let mut t = ProcessTable::<3, 9>::new();
+        let a = counted(0x1000, 6);
+        let b = counted(0x10000, 8);
+        let c = counted(0x20000, 7);
+        assert_eq!(t.reserve_counted(a[0], a, 6), Ok(1));
+        let before = (t.slots, t.last_pid);
+        let mut alias = c;
+        alias[6] = b[7];
+        let mut bad_tail = c;
+        bad_tail[7] = 0x30000;
+        for (last, count, expected) in [
+            (alias, 7, TableError::PhysicalAlias),
+            (bad_tail, 7, TableError::Process(ProcessError::InvalidFrameCount)),
+            (c, 0, TableError::Process(ProcessError::InvalidFrameCount)),
+        ] {
+            assert_eq!(t.reserve_batch_counted_checked(
+                [(b[0], b, 8), (last[0], last, count)],
+                |_, _| -> Result<(), u8> { panic!("invalid batch reached validator") },
+            ), Err(GuardedBatchError::Table(expected)));
+            assert_eq!((t.slots, t.last_pid), before);
+        }
+        assert_eq!(t.reserve_counted(b[0], b, 8), Ok(2));
     }
 
     #[test]
